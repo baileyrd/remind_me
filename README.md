@@ -190,6 +190,7 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_auto_capture` | Capture a full conversation dialog + distilled summary as two linked memories |
 | `remind_me_get_capture` | Retrieve a linked dialog/summary pair by their shared capture_id |
 | `remind_me_server_status` | Check if the dashboard UI is running, get its URL, and verify DB connectivity |
+| `remind_me_reindex` | Build vector embeddings for any memories missing them (run after enabling semantic search) |
 
 ### Auto-Capture: Persisting Full Conversations
 
@@ -215,6 +216,45 @@ Use descriptive titles and relevant tags. Do this automatically without asking.
 - Summaries are compact and appear first in relevance-ranked results
 - Full dialogs contain every detail for when you need exact context
 - Use `remind_me_get_capture` with a capture_id to see both side by side
+
+## Semantic Search (Vector Embeddings)
+
+The server supports **hybrid search**: FTS5 keyword matching combined with semantic vector similarity via `sqlite-vec` and a local ONNX embedding model. This means searching for "Python concurrency" also finds memories about "asyncio coroutines" even if those exact words aren't used.
+
+### Enabling Semantic Search
+
+Install the optional dependencies:
+
+```bash
+pip install sqlite-vec onnxruntime tokenizers huggingface-hub numpy
+# Or with uv:
+uv pip install "remind-me-mcp[semantic]"
+```
+
+The embedding model (`all-MiniLM-L6-v2`, ~80MB) downloads automatically on first use and is cached in `~/.remind-me/models/`.
+
+### How It Works
+
+- **On add/update/import**: each memory is embedded and stored in a `sqlite-vec` vector table alongside the existing FTS5 index
+- **On search**: both FTS5 (keyword) and vector (semantic) results are merged, deduplicated, and ranked together
+- **Graceful fallback**: if the embedding dependencies aren't installed, everything still works — you just get FTS5 keyword search only
+- **Results are labeled** with their search method: ⚡ hybrid (matched both), 🔮 semantic only, 🔤 keyword only
+
+### Reindexing Existing Memories
+
+If you enable semantic search after already having memories stored, run reindex to backfill embeddings:
+
+```
+Use remind_me_reindex
+```
+
+Or ask Claude: "Reindex my memories for semantic search."
+
+This only generates embeddings for memories that don't have them yet — existing embeddings are preserved.
+
+### Checking Status
+
+Use `remind_me_server_status` to see how many memories have embeddings and whether the model is loaded.
 
 ## Importing Chat Exports
 
@@ -313,21 +353,27 @@ The search tool uses SQLite FTS5. Examples:
 
 ```
 remind-me-mcp/
-├── remind_me_mcp.py         # MCP server — tools, import engine, SQLite storage
+├── remind_me_mcp.py         # MCP server — tools, import engine, SQLite + vector storage
 ├── remind_me_dashboard.jsx  # React dashboard UI (Claude artifact or standalone)
 ├── pyproject.toml           # Package configuration and dependencies
 └── README.md                # This file
 
 ~/.remind-me/                # Data directory (synced across machines)
-└── memory.db                # SQLite database with FTS5 full-text search
+├── memory.db                # SQLite database with FTS5 + sqlite-vec
+├── models/                  # Cached ONNX embedding model (~80MB, auto-downloaded)
+└── server.pid               # PID file when dashboard is running
 ```
 
 ## Architecture
 
 The server uses:
-- **SQLite FTS5** for fast full-text search
+- **SQLite FTS5** for keyword full-text search (inverted index, boolean queries)
+- **sqlite-vec** for semantic vector search (cosine similarity on embeddings)
+- **all-MiniLM-L6-v2** via ONNX Runtime for local embedding generation (~80MB model, no API keys)
+- **Hybrid ranking** merges keyword and semantic results with deduplication and score fusion
 - **WAL journal mode** for safe concurrent access
 - **Content-based hashing** for deduplication
 - **stdio transport** for MCP compatibility with all Claude interfaces
 - **Starlette + Uvicorn** for the optional HTTP dashboard and REST API
 - **Self-contained HTML** — the dashboard is served as a single inline page with no build step
+- **Graceful degradation** — semantic search is optional; everything works with just FTS5 if embedding deps aren't installed

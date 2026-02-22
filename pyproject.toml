@@ -11,6 +11,15 @@ dependencies = [
     "httpx>=0.25.0",
     "starlette>=0.40.0",
     "uvicorn>=0.30.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+semantic = [
+    "sqlite-vec>=0.1.0",
+    "onnxruntime>=1.16.0",
+    "tokenizers>=0.15.0",
+    "huggingface-hub>=0.20.0",
 ]
 
 [project.scripts]

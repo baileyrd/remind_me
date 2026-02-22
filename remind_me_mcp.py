@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import sqlite3
+import struct
 import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -24,6 +25,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
+import numpy as np
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -120,12 +122,130 @@ def get_server_status() -> dict[str, Any]:
 # Database helpers
 # ---------------------------------------------------------------------------
 
+# Embedding model config
+EMBEDDING_MODEL = os.environ.get("REMIND_ME_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+EMBEDDING_DIM = 384  # all-MiniLM-L6-v2 output dimension
+MODEL_DIR = MEMORY_DIR / "models"
+
+# Global embedding state (lazy-loaded)
+_embedder: _Embedder | None = None
+
+
+class _Embedder:
+    """Lightweight ONNX-based embedding engine. Downloads model on first use."""
+
+    def __init__(self, model_name: str = EMBEDDING_MODEL, dim: int = EMBEDDING_DIM):
+        self.model_name = model_name
+        self.dim = dim
+        self._session = None
+        self._tokenizer = None
+        self._ready = False
+
+    def _ensure_loaded(self) -> None:
+        if self._ready:
+            return
+        try:
+            from huggingface_hub import hf_hub_download
+            from tokenizers import Tokenizer
+            import onnxruntime as ort
+
+            MODEL_DIR.mkdir(parents=True, exist_ok=True)
+            cache_dir = str(MODEL_DIR)
+
+            log.info("Loading embedding model: %s", self.model_name)
+            model_path = hf_hub_download(
+                self.model_name, "onnx/model.onnx", cache_dir=cache_dir
+            )
+            tokenizer_path = hf_hub_download(
+                self.model_name, "tokenizer.json", cache_dir=cache_dir
+            )
+
+            self._session = ort.InferenceSession(
+                model_path, providers=["CPUExecutionProvider"]
+            )
+            self._tokenizer = Tokenizer.from_file(tokenizer_path)
+            self._tokenizer.enable_padding(pad_id=0, pad_token="[PAD]")
+            self._tokenizer.enable_truncation(max_length=256)
+            self._ready = True
+            log.info("Embedding model loaded (%d dimensions)", self.dim)
+
+        except ImportError as e:
+            log.warning(
+                "Embedding dependencies not installed (%s). "
+                "Install with: pip install onnxruntime tokenizers huggingface-hub numpy. "
+                "Semantic search will be unavailable; FTS5 keyword search still works.",
+                e,
+            )
+            raise
+        except Exception as e:
+            log.warning("Failed to load embedding model: %s. Semantic search unavailable.", e)
+            raise
+
+    def embed(self, texts: list[str]) -> np.ndarray:
+        """Embed a batch of texts. Returns (N, dim) float32 array, L2-normalized."""
+        self._ensure_loaded()
+        encoded = self._tokenizer.encode_batch(texts)
+        input_ids = np.array([e.ids for e in encoded], dtype=np.int64)
+        attention_mask = np.array([e.attention_mask for e in encoded], dtype=np.int64)
+        token_type_ids = np.zeros_like(input_ids)
+
+        outputs = self._session.run(None, {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "token_type_ids": token_type_ids,
+        })
+
+        # Mean pooling over token embeddings
+        embeddings = outputs[0]  # shape: (batch, seq_len, dim)
+        mask_expanded = attention_mask[:, :, np.newaxis].astype(np.float32)
+        pooled = (embeddings * mask_expanded).sum(axis=1) / mask_expanded.sum(axis=1).clip(min=1e-9)
+
+        # L2 normalize
+        norms = np.linalg.norm(pooled, axis=1, keepdims=True).clip(min=1e-9)
+        return (pooled / norms).astype(np.float32)
+
+    def embed_one(self, text: str) -> bytes:
+        """Embed a single text and return as bytes for sqlite-vec."""
+        vec = self.embed([text])[0]
+        return vec.tobytes()
+
+    @property
+    def available(self) -> bool:
+        try:
+            self._ensure_loaded()
+            return True
+        except Exception:
+            return False
+
+
+def _get_embedder() -> _Embedder | None:
+    """Get or create the global embedder. Returns None if dependencies missing."""
+    global _embedder
+    if _embedder is None:
+        _embedder = _Embedder()
+    try:
+        _embedder._ensure_loaded()
+        return _embedder
+    except Exception:
+        return None
+
+
 def _get_db() -> sqlite3.Connection:
     """Open (and lazily initialize) the SQLite database."""
     db = sqlite3.connect(str(DB_PATH), timeout=10)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")  # safe for concurrent readers
     db.execute("PRAGMA foreign_keys=ON")
+
+    # Load sqlite-vec extension if available
+    try:
+        import sqlite_vec
+        db.enable_load_extension(True)
+        sqlite_vec.load(db)
+        db.enable_load_extension(False)
+    except (ImportError, Exception) as e:
+        log.debug("sqlite-vec not available: %s (vector search disabled)", e)
+
     _ensure_schema(db)
     return db
 
@@ -180,7 +300,61 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_memories_source ON memories(source);
         CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
     """)
+
+    # Create sqlite-vec vector table if extension is loaded
+    try:
+        db.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS memories_vec USING vec0(embedding float[{EMBEDDING_DIM}])")
+    except Exception:
+        pass  # sqlite-vec not available
+
     db.commit()
+
+
+def _embed_and_store(db: sqlite3.Connection, memory_id: str, content: str) -> bool:
+    """Generate embedding for content and store in vector table. Returns True on success."""
+    embedder = _get_embedder()
+    if embedder is None:
+        return False
+    try:
+        rowid = db.execute("SELECT rowid FROM memories WHERE id = ?", (memory_id,)).fetchone()
+        if rowid is None:
+            return False
+        vec_bytes = embedder.embed_one(content[:2000])  # truncate very long content for embedding
+        # Delete existing vector if any (for updates)
+        db.execute("DELETE FROM memories_vec WHERE rowid = ?", (rowid[0],))
+        db.execute("INSERT INTO memories_vec(rowid, embedding) VALUES (?, ?)", (rowid[0], vec_bytes))
+        db.commit()
+        return True
+    except Exception as e:
+        log.debug("Failed to embed memory %s: %s", memory_id, e)
+        return False
+
+
+def _semantic_search(db: sqlite3.Connection, query: str, limit: int = 20) -> list[dict]:
+    """Search memories by semantic similarity. Returns list of dicts with 'distance' added."""
+    embedder = _get_embedder()
+    if embedder is None:
+        return []
+    try:
+        query_bytes = embedder.embed_one(query)
+        rows = db.execute(
+            """SELECT m.*, mv.distance
+               FROM memories_vec mv
+               JOIN memories m ON m.rowid = mv.rowid
+               WHERE mv.embedding MATCH ?
+               ORDER BY mv.distance
+               LIMIT ?""",
+            (query_bytes, limit),
+        ).fetchall()
+        results = []
+        for r in rows:
+            d = _row_to_dict(r)
+            d["semantic_distance"] = d.pop("distance", None)
+            results.append(d)
+        return results
+    except Exception as e:
+        log.debug("Semantic search failed: %s", e)
+        return []
 
 
 def _now_iso() -> str:
@@ -613,6 +787,16 @@ def import_chat_file(
             )
             stored += 1
 
+    db.commit()
+
+    # Embed all imported memories (batch after commit for efficiency)
+    for content in contents:
+        if not content.strip():
+            continue
+        for chunk in _chunk_text(content, max_length):
+            mem_id_check = hashlib.sha256(f"{chunk}{now}".encode()).hexdigest()[:12]
+            _embed_and_store(db, mem_id_check, chunk)
+
     stats = {"memories_created": stored, "raw_entries": len(contents), "file": path.name}
     db.execute(
         "INSERT INTO chat_imports (import_id, filename, hash, imported_at, stats) VALUES (?, ?, ?, ?, ?)",
@@ -677,6 +861,7 @@ async def memory_add(params: MemoryAddInput) -> str:
         ),
     )
     db.commit()
+    _embed_and_store(db, mem_id, params.content)
     return f"✓ Memory stored with id `{mem_id}` in category '{params.category}'."
 
 
@@ -691,7 +876,13 @@ async def memory_add(params: MemoryAddInput) -> str:
     },
 )
 async def memory_search(params: MemorySearchInput) -> str:
-    """Full-text search across all stored memories. Supports FTS5 query syntax (AND, OR, NOT, "exact phrase", prefix*).
+    """Hybrid search across all stored memories. Combines FTS5 keyword matching with semantic vector similarity.
+
+    If semantic search is available (embedding model loaded), results from both are merged
+    and deduplicated, with keyword matches boosted. Falls back to FTS5-only if embeddings
+    are unavailable.
+
+    Supports FTS5 query syntax for keyword search: AND, OR, NOT, "exact phrase", prefix*.
 
     Args:
         params (MemorySearchInput): Search query and optional filters.
@@ -700,6 +891,9 @@ async def memory_search(params: MemorySearchInput) -> str:
         str: Matching memories in the requested format.
     """
     db = _get_db()
+
+    # --- FTS5 keyword search ---
+    fts_memories: list[dict] = []
     try:
         rows = db.execute(
             """SELECT m.* FROM memories m
@@ -709,19 +903,77 @@ async def memory_search(params: MemorySearchInput) -> str:
                LIMIT ?""",
             (params.query, params.limit),
         ).fetchall()
-    except sqlite3.OperationalError as e:
-        return f"Search error: {e}. Try simpler query terms or quote exact phrases."
+        fts_memories = [_row_to_dict(r) for r in rows]
+    except sqlite3.OperationalError:
+        # FTS query syntax error — fall through to semantic-only
+        pass
 
-    memories = [_row_to_dict(r) for r in rows]
+    # --- Semantic vector search ---
+    sem_memories = _semantic_search(db, params.query, limit=params.limit)
+
+    # --- Merge and deduplicate (hybrid ranking) ---
+    seen: dict[str, dict] = {}
+    scores: dict[str, float] = {}
+
+    # FTS results get a boost (lower score = better)
+    for i, m in enumerate(fts_memories):
+        mid = m["id"]
+        seen[mid] = m
+        scores[mid] = i * 0.5  # FTS rank position, weighted
+
+    # Semantic results scored by distance
+    for i, m in enumerate(sem_memories):
+        mid = m["id"]
+        sem_score = m.get("semantic_distance", 2.0)
+        if mid in seen:
+            # Appeared in both — big boost
+            scores[mid] = scores[mid] * 0.3 + sem_score * 0.3
+            seen[mid]["_search_method"] = "hybrid"
+        else:
+            seen[mid] = m
+            scores[mid] = sem_score + 0.5  # slight penalty for semantic-only
+            seen[mid]["_search_method"] = "semantic"
+
+    # Mark FTS-only results
+    for mid in seen:
+        if "_search_method" not in seen[mid]:
+            seen[mid]["_search_method"] = "keyword"
+
+    # Sort by combined score
+    ranked = sorted(seen.values(), key=lambda m: scores[m["id"]])
 
     # Apply optional filters
     if params.category:
-        memories = [m for m in memories if m["category"] == params.category]
+        ranked = [m for m in ranked if m["category"] == params.category]
     if params.tags:
         tag_set = set(params.tags)
-        memories = [m for m in memories if tag_set.issubset(set(m.get("tags", [])))]
+        ranked = [m for m in ranked if tag_set.issubset(set(m.get("tags", [])))]
 
-    return _fmt_memories(memories, params.response_format)
+    ranked = ranked[:params.limit]
+
+    # Add search method indicator to output
+    if params.response_format == ResponseFormat.JSON:
+        return json.dumps({"count": len(ranked), "memories": ranked}, indent=2, default=str)
+
+    if not ranked:
+        return "_No memories found._"
+
+    parts = []
+    sem_available = len(sem_memories) > 0 or _get_embedder() is not None
+    method_label = "hybrid (keyword + semantic)" if sem_available else "keyword only"
+    parts.append(f"**{len(ranked)} results** via {method_label} search\n")
+
+    for m in ranked:
+        method = m.pop("_search_method", "")
+        dist = m.pop("semantic_distance", None)
+        badge = {"hybrid": "⚡", "semantic": "🔮", "keyword": "🔤"}.get(method, "")
+        parts.append(_fmt_memory_md(m).rstrip())
+        extras = [badge + method]
+        if dist is not None:
+            extras.append(f"distance: {dist:.3f}")
+        parts.append(f"_{' · '.join(extras)}_\n")
+
+    return "\n---\n".join(parts)
 
 
 @mcp.tool(
@@ -844,6 +1096,9 @@ async def memory_update(params: MemoryUpdateInput) -> str:
 
     db.execute(f"UPDATE memories SET {', '.join(sets)} WHERE id = ?", bindings)
     db.commit()
+    # Re-embed if content changed
+    if params.content is not None:
+        _embed_and_store(db, params.memory_id, params.content)
     return f"✓ Memory `{params.memory_id}` updated."
 
 
@@ -1122,6 +1377,10 @@ async def remind_me_auto_capture(params: AutoCaptureInput) -> str:
 
     db.commit()
 
+    # Embed both for semantic search (summary is more searchable, dialog has full context)
+    _embed_and_store(db, summary_id, params.summary)
+    _embed_and_store(db, dialog_id, params.conversation[:2000])
+
     tag_str = ", ".join(params.tags) if params.tags else "none"
     return (
         f"✓ Conversation captured!\n\n"
@@ -1209,6 +1468,68 @@ async def remind_me_get_capture(capture_id: str) -> str:
 
 
 @mcp.tool(
+    name="remind_me_reindex",
+    annotations={
+        "title": "Rebuild Vector Embeddings",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def remind_me_reindex() -> str:
+    """Rebuild vector embeddings for all memories that don't have them yet.
+
+    Run this after installing the embedding dependencies, or after importing
+    memories that were added before semantic search was enabled.
+    Existing embeddings are preserved; only missing ones are generated.
+
+    Returns:
+        str: Summary of how many embeddings were created.
+    """
+    embedder = _get_embedder()
+    if embedder is None:
+        return (
+            "Embedding model not available. Install dependencies:\n"
+            "```\npip install onnxruntime tokenizers huggingface-hub numpy sqlite-vec\n```\n"
+            "The model (~80MB) downloads automatically on first use."
+        )
+
+    db = _get_db()
+    # Find memories without embeddings
+    all_rows = db.execute("SELECT id, rowid, content FROM memories").fetchall()
+    existing_vecs = set()
+    try:
+        vec_rows = db.execute("SELECT rowid FROM memories_vec").fetchall()
+        existing_vecs = {r[0] for r in vec_rows}
+    except Exception:
+        pass
+
+    missing = [(r["id"], r["rowid"], r["content"]) for r in all_rows if r["rowid"] not in existing_vecs]
+
+    if not missing:
+        return f"✓ All {len(all_rows)} memories already have embeddings."
+
+    created = 0
+    for mem_id, rowid, content in missing:
+        try:
+            vec_bytes = embedder.embed_one(content[:2000])
+            db.execute("INSERT OR REPLACE INTO memories_vec(rowid, embedding) VALUES (?, ?)", (rowid, vec_bytes))
+            created += 1
+        except Exception as e:
+            log.debug("Failed to embed %s: %s", mem_id, e)
+
+    db.commit()
+    return (
+        f"✓ Reindex complete.\n\n"
+        f"**Total memories:** {len(all_rows)}\n"
+        f"**Already embedded:** {len(existing_vecs)}\n"
+        f"**Newly embedded:** {created}\n"
+        f"**Failed:** {len(missing) - created}"
+    )
+
+
+@mcp.tool(
     name="remind_me_server_status",
     annotations={
         "title": "Server Status",
@@ -1240,6 +1561,22 @@ async def remind_me_server_status() -> str:
     lines.append(f"\n**Database:** `{status['db_path']}`")
     lines.append(f"**DB exists:** {'yes' if status['db_exists'] else 'no'}")
     lines.append(f"\n**MCP (stdio):** ✓ Active (this connection)")
+
+    # Embedding status
+    embedder = _get_embedder()
+    if embedder is not None:
+        db = _get_db()
+        total_mems = db.execute("SELECT COUNT(*) as cnt FROM memories").fetchone()["cnt"]
+        try:
+            total_vecs = db.execute("SELECT COUNT(*) as cnt FROM memories_vec").fetchone()["cnt"]
+        except Exception:
+            total_vecs = 0
+        lines.append(f"\n**Semantic search:** ✓ Enabled ({EMBEDDING_MODEL})")
+        lines.append(f"**Embeddings:** {total_vecs}/{total_mems} memories indexed")
+        if total_vecs < total_mems:
+            lines.append(f"_Run `remind_me_reindex` to embed the remaining {total_mems - total_vecs} memories._")
+    else:
+        lines.append(f"\n**Semantic search:** ✗ Unavailable (install onnxruntime, tokenizers, huggingface-hub, numpy, sqlite-vec)")
 
     return "\n".join(lines)
 
