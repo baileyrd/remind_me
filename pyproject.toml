@@ -1,0 +1,19 @@
+[project]
+name = "remind-me-mcp"
+version = "1.0.0"
+description = "Persistent, searchable memory MCP server for Claude — works across Claude.ai, Claude Code, and Claude Desktop with multi-machine sync."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "mcp[cli]>=1.0.0",
+    "pydantic>=2.0.0",
+    "httpx>=0.25.0",
+]
+
+[project.scripts]
+remind-me-mcp = "memory_mcp:mcp.run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
