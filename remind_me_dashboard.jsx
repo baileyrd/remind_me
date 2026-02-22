@@ -496,7 +496,7 @@ export default function MemoryDashboard() {
           </div>
           <div>
             <h1 style={{ margin: 0, fontSize: 18, fontWeight: 700, fontFamily: sansStack, letterSpacing: "-0.02em" }}>Memory</h1>
-            <span style={{ fontSize: 11, color: theme.textMuted, fontFamily: fontStack }}>{stats.total} memories · ~/.claude-memory</span>
+            <span style={{ fontSize: 11, color: theme.textMuted, fontFamily: fontStack }}>{stats.total} memories · ~/.remind-me</span>
           </div>
         </div>
 
@@ -694,7 +694,7 @@ export default function MemoryDashboard() {
                   MCP Server Info
                 </h3>
                 <div style={{ fontFamily: fontStack, fontSize: 13, color: theme.textSecondary, lineHeight: 2 }}>
-                  <div><span style={{ color: theme.textMuted }}>Database:</span> <code style={{ color: theme.text }}>~/.claude-memory/memory.db</code></div>
+                  <div><span style={{ color: theme.textMuted }}>Database:</span> <code style={{ color: theme.text }}>~/.remind-me/memory.db</code></div>
                   <div><span style={{ color: theme.textMuted }}>Transport:</span> <code style={{ color: theme.text }}>stdio</code></div>
                   <div><span style={{ color: theme.textMuted }}>Search engine:</span> <code style={{ color: theme.text }}>SQLite FTS5</code></div>
                   <div><span style={{ color: theme.textMuted }}>Sync:</span> <code style={{ color: theme.text }}>File-based (Syncthing, git, etc.)</code></div>

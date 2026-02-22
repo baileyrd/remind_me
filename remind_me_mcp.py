@@ -1,5 +1,5 @@
 """
-Claude Memory MCP Server — persistent, searchable memory across Claude interfaces.
+Remind Me MCP Server — persistent, searchable memory across Claude interfaces.
 
 Supports:
   - Claude.ai, Claude Code, Claude Desktop (via stdio transport)
@@ -31,7 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 # Configuration
 # ---------------------------------------------------------------------------
 
-MEMORY_DIR = Path(os.environ.get("MEMORY_MCP_DIR", "~/.remind-me")).expanduser()
+MEMORY_DIR = Path(os.environ.get("REMIND_ME_MCP_DIR", "~/.remind-me")).expanduser()
 DB_PATH = MEMORY_DIR / "memory.db"
 IMPORT_LOG = MEMORY_DIR / "import_log.json"
 
@@ -40,7 +40,7 @@ MEMORY_DIR.mkdir(parents=True, exist_ok=True)
 
 # Logging — stderr only (stdio transport reserves stdout)
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(levelname)s | %(message)s")
-log = logging.getLogger("memory_mcp")
+log = logging.getLogger("remind_me_mcp")
 
 # ---------------------------------------------------------------------------
 # Database helpers
@@ -508,7 +508,7 @@ def import_chat_file(
 @asynccontextmanager
 async def app_lifespan():
     db = _get_db()
-    log.info("Memory MCP started — db at %s", DB_PATH)
+    log.info("Remind Me MCP started — db at %s", DB_PATH)
     yield {"db": db}
     db.close()
 
@@ -516,12 +516,12 @@ async def app_lifespan():
 # MCP Server
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("memory_mcp", lifespan=app_lifespan)
+mcp = FastMCP("remind_me_mcp", lifespan=app_lifespan)
 
 # ---- Tools ----------------------------------------------------------------
 
 @mcp.tool(
-    name="memory_add",
+    name="remind_me_add",
     annotations={
         "title": "Add a Memory",
         "readOnlyHint": False,
@@ -561,7 +561,7 @@ async def memory_add(params: MemoryAddInput) -> str:
 
 
 @mcp.tool(
-    name="memory_search",
+    name="remind_me_search",
     annotations={
         "title": "Search Memories",
         "readOnlyHint": True,
@@ -605,7 +605,7 @@ async def memory_search(params: MemorySearchInput) -> str:
 
 
 @mcp.tool(
-    name="memory_list",
+    name="remind_me_list",
     annotations={
         "title": "List Memories",
         "readOnlyHint": True,
@@ -651,7 +651,7 @@ async def memory_list(params: MemoryListInput) -> str:
 
 
 @mcp.tool(
-    name="memory_get",
+    name="remind_me_get",
     annotations={
         "title": "Get a Memory by ID",
         "readOnlyHint": True,
@@ -677,7 +677,7 @@ async def memory_get(memory_id: str) -> str:
 
 
 @mcp.tool(
-    name="memory_update",
+    name="remind_me_update",
     annotations={
         "title": "Update a Memory",
         "readOnlyHint": False,
@@ -728,7 +728,7 @@ async def memory_update(params: MemoryUpdateInput) -> str:
 
 
 @mcp.tool(
-    name="memory_delete",
+    name="remind_me_delete",
     annotations={
         "title": "Delete a Memory",
         "readOnlyHint": False,
@@ -755,7 +755,7 @@ async def memory_delete(params: MemoryDeleteInput) -> str:
 
 
 @mcp.tool(
-    name="memory_import_chat",
+    name="remind_me_import_chat",
     annotations={
         "title": "Import Chat Export",
         "readOnlyHint": False,
@@ -787,7 +787,7 @@ async def memory_import_chat(params: ChatImportInput) -> str:
 
 
 @mcp.tool(
-    name="memory_import_directory",
+    name="remind_me_import_directory",
     annotations={
         "title": "Bulk Import Chat Directory",
         "readOnlyHint": False,
@@ -845,7 +845,7 @@ async def memory_import_directory(params: BulkImportDirInput) -> str:
 
 
 @mcp.tool(
-    name="memory_stats",
+    name="remind_me_stats",
     annotations={
         "title": "Memory Statistics",
         "readOnlyHint": True,

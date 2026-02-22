@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [project.scripts]
-remind-me-mcp = "memory_mcp:mcp.run"
+remind-me-mcp = "remind_me_mcp:mcp.run"
 
 [build-system]
 requires = ["hatchling"]

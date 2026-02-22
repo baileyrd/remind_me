@@ -1,4 +1,4 @@
-# Claude Memory MCP Server
+# Remind Me MCP Server
 
 Persistent, searchable memory that works across **Claude.ai**, **Claude Code**, and **Claude Desktop** — with multi-machine sync support and a built-in dashboard UI.
 
@@ -10,7 +10,7 @@ Persistent, searchable memory that works across **Claude.ai**, **Claude Code**, 
 - **Bulk directory import** — point at a folder of exports and import them all
 - **Deduplication** — re-importing the same file is a safe no-op (tracked by file hash)
 - **Tagging & categorization** — organize memories with categories and tags
-- **Multi-machine sync** — database lives in `~/.claude-memory/` — sync it with Syncthing, Dropbox, git, or any file sync tool
+- **Multi-machine sync** — database lives in `~/.remind-me/` — sync it with Syncthing, Dropbox, git, or any file sync tool
 - **WAL mode** — SQLite Write-Ahead Logging ensures safe concurrent reads
 
 ## Quick Start
@@ -19,8 +19,8 @@ Persistent, searchable memory that works across **Claude.ai**, **Claude Code**, 
 
 ```bash
 # Clone or copy the server
-git clone <your-repo-url> ~/claude-memory-mcp
-cd ~/claude-memory-mcp
+git clone <your-repo-url> ~/remind-me-mcp
+cd ~/remind-me-mcp
 
 # Install with uv (recommended)
 uv pip install -e .
@@ -36,11 +36,11 @@ Add to your Claude Code MCP config (`~/.claude/claude_code_config.json` or proje
 ```json
 {
   "mcpServers": {
-    "memory": {
+    "remind-me": {
       "command": "uv",
-      "args": ["run", "--directory", "/path/to/claude-memory-mcp", "python", "memory_mcp.py"],
+      "args": ["run", "--directory", "/path/to/remind-me-mcp", "python", "remind_me_mcp.py"],
       "env": {
-        "MEMORY_MCP_DIR": "~/.claude-memory"
+        "REMIND_ME_MCP_DIR": "~/.remind-me"
       }
     }
   }
@@ -52,10 +52,10 @@ Or if installed as a package:
 ```json
 {
   "mcpServers": {
-    "memory": {
-      "command": "claude-memory-mcp",
+    "remind-me": {
+      "command": "remind-me-mcp",
       "env": {
-        "MEMORY_MCP_DIR": "~/.claude-memory"
+        "REMIND_ME_MCP_DIR": "~/.remind-me"
       }
     }
   }
@@ -69,11 +69,11 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 ```json
 {
   "mcpServers": {
-    "memory": {
+    "remind-me": {
       "command": "uv",
-      "args": ["run", "--directory", "/path/to/claude-memory-mcp", "python", "memory_mcp.py"],
+      "args": ["run", "--directory", "/path/to/remind-me-mcp", "python", "remind_me_mcp.py"],
       "env": {
-        "MEMORY_MCP_DIR": "~/.claude-memory"
+        "REMIND_ME_MCP_DIR": "~/.remind-me"
       }
     }
   }
@@ -86,7 +86,7 @@ If using the Claude in Chrome extension with MCP support, add the same server co
 
 ## Dashboard UI
 
-The memory dashboard (`memory_dashboard.jsx`) is a React artifact that provides a full visual interface to your memory store.
+The dashboard (`remind_me_dashboard.jsx`) is a React artifact that provides a full visual interface to your memory store.
 
 ### What It Does
 
@@ -99,12 +99,12 @@ The memory dashboard (`memory_dashboard.jsx`) is a React artifact that provides 
 ### How to Use It
 
 **Option A — Open directly in Claude.ai:**
-Upload or paste `memory_dashboard.jsx` as an artifact in any Claude conversation. It renders immediately with sample data so you can explore the interface.
+Upload or paste `remind_me_dashboard.jsx` as an artifact in any Claude conversation. It renders immediately with sample data so you can explore the interface.
 
 **Option B — Connect to your real database:**
 The dashboard is designed to swap its data layer. Replace the `useMemoryStore` hook's mock data with calls to a REST API wrapper around the MCP server. To add a lightweight HTTP API:
 
-1. Set `MEMORY_MCP_SERVE_UI=true` in your environment
+1. Set `REMIND_ME_MCP_SERVE_UI=true` in your environment
 2. Run the server — it will start an HTTP endpoint on `localhost:5199` alongside the stdio transport
 3. Point the dashboard's fetch calls at `http://localhost:5199/api/`
 
@@ -141,15 +141,15 @@ The stats view replaces the main content area with summary cards, horizontal bar
 
 | Tool | Description |
 |------|-------------|
-| `memory_add` | Store a new memory with content, category, tags, and metadata |
-| `memory_search` | Full-text search with FTS5 syntax (AND, OR, NOT, "phrases", prefix*) |
-| `memory_list` | List memories with filters (category, tags, source) and pagination |
-| `memory_get` | Retrieve a single memory by ID |
-| `memory_update` | Update a memory's content, category, tags, or metadata |
-| `memory_delete` | Permanently delete a memory |
-| `memory_import_chat` | Import a single chat export file |
-| `memory_import_directory` | Bulk import all exports from a directory |
-| `memory_stats` | View statistics: counts, categories, recent activity |
+| `remind_me_add` | Store a new memory with content, category, tags, and metadata |
+| `remind_me_search` | Full-text search with FTS5 syntax (AND, OR, NOT, "phrases", prefix*) |
+| `remind_me_list` | List memories with filters (category, tags, source) and pagination |
+| `remind_me_get` | Retrieve a single memory by ID |
+| `remind_me_update` | Update a memory's content, category, tags, or metadata |
+| `remind_me_delete` | Permanently delete a memory |
+| `remind_me_import_chat` | Import a single chat export file |
+| `remind_me_import_directory` | Bulk import all exports from a directory |
+| `remind_me_stats` | View statistics: counts, categories, recent activity |
 
 ## Importing Chat Exports
 
@@ -158,7 +158,7 @@ The stats view replaces the main content area with summary cards, horizontal bar
 Export your Claude conversations from claude.ai (Settings → Export Data), then:
 
 ```
-Use memory_import_directory with:
+Use remind_me_import_directory with:
   directory: ~/Downloads/claude-export/
   extract_mode: assistant_messages
   tags: ["claude", "historical"]
@@ -182,18 +182,18 @@ Use memory_import_directory with:
 
 ## Multi-Machine Sync
 
-The entire memory database lives in a single directory (default: `~/.claude-memory/`). To sync across machines:
+The entire memory database lives in a single directory (default: `~/.remind-me/`). To sync across machines:
 
 ### Option A: Syncthing (recommended — real-time, no cloud)
 
 1. Install Syncthing on both machines
-2. Share `~/.claude-memory/` between them
+2. Share `~/.remind-me/` between them
 3. SQLite WAL mode handles concurrent access safely
 
 ### Option B: Git
 
 ```bash
-cd ~/.claude-memory
+cd ~/.remind-me
 git init
 git add -A
 git commit -m "sync"
@@ -201,7 +201,7 @@ git remote add origin <your-repo>
 git push
 
 # On other machine:
-git clone <your-repo> ~/.claude-memory
+git clone <your-repo> ~/.remind-me
 ```
 
 Add a cron job or alias for periodic sync.
@@ -212,16 +212,16 @@ Symlink the memory directory into your cloud sync folder:
 
 ```bash
 # Example with Dropbox
-mv ~/.claude-memory ~/Dropbox/claude-memory
-ln -s ~/Dropbox/claude-memory ~/.claude-memory
+mv ~/.remind-me ~/Dropbox/remind-me
+ln -s ~/Dropbox/remind-me ~/.remind-me
 ```
 
 ### Custom Location
 
-Set `MEMORY_MCP_DIR` to any path:
+Set `REMIND_ME_MCP_DIR` to any path:
 
 ```bash
-export MEMORY_MCP_DIR="/mnt/synced-drive/claude-memory"
+export REMIND_ME_MCP_DIR="/mnt/synced-drive/remind-me"
 ```
 
 ## Search Syntax
@@ -240,20 +240,20 @@ The search tool uses SQLite FTS5. Examples:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MEMORY_MCP_DIR` | `~/.claude-memory` | Directory for the SQLite database |
-| `MEMORY_MCP_SERVE_UI` | `false` | Start HTTP API for the dashboard UI |
+| `REMIND_ME_MCP_DIR` | `~/.remind-me` | Directory for the SQLite database |
+| `REMIND_ME_MCP_SERVE_UI` | `false` | Start HTTP API for the dashboard UI |
 
 ## Project Structure
 
 ```
-claude-memory-mcp/
-├── memory_mcp.py           # MCP server — tools, import engine, SQLite storage
-├── memory_dashboard.jsx    # React dashboard UI (Claude artifact or standalone)
-├── pyproject.toml          # Package configuration and dependencies
-└── README.md               # This file
+remind-me-mcp/
+├── remind_me_mcp.py         # MCP server — tools, import engine, SQLite storage
+├── remind_me_dashboard.jsx  # React dashboard UI (Claude artifact or standalone)
+├── pyproject.toml           # Package configuration and dependencies
+└── README.md                # This file
 
-~/.claude-memory/           # Data directory (synced across machines)
-└── memory.db               # SQLite database with FTS5 full-text search
+~/.remind-me/                # Data directory (synced across machines)
+└── memory.db                # SQLite database with FTS5 full-text search
 ```
 
 ## Architecture
