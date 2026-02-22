@@ -34,6 +34,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 MEMORY_DIR = Path(os.environ.get("REMIND_ME_MCP_DIR", "~/.remind-me")).expanduser()
 DB_PATH = MEMORY_DIR / "memory.db"
 IMPORT_LOG = MEMORY_DIR / "import_log.json"
+PID_FILE = MEMORY_DIR / "server.pid"
 
 # Ensure directory exists
 MEMORY_DIR.mkdir(parents=True, exist_ok=True)
@@ -41,6 +42,79 @@ MEMORY_DIR.mkdir(parents=True, exist_ok=True)
 # Logging — stderr only (stdio transport reserves stdout)
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(levelname)s | %(message)s")
 log = logging.getLogger("remind_me_mcp")
+
+
+# ---------------------------------------------------------------------------
+# Server instance detection
+# ---------------------------------------------------------------------------
+
+def _read_pid_file() -> dict[str, Any] | None:
+    """Read the PID file to check if a UI server is running."""
+    if not PID_FILE.exists():
+        return None
+    try:
+        data = json.loads(PID_FILE.read_text())
+        pid = data.get("pid")
+        # Check if process is actually alive
+        if pid:
+            try:
+                os.kill(pid, 0)  # signal 0 = just check existence
+                return data
+            except OSError:
+                # Process is dead, clean up stale PID file
+                PID_FILE.unlink(missing_ok=True)
+                return None
+        return None
+    except (json.JSONDecodeError, KeyError, TypeError):
+        PID_FILE.unlink(missing_ok=True)
+        return None
+
+
+def _write_pid_file(host: str, port: int) -> None:
+    """Write PID file when UI server starts."""
+    PID_FILE.write_text(json.dumps({
+        "pid": os.getpid(),
+        "host": host,
+        "port": port,
+        "url": f"http://{host}:{port}",
+        "started_at": _now_iso(),
+    }, indent=2))
+
+
+def _remove_pid_file() -> None:
+    """Clean up PID file on shutdown."""
+    PID_FILE.unlink(missing_ok=True)
+
+
+def _check_ui_server_health(url: str) -> bool:
+    """Quick check if the UI server is actually responding."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(url + "/api/stats", method="GET")
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def get_server_status() -> dict[str, Any]:
+    """Get the current status of all running instances."""
+    info = _read_pid_file()
+    if info and _check_ui_server_health(info.get("url", "")):
+        return {
+            "ui_server": "running",
+            "ui_url": info["url"],
+            "ui_pid": info["pid"],
+            "ui_started": info.get("started_at", "unknown"),
+            "db_path": str(DB_PATH),
+            "db_exists": DB_PATH.exists(),
+        }
+    return {
+        "ui_server": "stopped",
+        "ui_url": None,
+        "db_path": str(DB_PATH),
+        "db_exists": DB_PATH.exists(),
+    }
 
 # ---------------------------------------------------------------------------
 # Database helpers
@@ -245,6 +319,52 @@ class BulkImportDirInput(BaseModel):
         if not p.is_dir():
             raise ValueError(f"Directory not found: {p}")
         return str(p)
+
+
+class AutoCaptureInput(BaseModel):
+    """Input for automatically capturing a full conversation and its summary."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    conversation: str = Field(
+        ...,
+        description=(
+            "The full conversation dialog to capture verbatim. "
+            "Include all turns with role prefixes, e.g.:\n"
+            "Human: ...\nAssistant: ...\nHuman: ...\nAssistant: ..."
+        ),
+        min_length=1,
+        max_length=500000,
+    )
+    summary: str = Field(
+        ...,
+        description=(
+            "A concise summary of the conversation covering: "
+            "key topics discussed, decisions made, facts learned, "
+            "preferences expressed, action items, and anything worth remembering. "
+            "This is stored as a separate memory linked to the full dialog."
+        ),
+        min_length=1,
+        max_length=50000,
+    )
+    title: str = Field(
+        default="",
+        description="Short title for the conversation (e.g., 'VLAN setup discussion', 'Python async patterns')",
+        max_length=200,
+    )
+    tags: list[str] = Field(
+        default_factory=list,
+        description="Tags for both the dialog and summary (e.g., ['python', 'work', 'architecture'])",
+        max_length=20,
+    )
+    category: str = Field(
+        default="conversation",
+        description="Category for the summary. The full dialog always uses 'dialog' category.",
+        max_length=100,
+    )
+    metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Optional metadata (e.g., {'project': 'remind-me-mcp', 'context': 'Claude Desktop'})",
+    )
 
 # ---------------------------------------------------------------------------
 # Formatting helpers
@@ -908,6 +1028,219 @@ async def memory_stats(params: MemoryStatsInput) -> str:
     lines.append("### Recent Memories")
     for r in data["recent"]:
         lines.append(f"- `{r['id']}` [{r['category']}] {r['preview']}…")
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    name="remind_me_auto_capture",
+    annotations={
+        "title": "Auto-Capture Conversation",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def remind_me_auto_capture(params: AutoCaptureInput) -> str:
+    """Capture an entire conversation as two linked memories: the full verbatim dialog and a concise summary.
+
+    Use this at the end of every conversation to persist both the raw exchange
+    and a distilled summary of key information. The summary is linked to the
+    dialog via metadata so they can be retrieved together.
+
+    The full dialog is stored with category 'dialog' and the summary uses the
+    category specified in params (default: 'conversation').
+
+    Args:
+        params (AutoCaptureInput): The conversation text, summary, tags, and metadata.
+
+    Returns:
+        str: Confirmation with both memory IDs.
+    """
+    db = _get_db()
+    now = _now_iso()
+
+    # Generate a shared capture_id to link dialog + summary
+    capture_id = _make_id(params.conversation[:200] + params.summary[:200])
+
+    title = params.title or params.summary[:80].split("\n")[0]
+
+    # -- Store the full dialog --
+    dialog_id = _make_id(params.conversation)
+    dialog_meta = {
+        **params.metadata,
+        "capture_id": capture_id,
+        "linked_summary": "",  # placeholder, filled after summary is created
+        "title": title,
+        "type": "dialog",
+    }
+    db.execute(
+        """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            dialog_id,
+            params.conversation,
+            "dialog",
+            json.dumps(params.tags),
+            "auto_capture",
+            json.dumps(dialog_meta),
+            now,
+            now,
+        ),
+    )
+
+    # -- Store the summary --
+    summary_id = _make_id(params.summary)
+    summary_meta = {
+        **params.metadata,
+        "capture_id": capture_id,
+        "linked_dialog": dialog_id,
+        "title": title,
+        "type": "summary",
+    }
+    db.execute(
+        """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            summary_id,
+            params.summary,
+            params.category,
+            json.dumps(params.tags),
+            "auto_capture",
+            json.dumps(summary_meta),
+            now,
+            now,
+        ),
+    )
+
+    # -- Back-link the dialog to the summary --
+    dialog_meta["linked_summary"] = summary_id
+    db.execute(
+        "UPDATE memories SET metadata = ? WHERE id = ?",
+        (json.dumps(dialog_meta), dialog_id),
+    )
+
+    db.commit()
+
+    tag_str = ", ".join(params.tags) if params.tags else "none"
+    return (
+        f"✓ Conversation captured!\n\n"
+        f"**Title:** {title}\n"
+        f"**Dialog:** `{dialog_id}` (category: dialog, {len(params.conversation)} chars)\n"
+        f"**Summary:** `{summary_id}` (category: {params.category})\n"
+        f"**Tags:** {tag_str}\n"
+        f"**Capture ID:** `{capture_id}` (links both memories)\n\n"
+        f"The full dialog and summary are linked — search for either and "
+        f"use `remind_me_get_capture` with capture_id `{capture_id}` to retrieve both."
+    )
+
+
+@mcp.tool(
+    name="remind_me_get_capture",
+    annotations={
+        "title": "Get Linked Dialog + Summary",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def remind_me_get_capture(capture_id: str) -> str:
+    """Retrieve a linked dialog and summary pair by their shared capture_id.
+
+    When a conversation is auto-captured, both the full dialog and its summary
+    share a capture_id in their metadata. This tool retrieves both.
+
+    Args:
+        capture_id (str): The capture_id that links a dialog and summary.
+
+    Returns:
+        str: Both memories formatted together, or an error if not found.
+    """
+    db = _get_db()
+    # Search for memories with this capture_id in metadata
+    rows = db.execute(
+        "SELECT * FROM memories WHERE metadata LIKE ? ORDER BY category",
+        (f'%"capture_id": "{capture_id}"%',),
+    ).fetchall()
+
+    if not rows:
+        # Try alternate JSON formatting (no space after colon)
+        rows = db.execute(
+            "SELECT * FROM memories WHERE metadata LIKE ? ORDER BY category",
+            (f'%"capture_id":"{capture_id}"%',),
+        ).fetchall()
+
+    if not rows:
+        return f"No capture found with id `{capture_id}`."
+
+    memories = [_row_to_dict(r) for r in rows]
+    dialog = next((m for m in memories if m.get("metadata", {}).get("type") == "dialog"), None)
+    summary = next((m for m in memories if m.get("metadata", {}).get("type") == "summary"), None)
+
+    title = (summary or dialog or {}).get("metadata", {}).get("title", "Untitled")
+    parts = [f"## Capture: {title}", f"**Capture ID:** `{capture_id}`\n"]
+
+    if summary:
+        tags = ", ".join(summary.get("tags", [])) or "none"
+        parts.append(f"### Summary (`{summary['id']}`)")
+        parts.append(f"**Category:** {summary['category']}  |  **Tags:** {tags}")
+        parts.append(f"**Captured:** {summary['created_at']}\n")
+        parts.append(summary["content"])
+        parts.append("")
+
+    if dialog:
+        char_count = len(dialog["content"])
+        parts.append(f"### Full Dialog (`{dialog['id']}` — {char_count:,} chars)")
+        parts.append(f"**Category:** dialog\n")
+        # Show first 3000 chars with truncation notice
+        if char_count > 3000:
+            parts.append(dialog["content"][:3000])
+            parts.append(f"\n\n… _({char_count - 3000:,} more characters — use `remind_me_get` with id `{dialog['id']}` for full text)_")
+        else:
+            parts.append(dialog["content"])
+
+    if not dialog and not summary:
+        parts.append("_Found memories with this capture_id but couldn't identify dialog/summary types._\n")
+        for m in memories:
+            parts.append(_fmt_memory_md(m))
+
+    return "\n".join(parts)
+
+
+@mcp.tool(
+    name="remind_me_server_status",
+    annotations={
+        "title": "Server Status",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def remind_me_server_status() -> str:
+    """Check the status of Remind Me services: whether the UI dashboard server is running, the database path, and connection info.
+
+    Use this to verify the system is operational or to get the dashboard URL.
+
+    Returns:
+        str: Status information about running instances.
+    """
+    status = get_server_status()
+    lines = ["## Remind Me Server Status\n"]
+
+    if status["ui_server"] == "running":
+        lines.append(f"**Dashboard UI:** ✓ Running at {status['ui_url']}")
+        lines.append(f"**UI PID:** {status['ui_pid']}")
+        lines.append(f"**Started:** {status['ui_started']}")
+    else:
+        lines.append("**Dashboard UI:** ✗ Not running")
+        lines.append("_Start with: `python remind_me_mcp.py --serve-ui`_")
+
+    lines.append(f"\n**Database:** `{status['db_path']}`")
+    lines.append(f"**DB exists:** {'yes' if status['db_exists'] else 'no'}")
+    lines.append(f"\n**MCP (stdio):** ✓ Active (this connection)")
+
     return "\n".join(lines)
 
 
@@ -1769,17 +2102,58 @@ ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(
 
 if __name__ == "__main__":
     import argparse
+    import atexit
+    import signal
 
     parser = argparse.ArgumentParser(description="Remind Me MCP Server")
     parser.add_argument("--serve-ui", action="store_true", default=SERVE_UI, help="Start the HTTP dashboard UI server")
     parser.add_argument("--ui-port", type=int, default=UI_PORT, help="Port for the dashboard UI (default: 5199)")
     parser.add_argument("--ui-host", type=str, default="127.0.0.1", help="Host to bind the UI server (default: 127.0.0.1)")
+    parser.add_argument("--status", action="store_true", help="Check if the UI server is running and exit")
     args = parser.parse_args()
 
+    # -- Status check mode --
+    if args.status:
+        status = get_server_status()
+        if status["ui_server"] == "running":
+            print(f"✓ Dashboard running at {status['ui_url']} (PID {status['ui_pid']})")
+        else:
+            print("✗ Dashboard not running")
+        print(f"  Database: {status['db_path']} ({'exists' if status['db_exists'] else 'missing'})")
+        sys.exit(0)
+
+    # -- UI server mode --
     if args.serve_ui:
         import uvicorn
+
+        # Check if already running
+        existing = _read_pid_file()
+        if existing and _check_ui_server_health(existing.get("url", "")):
+            log.warning(
+                "Dashboard is already running at %s (PID %d). "
+                "Stop it first or use a different port with --ui-port.",
+                existing["url"], existing["pid"],
+            )
+            sys.exit(1)
+
+        # Write PID file and register cleanup
+        _write_pid_file(args.ui_host, args.ui_port)
+        atexit.register(_remove_pid_file)
+
+        def _signal_handler(signum, frame):
+            _remove_pid_file()
+            sys.exit(0)
+        signal.signal(signal.SIGTERM, _signal_handler)
+        signal.signal(signal.SIGINT, _signal_handler)
+
         app = _build_api_app()
         log.info("Starting Remind Me dashboard at http://%s:%d", args.ui_host, args.ui_port)
         uvicorn.run(app, host=args.ui_host, port=args.ui_port, log_level="info")
+
+    # -- MCP stdio mode --
     else:
+        # Check if UI server is running and log it
+        existing = _read_pid_file()
+        if existing and _check_ui_server_health(existing.get("url", "")):
+            log.info("Dashboard UI is running at %s", existing["url"])
         mcp.run()

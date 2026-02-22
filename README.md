@@ -133,6 +133,23 @@ The dashboard is powered by a REST API you can also use directly:
 
 The project also includes `remind_me_dashboard.jsx` — a standalone React artifact with mock data that can be uploaded directly into Claude.ai for previewing the UI without running the server.
 
+### Instance Detection
+
+The server tracks running instances via a PID file (`~/.remind-me/server.pid`):
+
+- **Starting the dashboard** writes a PID file. If a dashboard is already running, the second instance exits with a warning instead of conflicting.
+- **MCP stdio mode** checks for a running dashboard on startup and logs its URL.
+- **`--status` flag** lets you check from the command line without starting anything:
+
+```bash
+python remind_me_mcp.py --status
+# ✓ Dashboard running at http://127.0.0.1:5199 (PID 12345)
+#   Database: /home/user/.remind-me/memory.db (exists)
+```
+
+- **`remind_me_server_status` tool** — Claude can check from inside a conversation whether the dashboard is up.
+- **PID file cleanup** happens automatically on shutdown (SIGTERM, SIGINT, or normal exit). Stale PID files from crashed processes are detected and removed.
+
 ### UI Layout
 
 ```
@@ -170,6 +187,34 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_import_chat` | Import a single chat export file |
 | `remind_me_import_directory` | Bulk import all exports from a directory |
 | `remind_me_stats` | View statistics: counts, categories, recent activity |
+| `remind_me_auto_capture` | Capture a full conversation dialog + distilled summary as two linked memories |
+| `remind_me_get_capture` | Retrieve a linked dialog/summary pair by their shared capture_id |
+| `remind_me_server_status` | Check if the dashboard UI is running, get its URL, and verify DB connectivity |
+
+### Auto-Capture: Persisting Full Conversations
+
+The `remind_me_auto_capture` tool stores **two linked memories** from each conversation:
+
+1. **Dialog** (category: `dialog`) — the full verbatim conversation, every turn preserved
+2. **Summary** (category: `conversation`) — a concise distillation of key topics, decisions, facts, and preferences
+
+Both memories share a `capture_id` in their metadata, so you can retrieve them together with `remind_me_get_capture`.
+
+**To use automatically**, add this to your Claude Desktop or Claude.ai custom instructions:
+
+```
+At the end of every conversation, use the remind_me_auto_capture tool to save:
+- The full conversation dialog (all turns verbatim)
+- A concise summary covering: topics discussed, decisions made, facts learned,
+  preferences expressed, and action items
+Use descriptive titles and relevant tags. Do this automatically without asking.
+```
+
+**How it works when searching:**
+- Searching for "FastAPI" finds both the summary and the full dialog
+- Summaries are compact and appear first in relevance-ranked results
+- Full dialogs contain every detail for when you need exact context
+- Use `remind_me_get_capture` with a capture_id to see both side by side
 
 ## Importing Chat Exports
 
