@@ -86,32 +86,52 @@ If using the Claude in Chrome extension with MCP support, add the same server co
 
 ## Dashboard UI
 
-The dashboard (`remind_me_dashboard.jsx`) is a React artifact that provides a full visual interface to your memory store.
+The server includes a built-in web dashboard for browsing, searching, and managing your memories visually.
+
+### Starting the Dashboard
+
+```bash
+# Option A: environment variable
+REMIND_ME_MCP_SERVE_UI=true python remind_me_mcp.py
+
+# Option B: command-line flag
+python remind_me_mcp.py --serve-ui
+
+# Option C: custom port and host
+python remind_me_mcp.py --serve-ui --ui-port 8080 --ui-host 0.0.0.0
+```
+
+Then open **http://localhost:5199** in your browser.
+
+> The `--serve-ui` mode runs the HTTP dashboard server. Without it, the server runs in stdio mode for Claude Code / Claude Desktop. They are separate modes — run one instance for MCP and optionally another for the UI.
 
 ### What It Does
 
 - **Browse & search** — full-text search with `⌘K` shortcut, category sidebar with counts, clickable tag filters
-- **View stats** — bar charts for categories, sources, and top tags; total counts and server info
+- **View stats** — bar charts for categories, sources, and top tags; database size and server info
 - **Add memories** — modal form with content editor, color-coded category picker, and tag input
 - **Edit & delete** — inline controls on every memory card with confirmation dialogs
 - **Expand/collapse** — long memories truncate at 200 characters with a click to expand
+- **Live data** — the dashboard reads and writes your real SQLite database; changes appear immediately
 
-### How to Use It
+### REST API
 
-**Option A — Open directly in Claude.ai:**
-Upload or paste `remind_me_dashboard.jsx` as an artifact in any Claude conversation. It renders immediately with sample data so you can explore the interface.
+The dashboard is powered by a REST API you can also use directly:
 
-**Option B — Connect to your real database:**
-The dashboard is designed to swap its data layer. Replace the `useMemoryStore` hook's mock data with calls to a REST API wrapper around the MCP server. To add a lightweight HTTP API:
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/stats` | Memory statistics, categories, tags, DB info |
+| `GET` | `/api/memories?category=&tags=&limit=&offset=` | List memories with filters |
+| `GET` | `/api/memories/search?q=&category=&tags=` | Full-text search |
+| `GET` | `/api/memories/{id}` | Get a single memory |
+| `POST` | `/api/memories` | Add a memory (JSON body: `{content, category, tags}`) |
+| `PUT` | `/api/memories/{id}` | Update a memory |
+| `DELETE` | `/api/memories/{id}` | Delete a memory |
+| `POST` | `/api/import` | Import a chat file (JSON body: `{file_path, extract_mode, tags}`) |
 
-1. Set `REMIND_ME_MCP_SERVE_UI=true` in your environment
-2. Run the server — it will start an HTTP endpoint on `localhost:5199` alongside the stdio transport
-3. Point the dashboard's fetch calls at `http://localhost:5199/api/`
+### Standalone Artifact
 
-> This HTTP bridge is optional. The core MCP server works independently over stdio.
-
-**Option C — Embed in your own app:**
-The component is a single self-contained React file with no external dependencies beyond React and Tailwind-compatible inline styles. Drop it into any React project.
+The project also includes `remind_me_dashboard.jsx` — a standalone React artifact with mock data that can be uploaded directly into Claude.ai for previewing the UI without running the server.
 
 ### UI Layout
 
@@ -241,7 +261,8 @@ The search tool uses SQLite FTS5. Examples:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `REMIND_ME_MCP_DIR` | `~/.remind-me` | Directory for the SQLite database |
-| `REMIND_ME_MCP_SERVE_UI` | `false` | Start HTTP API for the dashboard UI |
+| `REMIND_ME_MCP_SERVE_UI` | `false` | Start the HTTP dashboard server instead of stdio MCP |
+| `REMIND_ME_MCP_UI_PORT` | `5199` | Port for the dashboard server |
 
 ## Project Structure
 
@@ -262,5 +283,6 @@ The server uses:
 - **SQLite FTS5** for fast full-text search
 - **WAL journal mode** for safe concurrent access
 - **Content-based hashing** for deduplication
-- **stdio transport** for compatibility with all Claude interfaces
-- **React artifact** for the dashboard UI, renderable in Claude.ai or any React host
+- **stdio transport** for MCP compatibility with all Claude interfaces
+- **Starlette + Uvicorn** for the optional HTTP dashboard and REST API
+- **Self-contained HTML** — the dashboard is served as a single inline page with no build step
