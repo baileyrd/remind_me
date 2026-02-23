@@ -1,0 +1,138 @@
+# Requirements: Remind Me MCP — Full Refactor
+
+**Defined:** 2026-02-22
+**Core Value:** Every design principle from CLAUDE.md passes a green audit without breaking existing functionality
+
+## v1 Requirements
+
+Requirements for the refactored release. Each maps to roadmap phases.
+
+### Module Architecture
+
+- [ ] **ARCH-01**: Project is structured as a `remind_me_mcp/` package with separate modules for each concern (config, db, embeddings, models, formatting, importer, pid, server, tools, api, dashboard)
+- [ ] **ARCH-02**: `__init__.py` re-exports `mcp` from `server.py` so existing `pyproject.toml` entry point works unchanged
+- [ ] **ARCH-03**: `__main__.py` handles CLI argument parsing and mode dispatch (MCP stdio vs HTTP dashboard)
+- [ ] **ARCH-04**: Each module has its own logger via `logging.getLogger("remind_me_mcp.<module>")`
+- [ ] **ARCH-05**: Each module defines `__all__` to declare its explicit public surface
+- [ ] **ARCH-06**: No circular imports exist between any modules
+
+### Testing
+
+- [ ] **TEST-01**: pytest test suite exists with unit tests for all pure-function modules (importer parsers, chunker, formatting, models)
+- [ ] **TEST-02**: Integration tests exist for all 13 MCP tool handlers using in-memory SQLite
+- [ ] **TEST-03**: Integration tests exist for all Starlette HTTP API routes via TestClient or httpx
+- [ ] **TEST-04**: `conftest.py` provides shared fixtures: in-memory SQLite db with schema, mock embedder, sample memory factory
+- [ ] **TEST-05**: All async tests run correctly via pytest-asyncio with `asyncio_mode = "auto"`
+- [ ] **TEST-06**: Tests use in-memory SQLite (not mocks) for database operations to validate FTS5 triggers and SQL correctness
+
+### Error Handling
+
+- [ ] **ERRH-01**: No exceptions are silently swallowed — all caught exceptions are logged with appropriate level before handling
+- [ ] **ERRH-02**: Error handling uses specific exception types instead of bare `except Exception` where the failure mode is known
+- [ ] **ERRH-03**: MCP tool handlers return clear, user-facing error messages rather than opaque sentinel values
+
+### Async & Performance
+
+- [ ] **ASYN-01**: All sync embedding computations in async MCP tool handlers are wrapped with `asyncio.to_thread`
+- [ ] **ASYN-02**: DB connection is managed as a lazy lifespan-scoped singleton instead of opening a new connection per call
+- [ ] **ASYN-03**: SQLite thread-safety is handled correctly — no `ProgrammingError` under concurrent async operations
+
+### Bug Fixes
+
+- [ ] **BUGF-01**: Imported memories are embedded correctly at import time (fix ID mismatch in `import_chat_file` by collecting `(mem_id, chunk)` pairs)
+- [ ] **BUGF-02**: `remind_me_get_capture` uses a proper indexed `capture_id` column instead of fragile LIKE-based JSON metadata search
+
+### Data Layer
+
+- [ ] **DATA-01**: Schema migration system using `PRAGMA user_version` supports safe column additions and table changes on existing databases
+- [ ] **DATA-02**: Tag filtering happens in SQL via a `memory_tags` junction table, not post-fetch in Python, so pagination works correctly with tag filters
+- [ ] **DATA-03**: A single `import_directory()` function is shared between the MCP tool handler and the HTTP API handler (DRY)
+- [ ] **DATA-04**: `_make_id` semantics are normalized — either truly deterministic (content-hash only) or explicitly documented as non-deterministic with an appropriate name
+
+### Code Quality
+
+- [ ] **QUAL-01**: All public functions and classes have docstrings
+- [ ] **QUAL-02**: All function signatures have complete type hints
+- [ ] **QUAL-03**: Dashboard JSX is extracted to a separate `App.jsx` file in the `dashboard/` directory (no longer embedded as Python string)
+- [ ] **QUAL-04**: ruff is configured in `pyproject.toml` for linting and formatting
+- [ ] **QUAL-05**: mypy is configured in `pyproject.toml` for type checking
+- [ ] **QUAL-06**: `pyproject.toml` has test configuration (pytest settings, asyncio mode)
+
+## v2 Requirements
+
+Deferred to future release. Tracked but not in current roadmap.
+
+### Performance
+
+- **PERF-01**: `remind_me_reindex` processes memories in batches of 100-500 rows instead of loading all into memory
+- **PERF-02**: Bulk directory import uses concurrent file processing via thread pool
+
+### Security
+
+- **SECR-01**: CORS locked down to localhost origins only
+- **SECR-02**: Basic API token authentication on HTTP dashboard
+- **SECR-03**: Import path restricted to configured allowed directories
+
+### Infrastructure
+
+- **INFR-01**: CI/CD pipeline with automated test runs
+- **INFR-02**: Coverage enforcement gate (minimum threshold)
+- **INFR-03**: Version-pinned optional dependencies
+
+## Out of Scope
+
+| Feature | Reason |
+|---------|--------|
+| New MCP tools or parameter changes | Clients depend on existing interface — refactor only |
+| Dashboard build step (Vite/esbuild) | PROJECT.md constraint — keep Babel standalone |
+| Multiple PyPI packages | Single `pip install` constraint preserved |
+| `aiosqlite` or ORM | Correct fix is `asyncio.to_thread` + raw `sqlite3` |
+| PostgreSQL migration | Out of scope per PROJECT.md |
+| Node.js build tooling | Unnecessary complexity for simple dashboard |
+| pre-commit hooks | Disruptive during active refactor churn |
+
+## Traceability
+
+Which phases cover which requirements. Updated during roadmap creation.
+
+| Requirement | Phase | Status |
+|-------------|-------|--------|
+| ARCH-01 | Pending | Pending |
+| ARCH-02 | Pending | Pending |
+| ARCH-03 | Pending | Pending |
+| ARCH-04 | Pending | Pending |
+| ARCH-05 | Pending | Pending |
+| ARCH-06 | Pending | Pending |
+| TEST-01 | Pending | Pending |
+| TEST-02 | Pending | Pending |
+| TEST-03 | Pending | Pending |
+| TEST-04 | Pending | Pending |
+| TEST-05 | Pending | Pending |
+| TEST-06 | Pending | Pending |
+| ERRH-01 | Pending | Pending |
+| ERRH-02 | Pending | Pending |
+| ERRH-03 | Pending | Pending |
+| ASYN-01 | Pending | Pending |
+| ASYN-02 | Pending | Pending |
+| ASYN-03 | Pending | Pending |
+| BUGF-01 | Pending | Pending |
+| BUGF-02 | Pending | Pending |
+| DATA-01 | Pending | Pending |
+| DATA-02 | Pending | Pending |
+| DATA-03 | Pending | Pending |
+| DATA-04 | Pending | Pending |
+| QUAL-01 | Pending | Pending |
+| QUAL-02 | Pending | Pending |
+| QUAL-03 | Pending | Pending |
+| QUAL-04 | Pending | Pending |
+| QUAL-05 | Pending | Pending |
+| QUAL-06 | Pending | Pending |
+
+**Coverage:**
+- v1 requirements: 30 total
+- Mapped to phases: 0
+- Unmapped: 30
+
+---
+*Requirements defined: 2026-02-22*
+*Last updated: 2026-02-22 after initial definition*
