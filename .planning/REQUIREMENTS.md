@@ -97,42 +97,42 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| ARCH-01 | Pending | Pending |
-| ARCH-02 | Pending | Pending |
-| ARCH-03 | Pending | Pending |
-| ARCH-04 | Pending | Pending |
-| ARCH-05 | Pending | Pending |
-| ARCH-06 | Pending | Pending |
-| TEST-01 | Pending | Pending |
-| TEST-02 | Pending | Pending |
-| TEST-03 | Pending | Pending |
-| TEST-04 | Pending | Pending |
-| TEST-05 | Pending | Pending |
-| TEST-06 | Pending | Pending |
-| ERRH-01 | Pending | Pending |
-| ERRH-02 | Pending | Pending |
-| ERRH-03 | Pending | Pending |
-| ASYN-01 | Pending | Pending |
-| ASYN-02 | Pending | Pending |
-| ASYN-03 | Pending | Pending |
-| BUGF-01 | Pending | Pending |
-| BUGF-02 | Pending | Pending |
-| DATA-01 | Pending | Pending |
-| DATA-02 | Pending | Pending |
-| DATA-03 | Pending | Pending |
-| DATA-04 | Pending | Pending |
-| QUAL-01 | Pending | Pending |
-| QUAL-02 | Pending | Pending |
-| QUAL-03 | Pending | Pending |
-| QUAL-04 | Pending | Pending |
-| QUAL-05 | Pending | Pending |
-| QUAL-06 | Pending | Pending |
+| ARCH-01 | Phase 1 | Pending |
+| ARCH-02 | Phase 1 | Pending |
+| ARCH-03 | Phase 1 | Pending |
+| ARCH-04 | Phase 1 | Pending |
+| ARCH-05 | Phase 1 | Pending |
+| ARCH-06 | Phase 1 | Pending |
+| TEST-01 | Phase 2 | Pending |
+| TEST-02 | Phase 2 | Pending |
+| TEST-03 | Phase 2 | Pending |
+| TEST-04 | Phase 2 | Pending |
+| TEST-05 | Phase 2 | Pending |
+| TEST-06 | Phase 2 | Pending |
+| ERRH-01 | Phase 3 | Pending |
+| ERRH-02 | Phase 3 | Pending |
+| ERRH-03 | Phase 3 | Pending |
+| ASYN-01 | Phase 3 | Pending |
+| ASYN-02 | Phase 3 | Pending |
+| ASYN-03 | Phase 3 | Pending |
+| BUGF-01 | Phase 3 | Pending |
+| BUGF-02 | Phase 3 | Pending |
+| DATA-01 | Phase 3 | Pending |
+| DATA-02 | Phase 3 | Pending |
+| DATA-03 | Phase 3 | Pending |
+| DATA-04 | Phase 3 | Pending |
+| QUAL-01 | Phase 3 | Pending |
+| QUAL-02 | Phase 3 | Pending |
+| QUAL-03 | Phase 1 | Pending |
+| QUAL-04 | Phase 1 | Pending |
+| QUAL-05 | Phase 1 | Pending |
+| QUAL-06 | Phase 1 | Pending |
 
 **Coverage:**
 - v1 requirements: 30 total
-- Mapped to phases: 0
-- Unmapped: 30
+- Mapped to phases: 30
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-02-22*
-*Last updated: 2026-02-22 after initial definition*
+*Last updated: 2026-02-22 after roadmap creation*
