@@ -41,8 +41,8 @@ Requirements for the refactored release. Each maps to roadmap phases.
 
 ### Bug Fixes
 
-- [ ] **BUGF-01**: Imported memories are embedded correctly at import time (fix ID mismatch in `import_chat_file` by collecting `(mem_id, chunk)` pairs)
-- [ ] **BUGF-02**: `remind_me_get_capture` uses a proper indexed `capture_id` column instead of fragile LIKE-based JSON metadata search
+- [x] **BUGF-01**: Imported memories are embedded correctly at import time (fix ID mismatch in `import_chat_file` by collecting `(mem_id, chunk)` pairs)
+- [x] **BUGF-02**: `remind_me_get_capture` uses a proper indexed `capture_id` column instead of fragile LIKE-based JSON metadata search
 
 ### Data Layer
 
@@ -117,10 +117,10 @@ Which phases cover which requirements. Updated during roadmap creation.
 | ASYN-01 | Phase 3 | Pending |
 | ASYN-02 | Phase 3 | Pending |
 | ASYN-03 | Phase 3 | Pending |
-| BUGF-01 | Phase 3 | Pending |
-| BUGF-02 | Phase 3 | Pending |
+| BUGF-01 | Phase 3 | Complete |
+| BUGF-02 | Phase 3 | Complete |
 | DATA-01 | Phase 3 | Pending |
-| DATA-02 | Phase 3 | Pending |
+| DATA-02 | Phase 3 | Complete |
 | DATA-03 | Phase 3 | Pending |
 | DATA-04 | Phase 3 | Pending |
 | QUAL-01 | Phase 3 | Pending |

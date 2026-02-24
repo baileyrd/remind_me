@@ -10,9 +10,9 @@ See: .planning/PROJECT.md (updated 2026-02-22)
 ## Current Position
 
 Phase: 3 of 3 (Quality and Bug Fixes)
-Plan: 1 of 4 in current phase
+Plan: 2 of 4 in current phase
 Status: In progress
-Last activity: 2026-02-24 — Completed 03-01 (Schema migration system)
+Last activity: 2026-02-24 — Completed 03-02 (Bug fixes: BUGF-01, BUGF-02, DATA-02)
 
 Progress: [█████████░] 83%
 
@@ -29,14 +29,15 @@ Progress: [█████████░] 83%
 |-------|-------|-------|----------|
 | 01-package-structure | 3/3 | 13min | 4min |
 | 02-test-infrastructure | 4/4 | 10min | 2.5min |
-| 03-quality-and-bug-fixes | 1/4 | 2min | 2min |
+| 03-quality-and-bug-fixes | 2/4 | 6min | 3min |
 
 **Recent Trend:**
-- Last 5 plans: 01-02 (8min), 01-03 (2min), 02-01 (2min), 02-04 (2min), 03-01 (2min)
+- Last 5 plans: 01-03 (2min), 02-01 (2min), 02-04 (2min), 03-01 (2min), 03-02 (4min)
 - Trend: stable
 
 *Updated after each plan completion*
 | Phase 03-quality-and-bug-fixes P01 | 2 | 2 tasks | 2 files |
+| Phase 03-quality-and-bug-fixes P02 | 4 | 2 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -71,6 +72,10 @@ Recent decisions affecting current work:
 - [03-01]: json_valid(NEW.tags) guard in sync triggers — SQLite evaluates WHERE before json_each iteration, preventing malformed JSON tags from raising OperationalError on INSERT/UPDATE
 - [03-01]: ADD COLUMN wrapped in try/except OperationalError — SQLite raises if column exists; silent continue makes migration idempotent on re-run
 - [03-01]: memory_tags junction table is additive — JSON tags column preserved for backward compatibility and _row_to_dict deserialization
+- [03-02]: embed_pairs list collected during INSERT loop — avoids recomputing _make_id with a different timestamp (BUGF-01 fix)
+- [03-02]: SQL EXISTS subquery for tag filtering — ensures LIMIT applies after filter in both tools.py memory_list and api.py api_list (DATA-02 fix)
+- [03-02]: Table alias m.* required — needed when joining memory_tags to avoid column ambiguity in SELECT
+- [03-02]: api_search retains Python post-filter for tags — search result set is already merged/ranked in memory; search pagination fix deferred
 
 ### Pending Todos
 
@@ -85,5 +90,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-24
-Stopped at: Completed 03-01-PLAN.md — schema migration system with capture_id column and memory_tags junction table
+Stopped at: Completed 03-02-PLAN.md — BUGF-01, BUGF-02, DATA-02 bug fixes with regression tests (161 tests passing)
 Resume file: None
