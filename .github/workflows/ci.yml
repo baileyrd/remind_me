@@ -23,7 +23,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv pip install -e ".[semantic]" pytest-cov ruff pytest-asyncio
+        run: uv pip install -e ".[semantic]" pytest-cov "ruff>=0.15,<0.16" pytest-asyncio
 
       - name: Lint
         run: ruff check --output-format=github .

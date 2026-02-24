@@ -8,7 +8,7 @@ instances directly to tool handler functions.
 from __future__ import annotations
 
 import logging
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +21,7 @@ log = logging.getLogger("remind_me_mcp.models")
 # ---------------------------------------------------------------------------
 
 
-class ResponseFormat(str, Enum):
+class ResponseFormat(StrEnum):
     """Output format for list/search operations."""
 
     MARKDOWN = "markdown"
