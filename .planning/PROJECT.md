@@ -42,6 +42,18 @@ Persistent, searchable memory that works seamlessly across all Claude interfaces
 - [ ] API path embedding parity (REST API memories lack semantic embeddings)
 - [ ] Clean up ruff warnings (unused imports, type annotations)
 - [ ] Remove original monolith file (remind_me_mcp_original.py)
+- [ ] Narrow broad `except Exception` in embeddings.py/pid.py
+
+## Current Milestone: v1.1 Address 1.0 Tech Debt
+
+**Goal:** Clean up all known tech debt from v1.0 — security hardening, CI/CD, performance, embedding parity, code quality, and monolith removal.
+
+**Target features:**
+- Security hardening (CORS lockdown, API auth, import path restrictions)
+- CI/CD pipeline with automated test runs and coverage enforcement
+- Performance improvements (batch reindex, concurrent file processing)
+- API path embedding parity (REST API memories get semantic embeddings)
+- Code quality (ruff warnings, narrow exception handling, remove monolith)
 
 ### Out of Scope
 
@@ -81,4 +93,4 @@ Self-update feature added post-v1.0 with `--version`, `--check-update`, `--updat
 | Entry point via __main__:main | CLI flags (--version, --check-update, --update) need argparse | ✓ Good — replaced mcp.run entry point |
 
 ---
-*Last updated: 2026-02-24 after v1.0 milestone*
+*Last updated: 2026-02-24 after v1.1 milestone started*
