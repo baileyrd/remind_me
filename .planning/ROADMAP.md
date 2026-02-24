@@ -21,7 +21,7 @@
 **Milestone Goal:** Clean up all known tech debt from v1.0 — code quality, CI/CD, security, embedding correctness, and performance.
 
 - [x] **Phase 4: Code Quality and Cleanup** - Resolve all ruff warnings, narrow exception handlers, and remove the dead monolith file (completed 2026-02-24)
-- [ ] **Phase 5: CI/CD Pipeline** - Establish GitHub Actions with lint, test, and coverage gates that validate all subsequent phases
+- [x] **Phase 5: CI/CD Pipeline** - Establish GitHub Actions with lint, test, and coverage gates that validate all subsequent phases (completed 2026-02-24)
 - [ ] **Phase 6: Security Hardening** - Lock down CORS, restrict import paths, and add optional API key authentication
 - [ ] **Phase 7: API Embedding Parity** - Fix the correctness gap where REST API memories are invisible to semantic search
 - [ ] **Phase 8: Performance Improvements** - Batch reindex and concurrent file import for large-scale operation
@@ -50,7 +50,7 @@ Plans:
   1. A GitHub Actions workflow runs on every push and pull request, executing ruff lint and pytest across Python 3.11 and 3.12 matrix
   2. The CI job fails if test coverage falls below 80%, blocking merges on coverage regression
   3. A passing green CI badge is visible on the repository after a clean push
-**Plans:** 1 plan
+**Plans:** 1/1 plans complete
 Plans:
 - [ ] 05-01-PLAN.md — Create CI workflow (lint + test matrix + coverage gate) and add README badge (CICD-01, CICD-02)
 
@@ -96,7 +96,7 @@ Phases execute in numeric order: 4 → 5 → 6 → 7 → 8
 | 2. Test Infrastructure | v1.0 | 4/4 | Complete | 2026-02-24 |
 | 3. Quality and Bug Fixes | v1.0 | 5/5 | Complete | 2026-02-24 |
 | 4. Code Quality and Cleanup | 2/2 | Complete    | 2026-02-24 | - |
-| 5. CI/CD Pipeline | v1.1 | 0/1 | Not started | - |
+| 5. CI/CD Pipeline | 1/1 | Complete   | 2026-02-24 | - |
 | 6. Security Hardening | v1.1 | 0/? | Not started | - |
 | 7. API Embedding Parity | v1.1 | 0/? | Not started | - |
 | 8. Performance Improvements | v1.1 | 0/? | Not started | - |

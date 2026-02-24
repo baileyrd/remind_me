@@ -5,16 +5,16 @@
 See: .planning/PROJECT.md (updated 2026-02-24)
 
 **Core value:** Persistent, searchable memory across all Claude interfaces — modular, tested, maintainable
-**Current focus:** v1.1 Phase 4 — Code Quality and Cleanup
+**Current focus:** v1.1 Phase 5 — CI/CD Pipeline
 
 ## Current Position
 
-Phase: 4 of 8 (Code Quality and Cleanup)
-Plan: 2 of 2 in current phase — Phase 4 COMPLETE
+Phase: 5 of 8 (CI/CD Pipeline)
+Plan: 1 of 1 in current phase — Phase 5 Plan 1 COMPLETE
 Status: In progress
-Last activity: 2026-02-24 — Plan 04-02 complete (narrow exception handlers, document preserved broad handlers, Phase 4 done)
+Last activity: 2026-02-24 — Plan 05-01 complete (GitHub Actions CI workflow with ruff lint, pytest coverage gate, Python 3.11/3.12 matrix, CI badge in README)
 
-Progress: [###░░░░░░░] 30% (v1.1 — 1.5/5 phases... all 2 plans of phase 4 done)
+Progress: [####░░░░░░] 40% (v1.1 — 2/5 phases... all 1 plan of phase 5 done)
 
 ## Performance Metrics
 
@@ -31,6 +31,12 @@ Progress: [###░░░░░░░] 30% (v1.1 — 1.5/5 phases... all 2 plans o
 | 02-test-infrastructure | 4/4 | 10min | 2.5min |
 | 03-quality-and-bug-fixes | 5/5 | 21min | 4.2min |
 | 04-code-quality-and-cleanup | 2/2 | 3min | 1.5min |
+
+**v1.1 metrics:**
+
+| Phase | Plans | Duration | Avg/Plan |
+|-------|-------|----------|----------|
+| 05-ci-cd-pipeline | 1/1 | 2min | 2min |
 
 *v1.1 metrics will accumulate as phases complete*
 
@@ -51,6 +57,8 @@ Recent decisions affecting v1.1:
 - 04-01: Only sem_memories loop variable changed to _ (B007 line 180); fts_memories loop at line 174 uses i for ranking
 - 04-02: Used except OSError (builtin) not except urllib.error.URLError — simpler, no import needed, URLError is OSError subclass
 - 04-02: Four broad handlers preserved at ONNX and background-task boundaries; all carry "Broad catch intentional:" comment for grep auditing
+- [Phase 05-ci-cd-pipeline]: Coverage gate at 74% (measured 76% minus 2% headroom) — not 80% CICD-02 target; will increase as tests are added in Phases 6-8
+- [Phase 05-ci-cd-pipeline]: pytest-asyncio installed explicitly in CI — required for asyncio_mode=auto even though not a declared project dependency
 
 ### Pending Todos
 
@@ -60,11 +68,11 @@ None.
 
 - Phase 4 (RESOLVED 04-01): Side-effect import preservation — noqa: F401 comments survived ruff I001 auto-fix correctly
 - Phase 4 (RESOLVED 04-02): ONNX exception boundaries in embeddings.py (lines 82, 145, 164) and updater.py (line 370) documented with "Broad catch intentional:" comments; pid.py narrowed to except OSError
-- Phase 5: Measure actual coverage before setting `--cov-fail-under` threshold — set at (measured - 2%) to allow headroom for new code in Phases 6-8
+- Phase 5 (RESOLVED 05-01): Coverage gate set at 74% (measured 76% minus 2% headroom) — not 80% target; pytest-asyncio added explicitly for asyncio_mode=auto
 - Phase 6: Include both `localhost` and `127.0.0.1` in CORS allow_origins — they are distinct browser origins
 
 ## Session Continuity
 
 Last session: 2026-02-24
-Stopped at: Completed 04-02-PLAN.md (narrow exception handlers, document preserved broad handlers, Phase 4 complete)
+Stopped at: Completed 05-01-PLAN.md (GitHub Actions CI workflow with ruff lint, pytest coverage gate, Python 3.11/3.12 matrix)
 Resume file: None

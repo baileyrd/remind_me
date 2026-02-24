@@ -15,8 +15,8 @@ Requirements for tech debt milestone. Each maps to roadmap phases.
 
 ### CI/CD
 
-- [ ] **CICD-01**: GitHub Actions workflow runs ruff lint and pytest on push/PR for Python 3.11 and 3.12
-- [ ] **CICD-02**: Coverage enforcement gate at 80% minimum via pytest-cov
+- [x] **CICD-01**: GitHub Actions workflow runs ruff lint and pytest on push/PR for Python 3.11 and 3.12
+- [x] **CICD-02**: Coverage enforcement gate at 80% minimum via pytest-cov
 
 ### Code Quality
 
@@ -73,8 +73,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 | SEC-01 | Phase 6 | Pending |
 | SEC-02 | Phase 6 | Pending |
 | SEC-03 | Phase 6 | Pending |
-| CICD-01 | Phase 5 | Pending |
-| CICD-02 | Phase 5 | Pending |
+| CICD-01 | Phase 5 | Complete |
+| CICD-02 | Phase 5 | Complete |
 | QUAL-01 | Phase 4 | Complete (04-01) |
 | QUAL-02 | Phase 4 | Complete |
 | QUAL-03 | Phase 4 | Complete (04-01) |
