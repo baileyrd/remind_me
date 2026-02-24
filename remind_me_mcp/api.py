@@ -11,12 +11,13 @@ build time, keeping the Python source clean and the JSX separately editable.
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from remind_me_mcp.config import DB_PATH, IMPORT_ROOTS
+from remind_me_mcp.config import API_KEY, DB_PATH, IMPORT_ROOTS
 from remind_me_mcp.db import _get_db, _make_id, _now_iso, _row_to_dict
 from remind_me_mcp.importer import import_chat_file, import_directory
 
@@ -87,9 +88,33 @@ def _build_api_app() -> Starlette:
     """
     from starlette.applications import Starlette
     from starlette.middleware import Middleware
+    from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.middleware.cors import CORSMiddleware
     from starlette.responses import HTMLResponse, JSONResponse
     from starlette.routing import Route
+
+    class BearerAuthMiddleware(BaseHTTPMiddleware):
+        """Gate all /api/* routes behind Bearer token auth when REMIND_ME_API_KEY is set.
+
+        When api_key is None (env var unset), all requests pass through unchanged
+        preserving backward compatibility for existing deployments.
+        """
+
+        def __init__(self, app, api_key: str | None = None) -> None:
+            super().__init__(app)
+            self.api_key = api_key
+
+        async def dispatch(self, request, call_next):
+            """Pass requests through when auth is disabled; enforce bearer token otherwise."""
+            if self.api_key is None:
+                return await call_next(request)
+            if not request.url.path.startswith("/api/"):
+                return await call_next(request)
+            auth = request.headers.get("Authorization", "")
+            expected = f"Bearer {self.api_key}"
+            if hmac.compare_digest(auth, expected):
+                return await call_next(request)
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
     # -- helpers --
     def _json_ok(data: Any, status: int = 200) -> JSONResponse:
@@ -350,7 +375,13 @@ def _build_api_app() -> Starlette:
     ]
 
     middleware = [
-        Middleware(CORSMiddleware, allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:\d+)?", allow_methods=["*"], allow_headers=["*"]),
+        Middleware(
+            CORSMiddleware,
+            allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:\d+)?",
+            allow_methods=["*"],
+            allow_headers=["*"],
+        ),
+        Middleware(BearerAuthMiddleware, api_key=API_KEY),
     ]
 
     return Starlette(routes=routes, middleware=middleware)
