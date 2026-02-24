@@ -736,6 +736,58 @@ async def test_resource_categories(db_conn: sqlite3.Connection, memory_factory) 
 
 
 # ---------------------------------------------------------------------------
+# Error path tests — ERRH-01, ERRH-02, ERRH-03
+# ---------------------------------------------------------------------------
+
+
+async def test_memory_get_not_found_message(db_conn: sqlite3.Connection) -> None:
+    """Getting a nonexistent memory returns a user-facing 'not found' message."""
+    result = await memory_get("definitely_not_there")
+    assert "not found" in result.lower()
+    # Should mention the ID in the message
+    assert "definitely_not_there" in result
+
+
+async def test_memory_delete_not_found_message(db_conn: sqlite3.Connection) -> None:
+    """Deleting a nonexistent memory returns a user-facing 'not found' message."""
+    params = MemoryDeleteInput(memory_id="ghost_id_errh")
+    result = await memory_delete(params)
+    assert "not found" in result.lower()
+    assert "ghost_id_errh" in result
+
+
+async def test_memory_update_not_found_message(db_conn: sqlite3.Connection) -> None:
+    """Updating a nonexistent memory returns a user-facing 'not found' message."""
+    params = MemoryUpdateInput(memory_id="missing_id_errh", content="whatever")
+    result = await memory_update(params)
+    assert "not found" in result.lower()
+    assert "missing_id_errh" in result
+
+
+async def test_get_capture_not_found_message(db_conn: sqlite3.Connection) -> None:
+    """get_capture with nonexistent capture_id returns a 'No capture found' message."""
+    result = await remind_me_get_capture("no_such_capture_errh")
+    assert "No capture found" in result
+
+
+async def test_memory_import_chat_file_not_found(
+    db_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Importing a file that disappears after validation returns a JSON error."""
+    # Create a real file so Pydantic validation passes
+    chat_file = tmp_path / "disappears.json"
+    chat_file.write_text('{"chat_messages": []}')
+    params = ChatImportInput(file_path=str(chat_file))
+    # Delete the file before the handler runs to trigger FileNotFoundError
+    chat_file.unlink()
+
+    result_str = await memory_import_chat(params)
+    result = json.loads(result_str)
+    assert result["status"] == "error"
+    assert "not found" in result["error"].lower()
+
+
+# ---------------------------------------------------------------------------
 # Regression tests — BUGF-01, BUGF-02, DATA-02
 # ---------------------------------------------------------------------------
 

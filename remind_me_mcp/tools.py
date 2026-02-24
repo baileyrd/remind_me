@@ -69,21 +69,28 @@ async def memory_add(params: MemoryAddInput) -> str:
     db = _get_db()
     mem_id = _make_id(params.content)
     now = _now_iso()
-    db.execute(
-        """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            mem_id,
-            params.content,
-            params.category,
-            json.dumps(params.tags),
-            params.source,
-            json.dumps(params.metadata),
-            now,
-            now,
-        ),
-    )
-    db.commit()
+    try:
+        db.execute(
+            """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                mem_id,
+                params.content,
+                params.category,
+                json.dumps(params.tags),
+                params.source,
+                json.dumps(params.metadata),
+                now,
+                now,
+            ),
+        )
+        db.commit()
+    except sqlite3.IntegrityError as e:
+        log.error("Failed to add memory: %s", e)
+        return "Error: Could not add memory — a memory with this content may already exist."
+    except sqlite3.OperationalError as e:
+        log.error("Database error adding memory: %s", e)
+        return f"Error: Database operation failed — {e}"
     await asyncio.to_thread(_embed_and_store, db, mem_id, params.content)
     return f"✓ Memory stored with id `{mem_id}` in category '{params.category}'."
 
@@ -380,13 +387,19 @@ async def memory_import_chat(params: ChatImportInput) -> str:
     Returns:
         str: Import statistics.
     """
-    result = import_chat_file(
-        file_path=params.file_path,
-        category=params.category,
-        tags=params.tags,
-        extract_mode=params.extract_mode,
-        max_length=params.max_length,
-    )
+    try:
+        result = import_chat_file(
+            file_path=params.file_path,
+            category=params.category,
+            tags=params.tags,
+            extract_mode=params.extract_mode,
+            max_length=params.max_length,
+        )
+    except FileNotFoundError:
+        return json.dumps({"status": "error", "error": f"File not found: {params.file_path}"})
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        log.error("Import parse error for %s: %s", params.file_path, e)
+        return json.dumps({"status": "error", "error": f"Failed to parse file: {e}"})
     return json.dumps(result, indent=2)
 
 
@@ -483,6 +496,12 @@ async def memory_stats(params: MemoryStatsInput) -> str:
         "SELECT id, category, substr(content, 1, 80) as preview, created_at FROM memories ORDER BY created_at DESC LIMIT 5"
     ).fetchall()
 
+    try:
+        db_size = round(DB_PATH.stat().st_size / 1_048_576, 2) if DB_PATH.exists() else 0
+    except OSError as e:
+        log.warning("Could not stat DB file: %s", e)
+        db_size = 0
+
     data = {
         "total_memories": total,
         "total_imports": imports,
@@ -490,7 +509,7 @@ async def memory_stats(params: MemoryStatsInput) -> str:
         "sources": {r["source"]: r["cnt"] for r in sources},
         "recent": [dict(r) for r in recent],
         "db_path": str(DB_PATH),
-        "db_size_mb": round(DB_PATH.stat().st_size / 1_048_576, 2) if DB_PATH.exists() else 0,
+        "db_size_mb": db_size,
     }
 
     if params.response_format == ResponseFormat.JSON:
@@ -561,21 +580,6 @@ async def remind_me_auto_capture(params: AutoCaptureInput) -> str:
         "title": title,
         "type": "dialog",
     }
-    db.execute(
-        """INSERT INTO memories (id, content, category, tags, source, metadata, capture_id, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            dialog_id,
-            params.conversation,
-            "dialog",
-            json.dumps(params.tags),
-            "auto_capture",
-            json.dumps(dialog_meta),
-            capture_id,
-            now,
-            now,
-        ),
-    )
 
     # -- Store the summary --
     summary_id = _make_id(params.summary)
@@ -586,30 +590,50 @@ async def remind_me_auto_capture(params: AutoCaptureInput) -> str:
         "title": title,
         "type": "summary",
     }
-    db.execute(
-        """INSERT INTO memories (id, content, category, tags, source, metadata, capture_id, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            summary_id,
-            params.summary,
-            params.category,
-            json.dumps(params.tags),
-            "auto_capture",
-            json.dumps(summary_meta),
-            capture_id,
-            now,
-            now,
-        ),
-    )
 
-    # -- Back-link the dialog to the summary --
-    dialog_meta["linked_summary"] = summary_id
-    db.execute(
-        "UPDATE memories SET metadata = ? WHERE id = ?",
-        (json.dumps(dialog_meta), dialog_id),
-    )
+    try:
+        db.execute(
+            """INSERT INTO memories (id, content, category, tags, source, metadata, capture_id, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                dialog_id,
+                params.conversation,
+                "dialog",
+                json.dumps(params.tags),
+                "auto_capture",
+                json.dumps(dialog_meta),
+                capture_id,
+                now,
+                now,
+            ),
+        )
+        db.execute(
+            """INSERT INTO memories (id, content, category, tags, source, metadata, capture_id, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                summary_id,
+                params.summary,
+                params.category,
+                json.dumps(params.tags),
+                "auto_capture",
+                json.dumps(summary_meta),
+                capture_id,
+                now,
+                now,
+            ),
+        )
 
-    db.commit()
+        # -- Back-link the dialog to the summary --
+        dialog_meta["linked_summary"] = summary_id
+        db.execute(
+            "UPDATE memories SET metadata = ? WHERE id = ?",
+            (json.dumps(dialog_meta), dialog_id),
+        )
+
+        db.commit()
+    except sqlite3.OperationalError as e:
+        log.error("Failed to capture conversation: %s", e)
+        return f"Error: Could not capture conversation — database error: {e}"
 
     # Embed both for semantic search (summary is more searchable, dialog has full context)
     await asyncio.to_thread(_embed_and_store, db, summary_id, params.summary)
