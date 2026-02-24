@@ -46,7 +46,8 @@ patterns-established:
   - "CI-first: all subsequent phases get automatic push/PR validation at no additional cost"
   - "Coverage gate with headroom: set below measured to allow normal development without premature failures"
 
-requirements-completed: [CICD-01, CICD-02]
+requirements-completed: [CICD-01]
+requirements-partial: [CICD-02]
 
 # Metrics
 duration: 2min

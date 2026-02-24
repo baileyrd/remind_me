@@ -59,6 +59,7 @@ Recent decisions affecting v1.1:
 - 04-02: Four broad handlers preserved at ONNX and background-task boundaries; all carry "Broad catch intentional:" comment for grep auditing
 - [Phase 05-ci-cd-pipeline]: Coverage gate at 74% (measured 76% minus 2% headroom) — not 80% CICD-02 target; will increase as tests are added in Phases 6-8
 - [Phase 05-ci-cd-pipeline]: pytest-asyncio installed explicitly in CI — required for asyncio_mode=auto even though not a declared project dependency
+- [Phase 05-ci-cd-pipeline]: CICD-02 status corrected from Complete to Partial — gate mechanism works at 74% but requirement specifies 80%; will be fully satisfied when coverage reaches 80% in Phases 6-8
 
 ### Pending Todos
 
@@ -69,6 +70,7 @@ None.
 - Phase 4 (RESOLVED 04-01): Side-effect import preservation — noqa: F401 comments survived ruff I001 auto-fix correctly
 - Phase 4 (RESOLVED 04-02): ONNX exception boundaries in embeddings.py (lines 82, 145, 164) and updater.py (line 370) documented with "Broad catch intentional:" comments; pid.py narrowed to except OSError
 - Phase 5 (RESOLVED 05-01): Coverage gate set at 74% (measured 76% minus 2% headroom) — not 80% target; pytest-asyncio added explicitly for asyncio_mode=auto
+- Phase 5 (OPEN): CICD-02 requires 80% coverage gate but current gate is 74% (measured coverage 76%). Will resolve when Phases 6-8 add tests to reach 80%, at which point --cov-fail-under in ci.yml should be raised to 80
 - Phase 6: Include both `localhost` and `127.0.0.1` in CORS allow_origins — they are distinct browser origins
 
 ## Session Continuity
