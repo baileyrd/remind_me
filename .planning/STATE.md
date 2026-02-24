@@ -5,16 +5,16 @@
 See: .planning/PROJECT.md (updated 2026-02-22)
 
 **Core value:** Every design principle from CLAUDE.md passes a green audit without breaking existing functionality
-**Current focus:** Phase 1 — Package Structure
+**Current focus:** Phase 2 — Test Infrastructure
 
 ## Current Position
 
-Phase: 1 of 3 (Package Structure)
-Plan: 3 of 3 in current phase
-Status: Phase 1 complete
-Last activity: 2026-02-24 — Completed 01-03 (entry point wiring, ruff/mypy/pytest config)
+Phase: 2 of 3 (Test Infrastructure)
+Plan: 1 of 4 in current phase
+Status: In progress
+Last activity: 2026-02-24 — Completed 02-01 (shared pytest fixtures, smoke tests)
 
-Progress: [███░░░░░░░] 33%
+Progress: [████░░░░░░] 40%
 
 ## Performance Metrics
 
@@ -28,10 +28,11 @@ Progress: [███░░░░░░░] 33%
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 01-package-structure | 3/3 | 13min | 4min |
+| 02-test-infrastructure | 1/4 | 2min | 2min |
 
 **Recent Trend:**
-- Last 5 plans: 01-01 (3min), 01-02 (8min), 01-03 (2min)
-- Trend: -
+- Last 5 plans: 01-01 (3min), 01-02 (8min), 01-03 (2min), 02-01 (2min)
+- Trend: stable
 
 *Updated after each plan completion*
 
@@ -56,6 +57,9 @@ Recent decisions affecting current work:
 - [01-03]: __init__.py imports tools module as side effect — ensures @mcp.tool decorators fire before mcp.run() via entry point
 - [01-03]: Entry point keep as remind_me_mcp:mcp.run — FastMCP handles run loop; __main__.py for python -m usage
 - [01-03]: Monolith renamed to remind_me_mcp_original.py — eliminates Python import ambiguity with package directory
+- [02-01]: Session-scoped monkeypatch uses pytest.MonkeyPatch() directly — function-scoped monkeypatch fixture cannot be injected into session-scoped fixtures
+- [02-01]: FakeEmbedder seeds np.random.default_rng on hash(text) for deterministic per-text vectors without ML model dependency
+- [02-01]: db_conn monkeypatches both remind_me_mcp.db._get_db and remind_me_mcp.api._get_db since api.py imports _get_db directly
 
 ### Pending Todos
 
@@ -70,5 +74,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-24
-Stopped at: Completed 01-03-PLAN.md — entry points wired, monolith renamed, ruff/mypy/pytest configured
+Stopped at: Completed 02-01-PLAN.md — shared pytest fixtures and smoke tests
 Resume file: None

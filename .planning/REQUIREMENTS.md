@@ -21,9 +21,9 @@ Requirements for the refactored release. Each maps to roadmap phases.
 - [ ] **TEST-01**: pytest test suite exists with unit tests for all pure-function modules (importer parsers, chunker, formatting, models)
 - [ ] **TEST-02**: Integration tests exist for all 13 MCP tool handlers using in-memory SQLite
 - [ ] **TEST-03**: Integration tests exist for all Starlette HTTP API routes via TestClient or httpx
-- [ ] **TEST-04**: `conftest.py` provides shared fixtures: in-memory SQLite db with schema, mock embedder, sample memory factory
-- [ ] **TEST-05**: All async tests run correctly via pytest-asyncio with `asyncio_mode = "auto"`
-- [ ] **TEST-06**: Tests use in-memory SQLite (not mocks) for database operations to validate FTS5 triggers and SQL correctness
+- [x] **TEST-04**: `conftest.py` provides shared fixtures: in-memory SQLite db with schema, mock embedder, sample memory factory
+- [x] **TEST-05**: All async tests run correctly via pytest-asyncio with `asyncio_mode = "auto"`
+- [x] **TEST-06**: Tests use in-memory SQLite (not mocks) for database operations to validate FTS5 triggers and SQL correctness
 
 ### Error Handling
 
@@ -108,9 +108,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 | TEST-01 | Phase 2 | Pending |
 | TEST-02 | Phase 2 | Pending |
 | TEST-03 | Phase 2 | Pending |
-| TEST-04 | Phase 2 | Pending |
-| TEST-05 | Phase 2 | Pending |
-| TEST-06 | Phase 2 | Pending |
+| TEST-04 | Phase 2 | Complete |
+| TEST-05 | Phase 2 | Complete |
+| TEST-06 | Phase 2 | Complete |
 | ERRH-01 | Phase 3 | Pending |
 | ERRH-02 | Phase 3 | Pending |
 | ERRH-03 | Phase 3 | Pending |
