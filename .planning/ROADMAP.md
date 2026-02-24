@@ -23,7 +23,7 @@
 - [x] **Phase 4: Code Quality and Cleanup** - Resolve all ruff warnings, narrow exception handlers, and remove the dead monolith file (completed 2026-02-24)
 - [x] **Phase 5: CI/CD Pipeline** - Establish GitHub Actions with lint, test, and coverage gates that validate all subsequent phases (completed 2026-02-24)
 - [x] **Phase 6: Security Hardening** - Lock down CORS, restrict import paths, and add optional API key authentication (completed 2026-02-24)
-- [ ] **Phase 7: API Embedding Parity** - Fix the correctness gap where REST API memories are invisible to semantic search
+- [x] **Phase 7: API Embedding Parity** - Fix the correctness gap where REST API memories are invisible to semantic search (completed 2026-02-24)
 - [ ] **Phase 8: Performance Improvements** - Batch reindex and concurrent file import for large-scale operation
 
 ## Phase Details
@@ -77,7 +77,7 @@ Plans:
   1. A memory added via `POST /api/memories` appears in semantic search results within the same request/response cycle (a vector row exists in the embeddings table)
   2. A memory updated via `PUT /api/memories/{id}` with new content produces an updated embedding — the old semantic representation is replaced
   3. REST API memories and MCP tool memories are indistinguishable in semantic search results
-**Plans:** 1 plan
+**Plans:** 1/1 plans complete
 Plans:
 - [ ] 07-01-PLAN.md — TDD: Add embedding generation to REST API create/update handlers (EMBD-01, EMBD-02)
 
@@ -104,5 +104,5 @@ Phases execute in numeric order: 4 → 5 → 6 → 7 → 8
 | 4. Code Quality and Cleanup | 2/2 | Complete    | 2026-02-24 | - |
 | 5. CI/CD Pipeline | v1.1 | 2/2 | Complete | 2026-02-24 |
 | 6. Security Hardening | 2/2 | Complete    | 2026-02-24 | - |
-| 7. API Embedding Parity | v1.1 | 0/1 | Planned | - |
+| 7. API Embedding Parity | 1/1 | Complete   | 2026-02-24 | - |
 | 8. Performance Improvements | v1.1 | 0/? | Not started | - |

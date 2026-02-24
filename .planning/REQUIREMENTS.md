@@ -26,8 +26,8 @@ Requirements for tech debt milestone. Each maps to roadmap phases.
 
 ### Embedding Parity
 
-- [ ] **EMBD-01**: REST API `POST /api/memories` generates semantic embeddings on create (matching MCP tool behavior)
-- [ ] **EMBD-02**: REST API `PUT /api/memories/{id}` regenerates semantic embeddings on content update (matching MCP tool behavior)
+- [x] **EMBD-01**: REST API `POST /api/memories` generates semantic embeddings on create (matching MCP tool behavior)
+- [x] **EMBD-02**: REST API `PUT /api/memories/{id}` regenerates semantic embeddings on content update (matching MCP tool behavior)
 
 ### Performance
 
@@ -78,8 +78,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 | QUAL-01 | Phase 4 | Complete (04-01) |
 | QUAL-02 | Phase 4 | Complete |
 | QUAL-03 | Phase 4 | Complete (04-01) |
-| EMBD-01 | Phase 7 | Pending |
-| EMBD-02 | Phase 7 | Pending |
+| EMBD-01 | Phase 7 | Complete |
+| EMBD-02 | Phase 7 | Complete |
 | PERF-01 | Phase 8 | Pending |
 | PERF-02 | Phase 8 | Pending |
 

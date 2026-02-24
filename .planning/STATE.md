@@ -5,16 +5,16 @@
 See: .planning/PROJECT.md (updated 2026-02-24)
 
 **Core value:** Persistent, searchable memory across all Claude interfaces — modular, tested, maintainable
-**Current focus:** v1.1 Phase 6 — Security Hardening
+**Current focus:** v1.1 Phase 7 — API Embedding Parity
 
 ## Current Position
 
-Phase: 6 of 8 (Security Hardening)
-Plan: 2 of 2 in current phase — Phase 6 Plan 2 COMPLETE
+Phase: 7 of 8 (API Embedding Parity)
+Plan: 1 of 1 in current phase — Phase 7 Plan 1 COMPLETE
 Status: In progress
-Last activity: 2026-02-24 — Plan 06-02 complete (SEC-03 Bearer token auth middleware + 7 auth tests)
+Last activity: 2026-02-24 — Plan 07-01 complete (EMBD-01/EMBD-02: REST API embedding parity, 5 integration tests)
 
-Progress: [######░░░░] 60% (v1.1 — 3/5 phases)
+Progress: [#######░░░] 70% (v1.1 — 4/5 phases)
 
 ## Performance Metrics
 
@@ -38,6 +38,7 @@ Progress: [######░░░░] 60% (v1.1 — 3/5 phases)
 |-------|-------|----------|----------|
 | 05-ci-cd-pipeline | 2/2 | 5min | 2.5min |
 | 06-security-hardening | 2/2 | 6min | 3min |
+| 07-api-embedding-parity | 1/1 | 2min | 2min |
 
 *v1.1 metrics will accumulate as phases complete*
 
@@ -68,6 +69,9 @@ Recent decisions affecting v1.1:
 - [Phase 06-security-hardening, plan 02]: CORS middleware must be outermost (first in list) so OPTIONS preflight succeeds before auth sees the request
 - [Phase 06-security-hardening, plan 02]: hmac.compare_digest() used for timing-safe token comparison — stdlib, no extra deps
 - [Phase 06-security-hardening, plan 02]: client_with_auth test fixture patches API_KEY in both remind_me_mcp.config AND remind_me_mcp.api — from-import creates separate binding that must be updated independently
+- [Phase 07-api-embedding-parity, plan 01]: sqlite-vec 0.1.6 requires 'AND mv.k = ?' constraint instead of 'LIMIT ?' in knn JOIN queries — LIMIT does not push through the JOIN planner; fixed in _semantic_search
+- [Phase 07-api-embedding-parity, plan 01]: Gate api_update re-embed on 'content' in body and body['content'] is not None — tag-only updates must not call _embed_and_store (mirrors tools.py lines 359-360)
+- [Phase 07-api-embedding-parity, plan 01]: _embed_and_store called via asyncio.to_thread in async route handlers — consistent with tools.py memory_add/memory_update pattern
 
 ### Pending Todos
 
@@ -84,5 +88,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-02-24
-Stopped at: Completed 06-02-PLAN.md (SEC-03 Bearer token auth middleware + 7 auth tests, Phase 6 COMPLETE)
+Stopped at: Completed 07-01-PLAN.md (EMBD-01/EMBD-02 REST API embedding parity + _semantic_search knn fix, Phase 7 COMPLETE)
 Resume file: None
