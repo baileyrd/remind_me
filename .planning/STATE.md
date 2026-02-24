@@ -35,6 +35,7 @@ Progress: [████████░░] 73%
 - Trend: stable
 
 *Updated after each plan completion*
+| Phase 02-test-infrastructure P02 | 2 | 2 tasks | 4 files |
 
 ## Accumulated Context
 
