@@ -5,6 +5,8 @@ Uses the db_conn fixture from conftest.py which provides an in-memory
 SQLite connection with the full schema (tables, FTS5, triggers, indexes).
 
 FTS5 trigger tests use real in-memory SQLite — no mocks (TEST-06 requirement).
+Migration tests also use real in-memory SQLite to validate PRAGMA user_version
+handling, junction table creation, tag sync triggers, and idempotent re-runs.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ import sqlite3
 
 import pytest
 
-from remind_me_mcp.db import _ensure_schema, _make_id, _now_iso, _row_to_dict
+from remind_me_mcp.db import _ensure_schema, _make_id, _migrate_schema, _now_iso, _row_to_dict
 
 
 # ---------------------------------------------------------------------------
@@ -247,3 +249,165 @@ def test_schema_creates_indexes(db_conn: sqlite3.Connection) -> None:
     assert "idx_memories_category" in index_names
     assert "idx_memories_source" in index_names
     assert "idx_memories_created" in index_names
+
+
+# ---------------------------------------------------------------------------
+# Migration system — PRAGMA user_version, capture_id, memory_tags
+# ---------------------------------------------------------------------------
+
+
+def test_migrate_schema_sets_user_version(db_conn: sqlite3.Connection) -> None:
+    """_ensure_schema sets PRAGMA user_version to 2 on a fresh in-memory database."""
+    version = db_conn.execute("PRAGMA user_version").fetchone()[0]
+    assert version == 2, f"Expected user_version 2, got {version}"
+
+
+def test_capture_id_column_exists(db_conn: sqlite3.Connection) -> None:
+    """The memories table has a capture_id column after schema creation."""
+    columns = [row[1] for row in db_conn.execute("PRAGMA table_info(memories)").fetchall()]
+    assert "capture_id" in columns, "capture_id column is missing from memories table"
+
+
+def test_capture_id_index_exists(db_conn: sqlite3.Connection) -> None:
+    """An index named idx_memories_capture_id exists on the memories table."""
+    indexes = [
+        row[0]
+        for row in db_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+        ).fetchall()
+    ]
+    assert "idx_memories_capture_id" in indexes, "idx_memories_capture_id index is missing"
+
+
+def test_memory_tags_table_exists(db_conn: sqlite3.Connection) -> None:
+    """The memory_tags junction table exists with memory_id and tag columns."""
+    tables = [
+        row[0]
+        for row in db_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    ]
+    assert "memory_tags" in tables, "memory_tags table is missing"
+
+    tag_columns = [
+        row[1] for row in db_conn.execute("PRAGMA table_info(memory_tags)").fetchall()
+    ]
+    assert "memory_id" in tag_columns, "memory_id column missing from memory_tags"
+    assert "tag" in tag_columns, "tag column missing from memory_tags"
+
+
+def test_memory_tags_populated_on_insert(db_conn: sqlite3.Connection) -> None:
+    """Inserting a memory with JSON tags populates memory_tags via the after-insert trigger."""
+    now = _now_iso()
+    mem_id = _make_id("tags-junction-insert")
+    db_conn.execute(
+        """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (mem_id, "Tag junction insert test", "general", '["python","async"]', "manual", "{}", now, now),
+    )
+    db_conn.commit()
+
+    rows = db_conn.execute(
+        "SELECT tag FROM memory_tags WHERE memory_id = ? ORDER BY tag", (mem_id,)
+    ).fetchall()
+    tags_found = {row[0] for row in rows}
+    assert tags_found == {"python", "async"}, f"Expected python and async, got {tags_found}"
+
+
+def test_memory_tags_updated_on_tag_change(db_conn: sqlite3.Connection) -> None:
+    """Updating the tags column replaces memory_tags rows for that memory."""
+    now = _now_iso()
+    mem_id = _make_id("tags-junction-update")
+    db_conn.execute(
+        """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (mem_id, "Tag junction update test", "general", '["a","b"]', "manual", "{}", now, now),
+    )
+    db_conn.commit()
+
+    db_conn.execute(
+        "UPDATE memories SET tags = ?, updated_at = ? WHERE id = ?",
+        ('["b","c"]', _now_iso(), mem_id),
+    )
+    db_conn.commit()
+
+    rows = db_conn.execute(
+        "SELECT tag FROM memory_tags WHERE memory_id = ? ORDER BY tag", (mem_id,)
+    ).fetchall()
+    tags_found = {row[0] for row in rows}
+    assert tags_found == {"b", "c"}, f"Expected b and c after update, got {tags_found}"
+
+
+def test_memory_tags_deleted_on_memory_delete(db_conn: sqlite3.Connection) -> None:
+    """Deleting a memory removes its rows from memory_tags via the after-delete trigger."""
+    now = _now_iso()
+    mem_id = _make_id("tags-junction-delete")
+    db_conn.execute(
+        """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (mem_id, "Tag junction delete test", "general", '["x","y"]', "manual", "{}", now, now),
+    )
+    db_conn.commit()
+
+    # Confirm rows exist before deletion
+    before = db_conn.execute(
+        "SELECT tag FROM memory_tags WHERE memory_id = ?", (mem_id,)
+    ).fetchall()
+    assert len(before) == 2, f"Expected 2 tag rows before delete, got {len(before)}"
+
+    db_conn.execute("DELETE FROM memories WHERE id = ?", (mem_id,))
+    db_conn.commit()
+
+    after = db_conn.execute(
+        "SELECT tag FROM memory_tags WHERE memory_id = ?", (mem_id,)
+    ).fetchall()
+    assert len(after) == 0, f"Expected 0 tag rows after delete, got {len(after)}"
+
+
+def test_capture_id_backfill_from_metadata(db_conn: sqlite3.Connection) -> None:
+    """Running _migrate_schema on a db with metadata capture_id backfills the column.
+
+    Simulates an upgrade scenario: insert a row with capture_id=NULL and
+    capture_id stored in the metadata JSON, then call _migrate_schema again.
+    The column should be populated from the JSON metadata.
+    """
+    now = _now_iso()
+    mem_id = _make_id("backfill-capture-id")
+
+    # Insert with capture_id NULL and capture_id inside metadata JSON.
+    db_conn.execute(
+        """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at, capture_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)""",
+        (
+            mem_id,
+            "Backfill test content",
+            "general",
+            "[]",
+            "manual",
+            '{"capture_id": "abc123"}',
+            now,
+            now,
+        ),
+    )
+    db_conn.commit()
+
+    # Force user_version back to 0 to re-run v0->v1 migration (backfill step).
+    db_conn.execute("PRAGMA user_version = 0")
+    db_conn.commit()
+    _migrate_schema(db_conn)
+
+    row = db_conn.execute(
+        "SELECT capture_id FROM memories WHERE id = ?", (mem_id,)
+    ).fetchone()
+    assert row is not None, "Memory row not found after migration"
+    assert row[0] == "abc123", f"Expected capture_id='abc123', got {row[0]!r}"
+
+
+def test_migration_idempotent(db_conn: sqlite3.Connection) -> None:
+    """Running _ensure_schema twice on the same database does not raise and keeps user_version at 2."""
+    # db_conn fixture has already run _ensure_schema once via the fixture setup.
+    # Run it again to verify idempotency.
+    _ensure_schema(db_conn)
+
+    version = db_conn.execute("PRAGMA user_version").fetchone()[0]
+    assert version == 2, f"user_version should still be 2 after re-run, got {version}"
