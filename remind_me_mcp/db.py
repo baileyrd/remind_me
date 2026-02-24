@@ -33,12 +33,24 @@ log = logging.getLogger("remind_me_mcp.db")
 # Connection
 # ---------------------------------------------------------------------------
 
+_db_connection: sqlite3.Connection | None = None
+
 
 def _get_db() -> sqlite3.Connection:
-    """Open (and lazily initialize) the SQLite database."""
-    db = sqlite3.connect(str(DB_PATH), timeout=10)
+    """Return the lazily initialized SQLite database singleton.
+
+    The connection is configured with WAL journal mode for concurrent reader
+    access, busy_timeout for graceful lock contention, and
+    check_same_thread=False so it can be used from asyncio.to_thread workers.
+    """
+    global _db_connection
+    if _db_connection is not None:
+        return _db_connection
+
+    db = sqlite3.connect(str(DB_PATH), timeout=10, check_same_thread=False)
     db.row_factory = sqlite3.Row
-    db.execute("PRAGMA journal_mode=WAL")  # safe for concurrent readers
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA busy_timeout=5000")
     db.execute("PRAGMA foreign_keys=ON")
 
     # Load sqlite-vec extension if available
@@ -51,7 +63,16 @@ def _get_db() -> sqlite3.Connection:
         log.debug("sqlite-vec not available: %s (vector search disabled)", e)
 
     _ensure_schema(db)
+    _db_connection = db
     return db
+
+
+def _close_db() -> None:
+    """Close the singleton database connection. Called during shutdown."""
+    global _db_connection
+    if _db_connection is not None:
+        _db_connection.close()
+        _db_connection = None
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +374,7 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
 
 __all__ = [
     "_get_db",
+    "_close_db",
     "_ensure_schema",
     "_migrate_schema",
     "_embed_and_store",

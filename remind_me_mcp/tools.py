@@ -8,6 +8,7 @@ circular imports.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sqlite3
@@ -83,7 +84,7 @@ async def memory_add(params: MemoryAddInput) -> str:
         ),
     )
     db.commit()
-    _embed_and_store(db, mem_id, params.content)
+    await asyncio.to_thread(_embed_and_store, db, mem_id, params.content)
     return f"✓ Memory stored with id `{mem_id}` in category '{params.category}'."
 
 
@@ -133,7 +134,7 @@ async def memory_search(params: MemorySearchInput) -> str:
         pass
 
     # --- Semantic vector search ---
-    sem_memories = _semantic_search(db, params.query, limit=params.limit)
+    sem_memories = await asyncio.to_thread(_semantic_search, db, params.query, limit=params.limit)
 
     # --- Merge and deduplicate (hybrid ranking) ---
     seen: dict[str, dict] = {}
@@ -326,7 +327,7 @@ async def memory_update(params: MemoryUpdateInput) -> str:
     db.commit()
     # Re-embed if content changed
     if params.content is not None:
-        _embed_and_store(db, params.memory_id, params.content)
+        await asyncio.to_thread(_embed_and_store, db, params.memory_id, params.content)
     return f"✓ Memory `{params.memory_id}` updated."
 
 
@@ -610,8 +611,8 @@ async def remind_me_auto_capture(params: AutoCaptureInput) -> str:
     db.commit()
 
     # Embed both for semantic search (summary is more searchable, dialog has full context)
-    _embed_and_store(db, summary_id, params.summary)
-    _embed_and_store(db, dialog_id, params.conversation[:2000])
+    await asyncio.to_thread(_embed_and_store, db, summary_id, params.summary)
+    await asyncio.to_thread(_embed_and_store, db, dialog_id, params.conversation[:2000])
 
     tag_str = ", ".join(params.tags) if params.tags else "none"
     return (
@@ -740,7 +741,7 @@ async def remind_me_reindex() -> str:
     created = 0
     for mem_id, rowid, content in missing:
         try:
-            vec_bytes = embedder.embed_one(content[:2000])
+            vec_bytes = await asyncio.to_thread(embedder.embed_one, content[:2000])
             db.execute("INSERT OR REPLACE INTO memories_vec(rowid, embedding) VALUES (?, ?)", (rowid, vec_bytes))
             created += 1
         except Exception as e:

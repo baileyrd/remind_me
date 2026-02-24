@@ -17,7 +17,7 @@ from contextlib import asynccontextmanager
 from mcp.server.fastmcp import FastMCP
 
 from remind_me_mcp.config import DB_PATH
-from remind_me_mcp.db import _get_db
+from remind_me_mcp.db import _close_db, _get_db
 
 log = logging.getLogger("remind_me_mcp.server")
 
@@ -32,7 +32,7 @@ async def app_lifespan(app):
     db = _get_db()
     log.info("Remind Me MCP started — db at %s", DB_PATH)
     yield {"db": db}
-    db.close()
+    _close_db()
 
 
 # ---------------------------------------------------------------------------
