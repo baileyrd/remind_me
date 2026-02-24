@@ -63,6 +63,8 @@ Recent decisions affecting current work:
 - [02-01]: db_conn monkeypatches both remind_me_mcp.db._get_db and remind_me_mcp.api._get_db since api.py imports _get_db directly
 - [02-02]: Direct import of private pure functions — no MCP server context needed; all 75 tests run in 0.04s
 - [02-02]: FTS5 trigger tests use distinct unique words per test to avoid cross-test interference without requiring separate db_conn instances
+- [02-03]: db_conn fixture must patch remind_me_mcp.tools._get_db and remind_me_mcp.importer._get_db — both use 'from remind_me_mcp.db import _get_db' creating separate bindings not covered by the module attribute patch
+- [02-03]: server_status test monkeypatches remind_me_mcp.tools.get_server_status (not pid module) because tools.py imports it directly, creating a local binding
 - [02-04]: db_conn fixture uses check_same_thread=False — Starlette TestClient runs async handlers in a worker thread separate from pytest main thread
 - [02-04]: client fixture patches remind_me_mcp.importer._get_db directly because importer uses 'from ... import _get_db' local binding not affected by module attribute patch
 
@@ -79,5 +81,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-24
-Stopped at: Completed 02-02-PLAN.md — unit tests for importer, formatting, models, and db
+Stopped at: Completed 02-03-PLAN.md — integration tests for all 13 MCP tool handlers
 Resume file: None
