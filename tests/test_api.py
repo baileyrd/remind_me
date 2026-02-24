@@ -613,3 +613,178 @@ def test_auth_protects_all_api_routes(client_with_auth: TestClient) -> None:
     # DELETE /api/memories/fake-id
     r = client_with_auth.delete("/api/memories/fake-id")
     assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# EMBD-01 / EMBD-02: REST API embedding parity
+# ---------------------------------------------------------------------------
+
+
+def test_api_add_creates_embedding(db_conn_with_vec, mock_embedder, monkeypatch) -> None:
+    """EMBD-01: POST /api/memories creates a corresponding row in memories_vec."""
+    import remind_me_mcp.api as _api_mod
+    import remind_me_mcp.config as _cfg
+    import remind_me_mcp.importer as _importer_mod
+
+    monkeypatch.setattr(_importer_mod, "_get_db", lambda: db_conn_with_vec)
+    monkeypatch.setattr(_cfg, "IMPORT_ROOTS", [Path.home(), Path("/tmp").resolve()])
+    monkeypatch.setattr(_api_mod, "IMPORT_ROOTS", [Path.home(), Path("/tmp").resolve()])
+
+    app = _build_api_app()
+    client = TestClient(app)
+
+    response = client.post("/api/memories", json={"content": "embedding parity test memory"})
+    assert response.status_code == 201
+
+    mem_id = response.json()["id"]
+    rowid_row = db_conn_with_vec.execute(
+        "SELECT rowid FROM memories WHERE id = ?", (mem_id,)
+    ).fetchone()
+    assert rowid_row is not None, "Memory row should exist in memories table"
+    rowid = rowid_row[0]
+
+    vec_row = db_conn_with_vec.execute(
+        "SELECT rowid FROM memories_vec WHERE rowid = ?", (rowid,)
+    ).fetchone()
+    assert vec_row is not None, "memories_vec row should exist after POST /api/memories"
+
+
+def test_api_add_embedding_rowid_matches_memory(db_conn_with_vec, mock_embedder, monkeypatch) -> None:
+    """EMBD-01: The memories_vec rowid matches the memory's SQLite rowid (foreign key integrity)."""
+    import remind_me_mcp.api as _api_mod
+    import remind_me_mcp.config as _cfg
+    import remind_me_mcp.importer as _importer_mod
+
+    monkeypatch.setattr(_importer_mod, "_get_db", lambda: db_conn_with_vec)
+    monkeypatch.setattr(_cfg, "IMPORT_ROOTS", [Path.home(), Path("/tmp").resolve()])
+    monkeypatch.setattr(_api_mod, "IMPORT_ROOTS", [Path.home(), Path("/tmp").resolve()])
+
+    app = _build_api_app()
+    client = TestClient(app)
+
+    response = client.post("/api/memories", json={"content": "rowid match test memory"})
+    assert response.status_code == 201
+
+    mem_id = response.json()["id"]
+    mem_rowid = db_conn_with_vec.execute(
+        "SELECT rowid FROM memories WHERE id = ?", (mem_id,)
+    ).fetchone()[0]
+    vec_rowid = db_conn_with_vec.execute(
+        "SELECT rowid FROM memories_vec WHERE rowid = ?", (mem_rowid,)
+    ).fetchone()
+    assert vec_rowid is not None, "memories_vec rowid should match memory rowid"
+    assert vec_rowid[0] == mem_rowid, "memories_vec rowid must equal memory's SQLite rowid"
+
+
+def test_api_update_content_regenerates_embedding(db_conn_with_vec, mock_embedder, monkeypatch) -> None:
+    """EMBD-02: PUT /api/memories/{id} with new content updates the memories_vec row."""
+    import remind_me_mcp.api as _api_mod
+    import remind_me_mcp.config as _cfg
+    import remind_me_mcp.importer as _importer_mod
+
+    monkeypatch.setattr(_importer_mod, "_get_db", lambda: db_conn_with_vec)
+    monkeypatch.setattr(_cfg, "IMPORT_ROOTS", [Path.home(), Path("/tmp").resolve()])
+    monkeypatch.setattr(_api_mod, "IMPORT_ROOTS", [Path.home(), Path("/tmp").resolve()])
+
+    app = _build_api_app()
+    client = TestClient(app)
+
+    # Create initial memory
+    create_resp = client.post("/api/memories", json={"content": "original content for update test"})
+    assert create_resp.status_code == 201
+    mem_id = create_resp.json()["id"]
+
+    mem_rowid = db_conn_with_vec.execute(
+        "SELECT rowid FROM memories WHERE id = ?", (mem_id,)
+    ).fetchone()[0]
+
+    # Update with new content
+    update_resp = client.put(f"/api/memories/{mem_id}", json={"content": "updated content for embedding test"})
+    assert update_resp.status_code == 200
+
+    # Vec row should still be present (upsert by rowid — content changed, rowid unchanged)
+    vec_row = db_conn_with_vec.execute(
+        "SELECT rowid FROM memories_vec WHERE rowid = ?", (mem_rowid,)
+    ).fetchone()
+    assert vec_row is not None, "memories_vec row should still exist after content update"
+
+
+def test_api_update_no_content_preserves_embedding(db_conn_with_vec, mock_embedder, monkeypatch) -> None:
+    """EMBD-02: PUT /api/memories/{id} with only tags does NOT alter the memories_vec row."""
+    import remind_me_mcp.api as _api_mod
+    import remind_me_mcp.config as _cfg
+    import remind_me_mcp.importer as _importer_mod
+
+    monkeypatch.setattr(_importer_mod, "_get_db", lambda: db_conn_with_vec)
+    monkeypatch.setattr(_cfg, "IMPORT_ROOTS", [Path.home(), Path("/tmp").resolve()])
+    monkeypatch.setattr(_api_mod, "IMPORT_ROOTS", [Path.home(), Path("/tmp").resolve()])
+
+    app = _build_api_app()
+    client = TestClient(app)
+
+    # Create initial memory (with embedding)
+    create_resp = client.post("/api/memories", json={"content": "tag-only update test memory"})
+    assert create_resp.status_code == 201
+    mem_id = create_resp.json()["id"]
+
+    mem_rowid = db_conn_with_vec.execute(
+        "SELECT rowid FROM memories WHERE id = ?", (mem_id,)
+    ).fetchone()[0]
+
+    # Verify initial vec row exists
+    initial_vec = db_conn_with_vec.execute(
+        "SELECT rowid FROM memories_vec WHERE rowid = ?", (mem_rowid,)
+    ).fetchone()
+    assert initial_vec is not None, "Initial embedding should exist after POST"
+
+    # Update with only tags (no content)
+    update_resp = client.put(f"/api/memories/{mem_id}", json={"tags": ["new-tag"]})
+    assert update_resp.status_code == 200
+
+    # Vec row should still be present and unchanged
+    vec_row = db_conn_with_vec.execute(
+        "SELECT rowid FROM memories_vec WHERE rowid = ?", (mem_rowid,)
+    ).fetchone()
+    assert vec_row is not None, "memories_vec row should be preserved on tag-only update"
+
+
+def test_rest_and_mcp_memories_equally_findable_by_semantic_search(
+    db_conn_with_vec, mock_embedder, monkeypatch
+) -> None:
+    """Parity: REST API and MCP tool memories are equally retrievable via _semantic_search."""
+    import remind_me_mcp.api as _api_mod
+    import remind_me_mcp.config as _cfg
+    import remind_me_mcp.importer as _importer_mod
+    from remind_me_mcp.db import _embed_and_store, _make_id, _now_iso, _semantic_search
+
+    monkeypatch.setattr(_importer_mod, "_get_db", lambda: db_conn_with_vec)
+    monkeypatch.setattr(_cfg, "IMPORT_ROOTS", [Path.home(), Path("/tmp").resolve()])
+    monkeypatch.setattr(_api_mod, "IMPORT_ROOTS", [Path.home(), Path("/tmp").resolve()])
+
+    app = _build_api_app()
+    client = TestClient(app)
+
+    # Create a memory via REST API
+    rest_resp = client.post("/api/memories", json={"content": "REST API parity test memory"})
+    assert rest_resp.status_code == 201
+    rest_mem_id = rest_resp.json()["id"]
+
+    # Create an MCP-style memory directly (insert + embed, as tools.py does)
+    mcp_content = "MCP tool parity test memory"
+    mcp_mem_id = _make_id(mcp_content)
+    now = _now_iso()
+    import json as _json
+    db_conn_with_vec.execute(
+        """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (mcp_mem_id, mcp_content, "general", _json.dumps([]), "manual", _json.dumps({}), now, now),
+    )
+    db_conn_with_vec.commit()
+    _embed_and_store(db_conn_with_vec, mcp_mem_id, mcp_content)
+
+    # Both memories should appear in semantic search results
+    results = _semantic_search(db_conn_with_vec, "parity test", limit=10)
+    result_ids = {r["id"] for r in results}
+
+    assert rest_mem_id in result_ids, f"REST memory {rest_mem_id} not found in semantic search results: {result_ids}"
+    assert mcp_mem_id in result_ids, f"MCP memory {mcp_mem_id} not found in semantic search results: {result_ids}"

@@ -158,6 +158,47 @@ def mock_embedder(monkeypatch: pytest.MonkeyPatch) -> FakeEmbedder:
 
 
 # ---------------------------------------------------------------------------
+# In-memory database with sqlite-vec extension
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def db_conn_with_vec(monkeypatch: pytest.MonkeyPatch) -> sqlite3.Connection:
+    """Function-scoped fixture providing an isolated in-memory SQLite database with sqlite-vec loaded.
+
+    Extends db_conn by loading the sqlite-vec extension before _ensure_schema so
+    that the memories_vec virtual table is created. Monkeypatches _get_db in all
+    modules that call it so application code automatically uses this test database.
+
+    Yields the connection; closes it in teardown.
+    """
+    import sqlite_vec
+
+    db = sqlite3.connect(":memory:", check_same_thread=False)
+    db.row_factory = sqlite3.Row
+    db.enable_load_extension(True)
+    sqlite_vec.load(db)
+    db.enable_load_extension(False)
+    _ensure_schema(db)
+
+    import remind_me_mcp.api as _api_mod
+    import remind_me_mcp.db as _db_mod
+    import remind_me_mcp.importer as _importer_mod
+    import remind_me_mcp.tools as _tools_mod
+
+    monkeypatch.setattr(_db_mod, "_get_db", lambda: db)
+    monkeypatch.setattr(_api_mod, "_get_db", lambda: db)
+    # tools.py and importer.py use `from remind_me_mcp.db import _get_db` which
+    # creates separate bindings — patch those local references directly so tool
+    # handlers route through the test in-memory database.
+    monkeypatch.setattr(_tools_mod, "_get_db", lambda: db)
+    monkeypatch.setattr(_importer_mod, "_get_db", lambda: db)
+
+    yield db
+    db.close()
+
+
+# ---------------------------------------------------------------------------
 # Memory factory
 # ---------------------------------------------------------------------------
 
