@@ -10,18 +10,18 @@ See: .planning/PROJECT.md (updated 2026-02-22)
 ## Current Position
 
 Phase: 3 of 3 (Quality and Bug Fixes)
-Plan: 4 of 4 in current phase
+Plan: 5 of 5 in current phase
 Status: Complete
-Last activity: 2026-02-24 — Completed 03-04 (Error handling: specific exception types, log.warning/error, user-facing messages, ERRH-01 through ERRH-03)
+Last activity: 2026-02-24 — Completed 03-05 (DRY import_directory extraction, _make_id docs, full docstring/type-hint coverage across all modules)
 
 Progress: [██████████] 100%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 8
-- Average duration: 3min
-- Total execution time: 0.4 hours
+- Total plans completed: 9
+- Average duration: 3.7min
+- Total execution time: 0.6 hours
 
 **By Phase:**
 
@@ -29,10 +29,10 @@ Progress: [██████████] 100%
 |-------|-------|-------|----------|
 | 01-package-structure | 3/3 | 13min | 4min |
 | 02-test-infrastructure | 4/4 | 10min | 2.5min |
-| 03-quality-and-bug-fixes | 4/4 | 13min | 3.25min |
+| 03-quality-and-bug-fixes | 5/5 | 21min | 4.2min |
 
 **Recent Trend:**
-- Last 5 plans: 03-01 (2min), 03-02 (4min), 03-03 (4min), 03-04 (3min)
+- Last 5 plans: 03-01 (2min), 03-02 (4min), 03-03 (4min), 03-04 (3min), 03-05 (8min)
 - Trend: stable
 
 *Updated after each plan completion*
@@ -40,6 +40,7 @@ Progress: [██████████] 100%
 | Phase 03-quality-and-bug-fixes P02 | 4 | 2 tasks | 6 files |
 | Phase 03-quality-and-bug-fixes P03 | 4 | 2 tasks | 4 files |
 | Phase 03-quality-and-bug-fixes P04 | 3 | 2 tasks | 5 files |
+| Phase 03-quality-and-bug-fixes P05 | 8 | 2 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -86,6 +87,10 @@ Recent decisions affecting current work:
 - [Phase 03-04]: _embed_and_store/_semantic_search use log.warning not log.debug — embedding failures are unexpected operational issues
 - [Phase 03-04]: remind_me_auto_capture both INSERTs in one try/except OperationalError block for transaction atomicity
 - [Phase 03-04]: MCP tool error messages use "Error: <description> — <detail>" format for user actionability
+- [Phase 03-05]: import_directory() placed in importer.py alongside import_chat_file() — natural home, no new module needed (DATA-03 DRY)
+- [Phase 03-05]: _make_id function name unchanged; docstring "NOT deterministic" warning satisfies DATA-04 without renaming
+- [Phase 03-05]: Route handler docstrings in api.py are one-liners — inner closures inside _build_api_app don't need full Args/Returns
+- [Phase 03-05]: __version__ = "0.1.0" added to __init__.py per Python packaging conventions
 
 ### Pending Todos
 
@@ -100,5 +105,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-24
-Stopped at: Completed 03-04-PLAN.md — error handling: specific exception types, log.warning/error, user-facing MCP messages, 5 new ERRH tests (172 tests passing)
+Stopped at: Completed 03-05-PLAN.md — DRY import_directory() extraction, _make_id semantics documented, full docstring/type-hint coverage across all modules (172 tests passing)
 Resume file: None

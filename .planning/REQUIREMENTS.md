@@ -48,13 +48,13 @@ Requirements for the refactored release. Each maps to roadmap phases.
 
 - [x] **DATA-01**: Schema migration system using `PRAGMA user_version` supports safe column additions and table changes on existing databases
 - [x] **DATA-02**: Tag filtering happens in SQL via a `memory_tags` junction table, not post-fetch in Python, so pagination works correctly with tag filters
-- [ ] **DATA-03**: A single `import_directory()` function is shared between the MCP tool handler and the HTTP API handler (DRY)
-- [ ] **DATA-04**: `_make_id` semantics are normalized — either truly deterministic (content-hash only) or explicitly documented as non-deterministic with an appropriate name
+- [x] **DATA-03**: A single `import_directory()` function is shared between the MCP tool handler and the HTTP API handler (DRY)
+- [x] **DATA-04**: `_make_id` semantics are normalized — either truly deterministic (content-hash only) or explicitly documented as non-deterministic with an appropriate name
 
 ### Code Quality
 
-- [ ] **QUAL-01**: All public functions and classes have docstrings
-- [ ] **QUAL-02**: All function signatures have complete type hints
+- [x] **QUAL-01**: All public functions and classes have docstrings
+- [x] **QUAL-02**: All function signatures have complete type hints
 - [x] **QUAL-03**: Dashboard JSX is extracted to a separate `App.jsx` file in the `dashboard/` directory (no longer embedded as Python string)
 - [x] **QUAL-04**: ruff is configured in `pyproject.toml` for linting and formatting
 - [x] **QUAL-05**: mypy is configured in `pyproject.toml` for type checking
@@ -121,10 +121,10 @@ Which phases cover which requirements. Updated during roadmap creation.
 | BUGF-02 | Phase 3 | Complete |
 | DATA-01 | Phase 3 | Pending |
 | DATA-02 | Phase 3 | Complete |
-| DATA-03 | Phase 3 | Pending |
-| DATA-04 | Phase 3 | Pending |
-| QUAL-01 | Phase 3 | Pending |
-| QUAL-02 | Phase 3 | Pending |
+| DATA-03 | Phase 3 | Complete |
+| DATA-04 | Phase 3 | Complete |
+| QUAL-01 | Phase 3 | Complete |
+| QUAL-02 | Phase 3 | Complete |
 | QUAL-03 | Phase 1 | Complete |
 | QUAL-04 | Phase 1 | Complete (01-03) |
 | QUAL-05 | Phase 1 | Complete (01-03) |
