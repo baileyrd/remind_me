@@ -19,7 +19,7 @@ Requirements for the refactored release. Each maps to roadmap phases.
 ### Testing
 
 - [x] **TEST-01**: pytest test suite exists with unit tests for all pure-function modules (importer parsers, chunker, formatting, models)
-- [ ] **TEST-02**: Integration tests exist for all 13 MCP tool handlers using in-memory SQLite
+- [x] **TEST-02**: Integration tests exist for all 13 MCP tool handlers using in-memory SQLite
 - [x] **TEST-03**: Integration tests exist for all Starlette HTTP API routes via TestClient or httpx
 - [x] **TEST-04**: `conftest.py` provides shared fixtures: in-memory SQLite db with schema, mock embedder, sample memory factory
 - [x] **TEST-05**: All async tests run correctly via pytest-asyncio with `asyncio_mode = "auto"`
@@ -106,7 +106,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | ARCH-05 | Phase 1 | Complete (01-01) |
 | ARCH-06 | Phase 1 | Complete (01-03) |
 | TEST-01 | Phase 2 | Complete |
-| TEST-02 | Phase 2 | Pending |
+| TEST-02 | Phase 2 | Complete |
 | TEST-03 | Phase 2 | Complete |
 | TEST-04 | Phase 2 | Complete |
 | TEST-05 | Phase 2 | Complete |
