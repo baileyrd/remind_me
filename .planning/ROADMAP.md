@@ -50,7 +50,9 @@ Plans:
   1. A GitHub Actions workflow runs on every push and pull request, executing ruff lint and pytest across Python 3.11 and 3.12 matrix
   2. The CI job fails if test coverage falls below 80%, blocking merges on coverage regression
   3. A passing green CI badge is visible on the repository after a clean push
-**Plans**: TBD
+**Plans:** 1 plan
+Plans:
+- [ ] 05-01-PLAN.md — Create CI workflow (lint + test matrix + coverage gate) and add README badge (CICD-01, CICD-02)
 
 ### Phase 6: Security Hardening
 **Goal**: The dashboard API is hardened against cross-origin misuse, filesystem traversal, and unauthorized access when exposed outside localhost
@@ -94,7 +96,7 @@ Phases execute in numeric order: 4 → 5 → 6 → 7 → 8
 | 2. Test Infrastructure | v1.0 | 4/4 | Complete | 2026-02-24 |
 | 3. Quality and Bug Fixes | v1.0 | 5/5 | Complete | 2026-02-24 |
 | 4. Code Quality and Cleanup | 2/2 | Complete    | 2026-02-24 | - |
-| 5. CI/CD Pipeline | v1.1 | 0/? | Not started | - |
+| 5. CI/CD Pipeline | v1.1 | 0/1 | Not started | - |
 | 6. Security Hardening | v1.1 | 0/? | Not started | - |
 | 7. API Embedding Parity | v1.1 | 0/? | Not started | - |
 | 8. Performance Improvements | v1.1 | 0/? | Not started | - |
