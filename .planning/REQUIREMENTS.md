@@ -9,8 +9,8 @@ Requirements for tech debt milestone. Each maps to roadmap phases.
 
 ### Security
 
-- [ ] **SEC-01**: Dashboard API restricts CORS to localhost origins only (both `127.0.0.1` and `localhost`)
-- [ ] **SEC-02**: Import API restricts file paths to within user's home directory (configurable via `REMIND_ME_IMPORT_ROOTS` env var)
+- [x] **SEC-01**: Dashboard API restricts CORS to localhost origins only (both `127.0.0.1` and `localhost`)
+- [x] **SEC-02**: Import API restricts file paths to within user's home directory (configurable via `REMIND_ME_IMPORT_ROOTS` env var)
 - [ ] **SEC-03**: Optional API auth via `REMIND_ME_API_KEY` env var — Bearer token on all `/api/*` routes when set, no-op when unset
 
 ### CI/CD
@@ -70,8 +70,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| SEC-01 | Phase 6 | Pending |
-| SEC-02 | Phase 6 | Pending |
+| SEC-01 | Phase 6 | Complete |
+| SEC-02 | Phase 6 | Complete |
 | SEC-03 | Phase 6 | Pending |
 | CICD-01 | Phase 5 | Complete |
 | CICD-02 | Phase 5 | Partial (gate at 74%, target 80%) |

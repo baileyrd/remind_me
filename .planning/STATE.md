@@ -5,16 +5,16 @@
 See: .planning/PROJECT.md (updated 2026-02-24)
 
 **Core value:** Persistent, searchable memory across all Claude interfaces — modular, tested, maintainable
-**Current focus:** v1.1 Phase 5 — CI/CD Pipeline
+**Current focus:** v1.1 Phase 6 — Security Hardening
 
 ## Current Position
 
-Phase: 5 of 8 (CI/CD Pipeline)
-Plan: 2 of 2 in current phase — Phase 5 Plan 2 COMPLETE
-Status: Phase 5 complete
-Last activity: 2026-02-24 — Plan 05-02 complete (CICD-02 status corrected from Complete to Partial in REQUIREMENTS.md, STATE.md, and 05-01-SUMMARY.md)
+Phase: 6 of 8 (Security Hardening)
+Plan: 1 of 2 in current phase — Phase 6 Plan 1 COMPLETE
+Status: In progress
+Last activity: 2026-02-24 — Plan 06-01 complete (SEC-01 CORS restriction + SEC-02 import path guard)
 
-Progress: [####░░░░░░] 40% (v1.1 — 2/5 phases... all 1 plan of phase 5 done)
+Progress: [#####░░░░░] 50% (v1.1 — 2.5/5 phases)
 
 ## Performance Metrics
 
@@ -37,6 +37,7 @@ Progress: [####░░░░░░] 40% (v1.1 — 2/5 phases... all 1 plan of pha
 | Phase | Plans | Duration | Avg/Plan |
 |-------|-------|----------|----------|
 | 05-ci-cd-pipeline | 2/2 | 5min | 2.5min |
+| 06-security-hardening | 1/2 | 4min | 4min |
 
 *v1.1 metrics will accumulate as phases complete*
 
@@ -60,6 +61,9 @@ Recent decisions affecting v1.1:
 - [Phase 05-ci-cd-pipeline]: Coverage gate at 74% (measured 76% minus 2% headroom) — not 80% CICD-02 target; will increase as tests are added in Phases 6-8
 - [Phase 05-ci-cd-pipeline]: pytest-asyncio installed explicitly in CI — required for asyncio_mode=auto even though not a declared project dependency
 - [Phase 05-ci-cd-pipeline]: CICD-02 status corrected from Complete to Partial — gate mechanism works at 74% but requirement specifies 80%; will be fully satisfied when coverage reaches 80% in Phases 6-8
+- [Phase 06-security-hardening, plan 01]: allow_origin_regex uses re.fullmatch() in Starlette 0.52.1 — localhost.evil.com does not match the pattern; both localhost and 127.0.0.1 covered with any port
+- [Phase 06-security-hardening, plan 01]: Path guard fires before p.exists() to prevent information disclosure about forbidden paths; IMPORT_ROOTS defaults to [Path.home()]; empty env var treated as unset
+- [Phase 06-security-hardening, plan 01]: test fixture patches IMPORT_ROOTS to include /tmp so pytest tmp_path fixtures pass SEC-02 guard; test_api_import_nonexistent_file updated to use /tmp path inside allowed roots
 
 ### Pending Todos
 
@@ -71,10 +75,10 @@ None.
 - Phase 4 (RESOLVED 04-02): ONNX exception boundaries in embeddings.py (lines 82, 145, 164) and updater.py (line 370) documented with "Broad catch intentional:" comments; pid.py narrowed to except OSError
 - Phase 5 (RESOLVED 05-01): Coverage gate set at 74% (measured 76% minus 2% headroom) — not 80% target; pytest-asyncio added explicitly for asyncio_mode=auto
 - Phase 5 (OPEN): CICD-02 requires 80% coverage gate but current gate is 74% (measured coverage 76%). Will resolve when Phases 6-8 add tests to reach 80%, at which point --cov-fail-under in ci.yml should be raised to 80
-- Phase 6: Include both `localhost` and `127.0.0.1` in CORS allow_origins — they are distinct browser origins
+- Phase 6 (RESOLVED 06-01): Include both `localhost` and `127.0.0.1` in CORS — handled via regex; both covered with any port
 
 ## Session Continuity
 
 Last session: 2026-02-24
-Stopped at: Completed 05-02-PLAN.md (CICD-02 requirement status corrected to Partial across all planning documents)
+Stopped at: Completed 06-01-PLAN.md (SEC-01 CORS restriction + SEC-02 import path guard implemented and tested)
 Resume file: None
