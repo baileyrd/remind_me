@@ -16,7 +16,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from remind_me_mcp.config import DB_PATH
+from remind_me_mcp.config import DB_PATH, IMPORT_ROOTS
 from remind_me_mcp.db import _get_db, _make_id, _now_iso, _row_to_dict
 from remind_me_mcp.importer import import_chat_file, import_directory
 
@@ -79,7 +79,7 @@ def _build_api_app() -> Starlette:
 
     All Starlette imports are kept local to this function so the module can
     be imported without loading the web framework (used in MCP stdio mode).
-    Includes CORS middleware allowing all origins for dashboard access.
+    Includes CORS middleware restricted to localhost origins.
 
     Returns:
         A configured Starlette application with REST routes for memory CRUD,
@@ -300,6 +300,11 @@ def _build_api_app() -> Starlette:
             return _json_err("'file_path' is required")
 
         p = Path(file_path).expanduser().resolve()
+
+        # SEC-02: Reject paths outside configured import roots
+        if not any(p == root or root in p.parents for root in IMPORT_ROOTS):
+            return _json_err(f"Path not in allowed import roots: {p}")
+
         if not p.exists():
             return _json_err(f"Path not found: {p}")
 
@@ -345,7 +350,7 @@ def _build_api_app() -> Starlette:
     ]
 
     middleware = [
-        Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]),
+        Middleware(CORSMiddleware, allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:\d+)?", allow_methods=["*"], allow_headers=["*"]),
     ]
 
     return Starlette(routes=routes, middleware=middleware)

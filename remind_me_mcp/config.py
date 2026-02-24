@@ -42,6 +42,21 @@ SERVE_UI = os.environ.get("REMIND_ME_MCP_SERVE_UI", "").lower() in ("true", "1",
 UI_PORT = int(os.environ.get("REMIND_ME_MCP_UI_PORT", "5199"))
 
 # ---------------------------------------------------------------------------
+# Security
+# ---------------------------------------------------------------------------
+
+API_KEY: str | None = os.environ.get("REMIND_ME_API_KEY") or None
+"""Bearer token for /api/* routes. None when unset — auth disabled (backward-compatible)."""
+
+_import_roots_env: str | None = os.environ.get("REMIND_ME_IMPORT_ROOTS")
+IMPORT_ROOTS: list[Path] = (
+    [Path(r.strip()).expanduser().resolve() for r in _import_roots_env.split(":") if r.strip()]
+    if _import_roots_env
+    else [Path.home()]
+)
+"""Allowed filesystem roots for import operations. Colon-separated paths. Default: user home directory."""
+
+# ---------------------------------------------------------------------------
 # Logging — stderr only (stdout reserved for MCP stdio transport)
 # ---------------------------------------------------------------------------
 
@@ -62,4 +77,6 @@ __all__ = [
     "MODEL_DIR",
     "SERVE_UI",
     "UI_PORT",
+    "API_KEY",
+    "IMPORT_ROOTS",
 ]
