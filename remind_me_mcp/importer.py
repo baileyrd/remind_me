@@ -1,0 +1,269 @@
+"""
+remind_me_mcp.importer — Chat export import engine.
+
+Handles parsing JSON, JSONL, and Markdown chat export formats, chunking text
+into memory-sized pieces, and storing results into the database.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import re
+from pathlib import Path
+from typing import Any
+
+from remind_me_mcp.db import _embed_and_store, _get_db, _make_id, _now_iso, _row_to_dict
+
+log = logging.getLogger("remind_me_mcp.importer")
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _file_hash(path: str) -> str:
+    """Compute a short SHA-256 hash of a file's contents for deduplication."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
+
+
+def _chunk_text(text: str, max_len: int) -> list[str]:
+    """Split text into chunks, preferring paragraph boundaries."""
+    if len(text) <= max_len:
+        return [text]
+    chunks = []
+    while text:
+        if len(text) <= max_len:
+            chunks.append(text)
+            break
+        # Try to break at paragraph
+        idx = text.rfind("\n\n", 0, max_len)
+        if idx == -1:
+            idx = text.rfind("\n", 0, max_len)
+        if idx == -1:
+            idx = text.rfind(". ", 0, max_len)
+        if idx == -1:
+            idx = max_len
+        else:
+            idx += 1
+        chunks.append(text[:idx].strip())
+        text = text[idx:].strip()
+    return chunks
+
+
+def _extract_messages_from_json(data: Any, extract_mode: str) -> list[dict[str, str]]:
+    """
+    Handles various JSON shapes:
+      - List of {role, content} messages
+      - Dict with 'messages' key
+      - Claude export format with 'chat_messages' containing 'content' arrays
+      - List of conversations
+    Returns list of dicts with 'role' and 'content' keys.
+    """
+    messages: list[dict[str, str]] = []
+
+    # If it's a single conversation object with chat_messages (Claude export format)
+    if isinstance(data, dict) and "chat_messages" in data:
+        for msg in data["chat_messages"]:
+            role = msg.get("sender", msg.get("role", "unknown"))
+            # Claude exports have content as a list of {type, text} blocks
+            content_field = msg.get("content", msg.get("text", ""))
+            if isinstance(content_field, list):
+                text_parts = []
+                for block in content_field:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+                    elif isinstance(block, str):
+                        text_parts.append(block)
+                content = "\n".join(text_parts)
+            elif isinstance(content_field, str):
+                content = content_field
+            else:
+                content = str(content_field)
+            if content.strip():
+                messages.append({"role": role, "content": content.strip()})
+        return messages
+
+    # Standard {role, content} list
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                # Check if it's a conversation wrapper
+                if "messages" in item or "chat_messages" in item:
+                    messages.extend(_extract_messages_from_json(item, extract_mode))
+                elif "role" in item or "sender" in item:
+                    role = item.get("role", item.get("sender", "unknown"))
+                    content = item.get("content", item.get("text", ""))
+                    if isinstance(content, list):
+                        content = "\n".join(
+                            b.get("text", "") if isinstance(b, dict) else str(b)
+                            for b in content
+                        )
+                    if isinstance(content, str) and content.strip():
+                        messages.append({"role": role, "content": content.strip()})
+        return messages
+
+    # Dict with 'messages' key
+    if isinstance(data, dict) and "messages" in data:
+        return _extract_messages_from_json(data["messages"], extract_mode)
+
+    return messages
+
+
+def _filter_messages(messages: list[dict[str, str]], mode: str) -> list[str]:
+    """Filter messages based on extract_mode and return content strings."""
+    if mode == "assistant_messages":
+        return [m["content"] for m in messages if m["role"] in ("assistant", "bot")]
+    elif mode == "user_messages":
+        return [m["content"] for m in messages if m["role"] in ("user", "human")]
+    elif mode == "all_messages":
+        return [f"[{m['role']}] {m['content']}" for m in messages]
+    elif mode == "conversations":
+        if messages:
+            return ["\n\n".join(f"**{m['role']}:** {m['content']}" for m in messages)]
+        return []
+    elif mode == "summaries":
+        return [m["content"] for m in messages if "summary" in m.get("role", "").lower()]
+    return [m["content"] for m in messages]
+
+
+def _parse_markdown_chat(text: str, extract_mode: str) -> list[str]:
+    """Parse markdown-formatted chat exports."""
+    # Common patterns: "## Human", "## Assistant", "**User:**", etc.
+    pattern = re.compile(
+        r"(?:^|\n)(?:#{1,3}\s*|(?:\*\*))?(Human|User|Assistant|Claude|Bot|System)(?:\*\*)?[:\s]*\n?",
+        re.IGNORECASE,
+    )
+    parts = pattern.split(text)
+    messages: list[dict[str, str]] = []
+    i = 1
+    while i < len(parts) - 1:
+        role = parts[i].strip().lower()
+        content = parts[i + 1].strip()
+        if content:
+            messages.append({"role": role, "content": content})
+        i += 2
+
+    if not messages:
+        # No structure detected — treat entire file as one memory
+        return [text.strip()] if text.strip() else []
+
+    return _filter_messages(messages, extract_mode)
+
+
+# ---------------------------------------------------------------------------
+# Public import function
+# ---------------------------------------------------------------------------
+
+
+def import_chat_file(
+    file_path: str,
+    category: str,
+    tags: list[str],
+    extract_mode: str,
+    max_length: int,
+) -> dict[str, Any]:
+    """Import a single chat export file. Returns stats dict."""
+    path = Path(file_path)
+    fhash = _file_hash(file_path)
+    db = _get_db()
+
+    # Check for duplicate import
+    existing = db.execute("SELECT import_id FROM chat_imports WHERE hash = ?", (fhash,)).fetchone()
+    if existing:
+        return {"status": "skipped", "reason": "already_imported", "file": path.name, "import_id": existing["import_id"]}
+
+    suffix = path.suffix.lower()
+    raw = path.read_text(encoding="utf-8", errors="replace")
+
+    contents: list[str] = []
+
+    if suffix in (".json",):
+        data = json.loads(raw)
+        # Could be a list of conversations or a single conversation
+        if isinstance(data, list) and data and isinstance(data[0], dict) and ("chat_messages" in data[0] or "messages" in data[0]):
+            # Multiple conversations
+            for conv in data:
+                msgs = _extract_messages_from_json(conv, extract_mode)
+                contents.extend(_filter_messages(msgs, extract_mode))
+        else:
+            msgs = _extract_messages_from_json(data, extract_mode)
+            contents.extend(_filter_messages(msgs, extract_mode))
+    elif suffix in (".jsonl",):
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                msgs = _extract_messages_from_json(obj, extract_mode)
+                contents.extend(_filter_messages(msgs, extract_mode))
+            except json.JSONDecodeError:
+                continue
+    elif suffix in (".md", ".markdown", ".txt"):
+        contents = _parse_markdown_chat(raw, extract_mode)
+    else:
+        return {"status": "error", "reason": f"unsupported format: {suffix}", "file": path.name}
+
+    # Chunk and store
+    stored = 0
+    now = _now_iso()
+    import_id = _make_id(file_path)
+
+    for content in contents:
+        if not content.strip():
+            continue
+        for chunk in _chunk_text(content, max_length):
+            mem_id = _make_id(chunk)
+            db.execute(
+                """INSERT OR IGNORE INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    mem_id,
+                    chunk,
+                    category,
+                    json.dumps(tags),
+                    "chat_import",
+                    json.dumps({"import_id": import_id, "filename": path.name}),
+                    now,
+                    now,
+                ),
+            )
+            stored += 1
+
+    db.commit()
+
+    # Embed all imported memories (batch after commit for efficiency)
+    for content in contents:
+        if not content.strip():
+            continue
+        for chunk in _chunk_text(content, max_length):
+            mem_id_check = hashlib.sha256(f"{chunk}{now}".encode()).hexdigest()[:12]
+            _embed_and_store(db, mem_id_check, chunk)
+
+    stats = {"memories_created": stored, "raw_entries": len(contents), "file": path.name}
+    db.execute(
+        "INSERT INTO chat_imports (import_id, filename, hash, imported_at, stats) VALUES (?, ?, ?, ?, ?)",
+        (import_id, path.name, fhash, now, json.dumps(stats)),
+    )
+    db.commit()
+    return {"status": "ok", "import_id": import_id, **stats}
+
+
+# ---------------------------------------------------------------------------
+# Exports
+# ---------------------------------------------------------------------------
+
+__all__ = [
+    "import_chat_file",
+    "_chunk_text",
+    "_extract_messages_from_json",
+    "_filter_messages",
+    "_parse_markdown_chat",
+    "_file_hash",
+]
