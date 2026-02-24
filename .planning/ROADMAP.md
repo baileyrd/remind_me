@@ -45,13 +45,13 @@ Plans:
   3. All 13 MCP tool handlers are covered by integration tests using in-memory SQLite (not mocks) — FTS5 triggers and SQL correctness are exercised
   4. All Starlette HTTP API routes have integration tests via httpx AsyncClient or TestClient
   5. A test that imports a chat file and then calls a search tool confirms end-to-end behavior without touching the developer's real `~/.remind-me/memory.db`
-**Plans**: TBD
+**Plans:** 4 plans
 
 Plans:
-- [ ] 02-01: conftest.py fixtures (in-memory db, mock embedder, sample memory factory, tmp_path config)
-- [ ] 02-02: Unit tests for pure-function modules (importer parsers, chunker, formatting, models)
-- [ ] 02-03: Integration tests for all 13 MCP tool handlers and 2 resources
-- [ ] 02-04: Integration tests for all Starlette HTTP API routes
+- [ ] 02-01-PLAN.md — Shared pytest fixtures (in-memory db, mock embedder, memory factory, config isolation, smoke tests)
+- [ ] 02-02-PLAN.md — Unit tests for pure-function modules (importer parsers, chunker, formatting, models, db utilities)
+- [ ] 02-03-PLAN.md — Integration tests for all 13 MCP tool handlers and 2 resource handlers
+- [ ] 02-04-PLAN.md — Integration tests for all Starlette HTTP API routes via TestClient
 
 ### Phase 3: Quality and Bug Fixes
 **Goal**: The codebase passes a green audit on every CLAUDE.md design principle — async safety, robust error handling, DRY data layer, SQL-correct tag filtering, schema migration, full docstring coverage — while the two known bugs are fixed and verified by tests
