@@ -77,7 +77,9 @@ Plans:
   1. A memory added via `POST /api/memories` appears in semantic search results within the same request/response cycle (a vector row exists in the embeddings table)
   2. A memory updated via `PUT /api/memories/{id}` with new content produces an updated embedding — the old semantic representation is replaced
   3. REST API memories and MCP tool memories are indistinguishable in semantic search results
-**Plans**: TBD
+**Plans:** 1 plan
+Plans:
+- [ ] 07-01-PLAN.md — TDD: Add embedding generation to REST API create/update handlers (EMBD-01, EMBD-02)
 
 ### Phase 8: Performance Improvements
 **Goal**: Reindexing large memory databases and importing large file directories complete significantly faster via batch and concurrent processing
@@ -102,5 +104,5 @@ Phases execute in numeric order: 4 → 5 → 6 → 7 → 8
 | 4. Code Quality and Cleanup | 2/2 | Complete    | 2026-02-24 | - |
 | 5. CI/CD Pipeline | v1.1 | 2/2 | Complete | 2026-02-24 |
 | 6. Security Hardening | 2/2 | Complete    | 2026-02-24 | - |
-| 7. API Embedding Parity | v1.1 | 0/? | Not started | - |
+| 7. API Embedding Parity | v1.1 | 0/1 | Planned | - |
 | 8. Performance Improvements | v1.1 | 0/? | Not started | - |
