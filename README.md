@@ -1,5 +1,7 @@
 # Remind Me MCP Server
 
+[![CI](https://github.com/baileyrd/remind_me/actions/workflows/ci.yml/badge.svg)](https://github.com/baileyrd/remind_me/actions/workflows/ci.yml)
+
 Persistent, searchable memory that works across **Claude.ai**, **Claude Code**, and **Claude Desktop** — with multi-machine sync support and a built-in dashboard UI.
 
 ## Features
