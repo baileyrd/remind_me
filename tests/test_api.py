@@ -8,15 +8,12 @@ handlers synchronously — no async test code is needed.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pytest
 from starlette.testclient import TestClient
 
 from remind_me_mcp.api import _build_api_app
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Client fixture
@@ -31,10 +28,20 @@ def client(db_conn, monkeypatch):
     remind_me_mcp.db._get_db. This fixture additionally patches
     remind_me_mcp.importer._get_db so the /api/import route uses the same
     isolated in-memory connection.
+
+    IMPORT_ROOTS is patched to include /tmp so that test fixtures using
+    pytest's tmp_path (which lives under /tmp) are not rejected by the
+    SEC-02 path guard.
     """
+    import remind_me_mcp.api as _api_mod
+    import remind_me_mcp.config as _cfg
     import remind_me_mcp.importer as _importer_mod
 
     monkeypatch.setattr(_importer_mod, "_get_db", lambda: db_conn)
+
+    # Patch IMPORT_ROOTS to include tmp dirs used by test fixtures
+    monkeypatch.setattr(_cfg, "IMPORT_ROOTS", [Path.home(), Path("/tmp").resolve()])
+    monkeypatch.setattr(_api_mod, "IMPORT_ROOTS", [Path.home(), Path("/tmp").resolve()])
 
     app = _build_api_app()
     return TestClient(app)
@@ -330,8 +337,12 @@ def test_api_import_missing_path(client: TestClient) -> None:
 
 
 def test_api_import_nonexistent_file(client: TestClient) -> None:
-    """POST /api/import with a nonexistent file path should return 400 with not found message."""
-    response = client.post("/api/import", json={"file_path": "/nonexistent/path/file.json"})
+    """POST /api/import with a nonexistent file inside allowed roots returns 400 with not-found message.
+
+    SEC-02 path guard fires first for paths outside roots, so we use a path
+    inside /tmp (which is in the patched IMPORT_ROOTS) that does not exist.
+    """
+    response = client.post("/api/import", json={"file_path": "/tmp/nonexistent_remind_me_test_file.json"})
     assert response.status_code == 400
     data = response.json()
     assert "not found" in data["error"].lower()
@@ -417,3 +428,105 @@ def test_api_list_tag_filter_pagination(
         assert "alpha" in mem["tags"], (
             f"Memory {mem['id']} does not have 'alpha' tag: {mem['tags']}"
         )
+
+
+# ---------------------------------------------------------------------------
+# SEC-01: CORS restriction to localhost origins
+# ---------------------------------------------------------------------------
+
+
+def test_cors_allows_localhost(client: TestClient) -> None:
+    """SEC-01: Requests from http://localhost should receive ACAO header."""
+    r = client.get("/api/stats", headers={"Origin": "http://localhost"})
+    assert r.headers.get("access-control-allow-origin") == "http://localhost"
+
+
+def test_cors_allows_localhost_with_port(client: TestClient) -> None:
+    """SEC-01: Requests from http://localhost:5199 should receive ACAO header."""
+    r = client.get("/api/stats", headers={"Origin": "http://localhost:5199"})
+    assert r.headers.get("access-control-allow-origin") == "http://localhost:5199"
+
+
+def test_cors_allows_127_0_0_1(client: TestClient) -> None:
+    """SEC-01: Requests from http://127.0.0.1 should receive ACAO header."""
+    r = client.get("/api/stats", headers={"Origin": "http://127.0.0.1"})
+    assert r.headers.get("access-control-allow-origin") == "http://127.0.0.1"
+
+
+def test_cors_allows_127_0_0_1_with_port(client: TestClient) -> None:
+    """SEC-01: Requests from http://127.0.0.1:5199 should receive ACAO header."""
+    r = client.get("/api/stats", headers={"Origin": "http://127.0.0.1:5199"})
+    assert r.headers.get("access-control-allow-origin") == "http://127.0.0.1:5199"
+
+
+def test_cors_denies_external_origin_preflight(client: TestClient) -> None:
+    """SEC-01: Preflight OPTIONS from external origin should return 400."""
+    r = client.options("/api/stats", headers={
+        "Origin": "http://evil.com",
+        "Access-Control-Request-Method": "GET",
+    })
+    assert r.status_code == 400
+
+
+def test_cors_no_acao_for_external_simple_request(client: TestClient) -> None:
+    """SEC-01: Simple GET from external origin should NOT have ACAO header."""
+    r = client.get("/api/stats", headers={"Origin": "http://evil.com"})
+    assert "access-control-allow-origin" not in r.headers
+
+
+def test_cors_rejects_localhost_subdomain(client: TestClient) -> None:
+    """SEC-01: localhost.evil.com must not match — fullmatch prevents substring."""
+    r = client.get("/api/stats", headers={"Origin": "http://localhost.evil.com"})
+    assert "access-control-allow-origin" not in r.headers
+
+
+# ---------------------------------------------------------------------------
+# SEC-02: Import path restriction to allowed roots
+# ---------------------------------------------------------------------------
+
+
+def test_import_rejects_path_outside_home(client: TestClient) -> None:
+    """SEC-02: Import with path outside home should return 400."""
+    r = client.post("/api/import", json={"file_path": "/etc/passwd"})
+    assert r.status_code == 400
+    assert "not in allowed" in r.json()["error"].lower()
+
+
+def test_import_rejects_traversal_attempt(client: TestClient) -> None:
+    """SEC-02: Import with traversal sequence should be resolved and rejected."""
+    traversal_path = str(Path.home() / ".." / "etc" / "passwd")
+    r = client.post("/api/import", json={"file_path": traversal_path})
+    assert r.status_code == 400
+    assert "not in allowed" in r.json()["error"].lower()
+
+
+def test_import_allows_path_inside_home(client: TestClient, sample_chat_json: Path) -> None:
+    """SEC-02: Import with path inside allowed roots should succeed normally."""
+    r = client.post("/api/import", json={"file_path": str(sample_chat_json)})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["status"] == "ok"
+
+
+def test_import_custom_roots(client: TestClient, monkeypatch, tmp_path: Path) -> None:
+    """SEC-02: Custom IMPORT_ROOTS restricts to configured paths only."""
+    import remind_me_mcp.api as _api_mod
+    import remind_me_mcp.config as _cfg
+
+    custom_root = tmp_path / "allowed"
+    custom_root.mkdir()
+    test_file = custom_root / "test.json"
+    test_file.write_text('{"chat_messages": []}')
+
+    restricted_roots = [custom_root.resolve()]
+    monkeypatch.setattr(_cfg, "IMPORT_ROOTS", restricted_roots)
+    monkeypatch.setattr(_api_mod, "IMPORT_ROOTS", restricted_roots)
+
+    # File inside custom root: allowed
+    r = client.post("/api/import", json={"file_path": str(test_file)})
+    assert r.status_code == 200
+
+    # File outside custom root: rejected
+    r = client.post("/api/import", json={"file_path": str(Path.home() / "some_file.txt")})
+    assert r.status_code == 400
+    assert "not in allowed" in r.json()["error"].lower()
