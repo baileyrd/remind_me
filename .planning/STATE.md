@@ -10,11 +10,11 @@ See: .planning/PROJECT.md (updated 2026-02-22)
 ## Current Position
 
 Phase: 3 of 3 (Quality and Bug Fixes)
-Plan: 2 of 4 in current phase
+Plan: 3 of 4 in current phase
 Status: In progress
-Last activity: 2026-02-24 — Completed 03-02 (Bug fixes: BUGF-01, BUGF-02, DATA-02)
+Last activity: 2026-02-24 — Completed 03-03 (Async safety: singleton DB, asyncio.to_thread, ASYN-01 through ASYN-05)
 
-Progress: [█████████░] 83%
+Progress: [█████████░] 92%
 
 ## Performance Metrics
 
@@ -29,15 +29,16 @@ Progress: [█████████░] 83%
 |-------|-------|-------|----------|
 | 01-package-structure | 3/3 | 13min | 4min |
 | 02-test-infrastructure | 4/4 | 10min | 2.5min |
-| 03-quality-and-bug-fixes | 2/4 | 6min | 3min |
+| 03-quality-and-bug-fixes | 3/4 | 10min | 3.3min |
 
 **Recent Trend:**
-- Last 5 plans: 01-03 (2min), 02-01 (2min), 02-04 (2min), 03-01 (2min), 03-02 (4min)
+- Last 5 plans: 02-01 (2min), 02-04 (2min), 03-01 (2min), 03-02 (4min), 03-03 (4min)
 - Trend: stable
 
 *Updated after each plan completion*
 | Phase 03-quality-and-bug-fixes P01 | 2 | 2 tasks | 2 files |
 | Phase 03-quality-and-bug-fixes P02 | 4 | 2 tasks | 6 files |
+| Phase 03-quality-and-bug-fixes P03 | 4 | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -76,6 +77,10 @@ Recent decisions affecting current work:
 - [03-02]: SQL EXISTS subquery for tag filtering — ensures LIMIT applies after filter in both tools.py memory_list and api.py api_list (DATA-02 fix)
 - [03-02]: Table alias m.* required — needed when joining memory_tags to avoid column ambiguity in SELECT
 - [03-02]: api_search retains Python post-filter for tags — search result set is already merged/ranked in memory; search pagination fix deferred
+- [Phase 03-03]: _db_connection singleton at module level — lazy init avoids opening DB until first call; reset to None on _close_db for testability
+- [Phase 03-03]: check_same_thread=False required because asyncio.to_thread workers run on thread pool; WAL mode makes this safe
+- [Phase 03-03]: Only CPU-bound embedding calls wrapped with asyncio.to_thread — simple DB reads/writes are fast enough inline
+- [Phase 03-03]: busy_timeout=5000ms for graceful lock contention across multi-process DB access (Claude Code + Claude Desktop)
 
 ### Pending Todos
 
@@ -83,12 +88,12 @@ None yet.
 
 ### Blockers/Concerns
 
-- [Research]: asyncio.to_thread + SQLite threading interaction needs prototype test before finalizing pattern (see SUMMARY.md gaps)
+- [Resolved via 03-03]: asyncio.to_thread + SQLite threading interaction — verified safe with check_same_thread=False + WAL mode; 6 concurrency tests prove correctness
 - [Research]: ruff ASYNC rule codes may have changed since August 2025 cutoff — verify before configuring pyproject.toml
 - [Resolved via 03-01]: FTS5 memories_fts rebuild behavior during migration — memory_tags triggers use json_valid() guard; FTS triggers unchanged
 
 ## Session Continuity
 
 Last session: 2026-02-24
-Stopped at: Completed 03-02-PLAN.md — BUGF-01, BUGF-02, DATA-02 bug fixes with regression tests (161 tests passing)
+Stopped at: Completed 03-03-PLAN.md — async safety: singleton DB connection, asyncio.to_thread embedding offload, 6 concurrency tests (167 tests passing)
 Resume file: None

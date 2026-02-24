@@ -33,11 +33,11 @@ Requirements for the refactored release. Each maps to roadmap phases.
 
 ### Async & Performance
 
-- [ ] **ASYN-01**: All sync embedding computations in async MCP tool handlers are wrapped with `asyncio.to_thread`
-- [ ] **ASYN-02**: DB connection is managed as a lazy lifespan-scoped singleton instead of opening a new connection per call
-- [ ] **ASYN-03**: SQLite thread-safety is handled correctly — no `ProgrammingError` under concurrent async operations
-- [ ] **ASYN-04**: SQLite database opens in WAL journal mode (`PRAGMA journal_mode=WAL`) to support concurrent multi-process access (e.g., Claude Code + Claude Desktop running simultaneously)
-- [ ] **ASYN-05**: Database connection sets `busy_timeout` (e.g., 5000ms) so brief lock contention retries gracefully instead of hanging or erroring
+- [x] **ASYN-01**: All sync embedding computations in async MCP tool handlers are wrapped with `asyncio.to_thread`
+- [x] **ASYN-02**: DB connection is managed as a lazy lifespan-scoped singleton instead of opening a new connection per call
+- [x] **ASYN-03**: SQLite thread-safety is handled correctly — no `ProgrammingError` under concurrent async operations
+- [x] **ASYN-04**: SQLite database opens in WAL journal mode (`PRAGMA journal_mode=WAL`) to support concurrent multi-process access (e.g., Claude Code + Claude Desktop running simultaneously)
+- [x] **ASYN-05**: Database connection sets `busy_timeout` (e.g., 5000ms) so brief lock contention retries gracefully instead of hanging or erroring
 
 ### Bug Fixes
 
@@ -114,9 +114,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 | ERRH-01 | Phase 3 | Pending |
 | ERRH-02 | Phase 3 | Pending |
 | ERRH-03 | Phase 3 | Pending |
-| ASYN-01 | Phase 3 | Pending |
-| ASYN-02 | Phase 3 | Pending |
-| ASYN-03 | Phase 3 | Pending |
+| ASYN-01 | Phase 3 | Complete |
+| ASYN-02 | Phase 3 | Complete |
+| ASYN-03 | Phase 3 | Complete |
 | BUGF-01 | Phase 3 | Complete |
 | BUGF-02 | Phase 3 | Complete |
 | DATA-01 | Phase 3 | Pending |
@@ -129,8 +129,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 | QUAL-04 | Phase 1 | Complete (01-03) |
 | QUAL-05 | Phase 1 | Complete (01-03) |
 | QUAL-06 | Phase 1 | Complete (01-03) |
-| ASYN-04 | Phase 3 | Pending |
-| ASYN-05 | Phase 3 | Pending |
+| ASYN-04 | Phase 3 | Complete |
+| ASYN-05 | Phase 3 | Complete |
 
 **Coverage:**
 - v1 requirements: 32 total
