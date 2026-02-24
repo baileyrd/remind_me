@@ -20,7 +20,7 @@
 
 **Milestone Goal:** Clean up all known tech debt from v1.0 — code quality, CI/CD, security, embedding correctness, and performance.
 
-- [ ] **Phase 4: Code Quality and Cleanup** - Resolve all ruff warnings, narrow exception handlers, and remove the dead monolith file
+- [x] **Phase 4: Code Quality and Cleanup** - Resolve all ruff warnings, narrow exception handlers, and remove the dead monolith file (completed 2026-02-24)
 - [ ] **Phase 5: CI/CD Pipeline** - Establish GitHub Actions with lint, test, and coverage gates that validate all subsequent phases
 - [ ] **Phase 6: Security Hardening** - Lock down CORS, restrict import paths, and add optional API key authentication
 - [ ] **Phase 7: API Embedding Parity** - Fix the correctness gap where REST API memories are invisible to semantic search
@@ -37,7 +37,7 @@
   2. Exception handlers in embeddings.py, pid.py, and updater.py catch specific types rather than bare `Exception` at safe call sites, with broad clauses preserved only at intentional graceful-degradation boundaries
   3. The file `remind_me_mcp_original.py` no longer exists in the repository
   4. All 190 existing tests continue to pass after cleanup changes
-**Plans:** 2 plans
+**Plans:** 2/2 plans complete
 Plans:
 - [x] 04-01-PLAN.md — Delete monolith and resolve all ruff warnings (QUAL-03, QUAL-01) — completed 2026-02-24
 - [ ] 04-02-PLAN.md — Narrow exception handlers and final validation (QUAL-02)
@@ -93,7 +93,7 @@ Phases execute in numeric order: 4 → 5 → 6 → 7 → 8
 | 1. Package Structure | v1.0 | 3/3 | Complete | 2026-02-24 |
 | 2. Test Infrastructure | v1.0 | 4/4 | Complete | 2026-02-24 |
 | 3. Quality and Bug Fixes | v1.0 | 5/5 | Complete | 2026-02-24 |
-| 4. Code Quality and Cleanup | v1.1 | 1/2 | In progress | - |
+| 4. Code Quality and Cleanup | 2/2 | Complete   | 2026-02-24 | - |
 | 5. CI/CD Pipeline | v1.1 | 0/? | Not started | - |
 | 6. Security Hardening | v1.1 | 0/? | Not started | - |
 | 7. API Embedding Parity | v1.1 | 0/? | Not started | - |
