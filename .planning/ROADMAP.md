@@ -28,12 +28,12 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. The HTTP dashboard serves correctly when launched with the dashboard flag, with JSX loaded from `dashboard/App.jsx` instead of an embedded Python string
   4. No circular imports exist: `python -c "import remind_me_mcp"` exits cleanly
   5. ruff and mypy are runnable against the codebase via `pyproject.toml` configuration (zero configuration errors, even if lint warnings exist)
-**Plans**: TBD
+**Plans:** 3 plans
 
 Plans:
-- [ ] 01-01: Create package skeleton (config.py, db.py, embeddings.py, models.py, formatting.py)
-- [ ] 01-02: Extract importer.py, pid.py, server.py, tools.py, api.py, dashboard/
-- [ ] 01-03: Wire __init__.py, __main__.py, update pyproject.toml entry point, configure ruff/mypy
+- [ ] 01-01-PLAN.md — Create package skeleton (config.py, models.py, formatting.py, db.py, embeddings.py)
+- [ ] 01-02-PLAN.md — Extract behavioral modules (importer.py, pid.py, server.py, tools.py, api.py, dashboard/)
+- [ ] 01-03-PLAN.md — Wire __init__.py, __main__.py, update pyproject.toml entry point, configure ruff/mypy/pytest
 
 ### Phase 2: Test Infrastructure
 **Goal**: A pytest suite with full unit and integration coverage exists, written against Phase 1 module interfaces, providing the regression net required to safely change behavior in Phase 3
