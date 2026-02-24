@@ -9,11 +9,11 @@ Requirements for the refactored release. Each maps to roadmap phases.
 
 ### Module Architecture
 
-- [ ] **ARCH-01**: Project is structured as a `remind_me_mcp/` package with separate modules for each concern (config, db, embeddings, models, formatting, importer, pid, server, tools, api, dashboard)
+- [x] **ARCH-01**: Project is structured as a `remind_me_mcp/` package with separate modules for each concern (config, db, embeddings, models, formatting, importer, pid, server, tools, api, dashboard)
 - [ ] **ARCH-02**: `__init__.py` re-exports `mcp` from `server.py` so existing `pyproject.toml` entry point works unchanged
 - [ ] **ARCH-03**: `__main__.py` handles CLI argument parsing and mode dispatch (MCP stdio vs HTTP dashboard)
-- [ ] **ARCH-04**: Each module has its own logger via `logging.getLogger("remind_me_mcp.<module>")`
-- [ ] **ARCH-05**: Each module defines `__all__` to declare its explicit public surface
+- [x] **ARCH-04**: Each module has its own logger via `logging.getLogger("remind_me_mcp.<module>")`
+- [x] **ARCH-05**: Each module defines `__all__` to declare its explicit public surface
 - [ ] **ARCH-06**: No circular imports exist between any modules
 
 ### Testing
@@ -99,11 +99,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| ARCH-01 | Phase 1 | Pending |
+| ARCH-01 | Phase 1 | Complete (01-01) |
 | ARCH-02 | Phase 1 | Pending |
 | ARCH-03 | Phase 1 | Pending |
-| ARCH-04 | Phase 1 | Pending |
-| ARCH-05 | Phase 1 | Pending |
+| ARCH-04 | Phase 1 | Complete (01-01) |
+| ARCH-05 | Phase 1 | Complete (01-01) |
 | ARCH-06 | Phase 1 | Pending |
 | TEST-01 | Phase 2 | Pending |
 | TEST-02 | Phase 2 | Pending |
@@ -139,4 +139,4 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 ---
 *Requirements defined: 2026-02-22*
-*Last updated: 2026-02-23 after scope expansion (WAL concurrency fix)*
+*Last updated: 2026-02-24 after 01-01 completion (ARCH-01, ARCH-04, ARCH-05 marked complete)*
