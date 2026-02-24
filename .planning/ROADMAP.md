@@ -64,14 +64,14 @@ Plans:
   4. No `asyncio` event loop blockage occurs under concurrent tool calls — `asyncio.gather` on multiple MCP tool invocations completes without `ProgrammingError` or event loop starvation
   5. Two separate processes opening the same database file simultaneously can both read and write without hanging (WAL mode + busy_timeout verified)
   6. `pydoc` on any public function or class in any module returns a non-empty docstring
-**Plans**: TBD
+**Plans:** 5 plans
 
 Plans:
-- [ ] 03-01: Schema migration system (PRAGMA user_version), capture_id column, memory_tags junction table
-- [ ] 03-02: Fix BUGF-01 (import embedding ID mismatch) and BUGF-02 (capture_id lookup)
-- [ ] 03-03: Async safety — asyncio.to_thread for embedding calls, connection singleton, thread-safety
-- [ ] 03-04: Error handling — specific exception types, error propagation, user-facing tool messages
-- [ ] 03-05: DRY import_directory(), _make_id normalization, docstrings, type hints completion
+- [ ] 03-01-PLAN.md — Schema migration system (PRAGMA user_version), capture_id column, memory_tags junction table
+- [ ] 03-02-PLAN.md — Fix BUGF-01 (import embedding ID mismatch) and BUGF-02 (capture_id lookup), SQL tag filtering
+- [ ] 03-03-PLAN.md — Async safety: asyncio.to_thread for embedding calls, connection singleton, WAL mode, busy_timeout
+- [ ] 03-04-PLAN.md — Error handling: specific exception types, logging, user-facing tool error messages
+- [ ] 03-05-PLAN.md — DRY import_directory(), _make_id normalization, docstrings, type hints completion
 
 ## Progress
 
