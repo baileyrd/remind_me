@@ -12,9 +12,12 @@ handling, junction table creation, tag sync triggers, and idempotent re-runs.
 from __future__ import annotations
 
 import re
-import sqlite3
+from typing import TYPE_CHECKING
 
 from remind_me_mcp.db import _ensure_schema, _make_id, _migrate_schema, _now_iso, _row_to_dict
+
+if TYPE_CHECKING:
+    import sqlite3
 
 # ---------------------------------------------------------------------------
 # _now_iso

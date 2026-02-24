@@ -8,12 +8,15 @@ handlers synchronously — no async test code is needed.
 
 from __future__ import annotations
 
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 from starlette.testclient import TestClient
 
 from remind_me_mcp.api import _build_api_app
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Client fixture

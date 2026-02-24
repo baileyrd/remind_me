@@ -16,6 +16,7 @@ Current schema versions:
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -211,10 +212,8 @@ def _migrate_v0_to_v1(db: sqlite3.Connection) -> None:
         db: An open SQLite connection.
     """
     # Add column — safe to re-run; SQLite raises OperationalError if it exists.
-    try:
+    with contextlib.suppress(sqlite3.OperationalError):
         db.execute("ALTER TABLE memories ADD COLUMN capture_id TEXT DEFAULT NULL")
-    except sqlite3.OperationalError:
-        pass  # Column already exists — skip silently.
 
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_memories_capture_id ON memories(capture_id)"

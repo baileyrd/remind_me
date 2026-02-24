@@ -8,10 +8,13 @@ These run as part of every CI run to catch fixture regressions early.
 from __future__ import annotations
 
 import json
-import sqlite3
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    import sqlite3
+    from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # db_conn fixture

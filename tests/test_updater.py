@@ -48,7 +48,7 @@ def test_find_repo_root_outside_git_repo(tmp_path: Path) -> None:
         mock_path_cls.return_value.resolve.return_value = mock_resolved
 
         # Check that .git is not in tmp_path (it shouldn't be)
-        result = _find_repo_root()
+        _find_repo_root()
         # Since we patched Path(__file__), the function will walk tmp_path
         # which has no .git, so it returns None — unless the real __file__
         # is used. Let's do this more directly:

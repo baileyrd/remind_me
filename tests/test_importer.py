@@ -9,10 +9,7 @@ _file_hash which reads from disk (tmp_path used for isolation).
 from __future__ import annotations
 
 import json
-import sqlite3
-from pathlib import Path
-
-import pytest
+from typing import TYPE_CHECKING
 
 from remind_me_mcp.importer import (
     _chunk_text,
@@ -22,6 +19,12 @@ from remind_me_mcp.importer import (
     _parse_markdown_chat,
     import_chat_file,
 )
+
+if TYPE_CHECKING:
+    import sqlite3
+    from pathlib import Path
+
+    import pytest
 
 # ---------------------------------------------------------------------------
 # _chunk_text

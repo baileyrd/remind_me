@@ -177,7 +177,7 @@ async def memory_search(params: MemorySearchInput) -> str:
         scores[mid] = i * 0.5  # FTS rank position, weighted
 
     # Semantic results scored by distance
-    for i, m in enumerate(sem_memories):
+    for _, m in enumerate(sem_memories):
         mid = m["id"]
         sem_score = m.get("semantic_distance", 2.0)
         if mid in seen:

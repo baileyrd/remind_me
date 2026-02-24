@@ -14,11 +14,15 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from remind_me_mcp.config import DB_PATH
 from remind_me_mcp.db import _get_db, _make_id, _now_iso, _row_to_dict
 from remind_me_mcp.importer import import_chat_file, import_directory
+
+if TYPE_CHECKING:
+    from starlette.applications import Starlette
+    from starlette.requests import Request
 
 log = logging.getLogger("remind_me_mcp.api")
 
@@ -84,7 +88,6 @@ def _build_api_app() -> Starlette:
     from starlette.applications import Starlette
     from starlette.middleware import Middleware
     from starlette.middleware.cors import CORSMiddleware
-    from starlette.requests import Request
     from starlette.responses import HTMLResponse, JSONResponse
     from starlette.routing import Route
 

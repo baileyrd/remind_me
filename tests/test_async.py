@@ -53,7 +53,7 @@ def test_wal_mode_enabled() -> None:
     db = sqlite3.connect(":memory:")
     db.row_factory = sqlite3.Row
     # Apply WAL as _get_db does
-    result = db.execute("PRAGMA journal_mode=WAL").fetchone()
+    db.execute("PRAGMA journal_mode=WAL").fetchone()
     db.execute("PRAGMA foreign_keys=ON")
     _ensure_schema(db)
     try:

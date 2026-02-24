@@ -10,10 +10,7 @@ the test-controlled :memory: connection automatically.
 from __future__ import annotations
 
 import json
-import sqlite3
-from pathlib import Path
-
-import pytest
+from typing import TYPE_CHECKING
 
 from remind_me_mcp.models import (
     AutoCaptureInput,
@@ -44,6 +41,12 @@ from remind_me_mcp.tools import (
     resource_categories,
     resource_stats,
 )
+
+if TYPE_CHECKING:
+    import sqlite3
+    from pathlib import Path
+
+    import pytest
 
 # ---------------------------------------------------------------------------
 # memory_add tests
@@ -875,7 +878,7 @@ async def test_list_tag_filter_pagination(
         memory_factory(content=f"Untagged memory number {i} unique", tags=[])
 
     params = MemoryListInput(tags=["alpha"], limit=5)
-    result_str = await memory_list(params)
+    await memory_list(params)
 
     # Parse JSON to count results precisely
     json_params = MemoryListInput(tags=["alpha"], limit=5, response_format=ResponseFormat.JSON)

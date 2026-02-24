@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
 
 from remind_me_mcp.db import _ensure_schema, _make_id, _now_iso
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Config path isolation
