@@ -10,11 +10,11 @@ See: .planning/PROJECT.md (updated 2026-02-24)
 ## Current Position
 
 Phase: 6 of 8 (Security Hardening)
-Plan: 1 of 2 in current phase — Phase 6 Plan 1 COMPLETE
+Plan: 2 of 2 in current phase — Phase 6 Plan 2 COMPLETE
 Status: In progress
-Last activity: 2026-02-24 — Plan 06-01 complete (SEC-01 CORS restriction + SEC-02 import path guard)
+Last activity: 2026-02-24 — Plan 06-02 complete (SEC-03 Bearer token auth middleware + 7 auth tests)
 
-Progress: [#####░░░░░] 50% (v1.1 — 2.5/5 phases)
+Progress: [######░░░░] 60% (v1.1 — 3/5 phases)
 
 ## Performance Metrics
 
@@ -37,7 +37,7 @@ Progress: [#####░░░░░] 50% (v1.1 — 2.5/5 phases)
 | Phase | Plans | Duration | Avg/Plan |
 |-------|-------|----------|----------|
 | 05-ci-cd-pipeline | 2/2 | 5min | 2.5min |
-| 06-security-hardening | 1/2 | 4min | 4min |
+| 06-security-hardening | 2/2 | 6min | 3min |
 
 *v1.1 metrics will accumulate as phases complete*
 
@@ -64,6 +64,10 @@ Recent decisions affecting v1.1:
 - [Phase 06-security-hardening, plan 01]: allow_origin_regex uses re.fullmatch() in Starlette 0.52.1 — localhost.evil.com does not match the pattern; both localhost and 127.0.0.1 covered with any port
 - [Phase 06-security-hardening, plan 01]: Path guard fires before p.exists() to prevent information disclosure about forbidden paths; IMPORT_ROOTS defaults to [Path.home()]; empty env var treated as unset
 - [Phase 06-security-hardening, plan 01]: test fixture patches IMPORT_ROOTS to include /tmp so pytest tmp_path fixtures pass SEC-02 guard; test_api_import_nonexistent_file updated to use /tmp path inside allowed roots
+- [Phase 06-security-hardening, plan 02]: BearerAuthMiddleware defined inside _build_api_app() to preserve lazy Starlette import pattern (MCP stdio mode compatibility)
+- [Phase 06-security-hardening, plan 02]: CORS middleware must be outermost (first in list) so OPTIONS preflight succeeds before auth sees the request
+- [Phase 06-security-hardening, plan 02]: hmac.compare_digest() used for timing-safe token comparison — stdlib, no extra deps
+- [Phase 06-security-hardening, plan 02]: client_with_auth test fixture patches API_KEY in both remind_me_mcp.config AND remind_me_mcp.api — from-import creates separate binding that must be updated independently
 
 ### Pending Todos
 
@@ -80,5 +84,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-02-24
-Stopped at: Completed 06-01-PLAN.md (SEC-01 CORS restriction + SEC-02 import path guard implemented and tested)
+Stopped at: Completed 06-02-PLAN.md (SEC-03 Bearer token auth middleware + 7 auth tests, Phase 6 COMPLETE)
 Resume file: None

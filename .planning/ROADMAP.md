@@ -22,7 +22,7 @@
 
 - [x] **Phase 4: Code Quality and Cleanup** - Resolve all ruff warnings, narrow exception handlers, and remove the dead monolith file (completed 2026-02-24)
 - [x] **Phase 5: CI/CD Pipeline** - Establish GitHub Actions with lint, test, and coverage gates that validate all subsequent phases (completed 2026-02-24)
-- [ ] **Phase 6: Security Hardening** - Lock down CORS, restrict import paths, and add optional API key authentication
+- [x] **Phase 6: Security Hardening** - Lock down CORS, restrict import paths, and add optional API key authentication (completed 2026-02-24)
 - [ ] **Phase 7: API Embedding Parity** - Fix the correctness gap where REST API memories are invisible to semantic search
 - [ ] **Phase 8: Performance Improvements** - Batch reindex and concurrent file import for large-scale operation
 
@@ -64,7 +64,7 @@ Plans:
   2. Import API calls with file paths outside the user's home directory (or configured `REMIND_ME_IMPORT_ROOTS`) are rejected with an error, not executed
   3. When `REMIND_ME_API_KEY` is set, all `/api/*` routes require a matching `Authorization: Bearer <token>` header and return 401 for missing or incorrect tokens; when unset, all routes remain open (backward-compatible)
   4. Existing deployments with no new env vars set continue to function identically after upgrading
-**Plans:** 1/2 plans executed
+**Plans:** 2/2 plans complete
 Plans:
 - [ ] 06-01-PLAN.md — Add security config constants, restrict CORS to localhost, add import path guard (SEC-01, SEC-02)
 - [ ] 06-02-PLAN.md — Add optional Bearer token auth middleware for /api/* routes (SEC-03)
@@ -101,6 +101,6 @@ Phases execute in numeric order: 4 → 5 → 6 → 7 → 8
 | 3. Quality and Bug Fixes | v1.0 | 5/5 | Complete | 2026-02-24 |
 | 4. Code Quality and Cleanup | 2/2 | Complete    | 2026-02-24 | - |
 | 5. CI/CD Pipeline | v1.1 | 2/2 | Complete | 2026-02-24 |
-| 6. Security Hardening | 1/2 | In Progress|  | - |
+| 6. Security Hardening | 2/2 | Complete   | 2026-02-24 | - |
 | 7. API Embedding Parity | v1.1 | 0/? | Not started | - |
 | 8. Performance Improvements | v1.1 | 0/? | Not started | - |
