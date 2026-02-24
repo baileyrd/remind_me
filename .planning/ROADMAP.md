@@ -64,7 +64,10 @@ Plans:
   2. Import API calls with file paths outside the user's home directory (or configured `REMIND_ME_IMPORT_ROOTS`) are rejected with an error, not executed
   3. When `REMIND_ME_API_KEY` is set, all `/api/*` routes require a matching `Authorization: Bearer <token>` header and return 401 for missing or incorrect tokens; when unset, all routes remain open (backward-compatible)
   4. Existing deployments with no new env vars set continue to function identically after upgrading
-**Plans**: TBD
+**Plans:** 2 plans
+Plans:
+- [ ] 06-01-PLAN.md — Add security config constants, restrict CORS to localhost, add import path guard (SEC-01, SEC-02)
+- [ ] 06-02-PLAN.md — Add optional Bearer token auth middleware for /api/* routes (SEC-03)
 
 ### Phase 7: API Embedding Parity
 **Goal**: Memories created or updated through the REST API are immediately embedded and retrievable via semantic search — matching MCP tool behavior
