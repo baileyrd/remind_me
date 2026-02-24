@@ -224,24 +224,28 @@ async def memory_list(params: MemoryListInput) -> str:
     bindings: list[Any] = []
 
     if params.category:
-        conditions.append("category = ?")
+        conditions.append("m.category = ?")
         bindings.append(params.category)
     if params.source:
-        conditions.append("source = ?")
+        conditions.append("m.source = ?")
         bindings.append(params.source)
+    # Tag filtering via SQL JOIN on memory_tags (DATA-02 fix: correct pagination)
+    if params.tags:
+        for i, tag in enumerate(params.tags):
+            alias = f"mt{i}"
+            conditions.append(
+                f"EXISTS (SELECT 1 FROM memory_tags {alias}"
+                f" WHERE {alias}.memory_id = m.id AND {alias}.tag = ?)"
+            )
+            bindings.append(tag)
 
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-    total = db.execute(f"SELECT COUNT(*) as cnt FROM memories {where}", bindings).fetchone()["cnt"]
+    total = db.execute(f"SELECT COUNT(*) as cnt FROM memories m {where}", bindings).fetchone()["cnt"]
     rows = db.execute(
-        f"SELECT * FROM memories {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        f"SELECT m.* FROM memories m {where} ORDER BY m.created_at DESC LIMIT ? OFFSET ?",
         bindings + [params.limit, params.offset],
     ).fetchall()
     memories = [_row_to_dict(r) for r in rows]
-
-    # Tag filtering in Python (JSON array in column)
-    if params.tags:
-        tag_set = set(params.tags)
-        memories = [m for m in memories if tag_set.issubset(set(m.get("tags", [])))]
 
     return _fmt_memories(memories, params.response_format, total=total)
 
@@ -556,8 +560,8 @@ async def remind_me_auto_capture(params: AutoCaptureInput) -> str:
         "type": "dialog",
     }
     db.execute(
-        """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO memories (id, content, category, tags, source, metadata, capture_id, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             dialog_id,
             params.conversation,
@@ -565,6 +569,7 @@ async def remind_me_auto_capture(params: AutoCaptureInput) -> str:
             json.dumps(params.tags),
             "auto_capture",
             json.dumps(dialog_meta),
+            capture_id,
             now,
             now,
         ),
@@ -580,8 +585,8 @@ async def remind_me_auto_capture(params: AutoCaptureInput) -> str:
         "type": "summary",
     }
     db.execute(
-        """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO memories (id, content, category, tags, source, metadata, capture_id, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             summary_id,
             params.summary,
@@ -589,6 +594,7 @@ async def remind_me_auto_capture(params: AutoCaptureInput) -> str:
             json.dumps(params.tags),
             "auto_capture",
             json.dumps(summary_meta),
+            capture_id,
             now,
             now,
         ),
@@ -643,18 +649,11 @@ async def remind_me_get_capture(capture_id: str) -> str:
         str: Both memories formatted together, or an error if not found.
     """
     db = _get_db()
-    # Search for memories with this capture_id in metadata
+    # Use the indexed capture_id column for direct lookup (BUGF-02 fix)
     rows = db.execute(
-        "SELECT * FROM memories WHERE metadata LIKE ? ORDER BY category",
-        (f'%"capture_id": "{capture_id}"%',),
+        "SELECT * FROM memories WHERE capture_id = ? ORDER BY category",
+        (capture_id,),
     ).fetchall()
-
-    if not rows:
-        # Try alternate JSON formatting (no space after colon)
-        rows = db.execute(
-            "SELECT * FROM memories WHERE metadata LIKE ? ORDER BY category",
-            (f'%"capture_id":"{capture_id}"%',),
-        ).fetchall()
 
     if not rows:
         return f"No capture found with id `{capture_id}`."

@@ -210,10 +210,12 @@ def import_chat_file(
     else:
         return {"status": "error", "reason": f"unsupported format: {suffix}", "file": path.name}
 
-    # Chunk and store
+    # Chunk and store — collect (mem_id, chunk) pairs so the same IDs are used
+    # for both INSERT and embedding (BUGF-01 fix: prevents ID mismatch)
     stored = 0
     now = _now_iso()
     import_id = _make_id(file_path)
+    embed_pairs: list[tuple[str, str]] = []
 
     for content in contents:
         if not content.strip():
@@ -234,17 +236,14 @@ def import_chat_file(
                     now,
                 ),
             )
+            embed_pairs.append((mem_id, chunk))
             stored += 1
 
     db.commit()
 
-    # Embed all imported memories (batch after commit for efficiency)
-    for content in contents:
-        if not content.strip():
-            continue
-        for chunk in _chunk_text(content, max_length):
-            mem_id_check = hashlib.sha256(f"{chunk}{now}".encode()).hexdigest()[:12]
-            _embed_and_store(db, mem_id_check, chunk)
+    # Embed using the SAME mem_id that was used for INSERT (no recomputation)
+    for mem_id, chunk in embed_pairs:
+        _embed_and_store(db, mem_id, chunk)
 
     stats = {"memories_created": stored, "raw_entries": len(contents), "file": path.name}
     db.execute(

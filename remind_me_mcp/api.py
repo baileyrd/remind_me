@@ -116,35 +116,38 @@ def _build_api_app():
         })
 
     async def api_list(request: Request) -> JSONResponse:
-        import sqlite3 as _sqlite3
-
         db = _get_db()
         params = request.query_params
         conditions: list[str] = []
         bindings: list[Any] = []
 
         if cat := params.get("category"):
-            conditions.append("category = ?")
+            conditions.append("m.category = ?")
             bindings.append(cat)
         if src := params.get("source"):
-            conditions.append("source = ?")
+            conditions.append("m.source = ?")
             bindings.append(src)
+        # Tag filtering via SQL JOIN on memory_tags (DATA-02 fix: correct pagination)
+        if tag_param := params.get("tags"):
+            tags_list = tag_param.split(",")
+            for i, tag in enumerate(tags_list):
+                alias = f"mt{i}"
+                conditions.append(
+                    f"EXISTS (SELECT 1 FROM memory_tags {alias}"
+                    f" WHERE {alias}.memory_id = m.id AND {alias}.tag = ?)"
+                )
+                bindings.append(tag)
 
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         limit = min(int(params.get("limit", 50)), 200)
         offset = max(int(params.get("offset", 0)), 0)
 
-        total = db.execute(f"SELECT COUNT(*) as cnt FROM memories {where}", bindings).fetchone()["cnt"]
+        total = db.execute(f"SELECT COUNT(*) as cnt FROM memories m {where}", bindings).fetchone()["cnt"]
         rows = db.execute(
-            f"SELECT * FROM memories {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            f"SELECT m.* FROM memories m {where} ORDER BY m.created_at DESC LIMIT ? OFFSET ?",
             bindings + [limit, offset],
         ).fetchall()
         memories = [_row_to_dict(r) for r in rows]
-
-        # Tag filtering
-        if tag_param := params.get("tags"):
-            tag_set = set(tag_param.split(","))
-            memories = [m for m in memories if tag_set.issubset(set(m.get("tags", [])))]
 
         return _json_ok({
             "total": total,
