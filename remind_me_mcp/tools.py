@@ -515,13 +515,13 @@ async def memory_stats(params: MemoryStatsInput) -> str:
         return json.dumps(data, indent=2, default=str)
 
     lines = [
-        f"## Memory Store Statistics",
-        f"",
+        "## Memory Store Statistics",
+        "",
         f"**Total memories:** {total}",
         f"**Total imports:** {imports}",
         f"**Database:** `{DB_PATH}` ({data['db_size_mb']} MB)",
-        f"",
-        f"### Categories",
+        "",
+        "### Categories",
     ]
     for cat, cnt in data["categories"].items():
         lines.append(f"- **{cat}**: {cnt}")
@@ -701,7 +701,7 @@ async def remind_me_get_capture(capture_id: str) -> str:
     if dialog:
         char_count = len(dialog["content"])
         parts.append(f"### Full Dialog (`{dialog['id']}` — {char_count:,} chars)")
-        parts.append(f"**Category:** dialog\n")
+        parts.append("**Category:** dialog\n")
         # Show first 3000 chars with truncation notice
         if char_count > 3000:
             parts.append(dialog["content"][:3000])
@@ -815,7 +815,7 @@ async def remind_me_server_status() -> str:
 
     lines.append(f"\n**Database:** `{status['db_path']}`")
     lines.append(f"**DB exists:** {'yes' if status['db_exists'] else 'no'}")
-    lines.append(f"\n**MCP (stdio):** ✓ Active (this connection)")
+    lines.append("\n**MCP (stdio):** ✓ Active (this connection)")
 
     # Embedding status
     embedder = _get_embedder()
@@ -832,7 +832,7 @@ async def remind_me_server_status() -> str:
         if total_vecs < total_mems:
             lines.append(f"_Run `remind_me_reindex` to embed the remaining {total_mems - total_vecs} memories._")
     else:
-        lines.append(f"\n**Semantic search:** ✗ Unavailable (install onnxruntime, tokenizers, huggingface-hub, numpy, sqlite-vec)")
+        lines.append("\n**Semantic search:** ✗ Unavailable (install onnxruntime, tokenizers, huggingface-hub, numpy, sqlite-vec)")
 
     return "\n".join(lines)
 

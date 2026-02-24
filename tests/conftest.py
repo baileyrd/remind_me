@@ -17,7 +17,6 @@ import pytest
 
 from remind_me_mcp.db import _ensure_schema, _make_id, _now_iso
 
-
 # ---------------------------------------------------------------------------
 # Config path isolation
 # ---------------------------------------------------------------------------
@@ -48,8 +47,8 @@ def tmp_memory_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     mp.setattr(_cfg, "IMPORT_LOG", tmp_import_log)
 
     # Patch direct imports in sibling modules
-    import remind_me_mcp.db as _db_mod
     import remind_me_mcp.api as _api_mod
+    import remind_me_mcp.db as _db_mod
     import remind_me_mcp.pid as _pid_mod
     import remind_me_mcp.server as _srv_mod
 
@@ -83,10 +82,10 @@ def db_conn(monkeypatch: pytest.MonkeyPatch) -> sqlite3.Connection:
     db.row_factory = sqlite3.Row
     _ensure_schema(db)
 
-    import remind_me_mcp.db as _db_mod
     import remind_me_mcp.api as _api_mod
-    import remind_me_mcp.tools as _tools_mod
+    import remind_me_mcp.db as _db_mod
     import remind_me_mcp.importer as _importer_mod
+    import remind_me_mcp.tools as _tools_mod
 
     monkeypatch.setattr(_db_mod, "_get_db", lambda: db)
     monkeypatch.setattr(_api_mod, "_get_db", lambda: db)

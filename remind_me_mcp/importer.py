@@ -14,7 +14,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from remind_me_mcp.db import _embed_and_store, _get_db, _make_id, _now_iso, _row_to_dict
+from remind_me_mcp.db import _embed_and_store, _get_db, _make_id, _now_iso
 
 log = logging.getLogger("remind_me_mcp.importer")
 

@@ -47,9 +47,9 @@ class _Embedder:
         if self._ready:
             return
         try:
+            import onnxruntime as ort
             from huggingface_hub import hf_hub_download
             from tokenizers import Tokenizer
-            import onnxruntime as ort
 
             MODEL_DIR.mkdir(parents=True, exist_ok=True)
             cache_dir = str(MODEL_DIR)

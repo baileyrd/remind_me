@@ -8,14 +8,12 @@ handlers synchronously — no async test code is needed.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
 from starlette.testclient import TestClient
 
 from remind_me_mcp.api import _build_api_app
-
 
 # ---------------------------------------------------------------------------
 # Client fixture

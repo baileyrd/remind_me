@@ -189,7 +189,7 @@ def check_for_update() -> UpdateStatus:
     # Count commits behind
     try:
         behind_output = _run_git(
-            "rev-list", "--count", f"HEAD..origin/main", repo_path=repo,
+            "rev-list", "--count", "HEAD..origin/main", repo_path=repo,
         ).stdout.strip()
         commits_behind = int(behind_output)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError):
@@ -199,7 +199,7 @@ def check_for_update() -> UpdateStatus:
     commit_messages: list[str] = []
     try:
         log_output = _run_git(
-            "log", "--oneline", f"HEAD..origin/main", "--max-count=10", repo_path=repo,
+            "log", "--oneline", "HEAD..origin/main", "--max-count=10", repo_path=repo,
         ).stdout.strip()
         if log_output:
             commit_messages = log_output.splitlines()

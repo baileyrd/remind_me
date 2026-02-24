@@ -20,7 +20,6 @@ import pytest
 
 from remind_me_mcp.db import _ensure_schema
 
-
 # ---------------------------------------------------------------------------
 # Test 1: _get_db returns the same singleton connection object
 # ---------------------------------------------------------------------------

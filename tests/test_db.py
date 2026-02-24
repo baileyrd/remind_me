@@ -11,14 +11,10 @@ handling, junction table creation, tag sync triggers, and idempotent re-runs.
 
 from __future__ import annotations
 
-import json
 import re
 import sqlite3
 
-import pytest
-
 from remind_me_mcp.db import _ensure_schema, _make_id, _migrate_schema, _now_iso, _row_to_dict
-
 
 # ---------------------------------------------------------------------------
 # _now_iso

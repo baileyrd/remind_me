@@ -20,8 +20,7 @@ import hashlib
 import json
 import logging
 import sqlite3
-import struct
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from remind_me_mcp.config import DB_PATH, EMBEDDING_DIM
@@ -404,7 +403,7 @@ def _now_iso() -> str:
         ISO 8601 formatted datetime string with timezone offset, e.g.
         '2024-01-15T12:34:56.789012+00:00'.
     """
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _make_id(content: str) -> str:

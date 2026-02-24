@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from remind_me_mcp.config import DB_PATH
-from remind_me_mcp.db import _embed_and_store, _get_db, _make_id, _now_iso, _row_to_dict
+from remind_me_mcp.db import _get_db, _make_id, _now_iso, _row_to_dict
 from remind_me_mcp.importer import import_chat_file, import_directory
 
 log = logging.getLogger("remind_me_mcp.api")
@@ -70,7 +70,7 @@ def _build_dashboard_html() -> str:
 # ---------------------------------------------------------------------------
 
 
-def _build_api_app() -> "Starlette":
+def _build_api_app() -> Starlette:
     """Build a Starlette ASGI app that exposes the memory DB as a REST API.
 
     All Starlette imports are kept local to this function so the module can

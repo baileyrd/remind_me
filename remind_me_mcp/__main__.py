@@ -22,6 +22,7 @@ import logging
 import signal
 import sys
 
+import remind_me_mcp.tools  # noqa: F401 — ensure tools are registered before mcp.run()
 from remind_me_mcp.api import _build_api_app
 from remind_me_mcp.config import SERVE_UI, UI_PORT
 from remind_me_mcp.pid import (
@@ -32,7 +33,6 @@ from remind_me_mcp.pid import (
     get_server_status,
 )
 from remind_me_mcp.server import mcp
-import remind_me_mcp.tools  # noqa: F401 — ensure tools are registered before mcp.run()
 
 log = logging.getLogger("remind_me_mcp.__main__")
 

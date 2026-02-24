@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -84,8 +84,8 @@ class MemorySearchInput(BaseModel):
         min_length=1,
         max_length=500,
     )
-    category: Optional[str] = Field(default=None, description="Filter by category")
-    tags: Optional[list[str]] = Field(
+    category: str | None = Field(default=None, description="Filter by category")
+    tags: list[str] | None = Field(
         default=None, description="Filter: memory must have ALL of these tags"
     )
     limit: int = Field(default=20, description="Max results to return", ge=1, le=100)
@@ -97,11 +97,11 @@ class MemoryListInput(BaseModel):
 
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
-    category: Optional[str] = Field(default=None, description="Filter by category")
-    tags: Optional[list[str]] = Field(
+    category: str | None = Field(default=None, description="Filter by category")
+    tags: list[str] | None = Field(
         default=None, description="Filter: memory must have ALL of these tags"
     )
-    source: Optional[str] = Field(
+    source: str | None = Field(
         default=None, description="Filter by source (e.g., 'chat_import', 'manual')"
     )
     limit: int = Field(default=20, ge=1, le=100)
@@ -117,12 +117,12 @@ class MemoryUpdateInput(BaseModel):
     memory_id: str = Field(
         ..., description="The ID of the memory to update", min_length=1
     )
-    content: Optional[str] = Field(
+    content: str | None = Field(
         default=None, description="New content (if changing)", max_length=50000
     )
-    category: Optional[str] = Field(default=None, max_length=100)
-    tags: Optional[list[str]] = Field(default=None, max_length=20)
-    metadata: Optional[dict[str, Any]] = Field(default=None)
+    category: str | None = Field(default=None, max_length=100)
+    tags: list[str] | None = Field(default=None, max_length=20)
+    metadata: dict[str, Any] | None = Field(default=None)
 
 
 class MemoryDeleteInput(BaseModel):

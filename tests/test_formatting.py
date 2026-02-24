@@ -10,11 +10,8 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from remind_me_mcp.formatting import _fmt_memories, _fmt_memory_md
 from remind_me_mcp.models import ResponseFormat
-
 
 # ---------------------------------------------------------------------------
 # Helpers

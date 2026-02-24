@@ -45,7 +45,6 @@ from remind_me_mcp.tools import (
     resource_stats,
 )
 
-
 # ---------------------------------------------------------------------------
 # memory_add tests
 # ---------------------------------------------------------------------------
@@ -649,8 +648,8 @@ async def test_reindex_no_embedder(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Reindex without an embedder returns an 'not available' message."""
-    import remind_me_mcp.embeddings as _emb_mod
     import remind_me_mcp.db as _db_mod
+    import remind_me_mcp.embeddings as _emb_mod
 
     monkeypatch.setattr(_emb_mod, "_get_embedder", lambda: None)
     monkeypatch.setattr(_db_mod, "_get_embedder", lambda: None)
