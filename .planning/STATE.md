@@ -2,26 +2,25 @@
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-02-22)
+See: .planning/PROJECT.md (updated 2026-02-24)
 
-**Core value:** Every design principle from CLAUDE.md passes a green audit without breaking existing functionality
-**Current focus:** Phase 3 — Quality and Bug Fixes
+**Core value:** Persistent, searchable memory across all Claude interfaces — modular, tested, maintainable
+**Current focus:** Planning next milestone
 
 ## Current Position
 
-Phase: 3 of 3 (Quality and Bug Fixes)
-Plan: 5 of 5 in current phase
-Status: Complete
-Last activity: 2026-02-24 — Completed 03-05 (DRY import_directory extraction, _make_id docs, full docstring/type-hint coverage across all modules)
+Phase: v1.0 complete
+Status: Milestone shipped
+Last activity: 2026-02-24 — v1.0 Full Refactor milestone completed and archived
 
-Progress: [██████████] 100%
+Progress: [██████████] 100% (v1.0)
 
 ## Performance Metrics
 
-**Velocity:**
-- Total plans completed: 9
+**Velocity (v1.0):**
+- Total plans completed: 12
 - Average duration: 3.7min
-- Total execution time: 0.6 hours
+- Total execution time: ~0.6 hours
 
 **By Phase:**
 
@@ -31,79 +30,22 @@ Progress: [██████████] 100%
 | 02-test-infrastructure | 4/4 | 10min | 2.5min |
 | 03-quality-and-bug-fixes | 5/5 | 21min | 4.2min |
 
-**Recent Trend:**
-- Last 5 plans: 03-01 (2min), 03-02 (4min), 03-03 (4min), 03-04 (3min), 03-05 (8min)
-- Trend: stable
-
-*Updated after each plan completion*
-| Phase 03-quality-and-bug-fixes P01 | 2 | 2 tasks | 2 files |
-| Phase 03-quality-and-bug-fixes P02 | 4 | 2 tasks | 6 files |
-| Phase 03-quality-and-bug-fixes P03 | 4 | 2 tasks | 4 files |
-| Phase 03-quality-and-bug-fixes P04 | 3 | 2 tasks | 5 files |
-| Phase 03-quality-and-bug-fixes P05 | 8 | 2 tasks | 9 files |
-
 ## Accumulated Context
 
 ### Decisions
 
-Decisions are logged in PROJECT.md Key Decisions table.
-Recent decisions affecting current work:
-
-- [Init]: Refactor and test in parallel — build modules first (Phase 1), then tests (Phase 2), then fixes (Phase 3)
-- [Init]: Single package, multiple modules — preserves simple install while enabling separation of concerns
-- [Init]: Keep Babel standalone for dashboard — avoids Node.js build tooling dependency
-- [Init]: Fix bugs during Phase 3, after test coverage exists as a safety net
-- [01-01]: Pure extraction only — no logic changes in 01-01; all signatures and docstrings preserved verbatim
-- [01-01]: SERVE_UI and UI_PORT extracted to config.py (not HTTP layer) because they are environment configuration
-- [01-01]: uv venv created for project — uv pip install -e '.[semantic]' used for dependency setup
-- [01-02]: server.py must NOT import tools.py — tools.py imports mcp from server to prevent circular imports
-- [01-02]: Lazy Starlette imports inside _build_api_app() — prevents heavy web framework load in stdio-only mode
-- [01-02]: JSX loaded via Path(__file__).parent / 'dashboard' / 'App.jsx' at runtime — simpler than importlib.resources
-- [01-02]: Inline Babel-compatible JSX extracted from _get_dashboard_script() — NOT the ES module reference file
-- [01-03]: __init__.py imports tools module as side effect — ensures @mcp.tool decorators fire before mcp.run() via entry point
-- [01-03]: Entry point keep as remind_me_mcp:mcp.run — FastMCP handles run loop; __main__.py for python -m usage
-- [01-03]: Monolith renamed to remind_me_mcp_original.py — eliminates Python import ambiguity with package directory
-- [02-01]: Session-scoped monkeypatch uses pytest.MonkeyPatch() directly — function-scoped monkeypatch fixture cannot be injected into session-scoped fixtures
-- [02-01]: FakeEmbedder seeds np.random.default_rng on hash(text) for deterministic per-text vectors without ML model dependency
-- [02-01]: db_conn monkeypatches both remind_me_mcp.db._get_db and remind_me_mcp.api._get_db since api.py imports _get_db directly
-- [02-02]: Direct import of private pure functions — no MCP server context needed; all 75 tests run in 0.04s
-- [02-02]: FTS5 trigger tests use distinct unique words per test to avoid cross-test interference without requiring separate db_conn instances
-- [02-03]: db_conn fixture must patch remind_me_mcp.tools._get_db and remind_me_mcp.importer._get_db — both use 'from remind_me_mcp.db import _get_db' creating separate bindings not covered by the module attribute patch
-- [02-03]: server_status test monkeypatches remind_me_mcp.tools.get_server_status (not pid module) because tools.py imports it directly, creating a local binding
-- [02-04]: db_conn fixture uses check_same_thread=False — Starlette TestClient runs async handlers in a worker thread separate from pytest main thread
-- [02-04]: client fixture patches remind_me_mcp.importer._get_db directly because importer uses 'from ... import _get_db' local binding not affected by module attribute patch
-- [03-01]: json_valid(NEW.tags) guard in sync triggers — SQLite evaluates WHERE before json_each iteration, preventing malformed JSON tags from raising OperationalError on INSERT/UPDATE
-- [03-01]: ADD COLUMN wrapped in try/except OperationalError — SQLite raises if column exists; silent continue makes migration idempotent on re-run
-- [03-01]: memory_tags junction table is additive — JSON tags column preserved for backward compatibility and _row_to_dict deserialization
-- [03-02]: embed_pairs list collected during INSERT loop — avoids recomputing _make_id with a different timestamp (BUGF-01 fix)
-- [03-02]: SQL EXISTS subquery for tag filtering — ensures LIMIT applies after filter in both tools.py memory_list and api.py api_list (DATA-02 fix)
-- [03-02]: Table alias m.* required — needed when joining memory_tags to avoid column ambiguity in SELECT
-- [03-02]: api_search retains Python post-filter for tags — search result set is already merged/ranked in memory; search pagination fix deferred
-- [Phase 03-03]: _db_connection singleton at module level — lazy init avoids opening DB until first call; reset to None on _close_db for testability
-- [Phase 03-03]: check_same_thread=False required because asyncio.to_thread workers run on thread pool; WAL mode makes this safe
-- [Phase 03-03]: Only CPU-bound embedding calls wrapped with asyncio.to_thread — simple DB reads/writes are fast enough inline
-- [Phase 03-03]: busy_timeout=5000ms for graceful lock contention across multi-process DB access (Claude Code + Claude Desktop)
-- [Phase 03-04]: sqlite-vec load split into ImportError (package missing) + OperationalError (extension load fail) — distinct failure modes
-- [Phase 03-04]: _embed_and_store/_semantic_search use log.warning not log.debug — embedding failures are unexpected operational issues
-- [Phase 03-04]: remind_me_auto_capture both INSERTs in one try/except OperationalError block for transaction atomicity
-- [Phase 03-04]: MCP tool error messages use "Error: <description> — <detail>" format for user actionability
-- [Phase 03-05]: import_directory() placed in importer.py alongside import_chat_file() — natural home, no new module needed (DATA-03 DRY)
-- [Phase 03-05]: _make_id function name unchanged; docstring "NOT deterministic" warning satisfies DATA-04 without renaming
-- [Phase 03-05]: Route handler docstrings in api.py are one-liners — inner closures inside _build_api_app don't need full Args/Returns
-- [Phase 03-05]: __version__ = "0.1.0" added to __init__.py per Python packaging conventions
+Full decision log in PROJECT.md Key Decisions table.
 
 ### Pending Todos
 
-None yet.
+None.
 
 ### Blockers/Concerns
 
-- [Resolved via 03-03]: asyncio.to_thread + SQLite threading interaction — verified safe with check_same_thread=False + WAL mode; 6 concurrency tests prove correctness
-- [Research]: ruff ASYNC rule codes may have changed since August 2025 cutoff — verify before configuring pyproject.toml
-- [Resolved via 03-01]: FTS5 memories_fts rebuild behavior during migration — memory_tags triggers use json_valid() guard; FTS triggers unchanged
+None active. All v1.0 blockers resolved.
 
 ## Session Continuity
 
 Last session: 2026-02-24
-Stopped at: Completed 03-05-PLAN.md — DRY import_directory() extraction, _make_id semantics documented, full docstring/type-hint coverage across all modules (172 tests passing)
+Stopped at: v1.0 milestone completed, archived, and tagged
 Resume file: None
