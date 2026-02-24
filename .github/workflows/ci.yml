@@ -1,0 +1,32 @@
+# Coverage gate: 74% (measured 76% minus 2% headroom per STATE.md).
+# Target is 80% (CICD-02) — will increase as tests are added in Phases 6-8.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ci:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv pip install -e ".[semantic]" pytest-cov ruff pytest-asyncio
+
+      - name: Lint
+        run: ruff check --output-format=github .
+
+      - name: Test with coverage
+        run: pytest --cov=remind_me_mcp --cov-report=term-missing --cov-fail-under=74
