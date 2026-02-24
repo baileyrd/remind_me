@@ -67,7 +67,7 @@ Plans:
 **Plans:** 5 plans
 
 Plans:
-- [ ] 03-01-PLAN.md — Schema migration system (PRAGMA user_version), capture_id column, memory_tags junction table
+- [x] 03-01-PLAN.md — Schema migration system (PRAGMA user_version), capture_id column, memory_tags junction table
 - [ ] 03-02-PLAN.md — Fix BUGF-01 (import embedding ID mismatch) and BUGF-02 (capture_id lookup), SQL tag filtering
 - [ ] 03-03-PLAN.md — Async safety: asyncio.to_thread for embedding calls, connection singleton, WAL mode, busy_timeout
 - [ ] 03-04-PLAN.md — Error handling: specific exception types, logging, user-facing tool error messages
@@ -81,5 +81,5 @@ Phases execute in numeric order: 1 → 2 → 3
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Package Structure | 3/3 | Complete    | 2026-02-24 |
-| 2. Test Infrastructure | 3/4 | Complete    | 2026-02-24 |
-| 3. Quality and Bug Fixes | 0/5 | Not started | - |
+| 2. Test Infrastructure | 4/4 | Complete    | 2026-02-24 |
+| 3. Quality and Bug Fixes | 1/5 | In progress | - |

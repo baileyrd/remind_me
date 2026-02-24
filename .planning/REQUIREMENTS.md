@@ -46,8 +46,8 @@ Requirements for the refactored release. Each maps to roadmap phases.
 
 ### Data Layer
 
-- [ ] **DATA-01**: Schema migration system using `PRAGMA user_version` supports safe column additions and table changes on existing databases
-- [ ] **DATA-02**: Tag filtering happens in SQL via a `memory_tags` junction table, not post-fetch in Python, so pagination works correctly with tag filters
+- [x] **DATA-01**: Schema migration system using `PRAGMA user_version` supports safe column additions and table changes on existing databases
+- [x] **DATA-02**: Tag filtering happens in SQL via a `memory_tags` junction table, not post-fetch in Python, so pagination works correctly with tag filters
 - [ ] **DATA-03**: A single `import_directory()` function is shared between the MCP tool handler and the HTTP API handler (DRY)
 - [ ] **DATA-04**: `_make_id` semantics are normalized — either truly deterministic (content-hash only) or explicitly documented as non-deterministic with an appropriate name
 

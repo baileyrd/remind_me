@@ -5,23 +5,23 @@
 See: .planning/PROJECT.md (updated 2026-02-22)
 
 **Core value:** Every design principle from CLAUDE.md passes a green audit without breaking existing functionality
-**Current focus:** Phase 2 — Test Infrastructure
+**Current focus:** Phase 3 — Quality and Bug Fixes
 
 ## Current Position
 
-Phase: 2 of 3 (Test Infrastructure)
-Plan: 4 of 4 in current phase
+Phase: 3 of 3 (Quality and Bug Fixes)
+Plan: 1 of 4 in current phase
 Status: In progress
-Last activity: 2026-02-24 — Completed 02-04 (API integration tests)
+Last activity: 2026-02-24 — Completed 03-01 (Schema migration system)
 
-Progress: [████████░░] 73%
+Progress: [█████████░] 83%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 4
-- Average duration: 4min
-- Total execution time: 0.25 hours
+- Total plans completed: 8
+- Average duration: 3min
+- Total execution time: 0.4 hours
 
 **By Phase:**
 
@@ -29,13 +29,14 @@ Progress: [████████░░] 73%
 |-------|-------|-------|----------|
 | 01-package-structure | 3/3 | 13min | 4min |
 | 02-test-infrastructure | 4/4 | 10min | 2.5min |
+| 03-quality-and-bug-fixes | 1/4 | 2min | 2min |
 
 **Recent Trend:**
-- Last 5 plans: 01-01 (3min), 01-02 (8min), 01-03 (2min), 02-01 (2min), 02-04 (2min)
+- Last 5 plans: 01-02 (8min), 01-03 (2min), 02-01 (2min), 02-04 (2min), 03-01 (2min)
 - Trend: stable
 
 *Updated after each plan completion*
-| Phase 02-test-infrastructure P02 | 2 | 2 tasks | 4 files |
+| Phase 03-quality-and-bug-fixes P01 | 2 | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -67,6 +68,9 @@ Recent decisions affecting current work:
 - [02-03]: server_status test monkeypatches remind_me_mcp.tools.get_server_status (not pid module) because tools.py imports it directly, creating a local binding
 - [02-04]: db_conn fixture uses check_same_thread=False — Starlette TestClient runs async handlers in a worker thread separate from pytest main thread
 - [02-04]: client fixture patches remind_me_mcp.importer._get_db directly because importer uses 'from ... import _get_db' local binding not affected by module attribute patch
+- [03-01]: json_valid(NEW.tags) guard in sync triggers — SQLite evaluates WHERE before json_each iteration, preventing malformed JSON tags from raising OperationalError on INSERT/UPDATE
+- [03-01]: ADD COLUMN wrapped in try/except OperationalError — SQLite raises if column exists; silent continue makes migration idempotent on re-run
+- [03-01]: memory_tags junction table is additive — JSON tags column preserved for backward compatibility and _row_to_dict deserialization
 
 ### Pending Todos
 
@@ -76,10 +80,10 @@ None yet.
 
 - [Research]: asyncio.to_thread + SQLite threading interaction needs prototype test before finalizing pattern (see SUMMARY.md gaps)
 - [Research]: ruff ASYNC rule codes may have changed since August 2025 cutoff — verify before configuring pyproject.toml
-- [Research]: FTS5 memories_fts rebuild behavior during migration needs validation against actual SQLite behavior
+- [Resolved via 03-01]: FTS5 memories_fts rebuild behavior during migration — memory_tags triggers use json_valid() guard; FTS triggers unchanged
 
 ## Session Continuity
 
 Last session: 2026-02-24
-Stopped at: Completed 02-03-PLAN.md — integration tests for all 13 MCP tool handlers
+Stopped at: Completed 03-01-PLAN.md — schema migration system with capture_id column and memory_tags junction table
 Resume file: None
