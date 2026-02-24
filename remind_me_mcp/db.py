@@ -372,8 +372,8 @@ def _semantic_search(
                FROM memories_vec mv
                JOIN memories m ON m.rowid = mv.rowid
                WHERE mv.embedding MATCH ?
-               ORDER BY mv.distance
-               LIMIT ?""",
+               AND mv.k = ?
+               ORDER BY mv.distance""",
             (query_bytes, limit),
         ).fetchall()
         results = []

@@ -11,6 +11,7 @@ build time, keeping the Python source clean and the JSX separately editable.
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 import logging
@@ -18,7 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from remind_me_mcp.config import API_KEY, DB_PATH, IMPORT_ROOTS
-from remind_me_mcp.db import _get_db, _make_id, _now_iso, _row_to_dict
+from remind_me_mcp.db import _embed_and_store, _get_db, _make_id, _now_iso, _row_to_dict
 from remind_me_mcp.importer import import_chat_file, import_directory
 
 if TYPE_CHECKING:
@@ -262,6 +263,7 @@ def _build_api_app() -> Starlette:
             (mem_id, content, category, json.dumps(tags), source, json.dumps(metadata), now, now),
         )
         db.commit()
+        await asyncio.to_thread(_embed_and_store, db, mem_id, content)
         row = db.execute("SELECT * FROM memories WHERE id = ?", (mem_id,)).fetchone()
         return _json_ok(_row_to_dict(row), status=201)
 
@@ -300,6 +302,8 @@ def _build_api_app() -> Starlette:
 
         db.execute(f"UPDATE memories SET {', '.join(sets)} WHERE id = ?", bindings)
         db.commit()
+        if "content" in body and body["content"] is not None:
+            await asyncio.to_thread(_embed_and_store, db, memory_id, body["content"])
         updated = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
         return _json_ok(_row_to_dict(updated))
 
