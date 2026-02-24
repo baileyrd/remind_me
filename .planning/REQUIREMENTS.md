@@ -55,7 +55,7 @@ Requirements for the refactored release. Each maps to roadmap phases.
 
 - [ ] **QUAL-01**: All public functions and classes have docstrings
 - [ ] **QUAL-02**: All function signatures have complete type hints
-- [ ] **QUAL-03**: Dashboard JSX is extracted to a separate `App.jsx` file in the `dashboard/` directory (no longer embedded as Python string)
+- [x] **QUAL-03**: Dashboard JSX is extracted to a separate `App.jsx` file in the `dashboard/` directory (no longer embedded as Python string)
 - [ ] **QUAL-04**: ruff is configured in `pyproject.toml` for linting and formatting
 - [ ] **QUAL-05**: mypy is configured in `pyproject.toml` for type checking
 - [ ] **QUAL-06**: `pyproject.toml` has test configuration (pytest settings, asyncio mode)
@@ -125,7 +125,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | DATA-04 | Phase 3 | Pending |
 | QUAL-01 | Phase 3 | Pending |
 | QUAL-02 | Phase 3 | Pending |
-| QUAL-03 | Phase 1 | Pending |
+| QUAL-03 | Phase 1 | Complete |
 | QUAL-04 | Phase 1 | Pending |
 | QUAL-05 | Phase 1 | Pending |
 | QUAL-06 | Phase 1 | Pending |

@@ -32,7 +32,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 Plans:
 - [x] 01-01-PLAN.md — Create package skeleton (config.py, models.py, formatting.py, db.py, embeddings.py)
-- [ ] 01-02-PLAN.md — Extract behavioral modules (importer.py, pid.py, server.py, tools.py, api.py, dashboard/)
+- [x] 01-02-PLAN.md — Extract behavioral modules (importer.py, pid.py, server.py, tools.py, api.py, dashboard/)
 - [ ] 01-03-PLAN.md — Wire __init__.py, __main__.py, update pyproject.toml entry point, configure ruff/mypy/pytest
 
 ### Phase 2: Test Infrastructure
@@ -80,6 +80,6 @@ Phases execute in numeric order: 1 → 2 → 3
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Package Structure | 1/3 | In progress | - |
+| 1. Package Structure | 2/3 | In progress | - |
 | 2. Test Infrastructure | 0/4 | Not started | - |
 | 3. Quality and Bug Fixes | 0/5 | Not started | - |
