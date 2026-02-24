@@ -79,15 +79,22 @@ def db_conn(monkeypatch: pytest.MonkeyPatch) -> sqlite3.Connection:
 
     Yields the connection; closes it in teardown.
     """
-    db = sqlite3.connect(":memory:")
+    db = sqlite3.connect(":memory:", check_same_thread=False)
     db.row_factory = sqlite3.Row
     _ensure_schema(db)
 
     import remind_me_mcp.db as _db_mod
     import remind_me_mcp.api as _api_mod
+    import remind_me_mcp.tools as _tools_mod
+    import remind_me_mcp.importer as _importer_mod
 
     monkeypatch.setattr(_db_mod, "_get_db", lambda: db)
     monkeypatch.setattr(_api_mod, "_get_db", lambda: db)
+    # tools.py and importer.py use `from remind_me_mcp.db import _get_db` which
+    # creates separate bindings — patch those local references directly so tool
+    # handlers route through the test in-memory database.
+    monkeypatch.setattr(_tools_mod, "_get_db", lambda: db)
+    monkeypatch.setattr(_importer_mod, "_get_db", lambda: db)
 
     yield db
     db.close()
