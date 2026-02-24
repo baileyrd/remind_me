@@ -1,13 +1,17 @@
 """
 remind_me_mcp.__main__ — CLI argument parsing and mode dispatch.
 
-Supports three execution modes:
+Supports multiple execution modes:
   - MCP stdio mode (default): runs the FastMCP server over stdin/stdout
   - UI server mode (--serve-ui): starts the Starlette dashboard HTTP server
   - Status mode (--status): checks if the dashboard is running and exits
+  - Version mode (--version): prints the installed version and exits
+  - Check-update mode (--check-update): checks for updates and exits
+  - Update mode (--update): pulls latest changes and reinstalls
 
 Usage:
-  python -m remind_me_mcp [--serve-ui] [--ui-port PORT] [--ui-host HOST] [--status]
+  python -m remind_me_mcp [--serve-ui] [--ui-port PORT] [--ui-host HOST]
+                           [--status] [--version] [--check-update] [--update]
 """
 
 from __future__ import annotations
@@ -61,7 +65,75 @@ def main() -> None:
         action="store_true",
         help="Check if the UI server is running and exit",
     )
+    parser.add_argument(
+        "--version",
+        action="store_true",
+        help="Print the installed version and exit",
+    )
+    parser.add_argument(
+        "--check-update",
+        action="store_true",
+        help="Check for available updates and exit",
+    )
+    parser.add_argument(
+        "--update",
+        action="store_true",
+        help="Pull latest changes from origin and reinstall",
+    )
     args = parser.parse_args()
+
+    # -- Version mode --
+    if args.version:
+        from remind_me_mcp import __version__
+
+        print(f"remind-me-mcp {__version__}")
+        sys.exit(0)
+
+    # -- Check-update mode --
+    if args.check_update:
+        from remind_me_mcp.updater import check_for_update
+
+        status = check_for_update()
+        if status.error:
+            print(f"Error: {status.error}")
+            sys.exit(1)
+        print(f"Installed: {status.installed_version} (commit {status.local_commit})")
+        print(f"Remote:    commit {status.remote_commit}")
+        if status.update_available:
+            print(f"\nUpdate available — {status.commits_behind} commit(s) behind")
+            if status.commit_messages:
+                print("\nRecent changes:")
+                for msg in status.commit_messages[:10]:
+                    print(f"  {msg}")
+            print("\nRun 'remind-me-mcp --update' to apply.")
+        else:
+            print("\nUp to date.")
+        sys.exit(0)
+
+    # -- Update mode --
+    if args.update:
+        from remind_me_mcp.updater import check_for_update, perform_update
+
+        print("Checking for updates...")
+        status = check_for_update()
+        if status.error:
+            print(f"Error: {status.error}")
+            sys.exit(1)
+        if not status.update_available:
+            print(f"Already up to date at {status.installed_version} (commit {status.local_commit}).")
+            sys.exit(0)
+
+        print(f"Update available: {status.commits_behind} commit(s) behind")
+        print("Pulling and reinstalling...")
+        result = perform_update()
+        if not result.success:
+            print(f"Update failed: {result.error}")
+            sys.exit(1)
+        print(f"Updated: {result.previous_version} -> {result.new_version}")
+        print(f"Commits: {result.previous_commit} -> {result.new_commit}")
+        if result.restart_required:
+            print("\nRestart the MCP server for changes to take effect.")
+        sys.exit(0)
 
     # -- Status check mode --
     if args.status:

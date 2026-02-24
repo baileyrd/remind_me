@@ -23,7 +23,7 @@ semantic = [
 ]
 
 [project.scripts]
-remind-me-mcp = "remind_me_mcp:mcp.run"
+remind-me-mcp = "remind_me_mcp.__main__:main"
 
 [build-system]
 requires = ["hatchling"]

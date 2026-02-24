@@ -1,5 +1,5 @@
 """
-remind_me_mcp.tools — All 13 MCP tool handlers and 2 resource handlers.
+remind_me_mcp.tools — All 15 MCP tool handlers and 2 resource handlers.
 
 All handlers are registered on the `mcp` instance imported from server.py.
 This module imports mcp from server (not the other way around) to avoid
@@ -38,8 +38,32 @@ from remind_me_mcp.models import (
 )
 from remind_me_mcp.pid import get_server_status
 from remind_me_mcp.server import mcp
+from remind_me_mcp.updater import pop_update_notice
 
 log = logging.getLogger("remind_me_mcp.tools")
+
+
+# ---------------------------------------------------------------------------
+# Update notice helper
+# ---------------------------------------------------------------------------
+
+
+def _maybe_update_notice(response: str) -> str:
+    """Append a one-shot update notice to the response if available.
+
+    The notice fires once (on the first tool call after startup) then clears.
+
+    Args:
+        response: The original tool response string.
+
+    Returns:
+        The response, possibly with an appended update notice.
+    """
+    notice = pop_update_notice()
+    if notice:
+        return response + "\n\n---\n" + notice
+    return response
+
 
 # ---------------------------------------------------------------------------
 # Tool handlers
@@ -91,7 +115,7 @@ async def memory_add(params: MemoryAddInput) -> str:
         log.error("Database error adding memory: %s", e)
         return f"Error: Database operation failed — {e}"
     await asyncio.to_thread(_embed_and_store, db, mem_id, params.content)
-    return f"✓ Memory stored with id `{mem_id}` in category '{params.category}'."
+    return _maybe_update_notice(f"✓ Memory stored with id `{mem_id}` in category '{params.category}'.")
 
 
 @mcp.tool(
@@ -204,7 +228,7 @@ async def memory_search(params: MemorySearchInput) -> str:
             extras.append(f"distance: {dist:.3f}")
         parts.append(f"_{' · '.join(extras)}_\n")
 
-    return "\n---\n".join(parts)
+    return _maybe_update_notice("\n---\n".join(parts))
 
 
 @mcp.tool(
@@ -254,7 +278,7 @@ async def memory_list(params: MemoryListInput) -> str:
     ).fetchall()
     memories = [_row_to_dict(r) for r in rows]
 
-    return _fmt_memories(memories, params.response_format, total=total)
+    return _maybe_update_notice(_fmt_memories(memories, params.response_format, total=total))
 
 
 @mcp.tool(
@@ -509,7 +533,7 @@ async def memory_stats(params: MemoryStatsInput) -> str:
     lines.append("### Recent Memories")
     for r in data["recent"]:
         lines.append(f"- `{r['id']}` [{r['category']}] {r['preview']}…")
-    return "\n".join(lines)
+    return _maybe_update_notice("\n".join(lines))
 
 
 @mcp.tool(
@@ -814,6 +838,109 @@ async def remind_me_server_status() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Update tools
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool(
+    name="remind_me_check_update",
+    annotations={
+        "title": "Check for Updates",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def remind_me_check_update() -> str:
+    """Check if a newer version of remind-me-mcp is available on origin/main.
+
+    Fetches from the remote repository and compares commits. This is a
+    read-only operation — it does not modify any files.
+
+    Returns:
+        str: Markdown-formatted version status with commit comparison.
+    """
+    from remind_me_mcp.updater import check_for_update
+
+    status = await asyncio.to_thread(check_for_update)
+
+    if status.error:
+        return f"**Update check failed:** {status.error}"
+
+    lines = ["## remind-me-mcp Version Status\n"]
+    lines.append(f"**Installed version:** `{status.installed_version}`")
+    lines.append(f"**Local commit:** `{status.local_commit}`")
+    lines.append(f"**Remote commit:** `{status.remote_commit}`")
+
+    if status.update_available:
+        lines.append(
+            f"\n**Update available** — {status.commits_behind} "
+            f"commit{'s' if status.commits_behind != 1 else ''} behind"
+        )
+        if status.commit_messages:
+            lines.append("\n### Recent changes")
+            for msg in status.commit_messages[:10]:
+                lines.append(f"- `{msg}`")
+        lines.append(
+            "\nRun `remind_me_self_update` to pull and install the latest version."
+        )
+    else:
+        lines.append("\n**Up to date.**")
+
+    if status.repo_path:
+        lines.append(f"\n_Repository: `{status.repo_path}`_")
+
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    name="remind_me_self_update",
+    annotations={
+        "title": "Self-Update",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def remind_me_self_update(force: bool = False) -> str:
+    """Pull the latest changes from origin/main and reinstall the package.
+
+    Performs ``git pull --ff-only`` followed by ``pip install -e .``.
+    Refuses to run if the working tree has uncommitted changes, unless
+    ``force=True`` is passed.
+
+    After a successful update, the MCP server should be restarted for
+    changes to take effect.
+
+    Args:
+        force: Skip dirty-tree check if True. Defaults to False.
+
+    Returns:
+        str: Markdown-formatted result with version change and restart instructions.
+    """
+    from remind_me_mcp.updater import perform_update
+
+    result = await asyncio.to_thread(perform_update, force=force)
+
+    if not result.success:
+        return f"**Update failed:** {result.error}"
+
+    lines = ["## Update Successful\n"]
+    lines.append(f"**Previous:** `{result.previous_version}` (commit `{result.previous_commit}`)")
+    lines.append(f"**Updated to:** `{result.new_version}` (commit `{result.new_commit}`)")
+
+    if result.restart_required:
+        lines.append(
+            "\n**Restart required.** The MCP server must be restarted "
+            "for the new version to take effect."
+        )
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Resource handlers
 # ---------------------------------------------------------------------------
 
@@ -854,6 +981,8 @@ __all__ = [
     "remind_me_get_capture",
     "remind_me_reindex",
     "remind_me_server_status",
+    "remind_me_check_update",
+    "remind_me_self_update",
     "resource_stats",
     "resource_categories",
 ]

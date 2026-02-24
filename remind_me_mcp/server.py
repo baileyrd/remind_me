@@ -31,8 +31,9 @@ async def app_lifespan(app: FastMCP):
     """Open the database at startup and close it on shutdown.
 
     Passed as the lifespan argument to the FastMCP constructor. On startup,
-    opens the SQLite connection (triggering schema creation/migration) and
-    logs the database path. On shutdown (after yield), closes the connection.
+    opens the SQLite connection (triggering schema creation/migration),
+    logs the database path, and kicks off a background update check.
+    On shutdown (after yield), closes the connection.
 
     Args:
         app: The FastMCP application instance (unused, provided by the framework).
@@ -42,6 +43,11 @@ async def app_lifespan(app: FastMCP):
     """
     db = _get_db()
     log.info("Remind Me MCP started — db at %s", DB_PATH)
+
+    from remind_me_mcp.updater import start_background_check
+
+    start_background_check()
+
     yield {"db": db}
     _close_db()
 
