@@ -4,6 +4,14 @@ remind_me_mcp.db — Database connection, schema management, and helpers.
 All SQLite access goes through this module. The schema is created on first
 connection (via _ensure_schema). Vector embeddings are stored in a separate
 virtual table (memories_vec) when the sqlite-vec extension is available.
+
+Schema versioning uses PRAGMA user_version. Migrations are applied
+incrementally by _migrate_schema(), which is called at the end of
+_ensure_schema(). Each migration is idempotent and guarded by a version check.
+
+Current schema versions:
+  0 -> 1: Add capture_id column + index on memories table
+  1 -> 2: Add memory_tags junction table, indexes, and sync triggers
 """
 
 from __future__ import annotations
@@ -114,6 +122,143 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 
     db.commit()
 
+    # Apply incremental migrations to evolve the schema safely.
+    _migrate_schema(db)
+
+
+# ---------------------------------------------------------------------------
+# Schema migrations
+# ---------------------------------------------------------------------------
+
+# Current target schema version.  Increment when adding a new migration step.
+_SCHEMA_VERSION = 2
+
+
+def _migrate_schema(db: sqlite3.Connection) -> None:
+    """Apply incremental schema migrations using PRAGMA user_version.
+
+    Each migration step is guarded by a version check so that re-running this
+    function on an already-migrated database is a safe no-op (idempotent).
+
+    Migration history:
+      v0 -> v1: capture_id TEXT column + index on memories; backfill from metadata JSON.
+      v1 -> v2: memory_tags junction table, tag/memory indexes, sync triggers; backfill
+                from existing JSON tags column.
+
+    Args:
+        db: An open SQLite connection with row_factory=sqlite3.Row set.
+    """
+    current_version: int = db.execute("PRAGMA user_version").fetchone()[0]
+
+    if current_version < 1:
+        _migrate_v0_to_v1(db)
+        db.execute("PRAGMA user_version = 1")
+        current_version = 1
+
+    if current_version < 2:
+        _migrate_v1_to_v2(db)
+        db.execute("PRAGMA user_version = 2")
+        current_version = 2
+
+    db.commit()
+
+
+def _migrate_v0_to_v1(db: sqlite3.Connection) -> None:
+    """v0 -> v1: Add capture_id column and index; backfill from metadata JSON.
+
+    Uses ADD COLUMN in a try/except to handle the case where the column
+    already exists (making the operation idempotent).
+
+    Args:
+        db: An open SQLite connection.
+    """
+    # Add column — safe to re-run; SQLite raises OperationalError if it exists.
+    try:
+        db.execute("ALTER TABLE memories ADD COLUMN capture_id TEXT DEFAULT NULL")
+    except sqlite3.OperationalError:
+        pass  # Column already exists — skip silently.
+
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_memories_capture_id ON memories(capture_id)"
+    )
+
+    # Backfill capture_id from existing metadata JSON where the field is present.
+    db.execute(
+        """
+        UPDATE memories
+           SET capture_id = json_extract(metadata, '$.capture_id')
+         WHERE json_extract(metadata, '$.capture_id') IS NOT NULL
+           AND capture_id IS NULL
+        """
+    )
+
+
+def _migrate_v1_to_v2(db: sqlite3.Connection) -> None:
+    """v1 -> v2: Add memory_tags junction table, indexes, sync triggers; backfill.
+
+    Creates the memory_tags table that maps memory IDs to individual tag strings,
+    enabling efficient SQL-level tag filtering without JSON parsing. Three triggers
+    keep the junction table in sync with the JSON tags column on INSERT, UPDATE,
+    and DELETE.
+
+    Args:
+        db: An open SQLite connection.
+    """
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS memory_tags (
+            memory_id  TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+            tag        TEXT NOT NULL,
+            PRIMARY KEY (memory_id, tag)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_memory_tags_tag ON memory_tags(tag);
+
+        -- Keep memory_tags in sync when a memory is inserted.
+        -- json_valid() guard ensures malformed tags strings do not raise errors.
+        CREATE TRIGGER IF NOT EXISTS memories_tags_ai AFTER INSERT ON memories
+        BEGIN
+            INSERT OR IGNORE INTO memory_tags (memory_id, tag)
+            SELECT NEW.id, je.value
+              FROM json_each(NEW.tags) AS je
+             WHERE typeof(je.value) = 'text'
+               AND json_valid(NEW.tags);
+        END;
+
+        -- Keep memory_tags in sync when the tags column is updated.
+        CREATE TRIGGER IF NOT EXISTS memories_tags_au AFTER UPDATE OF tags ON memories
+        BEGIN
+            DELETE FROM memory_tags WHERE memory_id = OLD.id;
+            INSERT OR IGNORE INTO memory_tags (memory_id, tag)
+            SELECT NEW.id, je.value
+              FROM json_each(NEW.tags) AS je
+             WHERE typeof(je.value) = 'text'
+               AND json_valid(NEW.tags);
+        END;
+
+        -- Remove junction rows when a memory is deleted.
+        CREATE TRIGGER IF NOT EXISTS memories_tags_ad AFTER DELETE ON memories
+        BEGIN
+            DELETE FROM memory_tags WHERE memory_id = OLD.id;
+        END;
+    """)
+
+    # Backfill from existing JSON tags column for memories that pre-date the trigger.
+    rows = db.execute(
+        "SELECT id, tags FROM memories WHERE tags IS NOT NULL AND tags != '[]'"
+    ).fetchall()
+    for row in rows:
+        raw_tags = row["tags"]
+        try:
+            tags = json.loads(raw_tags) if isinstance(raw_tags, str) else raw_tags
+        except (json.JSONDecodeError, TypeError):
+            continue
+        for tag in tags:
+            if isinstance(tag, str):
+                db.execute(
+                    "INSERT OR IGNORE INTO memory_tags (memory_id, tag) VALUES (?, ?)",
+                    (row["id"], tag),
+                )
+
 
 # ---------------------------------------------------------------------------
 # Embedding helpers
@@ -209,6 +354,7 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
 __all__ = [
     "_get_db",
     "_ensure_schema",
+    "_migrate_schema",
     "_embed_and_store",
     "_semantic_search",
     "_now_iso",
