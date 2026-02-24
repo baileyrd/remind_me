@@ -367,8 +367,7 @@ def _background_check() -> None:
             )
             with _notice_lock:
                 _update_notice = "\n".join(parts)
-    except Exception:
-        # Background check should never crash the server
+    except Exception:  # Broad catch intentional: background check must never crash the server (graceful-degradation boundary)
         log.debug("Background update check failed", exc_info=True)
 
 

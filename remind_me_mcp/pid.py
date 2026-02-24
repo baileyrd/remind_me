@@ -99,7 +99,7 @@ def _check_ui_server_health(url: str) -> bool:
         req = urllib.request.Request(url + "/api/stats", method="GET")
         with urllib.request.urlopen(req, timeout=2) as resp:
             return resp.status == 200
-    except Exception:
+    except OSError:
         return False
 
 

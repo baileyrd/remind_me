@@ -79,7 +79,7 @@ class _Embedder:
                 e,
             )
             raise
-        except Exception as e:
+        except Exception as e:  # Broad catch intentional: ONNX Runtime raises non-stdlib exceptions (e.g., onnxruntime.capi.onnxruntime_pybind11_state.InvalidGraph)
             log.warning(
                 "Failed to load embedding model: %s. Semantic search unavailable.", e
             )
@@ -142,7 +142,7 @@ class _Embedder:
         try:
             self._ensure_loaded()
             return True
-        except Exception:
+        except Exception:  # Broad catch intentional: graceful-degradation boundary — returns False on any ONNX failure
             return False
 
 
@@ -161,7 +161,7 @@ def _get_embedder() -> _Embedder | None:
     try:
         _embedder._ensure_loaded()
         return _embedder
-    except Exception:
+    except Exception:  # Broad catch intentional: returns None on any ONNX load failure — caller checks None
         return None
 
 
