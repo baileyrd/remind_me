@@ -71,7 +71,12 @@ def _get_db() -> sqlite3.Connection:
 
 
 def _close_db() -> None:
-    """Close the singleton database connection. Called during shutdown."""
+    """Close the singleton database connection and reset it to None.
+
+    Safe to call if the connection has not been opened yet (no-op).
+    After this call, the next _get_db() invocation will open a fresh
+    connection. Used during application shutdown and in tests to reset state.
+    """
     global _db_connection
     if _db_connection is not None:
         _db_connection.close()
@@ -84,7 +89,17 @@ def _close_db() -> None:
 
 
 def _ensure_schema(db: sqlite3.Connection) -> None:
-    """Create tables, FTS virtual table, triggers, and indexes if absent."""
+    """Create tables, FTS virtual table, triggers, and indexes if absent.
+
+    Idempotent — safe to call on an existing database. Creates the memories
+    and chat_imports base tables, the FTS5 virtual table and its sync
+    triggers, the memories_vec vector table (if sqlite-vec is loaded), and
+    all required indexes. Calls _migrate_schema() at the end to apply any
+    pending incremental migrations.
+
+    Args:
+        db: An open SQLite connection to configure.
+    """
     db.executescript("""
         CREATE TABLE IF NOT EXISTS memories (
             id          TEXT PRIMARY KEY,
@@ -290,7 +305,20 @@ def _migrate_v1_to_v2(db: sqlite3.Connection) -> None:
 
 
 def _embed_and_store(db: sqlite3.Connection, memory_id: str, content: str) -> bool:
-    """Generate embedding for content and store in vector table. Returns True on success."""
+    """Generate embedding for content and store in the vector table.
+
+    Looks up the memory's rowid, generates a float32 embedding vector via the
+    ONNX engine, and upserts it into memories_vec. If the embedder is
+    unavailable or the vector table is missing, returns False silently.
+
+    Args:
+        db: An open SQLite connection with the memories_vec virtual table.
+        memory_id: The text primary key of the memory to embed.
+        content: The text content to embed (truncated to 2000 chars).
+
+    Returns:
+        True if the embedding was stored successfully, False otherwise.
+    """
     embedder = _get_embedder()
     if embedder is None:
         return False
@@ -320,7 +348,22 @@ def _embed_and_store(db: sqlite3.Connection, memory_id: str, content: str) -> bo
 def _semantic_search(
     db: sqlite3.Connection, query: str, limit: int = 20
 ) -> list[dict]:
-    """Search memories by semantic similarity. Returns list of dicts with 'distance' added."""
+    """Search memories by semantic similarity using the vector index.
+
+    Embeds the query text and performs an approximate nearest-neighbour
+    search against the memories_vec virtual table. Results include a
+    'semantic_distance' key (lower = more similar). Returns an empty list
+    if the embedder is unavailable or the vector table does not exist.
+
+    Args:
+        db: An open SQLite connection with the memories_vec virtual table.
+        query: The search query text to embed and compare.
+        limit: Maximum number of results to return.
+
+    Returns:
+        List of memory dicts (from _row_to_dict) with an added
+        'semantic_distance' float field, sorted by distance ascending.
+    """
     embedder = _get_embedder()
     if embedder is None:
         return []
@@ -355,7 +398,12 @@ def _semantic_search(
 
 
 def _now_iso() -> str:
-    """Return current UTC time as ISO 8601 string."""
+    """Return the current UTC time as an ISO 8601 string.
+
+    Returns:
+        ISO 8601 formatted datetime string with timezone offset, e.g.
+        '2024-01-15T12:34:56.789012+00:00'.
+    """
     return datetime.now(timezone.utc).isoformat()
 
 
@@ -379,7 +427,19 @@ def _make_id(content: str) -> str:
 
 
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
-    """Convert a sqlite3.Row to a plain dict, deserializing JSON fields."""
+    """Convert a sqlite3.Row to a plain dict, deserializing JSON fields.
+
+    Parses the 'tags', 'metadata', and 'stats' columns from their JSON string
+    representations into Python objects. Malformed JSON fields are left as-is
+    (logged at DEBUG level).
+
+    Args:
+        row: A sqlite3.Row from the memories or chat_imports table.
+
+    Returns:
+        A plain dict with all columns from the row, with JSON string fields
+        parsed into their corresponding Python types.
+    """
     d = dict(row)
     for key in ("tags", "metadata", "stats"):
         if key in d and isinstance(d[key], str):

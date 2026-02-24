@@ -26,7 +26,16 @@ log = logging.getLogger("remind_me_mcp.embeddings")
 class _Embedder:
     """Lightweight ONNX-based embedding engine. Downloads model on first use."""
 
-    def __init__(self, model_name: str = EMBEDDING_MODEL, dim: int = EMBEDDING_DIM):
+    def __init__(self, model_name: str = EMBEDDING_MODEL, dim: int = EMBEDDING_DIM) -> None:
+        """Initialise the embedder with model configuration.
+
+        The model is not loaded at construction time — loading is deferred
+        to the first call to embed() or embed_one() via _ensure_loaded().
+
+        Args:
+            model_name: HuggingFace model repository name or local path.
+            dim: Expected output embedding dimension (must match the model).
+        """
         self.model_name = model_name
         self.dim = dim
         self._session = None
@@ -77,7 +86,18 @@ class _Embedder:
             raise
 
     def embed(self, texts: list[str]) -> np.ndarray:
-        """Embed a batch of texts. Returns (N, dim) float32 array, L2-normalized."""
+        """Embed a batch of texts using the ONNX model.
+
+        Tokenizes the texts, runs a forward pass through the ONNX session,
+        applies mean pooling over token embeddings, and L2-normalises the
+        result so cosine similarity equals dot product.
+
+        Args:
+            texts: List of strings to embed (will be truncated to 256 tokens).
+
+        Returns:
+            Float32 numpy array of shape (N, dim), L2-normalised.
+        """
         self._ensure_loaded()
         encoded = self._tokenizer.encode_batch(texts)
         input_ids = np.array([e.ids for e in encoded], dtype=np.int64)
@@ -100,7 +120,19 @@ class _Embedder:
         return (pooled / norms).astype(np.float32)
 
     def embed_one(self, text: str) -> bytes:
-        """Embed a single text and return as bytes for sqlite-vec."""
+        """Embed a single text and return the vector as raw bytes.
+
+        Convenience wrapper around embed() that packs the float32 numpy
+        array into bytes for direct insertion into the sqlite-vec virtual
+        table (which expects struct-packed float32 blobs).
+
+        Args:
+            text: The text to embed.
+
+        Returns:
+            Raw bytes of the float32 embedding vector, suitable for
+            insertion into a sqlite-vec embedding column.
+        """
         vec = self.embed([text])[0]
         return vec.tobytes()
 

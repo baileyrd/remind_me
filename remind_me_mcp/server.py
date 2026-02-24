@@ -27,8 +27,19 @@ log = logging.getLogger("remind_me_mcp.server")
 
 
 @asynccontextmanager
-async def app_lifespan(app):
-    """Open the database at startup and close it on shutdown."""
+async def app_lifespan(app: FastMCP):
+    """Open the database at startup and close it on shutdown.
+
+    Passed as the lifespan argument to the FastMCP constructor. On startup,
+    opens the SQLite connection (triggering schema creation/migration) and
+    logs the database path. On shutdown (after yield), closes the connection.
+
+    Args:
+        app: The FastMCP application instance (unused, provided by the framework).
+
+    Yields:
+        Dict with key 'db' containing the open sqlite3.Connection.
+    """
     db = _get_db()
     log.info("Remind Me MCP started — db at %s", DB_PATH)
     yield {"db": db}

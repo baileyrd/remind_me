@@ -70,8 +70,17 @@ def _build_dashboard_html() -> str:
 # ---------------------------------------------------------------------------
 
 
-def _build_api_app():
-    """Build a Starlette ASGI app that exposes the memory DB as a REST API."""
+def _build_api_app() -> "Starlette":
+    """Build a Starlette ASGI app that exposes the memory DB as a REST API.
+
+    All Starlette imports are kept local to this function so the module can
+    be imported without loading the web framework (used in MCP stdio mode).
+    Includes CORS middleware allowing all origins for dashboard access.
+
+    Returns:
+        A configured Starlette application with REST routes for memory CRUD,
+        search, import, stats, and the dashboard UI.
+    """
     from starlette.applications import Starlette
     from starlette.middleware import Middleware
     from starlette.middleware.cors import CORSMiddleware
@@ -89,6 +98,7 @@ def _build_api_app():
     # -- routes --
 
     async def api_stats(request: Request) -> JSONResponse:
+        """Return aggregate statistics about the memory store."""
         db = _get_db()
         total = db.execute("SELECT COUNT(*) as cnt FROM memories").fetchone()["cnt"]
         categories = db.execute(
@@ -116,6 +126,7 @@ def _build_api_app():
         })
 
     async def api_list(request: Request) -> JSONResponse:
+        """List memories with optional category, source, and tag filters."""
         db = _get_db()
         params = request.query_params
         conditions: list[str] = []
@@ -158,6 +169,7 @@ def _build_api_app():
         })
 
     async def api_search(request: Request) -> JSONResponse:
+        """Full-text search memories using FTS5 with optional category/tag filters."""
         import sqlite3 as _sqlite3
 
         db = _get_db()
@@ -189,6 +201,7 @@ def _build_api_app():
         return _json_ok({"count": len(memories), "memories": memories})
 
     async def api_get(request: Request) -> JSONResponse:
+        """Retrieve a single memory by its ID."""
         db = _get_db()
         memory_id = request.path_params["memory_id"]
         row = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
@@ -197,6 +210,7 @@ def _build_api_app():
         return _json_ok(_row_to_dict(row))
 
     async def api_add(request: Request) -> JSONResponse:
+        """Create a new memory from a JSON request body."""
         try:
             body = await request.json()
         except (json.JSONDecodeError, TypeError, ValueError) as e:
@@ -224,6 +238,7 @@ def _build_api_app():
         return _json_ok(_row_to_dict(row), status=201)
 
     async def api_update(request: Request) -> JSONResponse:
+        """Update fields on an existing memory by its ID."""
         memory_id = request.path_params["memory_id"]
         try:
             body = await request.json()
@@ -261,6 +276,7 @@ def _build_api_app():
         return _json_ok(_row_to_dict(updated))
 
     async def api_delete(request: Request) -> JSONResponse:
+        """Permanently delete a memory by its ID."""
         memory_id = request.path_params["memory_id"]
         db = _get_db()
         result = db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
@@ -270,6 +286,7 @@ def _build_api_app():
         return _json_ok({"deleted": memory_id})
 
     async def api_import(request: Request) -> JSONResponse:
+        """Import a chat export file or directory into the memory store."""
         try:
             body = await request.json()
         except (json.JSONDecodeError, TypeError, ValueError) as e:

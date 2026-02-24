@@ -24,7 +24,16 @@ log = logging.getLogger("remind_me_mcp.pid")
 
 
 def _read_pid_file() -> dict[str, Any] | None:
-    """Read the PID file to check if a UI server is running."""
+    """Read the PID file and verify the recorded process is still alive.
+
+    Checks whether the process listed in the PID file is running via
+    os.kill(pid, 0). Removes stale or malformed PID files automatically.
+
+    Returns:
+        The parsed PID file dict (with keys pid, host, port, url,
+        started_at) if the server is running, or None if no server is
+        running or the PID file is stale/missing/malformed.
+    """
     if not PID_FILE.exists():
         return None
     try:
@@ -46,7 +55,15 @@ def _read_pid_file() -> dict[str, Any] | None:
 
 
 def _write_pid_file(host: str, port: int) -> None:
-    """Write PID file when UI server starts."""
+    """Write a JSON PID file recording the current process and server address.
+
+    Called immediately after the UI server starts. The file is used by
+    _read_pid_file() and _check_ui_server_health() to detect running instances.
+
+    Args:
+        host: The hostname or IP address the server is bound to.
+        port: The TCP port the server is listening on.
+    """
     PID_FILE.write_text(json.dumps({
         "pid": os.getpid(),
         "host": host,
@@ -57,12 +74,26 @@ def _write_pid_file(host: str, port: int) -> None:
 
 
 def _remove_pid_file() -> None:
-    """Clean up PID file on shutdown."""
+    """Remove the PID file on server shutdown.
+
+    Safe to call even if the file does not exist (missing_ok=True).
+    Registered as an atexit handler and SIGTERM/SIGINT handler in __main__.py.
+    """
     PID_FILE.unlink(missing_ok=True)
 
 
 def _check_ui_server_health(url: str) -> bool:
-    """Quick check if the UI server is actually responding."""
+    """Perform a quick HTTP health check against the UI server.
+
+    Sends a GET request to {url}/api/stats with a 2-second timeout.
+    Used to distinguish a live server from a stale PID file.
+
+    Args:
+        url: Base URL of the dashboard server, e.g. 'http://127.0.0.1:5199'.
+
+    Returns:
+        True if the server responds with HTTP 200, False otherwise.
+    """
     import urllib.request
     try:
         req = urllib.request.Request(url + "/api/stats", method="GET")
@@ -73,7 +104,16 @@ def _check_ui_server_health(url: str) -> bool:
 
 
 def get_server_status() -> dict[str, Any]:
-    """Get the current status of all running instances."""
+    """Get the current status of the UI dashboard server.
+
+    Combines PID file inspection and an HTTP health check to determine
+    whether the server is actually running and responding.
+
+    Returns:
+        Dict with keys: ui_server ('running' or 'stopped'), ui_url,
+        db_path, db_exists. Running instances also include ui_pid and
+        ui_started.
+    """
     info = _read_pid_file()
     if info and _check_ui_server_health(info.get("url", "")):
         return {

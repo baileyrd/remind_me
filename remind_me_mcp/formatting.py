@@ -21,7 +21,19 @@ log = logging.getLogger("remind_me_mcp.formatting")
 
 
 def _fmt_memory_md(m: dict) -> str:
-    """Render a single memory dict as a Markdown block."""
+    """Render a single memory dict as a Markdown block.
+
+    Produces a formatted section with the memory's ID, category, tags,
+    source, metadata, timestamps, and content (truncated at 2000 chars).
+
+    Args:
+        m: A memory dict as returned by _row_to_dict, with keys id,
+           category, tags, source, metadata, created_at, updated_at,
+           and content.
+
+    Returns:
+        A multi-line Markdown string ending with a blank line.
+    """
     tags = ", ".join(m.get("tags", [])) if m.get("tags") else "none"
     meta = m.get("metadata", {})
     meta_str = ", ".join(f"{k}={v}" for k, v in meta.items()) if meta else ""

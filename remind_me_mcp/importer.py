@@ -24,7 +24,18 @@ log = logging.getLogger("remind_me_mcp.importer")
 
 
 def _file_hash(path: str) -> str:
-    """Compute a short SHA-256 hash of a file's contents for deduplication."""
+    """Compute a short SHA-256 hash of a file's raw bytes for deduplication.
+
+    Reads the file in 8 KiB chunks to avoid loading large files into memory.
+    The returned hash is used as the key in the chat_imports table to detect
+    re-imports of the same file content, regardless of filename.
+
+    Args:
+        path: Absolute or relative path to the file to hash.
+
+    Returns:
+        First 16 hex characters of the SHA-256 digest (64-bit fingerprint).
+    """
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(8192), b""):
@@ -33,7 +44,19 @@ def _file_hash(path: str) -> str:
 
 
 def _chunk_text(text: str, max_len: int) -> list[str]:
-    """Split text into chunks, preferring paragraph boundaries."""
+    """Split text into chunks at natural boundaries, preferring paragraphs.
+
+    Tries to break at paragraph boundaries (double newline), then single
+    newlines, then sentence boundaries ('. '), and falls back to a hard
+    character cut if no boundary is found within max_len.
+
+    Args:
+        text: The text to split into chunks.
+        max_len: Maximum number of characters per chunk.
+
+    Returns:
+        List of non-empty stripped text chunks, each at most max_len chars.
+    """
     if len(text) <= max_len:
         return [text]
     chunks = []
@@ -57,13 +80,22 @@ def _chunk_text(text: str, max_len: int) -> list[str]:
 
 
 def _extract_messages_from_json(data: Any, extract_mode: str) -> list[dict[str, str]]:
-    """
+    """Extract a flat list of {role, content} messages from JSON data.
+
     Handles various JSON shapes:
       - List of {role, content} messages
       - Dict with 'messages' key
       - Claude export format with 'chat_messages' containing 'content' arrays
-      - List of conversations
-    Returns list of dicts with 'role' and 'content' keys.
+      - List of conversations (each containing 'messages' or 'chat_messages')
+
+    Args:
+        data: Parsed JSON value — may be a list, dict, or nested structure.
+        extract_mode: Message extraction strategy (passed through to recursive
+            calls; not used directly in this function).
+
+    Returns:
+        List of dicts with 'role' and 'content' string keys. Empty list if
+        no recognisable message structure is found.
     """
     messages: list[dict[str, str]] = []
 
@@ -116,7 +148,18 @@ def _extract_messages_from_json(data: Any, extract_mode: str) -> list[dict[str, 
 
 
 def _filter_messages(messages: list[dict[str, str]], mode: str) -> list[str]:
-    """Filter messages based on extract_mode and return content strings."""
+    """Filter and format messages according to the extraction mode.
+
+    Args:
+        messages: List of {role, content} dicts as returned by
+            _extract_messages_from_json.
+        mode: One of 'assistant_messages', 'user_messages', 'all_messages',
+            'conversations', or 'summaries'. Any other value returns all
+            content strings.
+
+    Returns:
+        List of content strings ready for chunking and storage.
+    """
     if mode == "assistant_messages":
         return [m["content"] for m in messages if m["role"] in ("assistant", "bot")]
     elif mode == "user_messages":
@@ -133,7 +176,19 @@ def _filter_messages(messages: list[dict[str, str]], mode: str) -> list[str]:
 
 
 def _parse_markdown_chat(text: str, extract_mode: str) -> list[str]:
-    """Parse markdown-formatted chat exports."""
+    """Parse markdown-formatted chat exports into content strings.
+
+    Detects common role heading patterns (## Human, **Assistant:**, etc.)
+    and splits the text into labeled message segments. Falls back to
+    treating the entire file as a single memory if no structure is found.
+
+    Args:
+        text: Raw markdown text from the chat export file.
+        extract_mode: Passed to _filter_messages to select which roles to keep.
+
+    Returns:
+        List of content strings extracted according to extract_mode.
+    """
     # Common patterns: "## Human", "## Assistant", "**User:**", etc.
     pattern = re.compile(
         r"(?:^|\n)(?:#{1,3}\s*|(?:\*\*))?(Human|User|Assistant|Claude|Bot|System)(?:\*\*)?[:\s]*\n?",
@@ -168,7 +223,27 @@ def import_chat_file(
     extract_mode: str,
     max_length: int,
 ) -> dict[str, Any]:
-    """Import a single chat export file. Returns stats dict."""
+    """Import a single chat export file into the memory store.
+
+    Parses the file based on its extension (.json, .jsonl, .md/.markdown/.txt),
+    extracts messages according to extract_mode, chunks them, and stores each
+    chunk as a separate memory. Deduplicates by file hash — if the same file
+    content has already been imported, returns a 'skipped' result immediately.
+
+    Args:
+        file_path: Path to the chat export file.
+        category: Category to assign to all imported memories.
+        tags: Tags to apply to all imported memories.
+        extract_mode: Message extraction strategy (e.g., 'assistant_messages').
+        max_length: Maximum characters per memory chunk.
+
+    Returns:
+        A status dict. On success: {'status': 'ok', 'import_id': str,
+        'memories_created': int, 'raw_entries': int, 'file': str}.
+        On skip: {'status': 'skipped', 'reason': str, 'file': str,
+        'import_id': str}. On unsupported format: {'status': 'error',
+        'reason': str, 'file': str}.
+    """
     path = Path(file_path)
     fhash = _file_hash(file_path)
     db = _get_db()
