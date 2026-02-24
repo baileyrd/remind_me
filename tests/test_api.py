@@ -47,6 +47,25 @@ def client(db_conn, monkeypatch):
     return TestClient(app)
 
 
+@pytest.fixture()
+def client_with_auth(db_conn, monkeypatch):
+    """Build a Starlette TestClient with API key authentication enabled.
+
+    Patches API_KEY to 'test-secret-key' in both config and api modules,
+    then rebuilds the app so BearerAuthMiddleware picks up the key.
+    """
+    import remind_me_mcp.api as _api_mod
+    import remind_me_mcp.config as _cfg
+    import remind_me_mcp.importer as _importer_mod
+
+    monkeypatch.setattr(_importer_mod, "_get_db", lambda: db_conn)
+    monkeypatch.setattr(_cfg, "API_KEY", "test-secret-key")
+    monkeypatch.setattr(_api_mod, "API_KEY", "test-secret-key")
+
+    app = _build_api_app()
+    return TestClient(app)
+
+
 # ---------------------------------------------------------------------------
 # Dashboard / index
 # ---------------------------------------------------------------------------
@@ -530,3 +549,67 @@ def test_import_custom_roots(client: TestClient, monkeypatch, tmp_path: Path) ->
     r = client.post("/api/import", json={"file_path": str(Path.home() / "some_file.txt")})
     assert r.status_code == 400
     assert "not in allowed" in r.json()["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# SEC-03: Optional Bearer token authentication
+# ---------------------------------------------------------------------------
+
+
+def test_api_requires_auth_when_key_set(client_with_auth: TestClient) -> None:
+    """SEC-03: /api/* routes return 401 when API key is set but no token provided."""
+    r = client_with_auth.get("/api/stats")
+    assert r.status_code == 401
+    assert r.json()["error"] == "Unauthorized"
+
+
+def test_api_rejects_wrong_token(client_with_auth: TestClient) -> None:
+    """SEC-03: /api/* routes return 401 with an incorrect Bearer token."""
+    r = client_with_auth.get("/api/stats", headers={"Authorization": "Bearer wrong-key"})
+    assert r.status_code == 401
+
+
+def test_api_accepts_valid_token(client_with_auth: TestClient) -> None:
+    """SEC-03: /api/* routes return 200 with correct Bearer token."""
+    r = client_with_auth.get("/api/stats", headers={"Authorization": "Bearer test-secret-key"})
+    assert r.status_code == 200
+
+
+def test_dashboard_accessible_without_auth(client_with_auth: TestClient) -> None:
+    """SEC-03: Dashboard route (/) is not gated by auth — accessible without token."""
+    r = client_with_auth.get("/")
+    assert r.status_code == 200
+    assert "text/html" in r.headers["content-type"]
+
+
+def test_api_open_when_no_key_configured(client: TestClient) -> None:
+    """SEC-03: When API_KEY is None (default), all routes are open without auth."""
+    r = client.get("/api/stats")
+    assert r.status_code == 200
+
+
+def test_auth_does_not_block_cors_preflight(client_with_auth: TestClient) -> None:
+    """SEC-03: CORS preflight OPTIONS from localhost should succeed even with auth enabled."""
+    r = client_with_auth.options("/api/stats", headers={
+        "Origin": "http://localhost:5199",
+        "Access-Control-Request-Method": "GET",
+        "Access-Control-Request-Headers": "Authorization",
+    })
+    # CORS middleware handles OPTIONS before auth — should return 200 with CORS headers
+    assert r.status_code == 200
+    assert "access-control-allow-origin" in r.headers
+
+
+def test_auth_protects_all_api_routes(client_with_auth: TestClient) -> None:
+    """SEC-03: POST, PUT, DELETE on /api/* all require auth."""
+    # POST /api/memories
+    r = client_with_auth.post("/api/memories", json={"content": "test"})
+    assert r.status_code == 401
+
+    # POST /api/import
+    r = client_with_auth.post("/api/import", json={"file_path": "/tmp/test.json"})
+    assert r.status_code == 401
+
+    # DELETE /api/memories/fake-id
+    r = client_with_auth.delete("/api/memories/fake-id")
+    assert r.status_code == 401
