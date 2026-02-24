@@ -204,6 +204,7 @@ def import_chat_file(
                 msgs = _extract_messages_from_json(obj, extract_mode)
                 contents.extend(_filter_messages(msgs, extract_mode))
             except json.JSONDecodeError:
+                log.debug("Skipping malformed JSONL line")
                 continue
     elif suffix in (".md", ".markdown", ".txt"):
         contents = _parse_markdown_chat(raw, extract_mode)

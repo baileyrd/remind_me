@@ -57,10 +57,13 @@ def _get_db() -> sqlite3.Connection:
     try:
         import sqlite_vec
         db.enable_load_extension(True)
-        sqlite_vec.load(db)
+        try:
+            sqlite_vec.load(db)
+        except sqlite3.OperationalError as e:
+            log.debug("sqlite-vec extension load failed: %s (vector search disabled)", e)
         db.enable_load_extension(False)
-    except (ImportError, Exception) as e:
-        log.debug("sqlite-vec not available: %s (vector search disabled)", e)
+    except ImportError as e:
+        log.debug("sqlite-vec not installed: %s (vector search disabled)", e)
 
     _ensure_schema(db)
     _db_connection = db
@@ -138,8 +141,8 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
             f"CREATE VIRTUAL TABLE IF NOT EXISTS memories_vec "
             f"USING vec0(embedding float[{EMBEDDING_DIM}])"
         )
-    except Exception:
-        pass  # sqlite-vec not available
+    except sqlite3.OperationalError as e:
+        log.debug("sqlite-vec virtual table not available: %s", e)
 
     db.commit()
 
@@ -306,8 +309,11 @@ def _embed_and_store(db: sqlite3.Connection, memory_id: str, content: str) -> bo
         )
         db.commit()
         return True
-    except Exception as e:
-        log.debug("Failed to embed memory %s: %s", memory_id, e)
+    except sqlite3.OperationalError as e:
+        log.warning("Database error storing embedding for %s: %s", memory_id, e)
+        return False
+    except (ValueError, TypeError) as e:
+        log.warning("Embedding computation failed for %s: %s", memory_id, e)
         return False
 
 
@@ -335,8 +341,11 @@ def _semantic_search(
             d["semantic_distance"] = d.pop("distance", None)
             results.append(d)
         return results
-    except Exception as e:
-        log.debug("Semantic search failed: %s", e)
+    except sqlite3.OperationalError as e:
+        log.warning("Database error during semantic search: %s", e)
+        return []
+    except (ValueError, TypeError) as e:
+        log.warning("Embedding error during semantic search: %s", e)
         return []
 
 
@@ -364,7 +373,7 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
             try:
                 d[key] = json.loads(d[key])
             except json.JSONDecodeError:
-                pass
+                log.debug("Malformed JSON in field %s: %r", key, d[key])
     return d
 
 

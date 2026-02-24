@@ -103,8 +103,8 @@ def _build_api_app():
             try:
                 for t in json.loads(row["tags"]):
                     all_tags[t] = all_tags.get(t, 0) + 1
-            except (json.JSONDecodeError, TypeError):
-                pass
+            except (json.JSONDecodeError, TypeError) as e:
+                log.debug("Malformed tags field skipped during stats aggregation: %s", e)
         return _json_ok({
             "total": total,
             "imports": imports,
@@ -199,8 +199,8 @@ def _build_api_app():
     async def api_add(request: Request) -> JSONResponse:
         try:
             body = await request.json()
-        except Exception:
-            return _json_err("Invalid JSON body")
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            return _json_err(f"Invalid JSON body: {e}")
 
         content = body.get("content", "").strip()
         if not content:
@@ -227,8 +227,8 @@ def _build_api_app():
         memory_id = request.path_params["memory_id"]
         try:
             body = await request.json()
-        except Exception:
-            return _json_err("Invalid JSON body")
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            return _json_err(f"Invalid JSON body: {e}")
 
         db = _get_db()
         row = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
@@ -272,8 +272,8 @@ def _build_api_app():
     async def api_import(request: Request) -> JSONResponse:
         try:
             body = await request.json()
-        except Exception:
-            return _json_err("Invalid JSON body")
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            return _json_err(f"Invalid JSON body: {e}")
 
         file_path = body.get("file_path", "").strip()
         if not file_path:
@@ -298,7 +298,8 @@ def _build_api_app():
                     try:
                         r = import_chat_file(str(f), category, tags, extract_mode, max_length)
                         results.append(r)
-                    except Exception as e:
+                    except (json.JSONDecodeError, UnicodeDecodeError, FileNotFoundError, OSError) as e:
+                        log.warning("Failed to import %s: %s", f.name, e)
                         results.append({"status": "error", "file": f.name, "error": str(e)})
                 ok = [r for r in results if r.get("status") == "ok"]
                 skipped = [r for r in results if r.get("status") == "skipped"]
@@ -315,7 +316,8 @@ def _build_api_app():
                 # Single file import
                 result = import_chat_file(str(p), category, tags, extract_mode, max_length)
                 return _json_ok(result)
-        except Exception as e:
+        except (FileNotFoundError, OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
+            log.error("Import failed for %s: %s", file_path, e)
             return _json_err(f"Import error: {e}")
 
     async def index(request: Request) -> HTMLResponse:

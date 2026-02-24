@@ -129,9 +129,9 @@ async def memory_search(params: MemorySearchInput) -> str:
             (params.query, params.limit),
         ).fetchall()
         fts_memories = [_row_to_dict(r) for r in rows]
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as e:
         # FTS query syntax error — fall through to semantic-only
-        pass
+        log.warning("FTS5 query syntax error for query %r: %s", params.query, e)
 
     # --- Semantic vector search ---
     sem_memories = await asyncio.to_thread(_semantic_search, db, params.query, limit=params.limit)
@@ -429,7 +429,8 @@ async def memory_import_directory(params: BulkImportDirInput) -> str:
                 max_length=params.max_length,
             )
             results.append(r)
-        except Exception as e:
+        except (json.JSONDecodeError, UnicodeDecodeError, FileNotFoundError, OSError) as e:
+            log.warning("Failed to import %s: %s", f.name, e)
             results.append({"status": "error", "file": f.name, "error": str(e)})
 
     ok = [r for r in results if r.get("status") == "ok"]
@@ -730,8 +731,8 @@ async def remind_me_reindex() -> str:
     try:
         vec_rows = db.execute("SELECT rowid FROM memories_vec").fetchall()
         existing_vecs = {r[0] for r in vec_rows}
-    except Exception:
-        pass
+    except sqlite3.OperationalError as e:
+        log.debug("memories_vec table not available: %s", e)
 
     missing = [(r["id"], r["rowid"], r["content"]) for r in all_rows if r["rowid"] not in existing_vecs]
 
@@ -744,8 +745,8 @@ async def remind_me_reindex() -> str:
             vec_bytes = await asyncio.to_thread(embedder.embed_one, content[:2000])
             db.execute("INSERT OR REPLACE INTO memories_vec(rowid, embedding) VALUES (?, ?)", (rowid, vec_bytes))
             created += 1
-        except Exception as e:
-            log.debug("Failed to embed %s: %s", mem_id, e)
+        except (sqlite3.OperationalError, ValueError, TypeError) as e:
+            log.warning("Failed to embed %s: %s", mem_id, e)
 
     db.commit()
     return (
@@ -800,7 +801,8 @@ async def remind_me_server_status() -> str:
         total_mems = db.execute("SELECT COUNT(*) as cnt FROM memories").fetchone()["cnt"]
         try:
             total_vecs = db.execute("SELECT COUNT(*) as cnt FROM memories_vec").fetchone()["cnt"]
-        except Exception:
+        except sqlite3.OperationalError as e:
+            log.debug("memories_vec table not available for status check: %s", e)
             total_vecs = 0
         lines.append(f"\n**Semantic search:** ✓ Enabled ({EMBEDDING_MODEL})")
         lines.append(f"**Embeddings:** {total_vecs}/{total_mems} memories indexed")
