@@ -377,3 +377,42 @@ def test_api_crud_cycle(client: TestClient) -> None:
     # GET: verify 404 after deletion
     final_response = client.get(f"/api/memories/{mem_id}")
     assert final_response.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Regression test — DATA-02: API tag-filtered pagination
+# ---------------------------------------------------------------------------
+
+
+def test_api_list_tag_filter_pagination(
+    client: TestClient,
+    memory_factory,
+) -> None:
+    """DATA-02 regression: GET /api/memories?tags=alpha&limit=5 returns exactly 5
+    memories all tagged 'alpha', not 5 pre-filter rows with fewer tagged results.
+
+    Creates 10 memories with tag 'alpha' and 10 without.  With the bug fixed, tag
+    filtering happens in SQL before LIMIT, so the response contains exactly 5 'alpha'
+    memories regardless of insertion order.
+    """
+    # Create 10 tagged and 10 untagged memories
+    for i in range(10):
+        memory_factory(content=f"API alpha tagged memory {i} unique content", tags=["alpha"])
+    for i in range(10):
+        memory_factory(content=f"API untagged memory {i} unique content", tags=[])
+
+    response = client.get("/api/memories?tags=alpha&limit=5")
+    assert response.status_code == 200
+    data = response.json()
+
+    # Must return exactly 5 results (not fewer due to Python post-filter)
+    assert data["count"] == 5, (
+        f"Expected exactly 5 results with tags=alpha limit=5, got {data['count']}. "
+        f"This indicates tag filtering still happens in Python after LIMIT."
+    )
+
+    # All returned memories must have the 'alpha' tag
+    for mem in data["memories"]:
+        assert "alpha" in mem["tags"], (
+            f"Memory {mem['id']} does not have 'alpha' tag: {mem['tags']}"
+        )

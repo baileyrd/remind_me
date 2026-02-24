@@ -8,6 +8,8 @@ _file_hash which reads from disk (tmp_path used for isolation).
 
 from __future__ import annotations
 
+import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -18,6 +20,7 @@ from remind_me_mcp.importer import (
     _file_hash,
     _filter_messages,
     _parse_markdown_chat,
+    import_chat_file,
 )
 
 
@@ -297,3 +300,69 @@ def test_file_hash_returns_16_chars(tmp_path: Path) -> None:
     result = _file_hash(str(f))
     assert len(result) == 16
     assert all(c in "0123456789abcdef" for c in result)
+
+
+# ---------------------------------------------------------------------------
+# Regression test — BUGF-01: import embedding ID matches INSERT ID
+# ---------------------------------------------------------------------------
+
+
+def test_import_embed_id_matches_insert_id(
+    db_conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """BUGF-01 regression: _embed_and_store is called with the exact mem_id
+    that was used in the INSERT statement.
+
+    Before the fix, the embedding loop recomputed a different ID via
+    ``hashlib.sha256(f"{chunk}{now}").hexdigest()[:12]``, causing a mismatch
+    between the memories row id and the embedding rowid.  After the fix, both
+    loops iterate the same (mem_id, chunk) pairs collected during INSERT.
+    """
+    import remind_me_mcp.importer as _importer_mod
+
+    # Spy: record every (memory_id, content) pair passed to _embed_and_store
+    embedded_ids: list[str] = []
+
+    def fake_embed_and_store(db, memory_id: str, content: str) -> None:
+        embedded_ids.append(memory_id)
+
+    monkeypatch.setattr(_importer_mod, "_embed_and_store", fake_embed_and_store)
+
+    # Write a small chat JSON file with two assistant messages
+    data = {
+        "chat_messages": [
+            {
+                "sender": "assistant",
+                "content": [{"type": "text", "text": "First unique content for BUGF-01 test."}],
+            },
+            {
+                "sender": "assistant",
+                "content": [{"type": "text", "text": "Second unique content for BUGF-01 test."}],
+            },
+        ]
+    }
+    chat_file = tmp_path / "bugf01_test.json"
+    chat_file.write_text(json.dumps(data))
+
+    result = import_chat_file(
+        file_path=str(chat_file),
+        category="test",
+        tags=[],
+        extract_mode="assistant_messages",
+        max_length=10000,
+    )
+    assert result["status"] == "ok"
+    assert result["memories_created"] >= 1
+
+    # Every ID passed to _embed_and_store must exist in the memories table
+    assert len(embedded_ids) >= 1, "Expected at least one embedding call"
+    for mem_id in embedded_ids:
+        row = db_conn.execute(
+            "SELECT id FROM memories WHERE id = ?", (mem_id,)
+        ).fetchone()
+        assert row is not None, (
+            f"_embed_and_store was called with mem_id={mem_id!r} but no matching "
+            f"row exists in memories — this indicates the BUGF-01 ID mismatch bug."
+        )

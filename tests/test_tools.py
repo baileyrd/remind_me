@@ -733,3 +733,112 @@ async def test_resource_categories(db_conn: sqlite3.Connection, memory_factory) 
 
     assert "alpha" in result
     assert "beta" in result
+
+
+# ---------------------------------------------------------------------------
+# Regression tests — BUGF-01, BUGF-02, DATA-02
+# ---------------------------------------------------------------------------
+
+
+async def test_import_then_search_embeds_correctly(
+    db_conn: sqlite3.Connection,
+    mock_embedder,
+    tmp_path: Path,
+) -> None:
+    """BUGF-01 regression (Phase 3 success criterion 1): import then search returns results.
+
+    Imports a JSON chat file via memory_import_chat, then calls memory_search with a
+    query matching the imported content.  With the bug fixed (embed_pairs collected
+    during INSERT), embeddings are stored against the correct memory IDs and FTS5 also
+    indexes the content, so the search must return non-empty results.
+    """
+    data = {
+        "chat_messages": [
+            {
+                "sender": "assistant",
+                "content": [{"type": "text", "text": "Asyncio is Python's asynchronous framework."}],
+            }
+        ]
+    }
+    chat_file = tmp_path / "import_search_test.json"
+    chat_file.write_text(json.dumps(data))
+
+    import_params = ChatImportInput(file_path=str(chat_file))
+    import_result = json.loads(await memory_import_chat(import_params))
+    assert import_result["status"] == "ok"
+    assert import_result["memories_created"] >= 1
+
+    # FTS5 keyword search must find the imported content
+    search_params = MemorySearchInput(query="asyncio")
+    search_result = await memory_search(search_params)
+
+    assert "_No memories found._" not in search_result
+    assert "asyncio" in search_result.lower() or "Asyncio" in search_result
+
+
+async def test_get_capture_uses_column_lookup(db_conn: sqlite3.Connection) -> None:
+    """BUGF-02 regression (Phase 3 success criterion 2): remind_me_get_capture
+    uses WHERE capture_id = ? column lookup, not metadata LIKE scan.
+
+    Inserts two memories with the capture_id column set directly (no capture_id
+    in metadata JSON) and verifies get_capture finds both by column value only.
+    """
+    from remind_me_mcp.db import _make_id, _now_iso
+
+    cap_id = "test_cap_bugf02"
+    now = _now_iso()
+
+    for content in ("Dialog memory for BUGF-02 test", "Summary memory for BUGF-02 test"):
+        mem_id = _make_id(content)
+        db_conn.execute(
+            """INSERT INTO memories
+               (id, content, category, tags, source, metadata, capture_id, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (mem_id, content, "dialog", "[]", "manual", "{}", cap_id, now, now),
+        )
+    db_conn.commit()
+
+    result = await remind_me_get_capture(cap_id)
+
+    # Both memories must be returned (capture found, not "No capture found")
+    assert "No capture found" not in result
+    assert cap_id in result
+
+
+async def test_list_tag_filter_pagination(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """DATA-02 regression (Phase 3 success criterion 3): memory_list with tags filter
+    and limit returns exactly `limit` tag-matching results.
+
+    Before the fix, tag filtering happened in Python after the LIMIT was applied in SQL,
+    so `limit=5` could return fewer than 5 results even when more tagged memories existed.
+    After the fix, the SQL WHERE clause filters by tag before LIMIT, so exactly 5 results
+    are returned and all have the expected tag.
+    """
+    # Create 10 memories with tag "alpha" and 10 without any tag
+    for i in range(10):
+        memory_factory(content=f"Alpha tagged memory number {i} unique", tags=["alpha"])
+    for i in range(10):
+        memory_factory(content=f"Untagged memory number {i} unique", tags=[])
+
+    params = MemoryListInput(tags=["alpha"], limit=5)
+    result_str = await memory_list(params)
+
+    # Parse JSON to count results precisely
+    json_params = MemoryListInput(tags=["alpha"], limit=5, response_format=ResponseFormat.JSON)
+    json_result_str = await memory_list(json_params)
+    data = json.loads(json_result_str)
+
+    # Must return exactly 5 results (not fewer due to Python post-filter)
+    assert data["count"] == 5, (
+        f"Expected exactly 5 results with tags=['alpha'] limit=5, got {data['count']}. "
+        f"This indicates tag filtering still happens in Python after LIMIT."
+    )
+
+    # All returned memories must have the 'alpha' tag
+    for mem in data["memories"]:
+        assert "alpha" in mem["tags"], (
+            f"Memory {mem['id']} does not have 'alpha' tag: {mem['tags']}"
+        )
