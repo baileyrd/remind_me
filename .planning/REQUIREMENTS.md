@@ -20,9 +20,9 @@ Requirements for tech debt milestone. Each maps to roadmap phases.
 
 ### Code Quality
 
-- [ ] **QUAL-01**: All ruff warnings resolved (26 auto-fix + 4 manual)
+- [x] **QUAL-01**: All ruff warnings resolved (26 auto-fix + 4 manual) — completed 2026-02-24 (04-01)
 - [ ] **QUAL-02**: Broad `except Exception` narrowed to specific types in embeddings.py, pid.py, and updater.py
-- [ ] **QUAL-03**: Original monolith file (`remind_me_mcp_original.py`) removed from repository
+- [x] **QUAL-03**: Original monolith file (`remind_me_mcp_original.py`) removed from repository — completed 2026-02-24 (04-01)
 
 ### Embedding Parity
 
@@ -75,9 +75,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 | SEC-03 | Phase 6 | Pending |
 | CICD-01 | Phase 5 | Pending |
 | CICD-02 | Phase 5 | Pending |
-| QUAL-01 | Phase 4 | Pending |
+| QUAL-01 | Phase 4 | Complete (04-01) |
 | QUAL-02 | Phase 4 | Pending |
-| QUAL-03 | Phase 4 | Pending |
+| QUAL-03 | Phase 4 | Complete (04-01) |
 | EMBD-01 | Phase 7 | Pending |
 | EMBD-02 | Phase 7 | Pending |
 | PERF-01 | Phase 8 | Pending |
@@ -90,4 +90,4 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 ---
 *Requirements defined: 2026-02-24*
-*Last updated: 2026-02-24 after roadmap creation (all 12 requirements mapped to Phases 4-8)*
+*Last updated: 2026-02-24 after 04-01 execution (QUAL-01 and QUAL-03 complete)*
