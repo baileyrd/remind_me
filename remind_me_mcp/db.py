@@ -360,7 +360,20 @@ def _now_iso() -> str:
 
 
 def _make_id(content: str) -> str:
-    """Deterministic short id from content hash + timestamp."""
+    """Generate a unique short ID from content and current timestamp.
+
+    NOT deterministic: calling with the same content at different times
+    produces different IDs. This is intentional — it allows storing
+    the same content multiple times (e.g., from different imports).
+
+    For truly content-deterministic IDs, use a bare content hash instead.
+
+    Args:
+        content: The text content to incorporate into the hash.
+
+    Returns:
+        A 12-character hex string derived from SHA-256 of content + timestamp.
+    """
     ts = _now_iso()
     return hashlib.sha256(f"{content}{ts}".encode()).hexdigest()[:12]
 

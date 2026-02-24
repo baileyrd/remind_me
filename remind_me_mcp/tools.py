@@ -12,7 +12,6 @@ import asyncio
 import json
 import logging
 import sqlite3
-from pathlib import Path
 from typing import Any
 
 from remind_me_mcp.db import (
@@ -24,7 +23,7 @@ from remind_me_mcp.db import (
     _semantic_search,
 )
 from remind_me_mcp.formatting import _fmt_memories, _fmt_memory_md
-from remind_me_mcp.importer import import_chat_file
+from remind_me_mcp.importer import import_chat_file, import_directory
 from remind_me_mcp.models import (
     AutoCaptureInput,
     BulkImportDirInput,
@@ -416,49 +415,25 @@ async def memory_import_chat(params: ChatImportInput) -> str:
 async def memory_import_directory(params: BulkImportDirInput) -> str:
     """Bulk import all chat export files from a directory.
 
-    Scans for .json, .jsonl, and .md files. Skips already-imported files.
+    Scans for .json, .jsonl, .md, .markdown, and .txt files. Skips
+    already-imported files (hash-based deduplication). Delegates to the
+    shared import_directory() function in importer.py (DRY).
 
     Args:
         params (BulkImportDirInput): Directory path and import options.
 
     Returns:
-        str: Summary of import results.
+        str: JSON summary with keys: files_processed, imported, skipped,
+        errors, total_memories_created, details.
     """
-    root = Path(params.directory)
-    extensions = {".json", ".jsonl", ".md", ".markdown", ".txt"}
-    if params.recursive:
-        files = [f for f in root.rglob("*") if f.suffix.lower() in extensions and f.is_file()]
-    else:
-        files = [f for f in root.iterdir() if f.suffix.lower() in extensions and f.is_file()]
-
-    results = []
-    for f in sorted(files):
-        try:
-            r = import_chat_file(
-                file_path=str(f),
-                category=params.category,
-                tags=params.tags,
-                extract_mode=params.extract_mode,
-                max_length=params.max_length,
-            )
-            results.append(r)
-        except (json.JSONDecodeError, UnicodeDecodeError, FileNotFoundError, OSError) as e:
-            log.warning("Failed to import %s: %s", f.name, e)
-            results.append({"status": "error", "file": f.name, "error": str(e)})
-
-    ok = [r for r in results if r.get("status") == "ok"]
-    skipped = [r for r in results if r.get("status") == "skipped"]
-    errors = [r for r in results if r.get("status") == "error"]
-    total_memories = sum(r.get("memories_created", 0) for r in ok)
-
-    summary = {
-        "files_processed": len(results),
-        "imported": len(ok),
-        "skipped": len(skipped),
-        "errors": len(errors),
-        "total_memories_created": total_memories,
-        "details": results,
-    }
+    summary = import_directory(
+        directory=params.directory,
+        category=params.category,
+        tags=params.tags,
+        extract_mode=params.extract_mode,
+        max_length=params.max_length,
+        recursive=params.recursive,
+    )
     return json.dumps(summary, indent=2)
 
 

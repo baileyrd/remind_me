@@ -256,11 +256,80 @@ def import_chat_file(
 
 
 # ---------------------------------------------------------------------------
+# Public directory import function
+# ---------------------------------------------------------------------------
+
+
+def import_directory(
+    directory: str,
+    category: str = "chat_import",
+    tags: list[str] | None = None,
+    extract_mode: str = "assistant_messages",
+    max_length: int = 10000,
+    recursive: bool = True,
+) -> dict[str, Any]:
+    """Import all chat export files from a directory.
+
+    Scans for .json, .jsonl, .md, .markdown, and .txt files. Skips
+    already-imported files (hash-based deduplication).
+
+    Args:
+        directory: Path to the directory containing chat export files.
+        category: Category to assign to all imported memories.
+        tags: Optional tags to apply to all imported memories.
+        extract_mode: Message extraction strategy.
+        max_length: Max characters per memory chunk.
+        recursive: Whether to search subdirectories.
+
+    Returns:
+        Summary dict with keys: files_processed, imported, skipped,
+        errors, total_memories_created, details.
+    """
+    root = Path(directory)
+    if tags is None:
+        tags = []
+    extensions = {".json", ".jsonl", ".md", ".markdown", ".txt"}
+    if recursive:
+        files = [f for f in root.rglob("*") if f.suffix.lower() in extensions and f.is_file()]
+    else:
+        files = [f for f in root.iterdir() if f.suffix.lower() in extensions and f.is_file()]
+
+    results: list[dict[str, Any]] = []
+    for f in sorted(files):
+        try:
+            r = import_chat_file(
+                file_path=str(f),
+                category=category,
+                tags=tags,
+                extract_mode=extract_mode,
+                max_length=max_length,
+            )
+            results.append(r)
+        except (json.JSONDecodeError, UnicodeDecodeError, FileNotFoundError, OSError) as e:
+            log.warning("Failed to import %s: %s", f.name, e)
+            results.append({"status": "error", "file": f.name, "error": str(e)})
+
+    ok = [r for r in results if r.get("status") == "ok"]
+    skipped = [r for r in results if r.get("status") == "skipped"]
+    errors = [r for r in results if r.get("status") == "error"]
+
+    return {
+        "files_processed": len(results),
+        "imported": len(ok),
+        "skipped": len(skipped),
+        "errors": len(errors),
+        "total_memories_created": sum(r.get("memories_created", 0) for r in ok),
+        "details": results,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Exports
 # ---------------------------------------------------------------------------
 
 __all__ = [
     "import_chat_file",
+    "import_directory",
     "_chunk_text",
     "_extract_messages_from_json",
     "_filter_messages",

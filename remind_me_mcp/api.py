@@ -18,7 +18,7 @@ from typing import Any
 
 from remind_me_mcp.config import DB_PATH
 from remind_me_mcp.db import _embed_and_store, _get_db, _make_id, _now_iso, _row_to_dict
-from remind_me_mcp.importer import import_chat_file
+from remind_me_mcp.importer import import_chat_file, import_directory
 
 log = logging.getLogger("remind_me_mcp.api")
 
@@ -290,28 +290,16 @@ def _build_api_app():
 
         try:
             if p.is_dir():
-                # Directory import
-                extensions = {".json", ".jsonl", ".md", ".markdown", ".txt"}
-                files = [f for f in p.rglob("*") if f.suffix.lower() in extensions and f.is_file()]
-                results = []
-                for f in sorted(files):
-                    try:
-                        r = import_chat_file(str(f), category, tags, extract_mode, max_length)
-                        results.append(r)
-                    except (json.JSONDecodeError, UnicodeDecodeError, FileNotFoundError, OSError) as e:
-                        log.warning("Failed to import %s: %s", f.name, e)
-                        results.append({"status": "error", "file": f.name, "error": str(e)})
-                ok = [r for r in results if r.get("status") == "ok"]
-                skipped = [r for r in results if r.get("status") == "skipped"]
-                errors = [r for r in results if r.get("status") == "error"]
-                return _json_ok({
-                    "files_processed": len(results),
-                    "imported": len(ok),
-                    "skipped": len(skipped),
-                    "errors": len(errors),
-                    "total_memories_created": sum(r.get("memories_created", 0) for r in ok),
-                    "details": results,
-                })
+                # Directory import — delegates to shared import_directory() (DRY)
+                summary = import_directory(
+                    directory=str(p),
+                    category=category,
+                    tags=tags,
+                    extract_mode=extract_mode,
+                    max_length=max_length,
+                    recursive=True,
+                )
+                return _json_ok(summary)
             else:
                 # Single file import
                 result = import_chat_file(str(p), category, tags, extract_mode, max_length)
