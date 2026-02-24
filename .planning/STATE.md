@@ -10,28 +10,28 @@ See: .planning/PROJECT.md (updated 2026-02-22)
 ## Current Position
 
 Phase: 2 of 3 (Test Infrastructure)
-Plan: 1 of 4 in current phase
+Plan: 4 of 4 in current phase
 Status: In progress
-Last activity: 2026-02-24 — Completed 02-01 (shared pytest fixtures, smoke tests)
+Last activity: 2026-02-24 — Completed 02-04 (API integration tests)
 
-Progress: [████░░░░░░] 40%
+Progress: [████████░░] 73%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 3
+- Total plans completed: 4
 - Average duration: 4min
-- Total execution time: 0.22 hours
+- Total execution time: 0.25 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 01-package-structure | 3/3 | 13min | 4min |
-| 02-test-infrastructure | 1/4 | 2min | 2min |
+| 02-test-infrastructure | 4/4 | 10min | 2.5min |
 
 **Recent Trend:**
-- Last 5 plans: 01-01 (3min), 01-02 (8min), 01-03 (2min), 02-01 (2min)
+- Last 5 plans: 01-01 (3min), 01-02 (8min), 01-03 (2min), 02-01 (2min), 02-04 (2min)
 - Trend: stable
 
 *Updated after each plan completion*
@@ -60,6 +60,10 @@ Recent decisions affecting current work:
 - [02-01]: Session-scoped monkeypatch uses pytest.MonkeyPatch() directly — function-scoped monkeypatch fixture cannot be injected into session-scoped fixtures
 - [02-01]: FakeEmbedder seeds np.random.default_rng on hash(text) for deterministic per-text vectors without ML model dependency
 - [02-01]: db_conn monkeypatches both remind_me_mcp.db._get_db and remind_me_mcp.api._get_db since api.py imports _get_db directly
+- [02-02]: Direct import of private pure functions — no MCP server context needed; all 75 tests run in 0.04s
+- [02-02]: FTS5 trigger tests use distinct unique words per test to avoid cross-test interference without requiring separate db_conn instances
+- [02-04]: db_conn fixture uses check_same_thread=False — Starlette TestClient runs async handlers in a worker thread separate from pytest main thread
+- [02-04]: client fixture patches remind_me_mcp.importer._get_db directly because importer uses 'from ... import _get_db' local binding not affected by module attribute patch
 
 ### Pending Todos
 
@@ -74,5 +78,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-24
-Stopped at: Completed 02-01-PLAN.md — shared pytest fixtures and smoke tests
+Stopped at: Completed 02-02-PLAN.md — unit tests for importer, formatting, models, and db
 Resume file: None

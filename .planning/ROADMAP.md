@@ -45,7 +45,7 @@ Plans:
   3. All 13 MCP tool handlers are covered by integration tests using in-memory SQLite (not mocks) — FTS5 triggers and SQL correctness are exercised
   4. All Starlette HTTP API routes have integration tests via httpx AsyncClient or TestClient
   5. A test that imports a chat file and then calls a search tool confirms end-to-end behavior without touching the developer's real `~/.remind-me/memory.db`
-**Plans:** 1/4 plans executed
+**Plans:** 3/4 plans executed
 
 Plans:
 - [ ] 02-01-PLAN.md — Shared pytest fixtures (in-memory db, mock embedder, memory factory, config isolation, smoke tests)
@@ -81,5 +81,5 @@ Phases execute in numeric order: 1 → 2 → 3
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Package Structure | 3/3 | Complete    | 2026-02-24 |
-| 2. Test Infrastructure | 1/4 | In Progress|  |
+| 2. Test Infrastructure | 3/4 | In Progress|  |
 | 3. Quality and Bug Fixes | 0/5 | Not started | - |
