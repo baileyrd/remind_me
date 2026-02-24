@@ -10,11 +10,11 @@ See: .planning/PROJECT.md (updated 2026-02-22)
 ## Current Position
 
 Phase: 3 of 3 (Quality and Bug Fixes)
-Plan: 3 of 4 in current phase
-Status: In progress
-Last activity: 2026-02-24 — Completed 03-03 (Async safety: singleton DB, asyncio.to_thread, ASYN-01 through ASYN-05)
+Plan: 4 of 4 in current phase
+Status: Complete
+Last activity: 2026-02-24 — Completed 03-04 (Error handling: specific exception types, log.warning/error, user-facing messages, ERRH-01 through ERRH-03)
 
-Progress: [█████████░] 92%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
@@ -29,16 +29,17 @@ Progress: [█████████░] 92%
 |-------|-------|-------|----------|
 | 01-package-structure | 3/3 | 13min | 4min |
 | 02-test-infrastructure | 4/4 | 10min | 2.5min |
-| 03-quality-and-bug-fixes | 3/4 | 10min | 3.3min |
+| 03-quality-and-bug-fixes | 4/4 | 13min | 3.25min |
 
 **Recent Trend:**
-- Last 5 plans: 02-01 (2min), 02-04 (2min), 03-01 (2min), 03-02 (4min), 03-03 (4min)
+- Last 5 plans: 03-01 (2min), 03-02 (4min), 03-03 (4min), 03-04 (3min)
 - Trend: stable
 
 *Updated after each plan completion*
 | Phase 03-quality-and-bug-fixes P01 | 2 | 2 tasks | 2 files |
 | Phase 03-quality-and-bug-fixes P02 | 4 | 2 tasks | 6 files |
 | Phase 03-quality-and-bug-fixes P03 | 4 | 2 tasks | 4 files |
+| Phase 03-quality-and-bug-fixes P04 | 3 | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -81,6 +82,10 @@ Recent decisions affecting current work:
 - [Phase 03-03]: check_same_thread=False required because asyncio.to_thread workers run on thread pool; WAL mode makes this safe
 - [Phase 03-03]: Only CPU-bound embedding calls wrapped with asyncio.to_thread — simple DB reads/writes are fast enough inline
 - [Phase 03-03]: busy_timeout=5000ms for graceful lock contention across multi-process DB access (Claude Code + Claude Desktop)
+- [Phase 03-04]: sqlite-vec load split into ImportError (package missing) + OperationalError (extension load fail) — distinct failure modes
+- [Phase 03-04]: _embed_and_store/_semantic_search use log.warning not log.debug — embedding failures are unexpected operational issues
+- [Phase 03-04]: remind_me_auto_capture both INSERTs in one try/except OperationalError block for transaction atomicity
+- [Phase 03-04]: MCP tool error messages use "Error: <description> — <detail>" format for user actionability
 
 ### Pending Todos
 
@@ -95,5 +100,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-24
-Stopped at: Completed 03-03-PLAN.md — async safety: singleton DB connection, asyncio.to_thread embedding offload, 6 concurrency tests (167 tests passing)
+Stopped at: Completed 03-04-PLAN.md — error handling: specific exception types, log.warning/error, user-facing MCP messages, 5 new ERRH tests (172 tests passing)
 Resume file: None

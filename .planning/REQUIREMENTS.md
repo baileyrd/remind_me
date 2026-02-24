@@ -27,9 +27,9 @@ Requirements for the refactored release. Each maps to roadmap phases.
 
 ### Error Handling
 
-- [ ] **ERRH-01**: No exceptions are silently swallowed — all caught exceptions are logged with appropriate level before handling
-- [ ] **ERRH-02**: Error handling uses specific exception types instead of bare `except Exception` where the failure mode is known
-- [ ] **ERRH-03**: MCP tool handlers return clear, user-facing error messages rather than opaque sentinel values
+- [x] **ERRH-01**: No exceptions are silently swallowed — all caught exceptions are logged with appropriate level before handling
+- [x] **ERRH-02**: Error handling uses specific exception types instead of bare `except Exception` where the failure mode is known
+- [x] **ERRH-03**: MCP tool handlers return clear, user-facing error messages rather than opaque sentinel values
 
 ### Async & Performance
 
@@ -111,9 +111,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 | TEST-04 | Phase 2 | Complete |
 | TEST-05 | Phase 2 | Complete |
 | TEST-06 | Phase 2 | Complete |
-| ERRH-01 | Phase 3 | Pending |
-| ERRH-02 | Phase 3 | Pending |
-| ERRH-03 | Phase 3 | Pending |
+| ERRH-01 | Phase 3 | Complete |
+| ERRH-02 | Phase 3 | Complete |
+| ERRH-03 | Phase 3 | Complete |
 | ASYN-01 | Phase 3 | Complete |
 | ASYN-02 | Phase 3 | Complete |
 | ASYN-03 | Phase 3 | Complete |
