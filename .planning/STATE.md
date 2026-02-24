@@ -10,27 +10,27 @@ See: .planning/PROJECT.md (updated 2026-02-22)
 ## Current Position
 
 Phase: 1 of 3 (Package Structure)
-Plan: 2 of 3 in current phase
-Status: In progress
-Last activity: 2026-02-24 — Completed 01-02 (behavioral module extraction)
+Plan: 3 of 3 in current phase
+Status: Phase 1 complete
+Last activity: 2026-02-24 — Completed 01-03 (entry point wiring, ruff/mypy/pytest config)
 
-Progress: [██░░░░░░░░] 22%
+Progress: [███░░░░░░░] 33%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 2
-- Average duration: 5min
-- Total execution time: 0.18 hours
+- Total plans completed: 3
+- Average duration: 4min
+- Total execution time: 0.22 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| 01-package-structure | 2/3 | 11min | 5min |
+| 01-package-structure | 3/3 | 13min | 4min |
 
 **Recent Trend:**
-- Last 5 plans: 01-01 (3min), 01-02 (8min)
+- Last 5 plans: 01-01 (3min), 01-02 (8min), 01-03 (2min)
 - Trend: -
 
 *Updated after each plan completion*
@@ -53,6 +53,9 @@ Recent decisions affecting current work:
 - [01-02]: Lazy Starlette imports inside _build_api_app() — prevents heavy web framework load in stdio-only mode
 - [01-02]: JSX loaded via Path(__file__).parent / 'dashboard' / 'App.jsx' at runtime — simpler than importlib.resources
 - [01-02]: Inline Babel-compatible JSX extracted from _get_dashboard_script() — NOT the ES module reference file
+- [01-03]: __init__.py imports tools module as side effect — ensures @mcp.tool decorators fire before mcp.run() via entry point
+- [01-03]: Entry point keep as remind_me_mcp:mcp.run — FastMCP handles run loop; __main__.py for python -m usage
+- [01-03]: Monolith renamed to remind_me_mcp_original.py — eliminates Python import ambiguity with package directory
 
 ### Pending Todos
 
@@ -67,5 +70,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-02-24
-Stopped at: Completed 01-02-PLAN.md — behavioral modules (importer, pid, server, tools, api, dashboard/App.jsx) extracted
+Stopped at: Completed 01-03-PLAN.md — entry points wired, monolith renamed, ruff/mypy/pytest configured
 Resume file: None

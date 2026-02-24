@@ -10,11 +10,11 @@ Requirements for the refactored release. Each maps to roadmap phases.
 ### Module Architecture
 
 - [x] **ARCH-01**: Project is structured as a `remind_me_mcp/` package with separate modules for each concern (config, db, embeddings, models, formatting, importer, pid, server, tools, api, dashboard)
-- [ ] **ARCH-02**: `__init__.py` re-exports `mcp` from `server.py` so existing `pyproject.toml` entry point works unchanged
-- [ ] **ARCH-03**: `__main__.py` handles CLI argument parsing and mode dispatch (MCP stdio vs HTTP dashboard)
+- [x] **ARCH-02**: `__init__.py` re-exports `mcp` from `server.py` so existing `pyproject.toml` entry point works unchanged
+- [x] **ARCH-03**: `__main__.py` handles CLI argument parsing and mode dispatch (MCP stdio vs HTTP dashboard)
 - [x] **ARCH-04**: Each module has its own logger via `logging.getLogger("remind_me_mcp.<module>")`
 - [x] **ARCH-05**: Each module defines `__all__` to declare its explicit public surface
-- [ ] **ARCH-06**: No circular imports exist between any modules
+- [x] **ARCH-06**: No circular imports exist between any modules
 
 ### Testing
 
@@ -56,9 +56,9 @@ Requirements for the refactored release. Each maps to roadmap phases.
 - [ ] **QUAL-01**: All public functions and classes have docstrings
 - [ ] **QUAL-02**: All function signatures have complete type hints
 - [x] **QUAL-03**: Dashboard JSX is extracted to a separate `App.jsx` file in the `dashboard/` directory (no longer embedded as Python string)
-- [ ] **QUAL-04**: ruff is configured in `pyproject.toml` for linting and formatting
-- [ ] **QUAL-05**: mypy is configured in `pyproject.toml` for type checking
-- [ ] **QUAL-06**: `pyproject.toml` has test configuration (pytest settings, asyncio mode)
+- [x] **QUAL-04**: ruff is configured in `pyproject.toml` for linting and formatting
+- [x] **QUAL-05**: mypy is configured in `pyproject.toml` for type checking
+- [x] **QUAL-06**: `pyproject.toml` has test configuration (pytest settings, asyncio mode)
 
 ## v2 Requirements
 
@@ -100,11 +100,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 | Requirement | Phase | Status |
 |-------------|-------|--------|
 | ARCH-01 | Phase 1 | Complete (01-01) |
-| ARCH-02 | Phase 1 | Pending |
-| ARCH-03 | Phase 1 | Pending |
+| ARCH-02 | Phase 1 | Complete (01-03) |
+| ARCH-03 | Phase 1 | Complete (01-03) |
 | ARCH-04 | Phase 1 | Complete (01-01) |
 | ARCH-05 | Phase 1 | Complete (01-01) |
-| ARCH-06 | Phase 1 | Pending |
+| ARCH-06 | Phase 1 | Complete (01-03) |
 | TEST-01 | Phase 2 | Pending |
 | TEST-02 | Phase 2 | Pending |
 | TEST-03 | Phase 2 | Pending |
@@ -126,9 +126,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 | QUAL-01 | Phase 3 | Pending |
 | QUAL-02 | Phase 3 | Pending |
 | QUAL-03 | Phase 1 | Complete |
-| QUAL-04 | Phase 1 | Pending |
-| QUAL-05 | Phase 1 | Pending |
-| QUAL-06 | Phase 1 | Pending |
+| QUAL-04 | Phase 1 | Complete (01-03) |
+| QUAL-05 | Phase 1 | Complete (01-03) |
+| QUAL-06 | Phase 1 | Complete (01-03) |
 | ASYN-04 | Phase 3 | Pending |
 | ASYN-05 | Phase 3 | Pending |
 
@@ -139,4 +139,4 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 ---
 *Requirements defined: 2026-02-22*
-*Last updated: 2026-02-24 after 01-01 completion (ARCH-01, ARCH-04, ARCH-05 marked complete)*
+*Last updated: 2026-02-24 after 01-03 completion (ARCH-02, ARCH-03, ARCH-06, QUAL-04, QUAL-05, QUAL-06 marked complete)*
