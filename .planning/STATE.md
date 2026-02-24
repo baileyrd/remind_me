@@ -12,7 +12,7 @@ See: .planning/PROJECT.md (updated 2026-02-22)
 Phase: 1 of 3 (Package Structure)
 Plan: 0 of 3 in current phase
 Status: Ready to plan
-Last activity: 2026-02-22 — Roadmap created
+Last activity: 2026-02-23 — Scope expanded (ASYN-04, ASYN-05: WAL concurrency fix)
 
 Progress: [░░░░░░░░░░] 0%
 
@@ -59,6 +59,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-02-22
-Stopped at: Roadmap created, STATE.md initialized — ready to begin Phase 1 planning
+Last session: 2026-02-23
+Stopped at: Scope expanded with WAL concurrency requirements — ready to begin Phase 1 planning
 Resume file: None

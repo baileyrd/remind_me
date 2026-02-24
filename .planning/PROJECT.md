@@ -29,6 +29,7 @@ Every design principle from CLAUDE.md passes a green audit — modularity, tests
 - [ ] Robust error handling — no silent exception swallowing, proper error propagation
 - [ ] DRY — eliminate duplicated directory import logic and any other repetition
 - [ ] Async-first — wrap sync embedding/DB calls with asyncio.to_thread
+- [ ] Multi-process concurrency — WAL mode + busy_timeout for simultaneous Claude Code + Desktop access
 - [ ] All public functions and classes have docstrings
 - [ ] Extensible module design — adding a new tool/feature doesn't require editing a monolithic file
 - [ ] Fix known bugs: import embedding ID mismatch, LIKE-based capture_id lookup
@@ -58,6 +59,7 @@ Every design principle from CLAUDE.md passes a green audit — modularity, tests
 - Known bug: `remind_me_get_capture` uses fragile LIKE-based JSON metadata search
 - Tag filtering happens in Python after SQL fetch, breaking pagination
 - DB connections opened fresh on every call with schema check overhead
+- Multi-process concurrency issue: Claude Code + Claude Desktop running simultaneously causes hanging due to SQLite default journal mode file-level locking
 - Codebase map available at `.planning/codebase/` with detailed analysis
 
 ## Constraints
@@ -77,6 +79,7 @@ Every design principle from CLAUDE.md passes a green audit — modularity, tests
 | Keep Babel standalone for dashboard | Avoids adding Node.js build tooling dependency for a simple dashboard | — Pending |
 | Fix bugs during refactor | Bugs surface naturally when restructuring the affected code | — Pending |
 | Defer security hardening | Separate concern — mixing security changes with structural refactor increases risk | — Pending |
+| SQLite WAL mode over PostgreSQL | WAL fixes multi-process concurrency without adding dependencies; PostgreSQL is overkill for a personal tool | — Pending |
 
 ---
-*Last updated: 2026-02-22 after initialization*
+*Last updated: 2026-02-23 after scope expansion (WAL concurrency fix)*

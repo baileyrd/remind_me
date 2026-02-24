@@ -36,6 +36,8 @@ Requirements for the refactored release. Each maps to roadmap phases.
 - [ ] **ASYN-01**: All sync embedding computations in async MCP tool handlers are wrapped with `asyncio.to_thread`
 - [ ] **ASYN-02**: DB connection is managed as a lazy lifespan-scoped singleton instead of opening a new connection per call
 - [ ] **ASYN-03**: SQLite thread-safety is handled correctly — no `ProgrammingError` under concurrent async operations
+- [ ] **ASYN-04**: SQLite database opens in WAL journal mode (`PRAGMA journal_mode=WAL`) to support concurrent multi-process access (e.g., Claude Code + Claude Desktop running simultaneously)
+- [ ] **ASYN-05**: Database connection sets `busy_timeout` (e.g., 5000ms) so brief lock contention retries gracefully instead of hanging or erroring
 
 ### Bug Fixes
 
@@ -127,12 +129,14 @@ Which phases cover which requirements. Updated during roadmap creation.
 | QUAL-04 | Phase 1 | Pending |
 | QUAL-05 | Phase 1 | Pending |
 | QUAL-06 | Phase 1 | Pending |
+| ASYN-04 | Phase 3 | Pending |
+| ASYN-05 | Phase 3 | Pending |
 
 **Coverage:**
-- v1 requirements: 30 total
-- Mapped to phases: 30
+- v1 requirements: 32 total
+- Mapped to phases: 32
 - Unmapped: 0
 
 ---
 *Requirements defined: 2026-02-22*
-*Last updated: 2026-02-22 after roadmap creation*
+*Last updated: 2026-02-23 after scope expansion (WAL concurrency fix)*

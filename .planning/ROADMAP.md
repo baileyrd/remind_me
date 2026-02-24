@@ -56,13 +56,14 @@ Plans:
 ### Phase 3: Quality and Bug Fixes
 **Goal**: The codebase passes a green audit on every CLAUDE.md design principle — async safety, robust error handling, DRY data layer, SQL-correct tag filtering, schema migration, full docstring coverage — while the two known bugs are fixed and verified by tests
 **Depends on**: Phase 2
-**Requirements**: ERRH-01, ERRH-02, ERRH-03, ASYN-01, ASYN-02, ASYN-03, BUGF-01, BUGF-02, DATA-01, DATA-02, DATA-03, DATA-04, QUAL-01, QUAL-02
+**Requirements**: ERRH-01, ERRH-02, ERRH-03, ASYN-01, ASYN-02, ASYN-03, ASYN-04, ASYN-05, BUGF-01, BUGF-02, DATA-01, DATA-02, DATA-03, DATA-04, QUAL-01, QUAL-02
 **Success Criteria** (what must be TRUE):
   1. Importing a chat file then calling `remind_me_search` returns embedded results for the imported memories (BUGF-01 fixed: no ID mismatch)
   2. `remind_me_get_capture` returns the correct capture record via an indexed `capture_id` column lookup, not a LIKE-based JSON scan (BUGF-02 fixed)
   3. Searching memories filtered by tag returns correctly paginated results — a tag-filtered query with `limit=5` returns exactly 5 matches, not 5 pre-filter rows truncated by Python (DATA-02 fixed)
   4. No `asyncio` event loop blockage occurs under concurrent tool calls — `asyncio.gather` on multiple MCP tool invocations completes without `ProgrammingError` or event loop starvation
-  5. `pydoc` on any public function or class in any module returns a non-empty docstring
+  5. Two separate processes opening the same database file simultaneously can both read and write without hanging (WAL mode + busy_timeout verified)
+  6. `pydoc` on any public function or class in any module returns a non-empty docstring
 **Plans**: TBD
 
 Plans:
