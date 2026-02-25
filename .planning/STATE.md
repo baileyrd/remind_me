@@ -5,16 +5,16 @@
 See: .planning/PROJECT.md (updated 2026-02-24)
 
 **Core value:** Persistent, searchable memory across all Claude interfaces — modular, tested, maintainable
-**Current focus:** v1.1 Phase 8 — Performance Improvements (COMPLETE)
+**Current focus:** v1.1 Phase 9 — Gap Closure (COMPLETE — CICD-02 satisfied)
 
 ## Current Position
 
 Phase: 9 of 9 (Gap Closure — Async Fix and Coverage)
-Plan: 1 of 1 in current phase — Phase 9 Plan 1 COMPLETE
-Status: COMPLETE — phase 09 gap closure done
-Last activity: 2026-02-25 — Plan 09-01 complete (PERF-02 gap closed: await import_directory in api.py, test_api_import_directory added, 216 tests)
+Plan: 2 of 2 in current phase — Phase 9 Plan 2 COMPLETE
+Status: COMPLETE — all v1.1 phases and gap-closure plans done
+Last activity: 2026-02-24 — Plan 09-02 complete (CICD-02 satisfied: 80.19% coverage, ci.yml gate raised to 80%, 234 tests)
 
-Progress: [##########] 100% (v1.1 — 5/5 phases COMPLETE)
+Progress: [##########] 100% (v1.1 — 5/5 phases COMPLETE, all gap-closure done)
 
 ## Performance Metrics
 
@@ -44,6 +44,7 @@ Progress: [##########] 100% (v1.1 — 5/5 phases COMPLETE)
 *v1.1 complete — all 5 phases executed*
 | Phase 08-performance-improvements P02 | 4min | 2 tasks | 4 files |
 | Phase 09-gap-closure-async-fix-and-coverage P01 | 5min | 1 task | 2 files |
+| Phase 09-gap-closure-async-fix-and-coverage P02 | 15min | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -87,17 +88,20 @@ None.
 ### Key Decisions (Phase 09)
 
 - [Phase 09-gap-closure, plan 01]: Plan test asserted `data["status"] == "ok"` for directory import but import_directory() summary dict has no top-level status key; assertion removed to match actual schema (files_processed, imported, total_memories_created)
+- [Phase 09-gap-closure, plan 02]: Plan's stated line numbers in api.py were stale (file modified by Phases 05-08); tests written by reading actual source lines — not trusting plan line references
+- [Phase 09-gap-closure, plan 02]: --cov-fail-under=80 uses raw float comparison; 79.53% display value of 79% was insufficient; required additional importer tests to reach 80.19%
+- [Phase 09-gap-closure, plan 02]: FTS5 OperationalError triggered via unmatched-quote query string; import OSError triggered via monkeypatch on import_chat_file
 
 ### Blockers/Concerns
 
 - Phase 4 (RESOLVED 04-01): Side-effect import preservation — noqa: F401 comments survived ruff I001 auto-fix correctly
 - Phase 4 (RESOLVED 04-02): ONNX exception boundaries in embeddings.py (lines 82, 145, 164) and updater.py (line 370) documented with "Broad catch intentional:" comments; pid.py narrowed to except OSError
 - Phase 5 (RESOLVED 05-01): Coverage gate set at 74% (measured 76% minus 2% headroom) — not 80% target; pytest-asyncio added explicitly for asyncio_mode=auto
-- Phase 5 (OPEN): CICD-02 requires 80% coverage gate but current gate is 74% (measured coverage 76%). Will resolve when Phases 6-8 add tests to reach 80%, at which point --cov-fail-under in ci.yml should be raised to 80
+- Phase 5 (RESOLVED 09-02): CICD-02 now fully satisfied — coverage 80.19%, ci.yml gate raised to --cov-fail-under=80; 234 tests passing
 - Phase 6 (RESOLVED 06-01): Include both `localhost` and `127.0.0.1` in CORS — handled via regex; both covered with any port
 
 ## Session Continuity
 
-Last session: 2026-02-25
-Stopped at: Completed 09-01-PLAN.md (PERF-02 gap closed: await fix in api.py + test_api_import_directory, 216 tests, Phase 9 COMPLETE)
+Last session: 2026-02-24
+Stopped at: Completed 09-02-PLAN.md (CICD-02 satisfied: 80.19% coverage gate enforced in ci.yml, 234 tests, Phase 09 COMPLETE)
 Resume file: None

@@ -25,7 +25,7 @@
 - [x] **Phase 6: Security Hardening** - Lock down CORS, restrict import paths, and add optional API key authentication (completed 2026-02-24)
 - [x] **Phase 7: API Embedding Parity** - Fix the correctness gap where REST API memories are invisible to semantic search (completed 2026-02-24)
 - [x] **Phase 8: Performance Improvements** - Batch reindex and concurrent file import for large-scale operation (completed 2026-02-25)
-- [ ] **Phase 9: Gap Closure — Async Bug Fix and Coverage Gate** - Fix unawaited coroutine in REST API directory import and raise coverage gate to 80%
+- [x] **Phase 9: Gap Closure — Async Bug Fix and Coverage Gate** - Fix unawaited coroutine in REST API directory import and raise coverage gate to 80% (completed 2026-02-25)
 
 ## Phase Details
 
@@ -105,7 +105,7 @@ Plans:
   2. A test exercises the REST API directory import path (`p.is_dir()` branch in `api_import`)
   3. `--cov-fail-under` in `.github/workflows/ci.yml` is set to 80
   4. `pytest --cov` reports >= 80% line coverage
-**Plans:** 1/2 plans executed
+**Plans:** 2/2 plans complete
 Plans:
 - [ ] 09-01-PLAN.md — Fix unawaited coroutine in api_import and add directory import test (PERF-02)
 - [ ] 09-02-PLAN.md — Add branch-coverage tests and raise CI gate to 80% (CICD-02)
@@ -125,4 +125,4 @@ Phases execute in numeric order: 4 → 5 → 6 → 7 → 8
 | 6. Security Hardening | 2/2 | Complete    | 2026-02-24 | - |
 | 7. API Embedding Parity | 1/1 | Complete   | 2026-02-24 | - |
 | 8. Performance Improvements | 2/2 | Complete   | 2026-02-25 | - |
-| 9. Gap Closure — Async Bug Fix and Coverage Gate | 1/2 | In Progress|  | - |
+| 9. Gap Closure — Async Bug Fix and Coverage Gate | 2/2 | Complete   | 2026-02-25 | - |
