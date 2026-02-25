@@ -42,6 +42,8 @@ from remind_me_mcp.updater import pop_update_notice
 
 log = logging.getLogger("remind_me_mcp.tools")
 
+EMBED_BATCH_SIZE = 32
+
 
 # ---------------------------------------------------------------------------
 # Update notice helper
@@ -763,13 +765,22 @@ async def remind_me_reindex() -> str:
         return f"✓ All {len(all_rows)} memories already have embeddings."
 
     created = 0
-    for mem_id, rowid, content in missing:
+    for batch_start in range(0, len(missing), EMBED_BATCH_SIZE):
+        batch = missing[batch_start : batch_start + EMBED_BATCH_SIZE]
+        ids = [item[0] for item in batch]
+        rowids = [item[1] for item in batch]
+        texts = [item[2][:2000] for item in batch]
         try:
-            vec_bytes = await asyncio.to_thread(embedder.embed_one, content[:2000])
-            db.execute("INSERT OR REPLACE INTO memories_vec(rowid, embedding) VALUES (?, ?)", (rowid, vec_bytes))
-            created += 1
+            vecs = await asyncio.to_thread(embedder.embed, texts)
+            for i, (mem_id, rowid) in enumerate(zip(ids, rowids)):
+                vec_bytes = vecs[i].tobytes()
+                db.execute(
+                    "INSERT OR REPLACE INTO memories_vec(rowid, embedding) VALUES (?, ?)",
+                    (rowid, vec_bytes),
+                )
+                created += 1
         except (sqlite3.OperationalError, ValueError, TypeError) as e:
-            log.warning("Failed to embed %s: %s", mem_id, e)
+            log.warning("Failed to embed batch starting at %s: %s", ids[0], e)
 
     db.commit()
     return (
