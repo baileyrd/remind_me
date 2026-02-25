@@ -812,3 +812,183 @@ def test_rest_and_mcp_memories_equally_findable_by_semantic_search(
 
     assert rest_mem_id in result_ids, f"REST memory {rest_mem_id} not found in semantic search results: {result_ids}"
     assert mcp_mem_id in result_ids, f"MCP memory {mcp_mem_id} not found in semantic search results: {result_ids}"
+
+
+# ---------------------------------------------------------------------------
+# Branch coverage — targeted tests for uncovered api.py lines (Phase 09-02)
+# ---------------------------------------------------------------------------
+
+
+def test_api_stats_malformed_tags(client: TestClient, db_conn) -> None:
+    """GET /api/stats silently skips memories with malformed JSON in the tags column.
+
+    Covers api.py: the except (json.JSONDecodeError, TypeError) branch inside the
+    tag aggregation loop in api_stats. Also covers the loop body (all_tags increment)
+    by inserting a memory with valid tags alongside the malformed one.
+    """
+    import json as _json
+
+    now = "2026-01-01T00:00:00Z"
+    # Insert a memory with malformed tags (triggers the except branch)
+    db_conn.execute(
+        """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        ("malformed-tags-id", "Malformed tags memory", "general", "NOT_VALID_JSON", "manual", _json.dumps({}), now, now),
+    )
+    # Insert a memory with valid tags (covers the loop body — all_tags increment)
+    db_conn.execute(
+        """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        ("valid-tags-id", "Valid tags memory", "general", _json.dumps(["python", "testing"]), "manual", _json.dumps({}), now, now),
+    )
+    db_conn.commit()
+
+    response = client.get("/api/stats")
+    assert response.status_code == 200
+    data = response.json()
+    # Should not crash — malformed tags row is silently skipped
+    assert "total" in data
+    assert data["total"] >= 2
+    # Valid tags memory should appear in tag counts
+    assert "python" in data["tags"]
+
+
+def test_api_list_filter_by_source(client: TestClient) -> None:
+    """GET /api/memories?source=manual filters results by source field.
+
+    Covers api.py lines 168-169: the 'if src := params.get("source")' branch
+    in api_list that adds source filtering to the SQL WHERE clause.
+    """
+    # Create memories with different sources
+    create_manual = client.post(
+        "/api/memories",
+        json={"content": "Manual source memory for filter test", "source": "manual"},
+    )
+    assert create_manual.status_code == 201
+
+    response = client.get("/api/memories?source=manual")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] >= 1
+    for mem in data["memories"]:
+        assert mem["source"] == "manual"
+
+
+def test_api_search_with_category_filter(client: TestClient) -> None:
+    """GET /api/memories/search?q=term&category=cat returns only the matching category.
+
+    Covers api.py lines 219-220: the 'if cat := params.get("category")' branch
+    that post-filters FTS5 results by category.
+    """
+    client.post("/api/memories", json={"content": "category filter alpha keyword", "category": "alpha"})
+    client.post("/api/memories", json={"content": "category filter beta keyword", "category": "beta"})
+
+    response = client.get("/api/memories/search?q=keyword&category=alpha")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] >= 1
+    for mem in data["memories"]:
+        assert mem["category"] == "alpha"
+
+
+def test_api_search_with_tag_filter(client: TestClient) -> None:
+    """GET /api/memories/search?q=term&tags=tag filters search results by tag.
+
+    Covers api.py lines 225-228: the 'if tag_param := params.get("tags")' branch
+    that post-filters FTS5 results to only include memories containing the tag.
+    """
+    client.post("/api/memories", json={"content": "tagged search target unique xyz", "tags": ["special-tag"]})
+    client.post("/api/memories", json={"content": "untagged search target unique xyz", "tags": []})
+
+    response = client.get("/api/memories/search?q=xyz&tags=special-tag")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] >= 1
+    for mem in data["memories"]:
+        assert "special-tag" in mem["tags"]
+
+
+def test_api_update_invalid_json_body(client: TestClient, memory_factory) -> None:
+    """PUT /api/memories/{id} with non-JSON body returns 400.
+
+    Covers api.py: the except (json.JSONDecodeError, TypeError, ValueError) branch
+    in api_update that handles malformed request bodies.
+    """
+    mem = memory_factory(content="Memory for invalid-JSON update test")
+    response = client.put(
+        f"/api/memories/{mem['id']}",
+        content=b"not valid json body",
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 400
+    data = response.json()
+    assert "invalid json" in data["error"].lower()
+
+
+def test_api_search_fts_error(client: TestClient) -> None:
+    """GET /api/memories/search with a malformed FTS5 query returns 400 search error.
+
+    Covers api.py: the except _sqlite3.OperationalError branch in api_search
+    that handles queries which FTS5 cannot parse (e.g., unmatched quotes).
+    """
+    # FTS5 raises OperationalError on syntactically invalid queries like unmatched quotes
+    response = client.get('/api/memories/search?q="unclosed+quote')
+    assert response.status_code == 400
+    data = response.json()
+    assert "search error" in data["error"].lower()
+
+
+def test_api_import_invalid_json_body(client: TestClient) -> None:
+    """POST /api/import with non-JSON body returns 400.
+
+    Covers api.py: the except (json.JSONDecodeError, TypeError, ValueError) branch
+    in api_import that handles malformed request bodies.
+    """
+    response = client.post(
+        "/api/import",
+        content=b"not valid json body",
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 400
+    data = response.json()
+    assert "invalid json" in data["error"].lower()
+
+
+def test_api_import_raises_oserror(client: TestClient, tmp_path: Path, monkeypatch) -> None:
+    """POST /api/import logs and returns 400 when import_chat_file raises OSError.
+
+    Covers api.py: the except (FileNotFoundError, OSError, ...) block in api_import
+    that handles runtime errors during file import (lines 361-363).
+    """
+    import remind_me_mcp.api as _api_mod
+
+    # Create a real file inside allowed roots so the path check passes
+    chat_file = tmp_path / "broken.json"
+    chat_file.write_text("{}")
+
+    # Monkeypatch import_chat_file to raise OSError so we hit the exception handler
+    def fake_import(*args, **kwargs):
+        raise OSError("simulated read error")
+
+    monkeypatch.setattr(_api_mod, "import_chat_file", fake_import)
+
+    response = client.post("/api/import", json={"file_path": str(chat_file)})
+    assert response.status_code == 400
+    data = response.json()
+    assert "import error" in data["error"].lower()
+
+
+def test_api_update_metadata_only(client: TestClient, memory_factory) -> None:
+    """PUT /api/memories/{id} with only a metadata dict updates metadata and returns 200.
+
+    Covers api.py: the 'if "metadata" in body and body["metadata"] is not None' branch
+    inside api_update that appends the metadata SET clause (lines 292-294).
+    """
+    mem = memory_factory(content="Memory for metadata-only update test")
+    response = client.put(
+        f"/api/memories/{mem['id']}",
+        json={"metadata": {"project": "remind_me", "phase": "09"}},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["metadata"].get("project") == "remind_me"

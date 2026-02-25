@@ -368,3 +368,104 @@ def test_import_embed_id_matches_insert_id(
             f"_embed_and_store was called with mem_id={mem_id!r} but no matching "
             f"row exists in memories — this indicates the BUGF-01 ID mismatch bug."
         )
+
+
+# ---------------------------------------------------------------------------
+# Branch coverage — targeted tests for uncovered importer.py lines (Phase 09-02)
+# ---------------------------------------------------------------------------
+
+
+def test_import_jsonl_format(
+    db_conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """import_chat_file processes .jsonl files by iterating over newline-delimited JSON objects.
+
+    Covers importer.py lines 279-289: the 'elif suffix in (".jsonl",)' branch
+    that reads each line, parses it as JSON, extracts messages, and accumulates contents.
+    """
+    import remind_me_mcp.importer as _importer_mod
+
+    monkeypatch.setattr(_importer_mod, "_get_db", lambda: db_conn)
+    monkeypatch.setattr(_importer_mod, "_embed_and_store", lambda db, mem_id, content: None)
+
+    jsonl_file = tmp_path / "chat.jsonl"
+    # Each JSONL line is a conversation object with chat_messages
+    jsonl_file.write_text(
+        '{"chat_messages": [{"sender": "assistant", "content": "Answer from first line"}]}\n'
+        '{"chat_messages": [{"sender": "assistant", "content": "Answer from second line"}]}\n'
+        "\n"  # blank line should be skipped
+    )
+
+    result = import_chat_file(
+        file_path=str(jsonl_file),
+        category="test",
+        tags=[],
+        extract_mode="assistant_messages",
+        max_length=10000,
+    )
+    assert result["status"] == "ok"
+    assert result["raw_entries"] >= 1
+
+
+def test_import_multi_conversation_json(
+    db_conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """import_chat_file handles JSON arrays where each element is a conversation object.
+
+    Covers importer.py lines 272-274: the 'if isinstance(data, list) and data and
+    isinstance(data[0], dict) and ("chat_messages" in data[0] or "messages" in data[0])'
+    branch that processes lists of conversation dicts.
+    """
+    import remind_me_mcp.importer as _importer_mod
+
+    monkeypatch.setattr(_importer_mod, "_get_db", lambda: db_conn)
+    monkeypatch.setattr(_importer_mod, "_embed_and_store", lambda db, mem_id, content: None)
+
+    multi_conv = [
+        {"chat_messages": [{"sender": "assistant", "content": "First conversation answer"}]},
+        {"chat_messages": [{"sender": "assistant", "content": "Second conversation answer"}]},
+    ]
+    json_file = tmp_path / "multi_conv.json"
+    json_file.write_text(json.dumps(multi_conv))
+
+    result = import_chat_file(
+        file_path=str(json_file),
+        category="test",
+        tags=[],
+        extract_mode="assistant_messages",
+        max_length=10000,
+    )
+    assert result["status"] == "ok"
+    assert result["raw_entries"] >= 2
+
+
+def test_import_unsupported_format(
+    db_conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """import_chat_file returns a status='error' dict for unsupported file extensions.
+
+    Covers importer.py line 262: the early-return guard checking suffix against
+    the set of supported extensions (.json, .jsonl, .md, .markdown, .txt).
+    """
+    import remind_me_mcp.importer as _importer_mod
+
+    monkeypatch.setattr(_importer_mod, "_get_db", lambda: db_conn)
+
+    xyz_file = tmp_path / "chat.xyz"
+    xyz_file.write_text("some unsupported format content")
+
+    result = import_chat_file(
+        file_path=str(xyz_file),
+        category="test",
+        tags=[],
+        extract_mode="assistant_messages",
+        max_length=10000,
+    )
+    assert result["status"] == "error"
+    assert "unsupported" in result["reason"].lower()
