@@ -1,5 +1,4 @@
-# Coverage gate: 74% (measured 76% minus 2% headroom per STATE.md).
-# Target is 80% (CICD-02) — will increase as tests are added in Phases 6-8.
+# Coverage gate: 80% (CICD-02 requirement satisfied — Phase 9 gap closure).
 name: CI
 
 on:
@@ -29,4 +28,4 @@ jobs:
         run: ruff check --output-format=github .
 
       - name: Test with coverage
-        run: pytest --cov=remind_me_mcp --cov-report=term-missing --cov-fail-under=74
+        run: pytest --cov=remind_me_mcp --cov-report=term-missing --cov-fail-under=80
