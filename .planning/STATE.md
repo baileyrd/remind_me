@@ -5,16 +5,16 @@
 See: .planning/PROJECT.md (updated 2026-02-24)
 
 **Core value:** Persistent, searchable memory across all Claude interfaces — modular, tested, maintainable
-**Current focus:** v1.1 Phase 7 — API Embedding Parity
+**Current focus:** v1.1 Phase 8 — Performance Improvements (COMPLETE)
 
 ## Current Position
 
-Phase: 7 of 8 (API Embedding Parity)
-Plan: 1 of 1 in current phase — Phase 7 Plan 1 COMPLETE
-Status: In progress
-Last activity: 2026-02-24 — Plan 07-01 complete (EMBD-01/EMBD-02: REST API embedding parity, 5 integration tests)
+Phase: 8 of 8 (Performance Improvements)
+Plan: 1 of 1 in current phase — Phase 8 Plan 1 COMPLETE
+Status: COMPLETE — all v1.1 phases done
+Last activity: 2026-02-24 — Plan 08-01 complete (PERF-01: batched reindex embedding, EMBED_BATCH_SIZE=32, 214 tests)
 
-Progress: [#######░░░] 70% (v1.1 — 4/5 phases)
+Progress: [##########] 100% (v1.1 — 5/5 phases COMPLETE)
 
 ## Performance Metrics
 
@@ -39,8 +39,9 @@ Progress: [#######░░░] 70% (v1.1 — 4/5 phases)
 | 05-ci-cd-pipeline | 2/2 | 5min | 2.5min |
 | 06-security-hardening | 2/2 | 6min | 3min |
 | 07-api-embedding-parity | 1/1 | 2min | 2min |
+| 08-performance-improvements | 1/1 | 2min | 2min |
 
-*v1.1 metrics will accumulate as phases complete*
+*v1.1 complete — all 5 phases executed*
 
 ## Accumulated Context
 
@@ -72,6 +73,7 @@ Recent decisions affecting v1.1:
 - [Phase 07-api-embedding-parity, plan 01]: sqlite-vec 0.1.6 requires 'AND mv.k = ?' constraint instead of 'LIMIT ?' in knn JOIN queries — LIMIT does not push through the JOIN planner; fixed in _semantic_search
 - [Phase 07-api-embedding-parity, plan 01]: Gate api_update re-embed on 'content' in body and body['content'] is not None — tag-only updates must not call _embed_and_store (mirrors tools.py lines 359-360)
 - [Phase 07-api-embedding-parity, plan 01]: _embed_and_store called via asyncio.to_thread in async route handlers — consistent with tools.py memory_add/memory_update pattern
+- [Phase 08-performance-improvements, plan 01]: EMBED_BATCH_SIZE = 32 module-level constant in tools.py; batched embedder.embed(texts) replaces per-item embed_one(); batch try/except logs ids[0] on failure; zip(strict=True) since ids and rowids always equal length
 
 ### Pending Todos
 
@@ -88,5 +90,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-02-24
-Stopped at: Completed 07-01-PLAN.md (EMBD-01/EMBD-02 REST API embedding parity + _semantic_search knn fix, Phase 7 COMPLETE)
+Stopped at: Completed 08-01-PLAN.md (PERF-01: batched reindex EMBED_BATCH_SIZE=32, 214 tests, Phase 8 COMPLETE — v1.1 DONE)
 Resume file: None

@@ -31,7 +31,7 @@ Requirements for tech debt milestone. Each maps to roadmap phases.
 
 ### Performance
 
-- [ ] **PERF-01**: Reindex tool processes embeddings in batches of 32 using `embedder.embed()` list API
+- [x] **PERF-01**: Reindex tool processes embeddings in batches of 32 using `embedder.embed()` list API
 - [ ] **PERF-02**: Directory import processes files concurrently with semaphore-bounded parallelism
 
 ## Future Requirements
@@ -80,7 +80,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | QUAL-03 | Phase 4 | Complete (04-01) |
 | EMBD-01 | Phase 7 | Complete |
 | EMBD-02 | Phase 7 | Complete |
-| PERF-01 | Phase 8 | Pending |
+| PERF-01 | Phase 8 | Complete |
 | PERF-02 | Phase 8 | Pending |
 
 **Coverage:**

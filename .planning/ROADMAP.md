@@ -89,7 +89,7 @@ Plans:
   1. The reindex tool processes embeddings in batches of 32 using the `embedder.embed(list)` batch API rather than one-at-a-time calls (measurable via reduced call count in tests)
   2. Directory import processes files concurrently with a bounded semaphore, completing faster than sequential processing on directories with 10+ files
   3. All 190+ tests continue to pass after performance refactors, confirming no behavioral regression
-**Plans:** 2 plans
+**Plans:** 1/2 plans executed
 Plans:
 - [ ] 08-01-PLAN.md — Batch reindex embedding loop with EMBED_BATCH_SIZE=32 (PERF-01)
 - [ ] 08-02-PLAN.md — Convert import_directory to async with semaphore-bounded concurrency (PERF-02)
@@ -108,4 +108,4 @@ Phases execute in numeric order: 4 → 5 → 6 → 7 → 8
 | 5. CI/CD Pipeline | v1.1 | 2/2 | Complete | 2026-02-24 |
 | 6. Security Hardening | 2/2 | Complete    | 2026-02-24 | - |
 | 7. API Embedding Parity | 1/1 | Complete   | 2026-02-24 | - |
-| 8. Performance Improvements | v1.1 | 0/2 | Not started | - |
+| 8. Performance Improvements | 1/2 | In Progress|  | - |
