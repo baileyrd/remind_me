@@ -2,7 +2,7 @@
 
 ## What This Is
 
-A personal memory server for Claude that persists facts, preferences, and conversations across sessions. Works with Claude.ai, Claude Code, and Claude Desktop via MCP (Model Context Protocol). Features hybrid search (FTS5 + semantic vectors), auto-capture of conversations, chat import, and an optional web dashboard. Structured as a well-tested 10-module Python package with async safety and schema migration support.
+A personal memory server for Claude that persists facts, preferences, and conversations across sessions. Works with Claude.ai, Claude Code, and Claude Desktop via MCP (Model Context Protocol). Features hybrid search (FTS5 + semantic vectors), auto-capture of conversations, chat import, and an optional web dashboard. Structured as a well-tested 10-module Python package with security hardening, CI/CD, and 80%+ test coverage.
 
 ## Core Value
 
@@ -33,27 +33,23 @@ Persistent, searchable memory that works seamlessly across all Claude interfaces
 - ✓ Both known bugs fixed (import embedding ID mismatch, capture_id LIKE scan) — v1.0
 - ✓ Dashboard JSX extracted to separate file — v1.0
 - ✓ Self-update feature with background check and CLI flags — post-v1.0
+- ✓ Zero ruff lint warnings, narrowed exception handlers — v1.1
+- ✓ Monolith file removed from repository — v1.1
+- ✓ GitHub Actions CI with lint + test + coverage gates (Python 3.11/3.12) — v1.1
+- ✓ Coverage enforcement at 80% minimum — v1.1
+- ✓ CORS restricted to localhost origins — v1.1
+- ✓ Import path traversal guard with configurable IMPORT_ROOTS — v1.1
+- ✓ Optional Bearer token auth for API routes — v1.1
+- ✓ REST API embedding parity (POST/PUT generate embeddings) — v1.1
+- ✓ Batch reindex (32 at a time) — v1.1
+- ✓ Concurrent directory import with semaphore-bounded parallelism — v1.1
 
 ### Active
 
-- [ ] Security hardening (CORS lockdown, API auth, import path restrictions)
-- [ ] CI/CD pipeline with automated test runs and coverage enforcement
-- [ ] Performance: batch reindex, concurrent file processing
-- [ ] API path embedding parity (REST API memories lack semantic embeddings)
-- [ ] Clean up ruff warnings (unused imports, type annotations)
-- [ ] Remove original monolith file (remind_me_mcp_original.py)
-- [ ] Narrow broad `except Exception` in embeddings.py/pid.py
-
-## Current Milestone: v1.1 Address 1.0 Tech Debt
-
-**Goal:** Clean up all known tech debt from v1.0 — security hardening, CI/CD, performance, embedding parity, code quality, and monolith removal.
-
-**Target features:**
-- Security hardening (CORS lockdown, API auth, import path restrictions)
-- CI/CD pipeline with automated test runs and coverage enforcement
-- Performance improvements (batch reindex, concurrent file processing)
-- API path embedding parity (REST API memories get semantic embeddings)
-- Code quality (ruff warnings, narrow exception handling, remove monolith)
+- [ ] REST API semantic search endpoint (`/api/memories/semantic-search`)
+- [ ] mypy strict mode enforcement
+- [ ] HTTPS/TLS support for dashboard
+- [ ] Rate limiting on API endpoints
 
 ### Out of Scope
 
@@ -61,16 +57,20 @@ Persistent, searchable memory that works seamlessly across all Claude interfaces
 - Splitting into separate installable packages — single package install preserved
 - PostgreSQL migration — SQLite with WAL is sufficient for personal use
 - Node.js build tooling — unnecessary complexity for simple dashboard
+- Full OAuth2/JWT auth — static bearer token sufficient for personal localhost tool
+- Rate limiting — single-user personal tool; no multi-tenant scenario
+- HTTPS/TLS — localhost traffic; self-signed certs add complexity with no benefit
 
 ## Context
 
-Shipped v1.0 with 7,215 lines of Python (3,680 package + 3,535 tests).
+Shipped v1.1 with 8,216 lines of Python (package + tests).
 Tech stack: Python 3.11+, FastMCP, SQLite (WAL), Pydantic, Starlette, ONNX Runtime (optional), React/Babel (dashboard).
 10-module package: config, db, embeddings, models, formatting, importer, pid, server, tools, api, plus dashboard/ subpackage.
-190 tests passing (172 v1.0 + 18 updater tests).
+234 tests passing at 80.19% line coverage.
 15 MCP tools + 2 resource handlers registered.
 Schema at version 2 (PRAGMA user_version) with migration support.
-Self-update feature added post-v1.0 with `--version`, `--check-update`, `--update` CLI flags.
+GitHub Actions CI validates every push/PR with lint + test + coverage gates.
+Security: CORS localhost-only, import path guard, optional Bearer token auth.
 
 ## Constraints
 
@@ -88,9 +88,15 @@ Self-update feature added post-v1.0 with `--version`, `--check-update`, `--updat
 | Single package, multiple modules | Preserves simple install while enabling separation of concerns | ✓ Good — 10 modules, zero circular imports |
 | Keep Babel standalone for dashboard | Avoids adding Node.js build tooling dependency for a simple dashboard | ✓ Good — dashboard works, no build step needed |
 | Fix bugs during refactor | Bugs surface naturally when restructuring the affected code | ✓ Good — both bugs found and fixed with tests |
-| Defer security hardening | Separate concern — mixing security changes with structural refactor increases risk | — Pending (next milestone candidate) |
+| Security hardening as separate milestone | Mixing security changes with structural refactor increases risk | ✓ Good — clean baseline made security changes reviewable |
 | SQLite WAL mode over PostgreSQL | WAL fixes multi-process concurrency without adding dependencies | ✓ Good — concurrent access verified by tests |
 | Entry point via __main__:main | CLI flags (--version, --check-update, --update) need argparse | ✓ Good — replaced mcp.run entry point |
+| Coverage gate at 74% initially, raised to 80% | Start below measured coverage, raise as tests accumulate | ✓ Good — avoided CI red while building toward target |
+| CORS regex over origin list | Handles both localhost and 127.0.0.1 with any port | ✓ Good — no subdomain bypass possible |
+| BearerAuthMiddleware inside _build_api_app() | Preserves lazy Starlette import for MCP stdio mode | ✓ Good — MCP mode never loads Starlette |
+| hmac.compare_digest for token comparison | Timing-safe comparison prevents side-channel attacks | ✓ Good — stdlib, no extra dependencies |
+| threading.Lock for concurrent SQLite writes | Serializes DB writes while allowing concurrent file I/O | ✓ Good — prevents InterfaceError under 8-worker concurrency |
+| sqlite-vec knn fix (AND mv.k = ?) | LIMIT doesn't push through JOIN in sqlite-vec 0.1.6 | ✓ Good — fixed semantic search for all code paths |
 
 ---
-*Last updated: 2026-02-24 after v1.1 milestone started*
+*Last updated: 2026-02-25 after v1.1 milestone*
