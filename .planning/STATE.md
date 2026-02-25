@@ -10,9 +10,9 @@ See: .planning/PROJECT.md (updated 2026-02-24)
 ## Current Position
 
 Phase: 8 of 8 (Performance Improvements)
-Plan: 1 of 1 in current phase — Phase 8 Plan 1 COMPLETE
+Plan: 2 of 2 in current phase — Phase 8 Plan 2 COMPLETE
 Status: COMPLETE — all v1.1 phases done
-Last activity: 2026-02-24 — Plan 08-01 complete (PERF-01: batched reindex embedding, EMBED_BATCH_SIZE=32, 214 tests)
+Last activity: 2026-02-24 — Plan 08-02 complete (PERF-02: async concurrent directory import, asyncio.gather + Semaphore + threading.Lock, 215 tests)
 
 Progress: [##########] 100% (v1.1 — 5/5 phases COMPLETE)
 
@@ -42,6 +42,7 @@ Progress: [##########] 100% (v1.1 — 5/5 phases COMPLETE)
 | 08-performance-improvements | 1/1 | 2min | 2min |
 
 *v1.1 complete — all 5 phases executed*
+| Phase 08-performance-improvements P02 | 4min | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -74,6 +75,9 @@ Recent decisions affecting v1.1:
 - [Phase 07-api-embedding-parity, plan 01]: Gate api_update re-embed on 'content' in body and body['content'] is not None — tag-only updates must not call _embed_and_store (mirrors tools.py lines 359-360)
 - [Phase 07-api-embedding-parity, plan 01]: _embed_and_store called via asyncio.to_thread in async route handlers — consistent with tools.py memory_add/memory_update pattern
 - [Phase 08-performance-improvements, plan 01]: EMBED_BATCH_SIZE = 32 module-level constant in tools.py; batched embedder.embed(texts) replaces per-item embed_one(); batch try/except logs ids[0] on failure; zip(strict=True) since ids and rowids always equal length
+- [Phase 08-performance-improvements]: IMPORT_CONCURRENCY = 8 in importer.py; asyncio.Semaphore created inside async function body (not module level) per Python 3.10+ event loop requirement
+- [Phase 08-performance-improvements]: threading.Lock (_import_lock) serializes SQLite DB writes in import_chat_file; file I/O + parsing run concurrently in Phase 1; only Phase 2 (DB writes) is locked — prevents InterfaceError from 8+ concurrent thread-pool workers
+- [Phase 08-performance-improvements]: sqlite3.DatabaseError (parent of OperationalError) now caught in _embed_and_store — concurrent thread access on shared connection surfaces as base DatabaseError in addition to OperationalError
 
 ### Pending Todos
 
@@ -90,5 +94,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-02-24
-Stopped at: Completed 08-01-PLAN.md (PERF-01: batched reindex EMBED_BATCH_SIZE=32, 214 tests, Phase 8 COMPLETE — v1.1 DONE)
+Stopped at: Completed 08-02-PLAN.md (PERF-02: async concurrent import_directory, asyncio.gather+Semaphore+threading.Lock, 215 tests, Phase 8 COMPLETE — v1.1 DONE)
 Resume file: None

@@ -24,7 +24,7 @@
 - [x] **Phase 5: CI/CD Pipeline** - Establish GitHub Actions with lint, test, and coverage gates that validate all subsequent phases (completed 2026-02-24)
 - [x] **Phase 6: Security Hardening** - Lock down CORS, restrict import paths, and add optional API key authentication (completed 2026-02-24)
 - [x] **Phase 7: API Embedding Parity** - Fix the correctness gap where REST API memories are invisible to semantic search (completed 2026-02-24)
-- [ ] **Phase 8: Performance Improvements** - Batch reindex and concurrent file import for large-scale operation
+- [x] **Phase 8: Performance Improvements** - Batch reindex and concurrent file import for large-scale operation (completed 2026-02-25)
 
 ## Phase Details
 
@@ -89,7 +89,7 @@ Plans:
   1. The reindex tool processes embeddings in batches of 32 using the `embedder.embed(list)` batch API rather than one-at-a-time calls (measurable via reduced call count in tests)
   2. Directory import processes files concurrently with a bounded semaphore, completing faster than sequential processing on directories with 10+ files
   3. All 190+ tests continue to pass after performance refactors, confirming no behavioral regression
-**Plans:** 1/2 plans executed
+**Plans:** 2/2 plans complete
 Plans:
 - [ ] 08-01-PLAN.md — Batch reindex embedding loop with EMBED_BATCH_SIZE=32 (PERF-01)
 - [ ] 08-02-PLAN.md — Convert import_directory to async with semaphore-bounded concurrency (PERF-02)
@@ -108,4 +108,4 @@ Phases execute in numeric order: 4 → 5 → 6 → 7 → 8
 | 5. CI/CD Pipeline | v1.1 | 2/2 | Complete | 2026-02-24 |
 | 6. Security Hardening | 2/2 | Complete    | 2026-02-24 | - |
 | 7. API Embedding Parity | 1/1 | Complete   | 2026-02-24 | - |
-| 8. Performance Improvements | 1/2 | In Progress|  | - |
+| 8. Performance Improvements | 2/2 | Complete   | 2026-02-25 | - |
