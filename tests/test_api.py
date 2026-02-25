@@ -367,6 +367,30 @@ def test_api_import_nonexistent_file(client: TestClient) -> None:
     assert "not found" in data["error"].lower()
 
 
+def test_api_import_directory(client: TestClient, db_conn, tmp_path: Path) -> None:
+    """POST /api/import with a directory path executes import and returns a summary.
+
+    Exercises the p.is_dir() branch in api_import. Requires the await fix
+    in api.py to return a real summary rather than a coroutine object.
+    """
+    import json
+
+    chat_file = tmp_path / "chat.json"
+    chat_file.write_text(json.dumps({
+        "chat_messages": [
+            {"sender": "user", "content": [{"type": "text", "text": "What is Python?"}]},
+            {"sender": "assistant", "content": [{"type": "text", "text": "Python is a programming language."}]},
+        ]
+    }))
+
+    response = client.post("/api/import", json={"file_path": str(tmp_path)})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["files_processed"] == 1
+    assert data["imported"] == 1
+    assert data["total_memories_created"] >= 1
+
+
 # ---------------------------------------------------------------------------
 # Full REST CRUD cycle
 # ---------------------------------------------------------------------------

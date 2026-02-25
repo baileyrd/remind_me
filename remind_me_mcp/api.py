@@ -345,7 +345,7 @@ def _build_api_app() -> Starlette:
         try:
             if p.is_dir():
                 # Directory import — delegates to shared import_directory() (DRY)
-                summary = import_directory(
+                summary = await import_directory(
                     directory=str(p),
                     category=category,
                     tags=tags,
