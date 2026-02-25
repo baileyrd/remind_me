@@ -772,7 +772,7 @@ async def remind_me_reindex() -> str:
         texts = [item[2][:2000] for item in batch]
         try:
             vecs = await asyncio.to_thread(embedder.embed, texts)
-            for i, (mem_id, rowid) in enumerate(zip(ids, rowids)):
+            for i, (_mem_id, rowid) in enumerate(zip(ids, rowids, strict=True)):
                 vec_bytes = vecs[i].tobytes()
                 db.execute(
                     "INSERT OR REPLACE INTO memories_vec(rowid, embedding) VALUES (?, ?)",

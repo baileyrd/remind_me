@@ -679,6 +679,40 @@ async def test_reindex_with_embedder(
     assert len(result) > 0
 
 
+async def test_reindex_batches_embed_calls(
+    db_conn: sqlite3.Connection,
+    mock_embedder,
+    memory_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reindex with 40 memories calls embedder.embed() twice (batch 32 + batch 8), not 40 times."""
+    from remind_me_mcp.tools import EMBED_BATCH_SIZE
+
+    # Create 40 memories so we get 2 batches (32 + 8)
+    for i in range(40):
+        memory_factory(content=f"Batch reindex test memory number {i} with unique content")
+
+    # Spy on embed calls to track batch sizes
+    call_log: list[list[str]] = []
+    original_embed = mock_embedder.embed
+
+    def spy_embed(texts: list[str]):
+        call_log.append(list(texts))
+        return original_embed(texts)
+
+    monkeypatch.setattr(mock_embedder, "embed", spy_embed)
+
+    result = await remind_me_reindex()
+
+    # Verify batch behavior: 40 items split into 2 batches (32 + 8)
+    assert len(call_log) == 2, f"Expected 2 batch calls (32+8), got {len(call_log)}"
+    assert len(call_log[0]) == EMBED_BATCH_SIZE, (
+        f"First batch should be {EMBED_BATCH_SIZE}, got {len(call_log[0])}"
+    )
+    assert len(call_log[1]) == 8, f"Second batch should be 8, got {len(call_log[1])}"
+    assert "Newly embedded" in result or "complete" in result.lower()
+
+
 # ---------------------------------------------------------------------------
 # remind_me_server_status tests
 # ---------------------------------------------------------------------------
