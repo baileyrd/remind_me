@@ -335,7 +335,9 @@ def _embed_and_store(db: sqlite3.Connection, memory_id: str, content: str) -> bo
         )
         db.commit()
         return True
-    except sqlite3.OperationalError as e:
+    except sqlite3.DatabaseError as e:
+        # Catches OperationalError (no vector table, missing table) and
+        # DatabaseError (concurrent thread access on shared connection).
         log.warning("Database error storing embedding for %s: %s", memory_id, e)
         return False
     except (ValueError, TypeError) as e:

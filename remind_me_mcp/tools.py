@@ -452,7 +452,7 @@ async def memory_import_directory(params: BulkImportDirInput) -> str:
         str: JSON summary with keys: files_processed, imported, skipped,
         errors, total_memories_created, details.
     """
-    summary = import_directory(
+    summary = await import_directory(
         directory=params.directory,
         category=params.category,
         tags=params.tags,

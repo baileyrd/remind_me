@@ -7,6 +7,7 @@ into memory-sized pieces, and storing results into the database.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -17,6 +18,8 @@ from typing import Any
 from remind_me_mcp.db import _embed_and_store, _get_db, _make_id, _now_iso
 
 log = logging.getLogger("remind_me_mcp.importer")
+
+IMPORT_CONCURRENCY = 8
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -335,7 +338,7 @@ def import_chat_file(
 # ---------------------------------------------------------------------------
 
 
-def import_directory(
+async def import_directory(
     directory: str,
     category: str = "chat_import",
     tags: list[str] | None = None,
@@ -343,10 +346,12 @@ def import_directory(
     max_length: int = 10000,
     recursive: bool = True,
 ) -> dict[str, Any]:
-    """Import all chat export files from a directory.
+    """Import all chat export files from a directory concurrently.
 
     Scans for .json, .jsonl, .md, .markdown, and .txt files. Skips
-    already-imported files (hash-based deduplication).
+    already-imported files (hash-based deduplication). Files are processed
+    concurrently using asyncio.gather with a semaphore bounded by
+    IMPORT_CONCURRENCY (default 8) to prevent resource exhaustion.
 
     Args:
         directory: Path to the directory containing chat export files.
@@ -369,20 +374,24 @@ def import_directory(
     else:
         files = [f for f in root.iterdir() if f.suffix.lower() in extensions and f.is_file()]
 
-    results: list[dict[str, Any]] = []
-    for f in sorted(files):
-        try:
-            r = import_chat_file(
-                file_path=str(f),
-                category=category,
-                tags=tags,
-                extract_mode=extract_mode,
-                max_length=max_length,
-            )
-            results.append(r)
-        except (json.JSONDecodeError, UnicodeDecodeError, FileNotFoundError, OSError) as e:
-            log.warning("Failed to import %s: %s", f.name, e)
-            results.append({"status": "error", "file": f.name, "error": str(e)})
+    sem = asyncio.Semaphore(IMPORT_CONCURRENCY)
+
+    async def _import_one(f: Path) -> dict[str, Any]:
+        async with sem:
+            try:
+                return await asyncio.to_thread(
+                    import_chat_file,
+                    file_path=str(f),
+                    category=category,
+                    tags=tags,
+                    extract_mode=extract_mode,
+                    max_length=max_length,
+                )
+            except (json.JSONDecodeError, UnicodeDecodeError, FileNotFoundError, OSError) as e:
+                log.warning("Failed to import %s: %s", f.name, e)
+                return {"status": "error", "file": f.name, "error": str(e)}
+
+    results = list(await asyncio.gather(*[_import_one(f) for f in sorted(files)]))
 
     ok = [r for r in results if r.get("status") == "ok"]
     skipped = [r for r in results if r.get("status") == "skipped"]
