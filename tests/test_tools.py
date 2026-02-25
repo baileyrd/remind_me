@@ -483,6 +483,33 @@ async def test_import_directory_empty(db_conn: sqlite3.Connection, tmp_path: Pat
     assert result["files_processed"] == 0
 
 
+async def test_import_directory_concurrent(
+    db_conn: sqlite3.Connection,
+    tmp_path: Path,
+) -> None:
+    """Importing a directory with 12 files processes all files correctly via concurrent dispatch."""
+    # Create 12 distinct JSON chat files
+    for i in range(12):
+        data = {
+            "chat_messages": [
+                {
+                    "sender": "assistant",
+                    "content": [{"type": "text", "text": f"Concurrent import test file {i}: unique content for concurrency test {i}"}],
+                }
+            ]
+        }
+        (tmp_path / f"concurrent_{i}.json").write_text(json.dumps(data))
+
+    params = BulkImportDirInput(directory=str(tmp_path))
+    result_str = await memory_import_directory(params)
+    result = json.loads(result_str)
+
+    assert result["files_processed"] == 12
+    assert result["imported"] == 12
+    assert result["errors"] == 0
+    assert result["total_memories_created"] >= 12
+
+
 # ---------------------------------------------------------------------------
 # memory_stats tests
 # ---------------------------------------------------------------------------

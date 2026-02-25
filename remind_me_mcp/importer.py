@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import re
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,10 @@ from remind_me_mcp.db import _embed_and_store, _get_db, _make_id, _now_iso
 log = logging.getLogger("remind_me_mcp.importer")
 
 IMPORT_CONCURRENCY = 8
+
+# Serializes SQLite write operations when import_chat_file runs concurrently
+# in multiple asyncio.to_thread workers sharing the same DB connection.
+_import_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -248,17 +253,15 @@ def import_chat_file(
         'reason': str, 'file': str}.
     """
     path = Path(file_path)
+
+    # --- Phase 1: File I/O and parsing (no lock needed; pure CPU/disk work) ---
     fhash = _file_hash(file_path)
-    db = _get_db()
-
-    # Check for duplicate import
-    existing = db.execute("SELECT import_id FROM chat_imports WHERE hash = ?", (fhash,)).fetchone()
-    if existing:
-        return {"status": "skipped", "reason": "already_imported", "file": path.name, "import_id": existing["import_id"]}
-
     suffix = path.suffix.lower()
-    raw = path.read_text(encoding="utf-8", errors="replace")
 
+    if suffix not in (".json", ".jsonl", ".md", ".markdown", ".txt"):
+        return {"status": "error", "reason": f"unsupported format: {suffix}", "file": path.name}
+
+    raw = path.read_text(encoding="utf-8", errors="replace")
     contents: list[str] = []
 
     if suffix in (".json",):
@@ -286,21 +289,30 @@ def import_chat_file(
                 continue
     elif suffix in (".md", ".markdown", ".txt"):
         contents = _parse_markdown_chat(raw, extract_mode)
-    else:
-        return {"status": "error", "reason": f"unsupported format: {suffix}", "file": path.name}
 
-    # Chunk and store — collect (mem_id, chunk) pairs so the same IDs are used
-    # for both INSERT and embedding (BUGF-01 fix: prevents ID mismatch)
-    stored = 0
+    # Pre-compute chunk/embed pairs before acquiring the lock
     now = _now_iso()
     import_id = _make_id(file_path)
     embed_pairs: list[tuple[str, str]] = []
-
     for content in contents:
         if not content.strip():
             continue
         for chunk in _chunk_text(content, max_length):
-            mem_id = _make_id(chunk)
+            embed_pairs.append((_make_id(chunk), chunk))
+
+    # --- Phase 2: DB writes (serialized via lock for thread safety) ---
+    with _import_lock:
+        db = _get_db()
+
+        # Check for duplicate import
+        existing = db.execute("SELECT import_id FROM chat_imports WHERE hash = ?", (fhash,)).fetchone()
+        if existing:
+            return {"status": "skipped", "reason": "already_imported", "file": path.name, "import_id": existing["import_id"]}
+
+        # Chunk and store — collect (mem_id, chunk) pairs so the same IDs are used
+        # for both INSERT and embedding (BUGF-01 fix: prevents ID mismatch)
+        stored = 0
+        for mem_id, chunk in embed_pairs:
             db.execute(
                 """INSERT OR IGNORE INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -315,21 +327,20 @@ def import_chat_file(
                     now,
                 ),
             )
-            embed_pairs.append((mem_id, chunk))
             stored += 1
 
-    db.commit()
+        db.commit()
 
-    # Embed using the SAME mem_id that was used for INSERT (no recomputation)
-    for mem_id, chunk in embed_pairs:
-        _embed_and_store(db, mem_id, chunk)
+        # Embed using the SAME mem_id that was used for INSERT (no recomputation)
+        for mem_id, chunk in embed_pairs:
+            _embed_and_store(db, mem_id, chunk)
 
-    stats = {"memories_created": stored, "raw_entries": len(contents), "file": path.name}
-    db.execute(
-        "INSERT INTO chat_imports (import_id, filename, hash, imported_at, stats) VALUES (?, ?, ?, ?, ?)",
-        (import_id, path.name, fhash, now, json.dumps(stats)),
-    )
-    db.commit()
+        stats = {"memories_created": stored, "raw_entries": len(contents), "file": path.name}
+        db.execute(
+            "INSERT INTO chat_imports (import_id, filename, hash, imported_at, stats) VALUES (?, ?, ?, ?, ?)",
+            (import_id, path.name, fhash, now, json.dumps(stats)),
+        )
+        db.commit()
     return {"status": "ok", "import_id": import_id, **stats}
 
 
