@@ -469,3 +469,127 @@ def test_import_unsupported_format(
     )
     assert result["status"] == "error"
     assert "unsupported" in result["reason"].lower()
+
+
+def test_import_jsonl_with_malformed_line(
+    db_conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """import_chat_file skips malformed JSONL lines without crashing.
+
+    Covers importer.py lines 287-289: the except json.JSONDecodeError handler
+    inside the JSONL loop that logs and continues past bad lines.
+    """
+    import remind_me_mcp.importer as _importer_mod
+
+    monkeypatch.setattr(_importer_mod, "_get_db", lambda: db_conn)
+    monkeypatch.setattr(_importer_mod, "_embed_and_store", lambda db, mem_id, content: None)
+
+    jsonl_file = tmp_path / "mixed.jsonl"
+    jsonl_file.write_text(
+        '{"chat_messages": [{"sender": "assistant", "content": "Valid line"}]}\n'
+        "THIS IS NOT VALID JSON !!!\n"  # malformed line — should be skipped
+    )
+
+    result = import_chat_file(
+        file_path=str(jsonl_file),
+        category="test",
+        tags=[],
+        extract_mode="assistant_messages",
+        max_length=10000,
+    )
+    # Import should succeed despite the malformed line
+    assert result["status"] == "ok"
+    # Only the valid line contributes
+    assert result["raw_entries"] >= 1
+
+
+def test_extract_messages_unrecognized_data() -> None:
+    """_extract_messages_from_json returns an empty list for unrecognized data shapes.
+
+    Covers importer.py line 155: the fallthrough 'return messages' for data that is
+    not a list, not a dict with chat_messages, and not a dict with messages.
+    """
+    from remind_me_mcp.importer import _extract_messages_from_json
+
+    # A plain string is not a recognizable conversation format
+    result = _extract_messages_from_json("just a string", "all_messages")
+    assert result == []
+
+    # A number is not recognizable either
+    result = _extract_messages_from_json(42, "all_messages")
+    assert result == []
+
+
+def test_extract_messages_chat_messages_string_blocks() -> None:
+    """_extract_messages_from_json handles content blocks that are raw strings (not dicts).
+
+    Covers importer.py lines 121-122: the 'elif isinstance(block, str)' branch
+    inside the chat_messages content-list loop.
+    """
+    from remind_me_mcp.importer import _extract_messages_from_json
+
+    data = {
+        "chat_messages": [
+            {
+                "sender": "assistant",
+                # content as list with raw string elements (not {type, text} dicts)
+                "content": ["Hello from assistant as a raw string"],
+            }
+        ]
+    }
+    result = _extract_messages_from_json(data, "all_messages")
+    assert len(result) == 1
+    assert "Hello from assistant as a raw string" in result[0]["content"]
+
+
+def test_extract_messages_non_string_content_field() -> None:
+    """_extract_messages_from_json converts non-string, non-list content to str.
+
+    Covers importer.py line 127: the 'else: content = str(content_field)' fallthrough
+    when content_field is neither a list nor a string (e.g., an integer or None-ish value).
+    """
+    from remind_me_mcp.importer import _extract_messages_from_json
+
+    data = {
+        "chat_messages": [
+            {
+                "sender": "assistant",
+                "content": 12345,  # integer — neither list nor str
+            }
+        ]
+    }
+    result = _extract_messages_from_json(data, "all_messages")
+    assert len(result) == 1
+    assert "12345" in result[0]["content"]
+
+
+def test_extract_messages_list_content_in_role_list() -> None:
+    """_extract_messages_from_json handles messages whose content field is a list.
+
+    Covers importer.py lines 142-146: the 'if isinstance(content, list)' branch
+    inside the standard {role, content} list path.
+    """
+    from remind_me_mcp.importer import _extract_messages_from_json
+
+    data = [
+        {
+            "role": "assistant",
+            # content as list of {text} dicts (not inside chat_messages)
+            "content": [{"text": "Part one"}, {"text": "Part two"}],
+        }
+    ]
+    result = _extract_messages_from_json(data, "all_messages")
+    assert len(result) == 1
+    assert "Part one" in result[0]["content"]
+
+
+def test_filter_conversations_empty_messages() -> None:
+    """_filter_messages with mode='conversations' and empty list returns empty list.
+
+    Covers importer.py line 180: the 'return []' branch in conversations mode
+    when the messages list is empty.
+    """
+    result = _filter_messages([], "conversations")
+    assert result == []
