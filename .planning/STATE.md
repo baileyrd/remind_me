@@ -9,10 +9,10 @@ See: .planning/PROJECT.md (updated 2026-02-24)
 
 ## Current Position
 
-Phase: 8 of 8 (Performance Improvements)
-Plan: 2 of 2 in current phase — Phase 8 Plan 2 COMPLETE
-Status: COMPLETE — all v1.1 phases done
-Last activity: 2026-02-24 — Plan 08-02 complete (PERF-02: async concurrent directory import, asyncio.gather + Semaphore + threading.Lock, 215 tests)
+Phase: 9 of 9 (Gap Closure — Async Fix and Coverage)
+Plan: 1 of 1 in current phase — Phase 9 Plan 1 COMPLETE
+Status: COMPLETE — phase 09 gap closure done
+Last activity: 2026-02-25 — Plan 09-01 complete (PERF-02 gap closed: await import_directory in api.py, test_api_import_directory added, 216 tests)
 
 Progress: [##########] 100% (v1.1 — 5/5 phases COMPLETE)
 
@@ -43,6 +43,7 @@ Progress: [##########] 100% (v1.1 — 5/5 phases COMPLETE)
 
 *v1.1 complete — all 5 phases executed*
 | Phase 08-performance-improvements P02 | 4min | 2 tasks | 4 files |
+| Phase 09-gap-closure-async-fix-and-coverage P01 | 5min | 1 task | 2 files |
 
 ## Accumulated Context
 
@@ -83,6 +84,10 @@ Recent decisions affecting v1.1:
 
 None.
 
+### Key Decisions (Phase 09)
+
+- [Phase 09-gap-closure, plan 01]: Plan test asserted `data["status"] == "ok"` for directory import but import_directory() summary dict has no top-level status key; assertion removed to match actual schema (files_processed, imported, total_memories_created)
+
 ### Blockers/Concerns
 
 - Phase 4 (RESOLVED 04-01): Side-effect import preservation — noqa: F401 comments survived ruff I001 auto-fix correctly
@@ -93,6 +98,6 @@ None.
 
 ## Session Continuity
 
-Last session: 2026-02-24
-Stopped at: Completed 08-02-PLAN.md (PERF-02: async concurrent import_directory, asyncio.gather+Semaphore+threading.Lock, 215 tests, Phase 8 COMPLETE — v1.1 DONE)
+Last session: 2026-02-25
+Stopped at: Completed 09-01-PLAN.md (PERF-02 gap closed: await fix in api.py + test_api_import_directory, 216 tests, Phase 9 COMPLETE)
 Resume file: None

@@ -81,7 +81,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | EMBD-01 | Phase 7 | Complete |
 | EMBD-02 | Phase 7 | Complete |
 | PERF-01 | Phase 8 | Complete |
-| PERF-02 | Phase 9 | Pending |
+| PERF-02 | Phase 9 | Complete |
 
 **Coverage:**
 - v1.1 requirements: 12 total
