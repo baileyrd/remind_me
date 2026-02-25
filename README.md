@@ -20,8 +20,8 @@ Persistent, searchable memory that works across **Claude.ai**, **Claude Code**, 
 ### 1. Install
 
 ```bash
-# Clone or copy the server
-git clone <your-repo-url> ~/remind-me-mcp
+# Clone the repository
+git clone https://github.com/baileyrd/remind_me.git ~/remind-me-mcp
 cd ~/remind-me-mcp
 
 # Install with uv (recommended)
@@ -39,8 +39,7 @@ Add to your Claude Code MCP config (`~/.claude/claude_code_config.json` or proje
 {
   "mcpServers": {
     "remind-me": {
-      "command": "uv",
-      "args": ["run", "--directory", "/path/to/remind-me-mcp", "python", "remind_me_mcp.py"],
+      "command": "remind-me-mcp",
       "env": {
         "REMIND_ME_MCP_DIR": "~/.remind-me"
       }
@@ -49,13 +48,14 @@ Add to your Claude Code MCP config (`~/.claude/claude_code_config.json` or proje
 }
 ```
 
-Or if installed as a package:
+Or run via `uv` without installing:
 
 ```json
 {
   "mcpServers": {
     "remind-me": {
-      "command": "remind-me-mcp",
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/remind-me-mcp", "python", "-m", "remind_me_mcp"],
       "env": {
         "REMIND_ME_MCP_DIR": "~/.remind-me"
       }
@@ -73,7 +73,7 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
   "mcpServers": {
     "remind-me": {
       "command": "uv",
-      "args": ["run", "--directory", "/path/to/remind-me-mcp", "python", "remind_me_mcp.py"],
+      "args": ["run", "--directory", "/path/to/remind-me-mcp", "python", "-m", "remind_me_mcp"],
       "env": {
         "REMIND_ME_MCP_DIR": "~/.remind-me"
       }
@@ -94,13 +94,13 @@ The server includes a built-in web dashboard for browsing, searching, and managi
 
 ```bash
 # Option A: environment variable
-REMIND_ME_MCP_SERVE_UI=true python remind_me_mcp.py
+REMIND_ME_MCP_SERVE_UI=true remind-me-mcp
 
 # Option B: command-line flag
-python remind_me_mcp.py --serve-ui
+remind-me-mcp --serve-ui
 
 # Option C: custom port and host
-python remind_me_mcp.py --serve-ui --ui-port 8080 --ui-host 0.0.0.0
+remind-me-mcp --serve-ui --ui-port 8080 --ui-host 0.0.0.0
 ```
 
 Then open **http://localhost:5199** in your browser.
@@ -144,7 +144,7 @@ The server tracks running instances via a PID file (`~/.remind-me/server.pid`):
 - **`--status` flag** lets you check from the command line without starting anything:
 
 ```bash
-python remind_me_mcp.py --status
+remind-me-mcp --status
 # ✓ Dashboard running at http://127.0.0.1:5199 (PID 12345)
 #   Database: /home/user/.remind-me/memory.db (exists)
 ```
@@ -193,6 +193,8 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_get_capture` | Retrieve a linked dialog/summary pair by their shared capture_id |
 | `remind_me_server_status` | Check if the dashboard UI is running, get its URL, and verify DB connectivity |
 | `remind_me_reindex` | Build vector embeddings for any memories missing them (run after enabling semantic search) |
+| `remind_me_check_update` | Check if a newer version is available on origin/main |
+| `remind_me_self_update` | Pull latest changes from origin and reinstall the package |
 
 ### Auto-Capture: Persisting Full Conversations
 
@@ -350,21 +352,54 @@ The search tool uses SQLite FTS5. Examples:
 | `REMIND_ME_MCP_DIR` | `~/.remind-me` | Directory for the SQLite database |
 | `REMIND_ME_MCP_SERVE_UI` | `false` | Start the HTTP dashboard server instead of stdio MCP |
 | `REMIND_ME_MCP_UI_PORT` | `5199` | Port for the dashboard server |
+| `REMIND_ME_EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | HuggingFace model for semantic embeddings |
+| `REMIND_ME_API_KEY` | *(unset)* | Bearer token for `/api/*` routes (auth disabled when unset) |
+| `REMIND_ME_IMPORT_ROOTS` | `$HOME` | Colon-separated allowed filesystem roots for import operations |
 
 ## Project Structure
 
 ```
 remind-me-mcp/
-├── remind_me_mcp.py         # MCP server — tools, import engine, SQLite + vector storage
-├── remind_me_dashboard.jsx  # React dashboard UI (Claude artifact or standalone)
-├── pyproject.toml           # Package configuration and dependencies
-└── README.md                # This file
+├── remind_me_mcp/              # Main package
+│   ├── __init__.py             # Package exports, version
+│   ├── __main__.py             # CLI entry point, mode dispatch
+│   ├── server.py               # FastMCP instance, app lifespan
+│   ├── tools.py                # 15 MCP tools + 2 resources
+│   ├── models.py               # Pydantic input models
+│   ├── config.py               # Environment configuration, constants
+│   ├── db.py                   # SQLite schema, migrations, helpers
+│   ├── api.py                  # Starlette HTTP API + dashboard HTML
+│   ├── importer.py             # Chat export parser & import engine
+│   ├── embeddings.py           # ONNX embedding engine
+│   ├── formatting.py           # Memory markdown/JSON formatters
+│   ├── pid.py                  # PID file management, instance detection
+│   ├── updater.py              # Version checking, self-update logic
+│   └── dashboard/
+│       └── App.jsx             # React dashboard component
+├── tests/                      # Test suite (pytest + pytest-asyncio)
+├── remind_me_dashboard.jsx     # Standalone React artifact for Claude.ai preview
+├── pyproject.toml              # Package configuration and dependencies
+└── README.md                   # This file
 
-~/.remind-me/                # Data directory (synced across machines)
-├── memory.db                # SQLite database with FTS5 + sqlite-vec
-├── models/                  # Cached ONNX embedding model (~80MB, auto-downloaded)
-└── server.pid               # PID file when dashboard is running
+~/.remind-me/                   # Data directory (synced across machines)
+├── memory.db                   # SQLite database with FTS5 + sqlite-vec
+├── models/                     # Cached ONNX embedding model (~80MB, auto-downloaded)
+└── server.pid                  # PID file when dashboard is running
 ```
+
+## CLI Reference
+
+```bash
+remind-me-mcp                        # MCP stdio mode (default)
+remind-me-mcp --serve-ui             # Start dashboard UI server
+remind-me-mcp --serve-ui --ui-port 8080 --ui-host 0.0.0.0
+remind-me-mcp --status               # Check if dashboard is running
+remind-me-mcp --version              # Print installed version
+remind-me-mcp --check-update         # Check for available updates
+remind-me-mcp --update               # Pull latest and reinstall
+```
+
+You can also run via `python -m remind_me_mcp` with the same flags.
 
 ## Architecture
 
