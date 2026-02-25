@@ -16,7 +16,7 @@ Requirements for tech debt milestone. Each maps to roadmap phases.
 ### CI/CD
 
 - [x] **CICD-01**: GitHub Actions workflow runs ruff lint and pytest on push/PR for Python 3.11 and 3.12
-- [ ] **CICD-02**: Coverage enforcement gate at 80% minimum via pytest-cov — *Partial: gate mechanism active at 74% (measured 76% minus headroom); will raise to 80% as tests are added in Phases 6-8*
+- [ ] **CICD-02**: Coverage enforcement gate at 80% minimum via pytest-cov — *Partial: gate at 74%, coverage at 77%. Phase 9 gap closure will raise gate to 80%*
 
 ### Code Quality
 
@@ -74,14 +74,14 @@ Which phases cover which requirements. Updated during roadmap creation.
 | SEC-02 | Phase 6 | Complete |
 | SEC-03 | Phase 6 | Complete |
 | CICD-01 | Phase 5 | Complete |
-| CICD-02 | Phase 5 | Partial (gate at 74%, target 80%) |
+| CICD-02 | Phase 9 | Pending |
 | QUAL-01 | Phase 4 | Complete (04-01) |
 | QUAL-02 | Phase 4 | Complete |
 | QUAL-03 | Phase 4 | Complete (04-01) |
 | EMBD-01 | Phase 7 | Complete |
 | EMBD-02 | Phase 7 | Complete |
 | PERF-01 | Phase 8 | Complete |
-| PERF-02 | Phase 8 | Complete |
+| PERF-02 | Phase 9 | Pending |
 
 **Coverage:**
 - v1.1 requirements: 12 total
@@ -90,4 +90,4 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 ---
 *Requirements defined: 2026-02-24*
-*Last updated: 2026-02-24 after 05-02 execution (CICD-02 corrected from Complete to Partial — gate at 74%, target 80%)*
+*Last updated: 2026-02-24 after gap closure planning — CICD-02 and PERF-02 reassigned to Phase 9*
