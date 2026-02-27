@@ -7,12 +7,13 @@ Persistent, searchable memory that works across **Claude.ai**, **Claude Code**, 
 ## Features
 
 - **Full-text search** via SQLite FTS5 — fast, offline, no external services
+- **Hybrid semantic search** — FTS5 keyword matching + vector similarity via `sqlite-vec` and a local ONNX embedding model
+- **Distributed sync** — offline-first with outbox pattern, Postgres hub, and peer-to-peer sync over Tailscale
 - **Dashboard UI** — browse, search, add, edit, and delete memories from a web interface
 - **Chat export import** — ingest JSON, JSONL, or Markdown exports from Claude, ChatGPT, or custom formats
 - **Bulk directory import** — point at a folder of exports and import them all
 - **Deduplication** — re-importing the same file is a safe no-op (tracked by file hash)
 - **Tagging & categorization** — organize memories with categories and tags
-- **Multi-machine sync** — database lives in `~/.remind-me/` — sync it with Syncthing, Dropbox, git, or any file sync tool
 - **WAL mode** — SQLite Write-Ahead Logging ensures safe concurrent reads
 
 ## Quick Start
@@ -81,6 +82,26 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
   }
 }
 ```
+
+#### Claude Desktop on Windows with WSL
+
+When running MCP servers in Claude Desktop via `wsl.exe`, environment variables in the `env` block **do not pass through** to the WSL process. You must inline them directly in the command string:
+
+```json
+{
+  "mcpServers": {
+    "remind-me": {
+      "command": "wsl.exe",
+      "args": [
+        "bash", "-c",
+        "REMIND_ME_MCP_DIR=~/.remind-me REMIND_ME_NODE_ID=my-pc REMIND_ME_HUB_URL=http://hub:8765 REMIND_ME_SYNC_SECRET=your-secret remind-me-mcp"
+      ]
+    }
+  }
+}
+```
+
+> The `env` block in the config is ignored by `wsl.exe` — all environment variables must be part of the `bash -c` command string.
 
 ### 4. Configure for Claude.ai (via Claude in Chrome)
 
@@ -196,6 +217,8 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_check_update` | Check if a newer version is available on origin/main |
 | `remind_me_self_update` | Pull latest changes from origin and reinstall the package |
 
+16 tools + 2 resources (`stats` and `categories`).
+
 ### Auto-Capture: Persisting Full Conversations
 
 The `remind_me_auto_capture` tool stores **two linked memories** from each conversation:
@@ -291,36 +314,76 @@ Use remind_me_import_directory with:
 
 ## Multi-Machine Sync
 
-The entire memory database lives in a single directory (default: `~/.remind-me/`). To sync across machines:
+### Distributed Sync (recommended)
 
-### Option A: Syncthing (recommended — real-time, no cloud)
+The built-in sync engine provides automatic, offline-first synchronization across machines using a hub-and-spoke architecture:
 
+- **Local SQLite** on each machine preserves FTS5 and sqlite-vec functionality
+- **Outbox pattern** captures all local writes for reliable delivery
+- **Postgres hub** acts as the central sync point (runs as a container)
+- **Peer-to-peer** direct sync between machines via Tailscale (optional)
+- **Last-write-wins** conflict resolution on `updated_at`
+- **Background sync** runs in a daemon thread at a configurable interval
+
+#### Setting Up the Hub
+
+The sync hub is a FastAPI server backed by Postgres. Deploy it with Podman or Docker:
+
+1. Run a Postgres instance (e.g., via Podman Quadlet or Docker Compose)
+2. Deploy the sync hub container pointing at the Postgres instance
+3. Ensure the hub is reachable from all machines (e.g., via Tailscale)
+
+#### Configuring a Node
+
+Add the sync environment variables to your MCP config:
+
+```json
+{
+  "mcpServers": {
+    "remind-me": {
+      "command": "remind-me-mcp",
+      "env": {
+        "REMIND_ME_MCP_DIR": "~/.remind-me",
+        "REMIND_ME_NODE_ID": "my-laptop",
+        "REMIND_ME_HUB_URL": "http://100.x.x.x:8765",
+        "REMIND_ME_SYNC_SECRET": "your-shared-secret",
+        "REMIND_ME_SYNC_INTERVAL": "60",
+        "REMIND_ME_PEER_PORT": "8766",
+        "REMIND_ME_STATIC_PEERS": "[]"
+      }
+    }
+  }
+}
+```
+
+Sync is enabled automatically when `NODE_ID`, `HUB_URL`, and `SYNC_SECRET` are all set. Each machine needs its own unique `NODE_ID`.
+
+#### How It Works
+
+1. Every local write (add, update, delete) is recorded in a `sync_outbox` table
+2. The background sync thread pushes outbox entries to the hub and pulls new records
+3. Incoming records are upserted with last-write-wins on `updated_at`
+4. Records pulled from the hub are marked as already-sent in the outbox to prevent echo
+5. Optionally, peers discover each other via Tailscale and sync directly
+
+### File-Based Sync (alternative)
+
+If you prefer not to run a hub, the memory database lives in a single directory (default: `~/.remind-me/`) and can be synced with file-based tools:
+
+**Syncthing** (real-time, no cloud):
 1. Install Syncthing on both machines
 2. Share `~/.remind-me/` between them
 3. SQLite WAL mode handles concurrent access safely
 
-### Option B: Git
-
+**Git**:
 ```bash
-cd ~/.remind-me
-git init
-git add -A
-git commit -m "sync"
-git remote add origin <your-repo>
-git push
-
-# On other machine:
-git clone <your-repo> ~/.remind-me
+cd ~/.remind-me && git init && git add -A && git commit -m "sync"
+git remote add origin <your-repo> && git push
+# On other machine: git clone <your-repo> ~/.remind-me
 ```
 
-Add a cron job or alias for periodic sync.
-
-### Option C: Dropbox / Google Drive / OneDrive
-
-Symlink the memory directory into your cloud sync folder:
-
+**Dropbox / Google Drive / OneDrive**:
 ```bash
-# Example with Dropbox
 mv ~/.remind-me ~/Dropbox/remind-me
 ln -s ~/Dropbox/remind-me ~/.remind-me
 ```
@@ -355,6 +418,13 @@ The search tool uses SQLite FTS5. Examples:
 | `REMIND_ME_EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | HuggingFace model for semantic embeddings |
 | `REMIND_ME_API_KEY` | *(unset)* | Bearer token for `/api/*` routes (auth disabled when unset) |
 | `REMIND_ME_IMPORT_ROOTS` | `$HOME` | Colon-separated allowed filesystem roots for import operations |
+| `REMIND_ME_NODE_ID` | *(unset)* | Unique identifier for this machine (enables sync when set with HUB_URL and SYNC_SECRET) |
+| `REMIND_ME_HUB_URL` | *(unset)* | URL of the sync hub (e.g., `http://100.x.x.x:8765`) |
+| `REMIND_ME_SYNC_SECRET` | *(unset)* | Shared bearer token for hub and peer authentication |
+| `REMIND_ME_SYNC_INTERVAL` | `60` | Seconds between sync cycles |
+| `REMIND_ME_PEER_PORT` | `8766` | Local port for the peer-to-peer sync server |
+| `REMIND_ME_STATIC_PEERS` | `[]` | JSON array of static peer configs (for environments without Tailscale) |
+| `REMIND_ME_TAILSCALE_SOCKET` | *(unset)* | Path to Tailscale socket for peer discovery (auto-detected if empty) |
 
 ## Project Structure
 
@@ -364,7 +434,7 @@ remind-me-mcp/
 │   ├── __init__.py             # Package exports, version
 │   ├── __main__.py             # CLI entry point, mode dispatch
 │   ├── server.py               # FastMCP instance, app lifespan
-│   ├── tools.py                # 15 MCP tools + 2 resources
+│   ├── tools.py                # 16 MCP tools + 2 resources
 │   ├── models.py               # Pydantic input models
 │   ├── config.py               # Environment configuration, constants
 │   ├── db.py                   # SQLite schema, migrations, helpers
@@ -374,6 +444,8 @@ remind-me-mcp/
 │   ├── formatting.py           # Memory markdown/JSON formatters
 │   ├── pid.py                  # PID file management, instance detection
 │   ├── updater.py              # Version checking, self-update logic
+│   ├── sync.py                 # Background sync engine (hub + peer push/pull)
+│   ├── peer_server.py          # Lightweight HTTP server for peer-to-peer sync
 │   └── dashboard/
 │       └── App.jsx             # React dashboard component
 ├── tests/                      # Test suite (pytest + pytest-asyncio)
@@ -408,9 +480,12 @@ The server uses:
 - **sqlite-vec** for semantic vector search (cosine similarity on embeddings)
 - **all-MiniLM-L6-v2** via ONNX Runtime for local embedding generation (~80MB model, no API keys)
 - **Hybrid ranking** merges keyword and semantic results with deduplication and score fusion
+- **Outbox-based sync** — local writes are captured in `sync_outbox`, pushed to hub/peers in background
+- **Postgres hub** — central sync point with last-write-wins conflict resolution
+- **Peer-to-peer sync** — direct machine-to-machine sync via Tailscale peer discovery
 - **WAL journal mode** for safe concurrent access
 - **Content-based hashing** for deduplication
 - **stdio transport** for MCP compatibility with all Claude interfaces
 - **Starlette + Uvicorn** for the optional HTTP dashboard and REST API
 - **Self-contained HTML** — the dashboard is served as a single inline page with no build step
-- **Graceful degradation** — semantic search is optional; everything works with just FTS5 if embedding deps aren't installed
+- **Graceful degradation** — semantic search and distributed sync are both optional; core functionality works with just FTS5 and local storage
