@@ -170,7 +170,7 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 # Current target schema version.  Increment when adding a new migration step.
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 
 def _migrate_schema(db: sqlite3.Connection) -> None:
@@ -198,6 +198,11 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         _migrate_v1_to_v2(db)
         db.execute("PRAGMA user_version = 2")
         current_version = 2
+    
+    if current_version < 3:
+        _migrate_v2_to_v3(db)
+        db.execute("PRAGMA user_version = 3")
+        current_version = 3
 
     db.commit()
 
@@ -295,6 +300,100 @@ def _migrate_v1_to_v2(db: sqlite3.Connection) -> None:
                     "INSERT OR IGNORE INTO memory_tags (memory_id, tag) VALUES (?, ?)",
                     (row["id"], tag),
                 )
+
+
+def _migrate_v2_to_v3(db: sqlite3.Connection) -> None:
+    """v2 -> v3: Add node_id, sync_log, sync_outbox, outbox triggers."""
+
+    with contextlib.suppress(sqlite3.OperationalError):
+        db.execute("ALTER TABLE memories ADD COLUMN node_id TEXT DEFAULT NULL")
+
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS sync_log (
+            remote_id   TEXT NOT NULL,
+            last_pull   TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00',
+            last_push   TEXT NOT NULL DEFAULT '1970-01-01T00:00:00+00:00',
+            PRIMARY KEY (remote_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS sync_outbox (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id   TEXT NOT NULL,
+            operation   TEXT NOT NULL,
+            payload     TEXT NOT NULL,
+            created_at  TEXT NOT NULL,
+            sent_at     TEXT DEFAULT ''
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_outbox_unsent
+            ON sync_outbox(sent_at) WHERE sent_at = '';
+
+        CREATE INDEX IF NOT EXISTS idx_outbox_memory_id
+            ON sync_outbox(memory_id);
+
+        CREATE TRIGGER IF NOT EXISTS memories_outbox_ai
+        AFTER INSERT ON memories BEGIN
+            INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+            VALUES (
+                NEW.id, 'insert',
+                json_object(
+                    'id',         NEW.id,
+                    'content',    NEW.content,
+                    'category',   NEW.category,
+                    'tags',       NEW.tags,
+                    'source',     NEW.source,
+                    'metadata',   NEW.metadata,
+                    'created_at', NEW.created_at,
+                    'updated_at', NEW.updated_at,
+                    'capture_id', NEW.capture_id,
+                    'node_id',    NEW.node_id
+                ),
+                datetime('now', 'utc')
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS memories_outbox_au
+        AFTER UPDATE ON memories BEGIN
+            INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+            VALUES (
+                NEW.id, 'update',
+                json_object(
+                    'id',         NEW.id,
+                    'content',    NEW.content,
+                    'category',   NEW.category,
+                    'tags',       NEW.tags,
+                    'source',     NEW.source,
+                    'metadata',   NEW.metadata,
+                    'created_at', NEW.created_at,
+                    'updated_at', NEW.updated_at,
+                    'capture_id', NEW.capture_id,
+                    'node_id',    NEW.node_id
+                ),
+                datetime('now', 'utc')
+            );
+        END;
+    """)
+
+    # Backfill existing memories into outbox so first sync pushes everything
+    db.execute("""
+        INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+        SELECT
+            id, 'insert',
+            json_object(
+                'id',         id,
+                'content',    content,
+                'category',   category,
+                'tags',       tags,
+                'source',     source,
+                'metadata',   metadata,
+                'created_at', created_at,
+                'updated_at', updated_at,
+                'capture_id', capture_id,
+                'node_id',    node_id
+            ),
+            datetime('now', 'utc')
+        FROM memories
+    """)
 
 
 # ---------------------------------------------------------------------------

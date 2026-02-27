@@ -80,3 +80,19 @@ __all__ = [
     "API_KEY",
     "IMPORT_ROOTS",
 ]
+
+
+import json
+import os
+
+# Sync configuration
+NODE_ID = os.environ.get("REMIND_ME_NODE_ID", "")
+HUB_URL = os.environ.get("REMIND_ME_HUB_URL", "")
+SYNC_SECRET = os.environ.get("REMIND_ME_SYNC_SECRET", "")
+SYNC_INTERVAL = int(os.environ.get("REMIND_ME_SYNC_INTERVAL", "60"))
+PEER_PORT = int(os.environ.get("REMIND_ME_PEER_PORT", "8766"))
+SYNC_ENABLED = bool(NODE_ID and HUB_URL and SYNC_SECRET)
+STATIC_PEERS: list[dict] = json.loads(
+    os.environ.get("REMIND_ME_STATIC_PEERS", "[]")
+)
+TAILSCALE_SOCKET = os.environ.get("REMIND_ME_TAILSCALE_SOCKET", "")

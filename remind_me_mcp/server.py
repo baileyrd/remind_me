@@ -16,10 +16,11 @@ from contextlib import asynccontextmanager
 
 from mcp.server.fastmcp import FastMCP
 
-from remind_me_mcp.config import DB_PATH
+from remind_me_mcp.config import DB_PATH, SYNC_ENABLED
 from remind_me_mcp.db import _close_db, _get_db
 
 log = logging.getLogger("remind_me_mcp.server")
+
 
 # ---------------------------------------------------------------------------
 # Application lifespan
@@ -45,12 +46,17 @@ async def app_lifespan(app: FastMCP):
     log.info("Remind Me MCP started — db at %s", DB_PATH)
 
     from remind_me_mcp.updater import start_background_check
-
     start_background_check()
+
+    if SYNC_ENABLED:
+        from remind_me_mcp.peer_server import start_peer_server
+        from remind_me_mcp.sync import start_sync_thread
+        start_peer_server()
+        start_sync_thread()
+        log.info("Sync started")
 
     yield {"db": db}
     _close_db()
-
 
 # ---------------------------------------------------------------------------
 # MCP server instance
