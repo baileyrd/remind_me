@@ -87,6 +87,7 @@ import os
 
 # Sync configuration
 NODE_ID = os.environ.get("REMIND_ME_NODE_ID", "")
+CLIENT: str = os.getenv("REMIND_ME_CLIENT", "unknown")
 HUB_URL = os.environ.get("REMIND_ME_HUB_URL", "")
 SYNC_SECRET = os.environ.get("REMIND_ME_SYNC_SECRET", "")
 SYNC_INTERVAL = int(os.environ.get("REMIND_ME_SYNC_INTERVAL", "60"))

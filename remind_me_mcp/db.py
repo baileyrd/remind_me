@@ -170,7 +170,8 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 # Current target schema version.  Increment when adding a new migration step.
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
+
 
 
 def _migrate_schema(db: sqlite3.Connection) -> None:
@@ -203,6 +204,11 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         _migrate_v2_to_v3(db)
         db.execute("PRAGMA user_version = 3")
         current_version = 3
+    
+    if current_version < 4:
+        _migrate_v3_to_v4(db)
+        db.execute("PRAGMA user_version = 4")
+        current_version = 4
 
     db.commit()
 
@@ -395,6 +401,75 @@ def _migrate_v2_to_v3(db: sqlite3.Connection) -> None:
         FROM memories
     """)
 
+
+def _migrate_v3_to_v4(db: sqlite3.Connection) -> None:
+    """v3 -> v4: Add client column to memories; backfill existing records with 'unknown'.
+
+    The client column identifies what tool created the memory:
+    'claude-desktop', 'claude-code', 'unknown' (pre-existing records).
+
+    Args:
+        db: An open SQLite connection.
+    """
+    with contextlib.suppress(sqlite3.OperationalError):
+        db.execute(
+            "ALTER TABLE memories ADD COLUMN client TEXT NOT NULL DEFAULT 'unknown'"
+        )
+
+    db.execute("CREATE INDEX IF NOT EXISTS idx_memories_client ON memories(client)")
+
+    # Backfill existing records
+    db.execute("UPDATE memories SET client = 'unknown' WHERE client IS NULL OR client = ''")
+
+    # Drop and recreate outbox triggers to include client field
+    db.executescript("""
+        DROP TRIGGER IF EXISTS memories_outbox_ai;
+        DROP TRIGGER IF EXISTS memories_outbox_au;
+
+        CREATE TRIGGER IF NOT EXISTS memories_outbox_ai
+        AFTER INSERT ON memories BEGIN
+            INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+            VALUES (
+                NEW.id, 'insert',
+                json_object(
+                    'id',         NEW.id,
+                    'content',    NEW.content,
+                    'category',   NEW.category,
+                    'tags',       NEW.tags,
+                    'source',     NEW.source,
+                    'metadata',   NEW.metadata,
+                    'created_at', NEW.created_at,
+                    'updated_at', NEW.updated_at,
+                    'capture_id', NEW.capture_id,
+                    'node_id',    NEW.node_id,
+                    'client',     NEW.client
+                ),
+                datetime('now', 'utc')
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS memories_outbox_au
+        AFTER UPDATE ON memories BEGIN
+            INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+            VALUES (
+                NEW.id, 'update',
+                json_object(
+                    'id',         NEW.id,
+                    'content',    NEW.content,
+                    'category',   NEW.category,
+                    'tags',       NEW.tags,
+                    'source',     NEW.source,
+                    'metadata',   NEW.metadata,
+                    'created_at', NEW.created_at,
+                    'updated_at', NEW.updated_at,
+                    'capture_id', NEW.capture_id,
+                    'node_id',    NEW.node_id,
+                    'client',     NEW.client
+                ),
+                datetime('now', 'utc')
+            );
+        END;
+    """)
 
 # ---------------------------------------------------------------------------
 # Embedding helpers

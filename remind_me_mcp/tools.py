@@ -37,6 +37,7 @@ from remind_me_mcp.models import (
     ResponseFormat,
 )
 from remind_me_mcp.pid import get_server_status
+from remind_me_mcp.config import CLIENT, NODE_ID
 from remind_me_mcp.server import mcp
 from remind_me_mcp.updater import pop_update_notice
 
@@ -96,8 +97,8 @@ async def memory_add(params: MemoryAddInput) -> str:
     now = _now_iso()
     try:
         db.execute(
-            """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at, node_id, client)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 mem_id,
                 params.content,
@@ -107,6 +108,8 @@ async def memory_add(params: MemoryAddInput) -> str:
                 json.dumps(params.metadata),
                 now,
                 now,
+                NODE_ID,
+                CLIENT,
             ),
         )
         db.commit()
@@ -594,8 +597,8 @@ async def remind_me_auto_capture(params: AutoCaptureInput) -> str:
 
     try:
         db.execute(
-            """INSERT INTO memories (id, content, category, tags, source, metadata, capture_id, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO memories (id, content, category, tags, source, metadata, capture_id, created_at, updated_at, node_id, client)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 dialog_id,
                 params.conversation,
@@ -606,11 +609,13 @@ async def remind_me_auto_capture(params: AutoCaptureInput) -> str:
                 capture_id,
                 now,
                 now,
+                NODE_ID,
+                CLIENT,
             ),
         )
         db.execute(
-            """INSERT INTO memories (id, content, category, tags, source, metadata, capture_id, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO memories (id, content, category, tags, source, metadata, capture_id, created_at, updated_at, node_id, client)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 summary_id,
                 params.summary,
@@ -621,6 +626,8 @@ async def remind_me_auto_capture(params: AutoCaptureInput) -> str:
                 capture_id,
                 now,
                 now,
+                NODE_ID,
+                CLIENT,
             ),
         )
 
