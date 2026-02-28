@@ -119,7 +119,7 @@ async def memory_add(params: MemoryAddInput) -> str:
     except sqlite3.OperationalError as e:
         log.error("Database error adding memory: %s", e)
         return f"Error: Database operation failed — {e}"
-    await asyncio.to_thread(_embed_and_store, db, mem_id, params.content)
+    await asyncio.to_thread(_embed_and_store, mem_id, params.content)
     return _maybe_update_notice(f"✓ Memory stored with id `{mem_id}` in category '{params.category}'.")
 
 
@@ -169,7 +169,7 @@ async def memory_search(params: MemorySearchInput) -> str:
         log.warning("FTS5 query syntax error for query %r: %s", params.query, e)
 
     # --- Semantic vector search ---
-    sem_memories = await asyncio.to_thread(_semantic_search, db, params.query, limit=params.limit)
+    sem_memories = await asyncio.to_thread(_semantic_search, params.query, limit=params.limit)
 
     # --- Merge and deduplicate (hybrid ranking) ---
     seen: dict[str, dict] = {}
@@ -362,7 +362,7 @@ async def memory_update(params: MemoryUpdateInput) -> str:
     db.commit()
     # Re-embed if content changed
     if params.content is not None:
-        await asyncio.to_thread(_embed_and_store, db, params.memory_id, params.content)
+        await asyncio.to_thread(_embed_and_store, params.memory_id, params.content)
     return f"✓ Memory `{params.memory_id}` updated."
 
 
@@ -644,8 +644,8 @@ async def remind_me_auto_capture(params: AutoCaptureInput) -> str:
         return f"Error: Could not capture conversation — database error: {e}"
 
     # Embed both for semantic search (summary is more searchable, dialog has full context)
-    await asyncio.to_thread(_embed_and_store, db, summary_id, params.summary)
-    await asyncio.to_thread(_embed_and_store, db, dialog_id, params.conversation[:2000])
+    await asyncio.to_thread(_embed_and_store, summary_id, params.summary)
+    await asyncio.to_thread(_embed_and_store, dialog_id, params.conversation[:2000])
 
     tag_str = ", ".join(params.tags) if params.tags else "none"
     return (

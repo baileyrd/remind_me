@@ -804,10 +804,10 @@ def test_rest_and_mcp_memories_equally_findable_by_semantic_search(
         (mcp_mem_id, mcp_content, "general", _json.dumps([]), "manual", _json.dumps({}), now, now),
     )
     db_conn_with_vec.commit()
-    _embed_and_store(db_conn_with_vec, mcp_mem_id, mcp_content)
+    _embed_and_store(mcp_mem_id, mcp_content)
 
     # Both memories should appear in semantic search results
-    results = _semantic_search(db_conn_with_vec, "parity test", limit=10)
+    results = _semantic_search("parity test", limit=10)
     result_ids = {r["id"] for r in results}
 
     assert rest_mem_id in result_ids, f"REST memory {rest_mem_id} not found in semantic search results: {result_ids}"

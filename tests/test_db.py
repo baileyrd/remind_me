@@ -256,9 +256,10 @@ def test_schema_creates_indexes(db_conn: sqlite3.Connection) -> None:
 
 
 def test_migrate_schema_sets_user_version(db_conn: sqlite3.Connection) -> None:
-    """_ensure_schema sets PRAGMA user_version to 2 on a fresh in-memory database."""
+    """_ensure_schema sets PRAGMA user_version to the current schema version."""
+    from remind_me_mcp.db import _SCHEMA_VERSION
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 2, f"Expected user_version 2, got {version}"
+    assert version == _SCHEMA_VERSION, f"Expected user_version {_SCHEMA_VERSION}, got {version}"
 
 
 def test_capture_id_column_exists(db_conn: sqlite3.Connection) -> None:
@@ -403,10 +404,11 @@ def test_capture_id_backfill_from_metadata(db_conn: sqlite3.Connection) -> None:
 
 
 def test_migration_idempotent(db_conn: sqlite3.Connection) -> None:
-    """Running _ensure_schema twice on the same database does not raise and keeps user_version at 2."""
+    """Running _ensure_schema twice on the same database does not raise and keeps user_version stable."""
+    from remind_me_mcp.db import _SCHEMA_VERSION
     # db_conn fixture has already run _ensure_schema once via the fixture setup.
     # Run it again to verify idempotency.
     _ensure_schema(db_conn)
 
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 2, f"user_version should still be 2 after re-run, got {version}"
+    assert version == _SCHEMA_VERSION, f"user_version should still be {_SCHEMA_VERSION} after re-run, got {version}"

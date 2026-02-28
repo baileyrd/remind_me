@@ -2,12 +2,12 @@
 tests.test_async — Async safety and concurrency tests for remind_me_mcp.
 
 Verifies:
-  - _get_db returns the same singleton connection object on repeated calls
+  - _get_db returns the same connection on repeated calls within a thread
   - SQLite is configured with WAL journal mode (PRAGMA journal_mode=WAL)
   - busy_timeout is set to 5000 ms (PRAGMA busy_timeout=5000)
   - Multiple concurrent tool calls via asyncio.gather complete without errors
   - Blocking embedding computations are offloaded via asyncio.to_thread
-  - Connections with check_same_thread=False allow cross-thread access
+  - Per-thread connections: each thread gets its own connection
 """
 
 from __future__ import annotations
@@ -21,12 +21,12 @@ import pytest
 from remind_me_mcp.db import _ensure_schema
 
 # ---------------------------------------------------------------------------
-# Test 1: _get_db returns the same singleton connection object
+# Test 1: _get_db returns the same connection within a thread
 # ---------------------------------------------------------------------------
 
 
-def test_get_db_returns_singleton(db_conn: sqlite3.Connection) -> None:
-    """_get_db should return the same connection object on repeated calls.
+def test_get_db_returns_same_connection_per_thread(db_conn: sqlite3.Connection) -> None:
+    """_get_db should return the same connection on repeated calls within a thread.
 
     The db_conn fixture monkeypatches _get_db to return a constant lambda, so
     two successive calls must return the identical object (Python identity check).
@@ -35,7 +35,7 @@ def test_get_db_returns_singleton(db_conn: sqlite3.Connection) -> None:
 
     first = _db_mod._get_db()
     second = _db_mod._get_db()
-    assert first is second, "_get_db must return the singleton connection, not a new one each call"
+    assert first is second, "_get_db must return the same connection within a thread"
 
 
 # ---------------------------------------------------------------------------
@@ -173,36 +173,67 @@ async def test_embed_and_store_runs_in_thread(
 
 
 # ---------------------------------------------------------------------------
-# Test 6: check_same_thread=False allows cross-thread access
+# Test 6: per-thread connections — each thread gets its own connection
 # ---------------------------------------------------------------------------
 
 
-def test_check_same_thread_false() -> None:
-    """A connection opened with check_same_thread=False must be usable from other threads.
+def test_per_thread_connections(tmp_path) -> None:
+    """_get_db returns a different connection object in each thread.
 
-    Replicates the _get_db connection parameters and verifies that a worker
-    thread can execute a query without raising an sqlite3.ProgrammingError.
+    Creates a temporary file-backed database and verifies that the main
+    thread and a worker thread each receive distinct connection objects,
+    confirming per-thread isolation.
     """
-    db = sqlite3.connect(":memory:", check_same_thread=False)
-    db.row_factory = sqlite3.Row
-    _ensure_schema(db)
+    import remind_me_mcp.db as _db_mod
 
-    errors: list[Exception] = []
+    test_db_path = tmp_path / "thread_test.db"
 
-    def worker() -> None:
-        """Run a simple query from a different thread."""
-        try:
-            db.execute("SELECT 1").fetchone()
-        except Exception as exc:
-            errors.append(exc)
+    # Save original state
+    orig_local = _db_mod._local
+    orig_all = _db_mod._all_connections
+    orig_lock = _db_mod._connections_lock
+    orig_ready = _db_mod._schema_ready
+    orig_db_path = _db_mod.DB_PATH
 
-    t = threading.Thread(target=worker)
-    t.start()
-    t.join()
+    try:
+        # Reset module state for a clean test
+        _db_mod._local = threading.local()
+        _db_mod._all_connections = []
+        _db_mod._connections_lock = threading.Lock()
+        _db_mod._schema_ready = False
+        _db_mod.DB_PATH = test_db_path
 
-    db.close()
+        main_conn = _db_mod._get_db()
+        worker_conn = [None]
+        errors: list[Exception] = []
 
-    assert not errors, (
-        f"Cross-thread access raised an exception: {errors}. "
-        "The connection must be opened with check_same_thread=False."
-    )
+        def worker() -> None:
+            try:
+                worker_conn[0] = _db_mod._get_db()
+                # Verify the worker's connection is functional
+                worker_conn[0].execute("SELECT 1").fetchone()
+            except Exception as exc:
+                errors.append(exc)
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join()
+
+        assert not errors, f"Worker thread raised: {errors}"
+        assert worker_conn[0] is not None, "Worker must get a connection"
+        assert main_conn is not worker_conn[0], (
+            "Each thread must get its own connection object"
+        )
+        assert len(_db_mod._all_connections) == 2, (
+            "Both connections must be tracked for cleanup"
+        )
+
+        # Clean up
+        _db_mod._close_db()
+    finally:
+        # Restore original state
+        _db_mod._local = orig_local
+        _db_mod._all_connections = orig_all
+        _db_mod._connections_lock = orig_lock
+        _db_mod._schema_ready = orig_ready
+        _db_mod.DB_PATH = orig_db_path

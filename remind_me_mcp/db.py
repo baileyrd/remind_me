@@ -21,6 +21,7 @@ import hashlib
 import json
 import logging
 import sqlite3
+import threading
 from datetime import UTC, datetime
 from typing import Any
 
@@ -30,30 +31,40 @@ from remind_me_mcp.embeddings import _get_embedder
 log = logging.getLogger("remind_me_mcp.db")
 
 # ---------------------------------------------------------------------------
-# Connection
+# Connection — per-thread with registry for shutdown cleanup
 # ---------------------------------------------------------------------------
 
-_db_connection: sqlite3.Connection | None = None
+_local = threading.local()
+_all_connections: list[sqlite3.Connection] = []
+_connections_lock = threading.Lock()
+_schema_ready = False
 
 
 def _get_db() -> sqlite3.Connection:
-    """Return the lazily initialized SQLite database singleton.
+    """Return a per-thread SQLite connection, creating one if needed.
 
-    The connection is configured with WAL journal mode for concurrent reader
-    access, busy_timeout for graceful lock contention, and
-    check_same_thread=False so it can be used from asyncio.to_thread workers.
+    Each thread gets its own connection configured with WAL journal mode for
+    concurrent access, busy_timeout for graceful lock contention, and foreign
+    key enforcement. The sqlite-vec extension is loaded per-connection when
+    available. Schema initialisation runs once (guarded by a lock) on the
+    first connection created.
+
+    All connections are tracked in ``_all_connections`` so ``_close_db()``
+    can shut them down at application exit.
     """
-    global _db_connection
-    if _db_connection is not None:
-        return _db_connection
+    global _schema_ready
 
-    db = sqlite3.connect(str(DB_PATH), timeout=10, check_same_thread=False)
+    conn = getattr(_local, "connection", None)
+    if conn is not None:
+        return conn
+
+    db = sqlite3.connect(str(DB_PATH), timeout=10)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA busy_timeout=5000")
     db.execute("PRAGMA foreign_keys=ON")
 
-    # Load sqlite-vec extension if available
+    # Load sqlite-vec extension if available (per-connection)
     try:
         import sqlite_vec
         db.enable_load_extension(True)
@@ -65,22 +76,36 @@ def _get_db() -> sqlite3.Connection:
     except ImportError as e:
         log.debug("sqlite-vec not installed: %s (vector search disabled)", e)
 
-    _ensure_schema(db)
-    _db_connection = db
+    # Run schema init/migration once across all threads
+    with _connections_lock:
+        if not _schema_ready:
+            _ensure_schema(db)
+            _schema_ready = True
+        _all_connections.append(db)
+
+    _local.connection = db
     return db
 
 
 def _close_db() -> None:
-    """Close the singleton database connection and reset it to None.
+    """Close all per-thread database connections and reset state.
 
-    Safe to call if the connection has not been opened yet (no-op).
-    After this call, the next _get_db() invocation will open a fresh
-    connection. Used during application shutdown and in tests to reset state.
+    Safe to call even if no connections have been opened (no-op).
+    After this call, the next ``_get_db()`` invocation on any thread will
+    open a fresh connection. Used during application shutdown and in tests
+    to reset state.
     """
-    global _db_connection
-    if _db_connection is not None:
-        _db_connection.close()
-        _db_connection = None
+    global _schema_ready
+    with _connections_lock:
+        for conn in _all_connections:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        _all_connections.clear()
+        _schema_ready = False
+    # Clear the calling thread's local reference
+    _local.connection = None
 
 
 # ---------------------------------------------------------------------------
@@ -476,15 +501,15 @@ def _migrate_v3_to_v4(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _embed_and_store(db: sqlite3.Connection, memory_id: str, content: str) -> bool:
+def _embed_and_store(memory_id: str, content: str) -> bool:
     """Generate embedding for content and store in the vector table.
 
-    Looks up the memory's rowid, generates a float32 embedding vector via the
-    ONNX engine, and upserts it into memories_vec. If the embedder is
-    unavailable or the vector table is missing, returns False silently.
+    Acquires its own per-thread database connection via ``_get_db()``, looks
+    up the memory's rowid, generates a float32 embedding vector via the ONNX
+    engine, and upserts it into memories_vec. If the embedder is unavailable
+    or the vector table is missing, returns False silently.
 
     Args:
-        db: An open SQLite connection with the memories_vec virtual table.
         memory_id: The text primary key of the memory to embed.
         content: The text content to embed (truncated to 2000 chars).
 
@@ -495,6 +520,7 @@ def _embed_and_store(db: sqlite3.Connection, memory_id: str, content: str) -> bo
     if embedder is None:
         return False
     try:
+        db = _get_db()
         rowid = db.execute(
             "SELECT rowid FROM memories WHERE id = ?", (memory_id,)
         ).fetchone()
@@ -510,8 +536,6 @@ def _embed_and_store(db: sqlite3.Connection, memory_id: str, content: str) -> bo
         db.commit()
         return True
     except sqlite3.DatabaseError as e:
-        # Catches OperationalError (no vector table, missing table) and
-        # DatabaseError (concurrent thread access on shared connection).
         log.warning("Database error storing embedding for %s: %s", memory_id, e)
         return False
     except (ValueError, TypeError) as e:
@@ -519,18 +543,16 @@ def _embed_and_store(db: sqlite3.Connection, memory_id: str, content: str) -> bo
         return False
 
 
-def _semantic_search(
-    db: sqlite3.Connection, query: str, limit: int = 20
-) -> list[dict]:
+def _semantic_search(query: str, limit: int = 20) -> list[dict]:
     """Search memories by semantic similarity using the vector index.
 
-    Embeds the query text and performs an approximate nearest-neighbour
-    search against the memories_vec virtual table. Results include a
+    Acquires its own per-thread database connection via ``_get_db()``, embeds
+    the query text, and performs an approximate nearest-neighbour search
+    against the memories_vec virtual table. Results include a
     'semantic_distance' key (lower = more similar). Returns an empty list
     if the embedder is unavailable or the vector table does not exist.
 
     Args:
-        db: An open SQLite connection with the memories_vec virtual table.
         query: The search query text to embed and compare.
         limit: Maximum number of results to return.
 
@@ -542,6 +564,7 @@ def _semantic_search(
     if embedder is None:
         return []
     try:
+        db = _get_db()
         query_bytes = embedder.embed_one(query)
         rows = db.execute(
             """SELECT m.*, mv.distance

@@ -263,7 +263,7 @@ def _build_api_app() -> Starlette:
             (mem_id, content, category, json.dumps(tags), source, json.dumps(metadata), now, now),
         )
         db.commit()
-        await asyncio.to_thread(_embed_and_store, db, mem_id, content)
+        await asyncio.to_thread(_embed_and_store, mem_id, content)
         row = db.execute("SELECT * FROM memories WHERE id = ?", (mem_id,)).fetchone()
         return _json_ok(_row_to_dict(row), status=201)
 
@@ -303,7 +303,7 @@ def _build_api_app() -> Starlette:
         db.execute(f"UPDATE memories SET {', '.join(sets)} WHERE id = ?", bindings)
         db.commit()
         if "content" in body and body["content"] is not None:
-            await asyncio.to_thread(_embed_and_store, db, memory_id, body["content"])
+            await asyncio.to_thread(_embed_and_store, memory_id, body["content"])
         updated = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
         return _json_ok(_row_to_dict(updated))
 

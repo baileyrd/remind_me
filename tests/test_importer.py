@@ -327,7 +327,7 @@ def test_import_embed_id_matches_insert_id(
     # Spy: record every (memory_id, content) pair passed to _embed_and_store
     embedded_ids: list[str] = []
 
-    def fake_embed_and_store(db, memory_id: str, content: str) -> None:
+    def fake_embed_and_store(memory_id: str, content: str) -> None:
         embedded_ids.append(memory_id)
 
     monkeypatch.setattr(_importer_mod, "_embed_and_store", fake_embed_and_store)
@@ -388,7 +388,7 @@ def test_import_jsonl_format(
     import remind_me_mcp.importer as _importer_mod
 
     monkeypatch.setattr(_importer_mod, "_get_db", lambda: db_conn)
-    monkeypatch.setattr(_importer_mod, "_embed_and_store", lambda db, mem_id, content: None)
+    monkeypatch.setattr(_importer_mod, "_embed_and_store", lambda mem_id, content: None)
 
     jsonl_file = tmp_path / "chat.jsonl"
     # Each JSONL line is a conversation object with chat_messages
@@ -423,7 +423,7 @@ def test_import_multi_conversation_json(
     import remind_me_mcp.importer as _importer_mod
 
     monkeypatch.setattr(_importer_mod, "_get_db", lambda: db_conn)
-    monkeypatch.setattr(_importer_mod, "_embed_and_store", lambda db, mem_id, content: None)
+    monkeypatch.setattr(_importer_mod, "_embed_and_store", lambda mem_id, content: None)
 
     multi_conv = [
         {"chat_messages": [{"sender": "assistant", "content": "First conversation answer"}]},
@@ -484,7 +484,7 @@ def test_import_jsonl_with_malformed_line(
     import remind_me_mcp.importer as _importer_mod
 
     monkeypatch.setattr(_importer_mod, "_get_db", lambda: db_conn)
-    monkeypatch.setattr(_importer_mod, "_embed_and_store", lambda db, mem_id, content: None)
+    monkeypatch.setattr(_importer_mod, "_embed_and_store", lambda mem_id, content: None)
 
     jsonl_file = tmp_path / "mixed.jsonl"
     jsonl_file.write_text(

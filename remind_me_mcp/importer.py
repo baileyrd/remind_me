@@ -333,7 +333,7 @@ def import_chat_file(
 
         # Embed using the SAME mem_id that was used for INSERT (no recomputation)
         for mem_id, chunk in embed_pairs:
-            _embed_and_store(db, mem_id, chunk)
+            _embed_and_store(mem_id, chunk)
 
         stats = {"memories_created": stored, "raw_entries": len(contents), "file": path.name}
         db.execute(
