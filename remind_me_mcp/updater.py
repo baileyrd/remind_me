@@ -95,19 +95,33 @@ def _run_git(*args: str, repo_path: Path) -> subprocess.CompletedProcess[str]:
 
 
 def _run_pip(*args: str) -> subprocess.CompletedProcess[str]:
-    """Run a pip command.
+    """Run a pip install command, preferring uv over pip.
+
+    Tries ``uv pip`` first (faster, commonly used with modern venvs).
+    Falls back to ``python -m pip`` if uv is not installed.
 
     Args:
-        *args: Pip subcommand and arguments.
+        *args: Pip subcommand and arguments (e.g. ``"install"``, ``"-e"``, ``"."``).
 
     Returns:
         CompletedProcess with captured stdout/stderr.
 
     Raises:
         subprocess.TimeoutExpired: If the command takes longer than 120 seconds.
-        subprocess.CalledProcessError: If pip exits with non-zero status.
+        subprocess.CalledProcessError: If the install command exits with non-zero status.
     """
+    import shutil
     import sys
+
+    uv = shutil.which("uv")
+    if uv:
+        return subprocess.run(
+            [uv, "pip", *args],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=True,
+        )
 
     return subprocess.run(
         [sys.executable, "-m", "pip", *args],
