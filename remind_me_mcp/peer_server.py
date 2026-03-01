@@ -117,12 +117,22 @@ class PeerHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "not found"})
 
 
-def start_peer_server() -> Thread:
+def start_peer_server() -> Thread | None:
     """Start the peer HTTP server in a daemon thread.
 
     Returns the thread so the caller can join it on shutdown if needed.
+    Returns None if the port is already in use (another instance is serving).
     """
-    server = HTTPServer(("0.0.0.0", PEER_PORT), PeerHandler)
+    try:
+        server = HTTPServer(("0.0.0.0", PEER_PORT), PeerHandler)
+    except OSError as exc:
+        log.info(
+            "Peer server port %d already in use (another instance is "
+            "likely running) — skipping: %s",
+            PEER_PORT,
+            exc,
+        )
+        return None
     thread = Thread(target=server.serve_forever, daemon=True, name="peer-server")
     thread.start()
     log.info("Peer server listening on port %d", PEER_PORT)
