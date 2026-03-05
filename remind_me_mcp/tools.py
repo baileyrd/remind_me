@@ -1,5 +1,5 @@
 """
-remind_me_mcp.tools — All 17 MCP tool handlers and 2 resource handlers.
+remind_me_mcp.tools — All 19 MCP tool handlers and 2 resource handlers.
 
 All handlers are registered on the `mcp` instance imported from server.py.
 This module imports mcp from server (not the other way around) to avoid
@@ -29,6 +29,8 @@ from remind_me_mcp.models import (
     AutoCaptureInput,
     BulkImportDirInput,
     ChatImportInput,
+    DecomposeBatchInput,
+    DecomposeInput,
     MemoryAddInput,
     MemoryDeleteInput,
     MemoryListInput,
@@ -1254,6 +1256,189 @@ async def remind_me_reclassify_batch(params: ReclassifyBatchInput) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Decomposition tools (Phase 12 Plan 01)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool(
+    name="remind_me_decompose",
+    annotations={
+        "title": "Decompose Capture into Atomic Facts",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def remind_me_decompose(params: DecomposeInput) -> str:
+    """Break a captured conversation into individually searchable atomic facts.
+
+    Each fact is stored as a separate memory linked to the parent capture via
+    source_capture_id. Facts inherit the parent's tags and can optionally
+    receive additional tags and a memory_type classification.
+
+    Args:
+        params: The capture_id to decompose and the list of extracted facts.
+
+    Returns:
+        JSON string with created count, fact IDs, capture_id, and inherited tags.
+    """
+    db = _get_db()
+    now = _now_iso()
+
+    # Look up parent capture by capture_id
+    parent_row = db.execute(
+        "SELECT tags FROM memories WHERE capture_id = ? LIMIT 1",
+        (params.capture_id,),
+    ).fetchone()
+
+    if parent_row is None:
+        return f"Error: No memory found with capture_id '{params.capture_id}'"
+
+    # Parse parent tags
+    raw_tags = parent_row["tags"]
+    if isinstance(raw_tags, str):
+        try:
+            parent_tags = json.loads(raw_tags)
+        except (json.JSONDecodeError, TypeError):
+            parent_tags = []
+    else:
+        parent_tags = raw_tags if raw_tags else []
+
+    fact_ids: list[str] = []
+
+    for fact in params.facts:
+        fact_id = _make_id(fact.content)
+
+        # Merge tags: parent_tags + extra_tags, deduplicated, order preserved
+        merged_tags = list(dict.fromkeys(parent_tags + fact.extra_tags))
+
+        # Determine memory_type and decay_rate
+        memory_type = fact.memory_type or "unclassified"
+        decay_rate = DECAY_RATES.get(memory_type, 0.10)
+
+        db.execute(
+            """INSERT INTO memories (
+                id, content, category, tags, source, metadata,
+                capture_id, source_capture_id,
+                created_at, updated_at, node_id, client,
+                memory_type, decay_rate, vitality, base_weight,
+                status, accessed_at, access_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                fact_id,
+                fact.content,
+                "fact",
+                json.dumps(merged_tags),
+                "decomposition",
+                json.dumps({"source_capture_id": params.capture_id}),
+                None,  # capture_id — these are not captures themselves
+                params.capture_id,  # source_capture_id
+                now,
+                now,
+                NODE_ID,
+                CLIENT,
+                memory_type,
+                decay_rate,
+                1.0,  # vitality
+                1.0,  # base_weight
+                "active",
+                now,  # accessed_at
+                0,  # access_count
+            ),
+        )
+
+        fact_ids.append(fact_id)
+
+        # Fire-and-forget embed
+        asyncio.create_task(
+            asyncio.to_thread(_embed_and_store, fact_id, fact.content)
+        )
+
+    db.commit()
+
+    result = {
+        "created": len(fact_ids),
+        "fact_ids": fact_ids,
+        "capture_id": params.capture_id,
+        "parent_tags_inherited": parent_tags,
+    }
+    return json.dumps(result)
+
+
+@mcp.tool(
+    name="remind_me_decompose_batch",
+    annotations={
+        "title": "Get Undecomposed Memories",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def remind_me_decompose_batch(params: DecomposeBatchInput) -> str:
+    """Fetch a batch of captures that have not yet been decomposed into atomic facts.
+
+    Returns memories that have a capture_id (are captures), are not themselves
+    decomposed children, and have no children with matching source_capture_id.
+    Claude can then review each and call remind_me_decompose with extracted facts.
+
+    Args:
+        params: Batch size (default 20, max 100).
+
+    Returns:
+        JSON string with memories array and total_undecomposed count.
+    """
+    db = _get_db()
+
+    # Count total undecomposed captures
+    total_row = db.execute(
+        """SELECT COUNT(*) as cnt FROM memories m
+           WHERE m.capture_id IS NOT NULL
+             AND m.source_capture_id IS NULL
+             AND NOT EXISTS (
+                 SELECT 1 FROM memories c WHERE c.source_capture_id = m.capture_id
+             )""",
+    ).fetchone()
+    total_undecomposed = total_row["cnt"]
+
+    # Fetch batch
+    rows = db.execute(
+        """SELECT id, substr(content, 1, 500) as content_snippet, category, tags, capture_id
+           FROM memories m
+           WHERE m.capture_id IS NOT NULL
+             AND m.source_capture_id IS NULL
+             AND NOT EXISTS (
+                 SELECT 1 FROM memories c WHERE c.source_capture_id = m.capture_id
+             )
+           LIMIT ?""",
+        (params.batch_size,),
+    ).fetchall()
+
+    memories = []
+    for row in rows:
+        tags = row["tags"]
+        if isinstance(tags, str):
+            try:
+                tags = json.loads(tags)
+            except (json.JSONDecodeError, TypeError):
+                tags = []
+        memories.append({
+            "id": row["id"],
+            "content_snippet": row["content_snippet"],
+            "category": row["category"],
+            "tags": tags,
+            "capture_id": row["capture_id"],
+        })
+
+    result = {
+        "memories": memories,
+        "total_undecomposed": total_undecomposed,
+    }
+    return json.dumps(result, indent=2)
+
+
+# ---------------------------------------------------------------------------
 # Resource handlers
 # ---------------------------------------------------------------------------
 
@@ -1299,6 +1484,8 @@ __all__ = [
     "remind_me_reclassify",
     "remind_me_reclassify_batch",
     "remind_me_vitality_report",
+    "remind_me_decompose",
+    "remind_me_decompose_batch",
     "resource_stats",
     "resource_categories",
 ]
