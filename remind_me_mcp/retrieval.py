@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime
 from typing import TypedDict
 
 # ---------------------------------------------------------------------------
@@ -200,7 +201,70 @@ def apply_token_budget(ranked_memories: list[dict], budget: int) -> SearchEnvelo
 
 
 # ---------------------------------------------------------------------------
+# Debug signals & tier breakdown
+# ---------------------------------------------------------------------------
+
+
+def build_debug_signals(memory: dict) -> dict:
+    """Extract ranking debug signals from an RRF-ranked memory dict.
+
+    Returns a dict with keys: semantic_rank, keyword_rank, recency_rank,
+    vitality_rank, and days_old. If ``created_at`` is missing or unparseable,
+    ``days_old`` is set to ``None``.
+
+    Args:
+        memory: A memory dict augmented by :func:`rank_rrf` with rank metadata.
+
+    Returns:
+        Dict of debug signal values for transparency/explainability.
+    """
+    days_old: int | None = None
+    created_at = memory.get("created_at")
+    if created_at is not None:
+        try:
+            created_dt = datetime.fromisoformat(str(created_at))
+            if created_dt.tzinfo is None:
+                created_dt = created_dt.replace(tzinfo=UTC)
+            days_old = (datetime.now(UTC) - created_dt).days
+        except (ValueError, TypeError):
+            days_old = None
+
+    return {
+        "semantic_rank": memory.get("_semantic_rank"),
+        "keyword_rank": memory.get("_keyword_rank"),
+        "recency_rank": memory.get("_recency_rank"),
+        "vitality_rank": memory.get("_vitality_rank"),
+        "days_old": days_old,
+    }
+
+
+def compute_tier_breakdown(memories: list[dict]) -> dict[str, int]:
+    """Count memories by their ``_search_method`` value.
+
+    Args:
+        memories: List of memory dicts, each with a ``_search_method`` key.
+
+    Returns:
+        Dict with keys ``keyword``, ``semantic``, ``hybrid`` and integer counts.
+        Missing tiers default to 0.
+    """
+    counts: dict[str, int] = {"keyword": 0, "semantic": 0, "hybrid": 0}
+    for mem in memories:
+        method = mem.get("_search_method", "")
+        if method in counts:
+            counts[method] += 1
+    return counts
+
+
+# ---------------------------------------------------------------------------
 # Exports
 # ---------------------------------------------------------------------------
 
-__all__ = ["RRF_K", "SearchEnvelope", "rank_rrf", "apply_token_budget"]
+__all__ = [
+    "RRF_K",
+    "SearchEnvelope",
+    "rank_rrf",
+    "apply_token_budget",
+    "build_debug_signals",
+    "compute_tier_breakdown",
+]
