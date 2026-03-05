@@ -48,11 +48,11 @@ Requirements for Intelligent Retrieval milestone. Each maps to roadmap phases.
 
 ### Vault Hygiene
 
-- [ ] **HYGN-01**: remind_me_consolidate tool clusters semantically similar memories above a configurable similarity threshold
-- [ ] **HYGN-02**: Consolidation supports dry_run mode that reports clusters without modifying data
-- [ ] **HYGN-03**: Auto-merge mode merges cluster content into highest-vitality canonical record
-- [ ] **HYGN-04**: Superseded memories get superseded_by set to canonical ID (not deleted)
-- [ ] **HYGN-05**: Canonical record inherits summed access_count from all merged members
+- [x] **HYGN-01**: remind_me_consolidate tool clusters semantically similar memories above a configurable similarity threshold
+- [x] **HYGN-02**: Consolidation supports dry_run mode that reports clusters without modifying data
+- [x] **HYGN-03**: Auto-merge mode merges cluster content into highest-vitality canonical record
+- [x] **HYGN-04**: Superseded memories get superseded_by set to canonical ID (not deleted)
+- [x] **HYGN-05**: Canonical record inherits summed access_count from all merged members
 
 ### Transparency
 
@@ -107,11 +107,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 | STRC-02 | Phase 13 | Complete |
 | STRC-03 | Phase 13 | Complete |
 | STRC-04 | Phase 13 | Complete |
-| HYGN-01 | Phase 14 | Pending |
-| HYGN-02 | Phase 14 | Pending |
-| HYGN-03 | Phase 14 | Pending |
-| HYGN-04 | Phase 14 | Pending |
-| HYGN-05 | Phase 14 | Pending |
+| HYGN-01 | Phase 14 | Complete |
+| HYGN-02 | Phase 14 | Complete |
+| HYGN-03 | Phase 14 | Complete |
+| HYGN-04 | Phase 14 | Complete |
+| HYGN-05 | Phase 14 | Complete |
 | TRNS-01 | Phase 13 | Complete |
 | TRNS-02 | Phase 13 | Complete |
 

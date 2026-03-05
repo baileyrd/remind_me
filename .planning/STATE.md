@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: Intelligent Retrieval
-status: completed
-stopped_at: Completed 13-01-PLAN.md (structured memory columns and query routing)
-last_updated: "2026-03-05T19:28:52.606Z"
-last_activity: 2026-03-05 -- Plan 13-01 (structured memory columns and query routing) completed
+status: in_progress
+stopped_at: Completed 14-01-PLAN.md (consolidation module pure functions)
+last_updated: "2026-03-05T20:06:00.000Z"
+last_activity: 2026-03-05 -- Plan 14-01 (consolidation module pure functions) completed
 progress:
   total_phases: 5
   completed_phases: 2
-  total_plans: 4
-  completed_plans: 4
+  total_plans: 6
+  completed_plans: 5
   percent: 100
 ---
 
@@ -21,16 +21,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-04)
 
 **Core value:** Persistent, searchable memory across all Claude interfaces -- modular, tested, maintainable
-**Current focus:** v1.2 Intelligent Retrieval -- Phase 13: Structured Memory and Transparency
+**Current focus:** v1.2 Intelligent Retrieval -- Phase 14: Vault Hygiene
 
 ## Current Position
 
-Phase: 13 of 14 (Structured Memory and Transparency)
-Plan: 2 of 2
-Status: Phase Complete
-Last activity: 2026-03-05 -- Plan 13-01 (structured memory columns and query routing) completed
+Phase: 14 of 14 (Vault Hygiene)
+Plan: 1 of 2
+Status: Plan 01 Complete
+Last activity: 2026-03-05 -- Plan 14-01 (consolidation module pure functions) completed
 
-Progress: [██████████] 100%
+Progress: [█████████░] 91%
 
 ## Performance Metrics
 
@@ -50,6 +50,7 @@ Progress: [██████████] 100%
 - Phase 11: 3/3 plans complete
 - Phase 12: 2/2 plans complete
 - Phase 13: 2/2 plans complete (structured memory and transparency)
+- Phase 14: 1/2 plans complete (vault hygiene consolidation)
 
 ## Accumulated Context
 
@@ -85,6 +86,9 @@ Full decision log in PROJECT.md Key Decisions table.
 - [Phase 13]: Structured query uses regex for subject:/predicate: prefix parsing with quoted and unquoted values
 - [Phase 13]: Superseded memories excluded via SQL WHERE clause (superseded_by IS NULL)
 - [Phase 13]: Structured results bypass RRF pipeline entirely; fall back to FTS/semantic with stripped query when no results
+- [Phase 14]: Union-Find for transitive clustering (A~B and B~C implies single cluster)
+- [Phase 14]: Content merge uses dict.fromkeys for order-preserving line deduplication
+- [Phase 14]: pick_canonical tiebreaks on accessed_at (most recent wins when vitality equal)
 
 ### Pending Todos
 
@@ -96,6 +100,6 @@ None.
 
 ## Session Continuity
 
-Last session: 2026-03-05T19:23:03Z
-Stopped at: Completed 13-01-PLAN.md (structured memory columns and query routing)
+Last session: 2026-03-05T20:03:26Z
+Stopped at: Completed 14-01-PLAN.md (consolidation module pure functions)
 Resume file: None
