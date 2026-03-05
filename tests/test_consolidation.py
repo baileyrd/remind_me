@@ -1,17 +1,21 @@
 """
 Tests for remind_me_mcp.consolidation — pure-function clustering, canonical
-selection, and merge logic for vault hygiene.
+selection, merge logic, and integration tests for the consolidation MCP tool.
 
 Covers requirements HYGN-01 through HYGN-05.
 """
 
 from __future__ import annotations
 
+import json
+import sqlite3
+
 import numpy as np
 import pytest
 from pydantic import ValidationError
 
 from remind_me_mcp.consolidation import find_clusters, merge_cluster, pick_canonical
+from remind_me_mcp.db import _make_id, _now_iso
 from remind_me_mcp.models import ConsolidateInput
 
 
@@ -268,3 +272,236 @@ class TestConsolidateInput:
 
         valid = ConsolidateInput(limit=100)
         assert valid.limit == 100
+
+
+# ---------------------------------------------------------------------------
+# Integration tests — consolidation tool handler (Phase 14 Plan 02)
+# ---------------------------------------------------------------------------
+
+
+def _insert_memory_with_vec(
+    db: sqlite3.Connection,
+    mock_embedder: object,
+    *,
+    memory_id: str | None = None,
+    content: str = "Test memory",
+    category: str = "general",
+    tags: list[str] | None = None,
+    vitality: float = 1.0,
+    access_count: int = 0,
+    decay_rate: float = 0.10,
+    base_weight: float = 1.0,
+    status: str = "active",
+    superseded_by: str | None = None,
+) -> str:
+    """Insert a memory row AND its embedding into the test database.
+
+    Uses mock_embedder.embed_one to generate deterministic embeddings and stores
+    them in memories_vec. Returns the memory ID.
+
+    Args:
+        db: Test database connection with sqlite-vec loaded.
+        mock_embedder: FakeEmbedder instance for deterministic embeddings.
+        memory_id: Optional explicit ID; generated from content if not provided.
+        content: Memory content text.
+        category: Memory category.
+        tags: Tag list (default empty).
+        vitality: Vitality score.
+        access_count: Access count.
+        decay_rate: Decay rate.
+        base_weight: Base weight.
+        status: Memory status ('active' or 'dormant').
+        superseded_by: ID of canonical memory if this memory is superseded.
+
+    Returns:
+        The memory ID string.
+    """
+    if tags is None:
+        tags = []
+    if memory_id is None:
+        memory_id = _make_id(content)
+    now = _now_iso()
+
+    db.execute(
+        """INSERT INTO memories (
+            id, content, category, tags, source, metadata,
+            created_at, updated_at, accessed_at,
+            vitality, access_count, decay_rate, base_weight,
+            status, memory_type, superseded_by
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            memory_id, content, category, json.dumps(tags),
+            "manual", "{}",
+            now, now, now,
+            vitality, access_count, decay_rate, base_weight,
+            status, "unclassified", superseded_by,
+        ),
+    )
+
+    # Store embedding in memories_vec
+    emb_bytes = mock_embedder.embed_one(content)  # type: ignore[union-attr]
+    rowid = db.execute(
+        "SELECT rowid FROM memories WHERE id = ?", (memory_id,)
+    ).fetchone()[0]
+    db.execute(
+        "INSERT INTO memories_vec(rowid, embedding) VALUES (?, ?)",
+        (rowid, emb_bytes),
+    )
+
+    db.commit()
+    return memory_id
+
+
+class TestConsolidateToolIntegration:
+    """Integration tests for the remind_me_consolidate tool handler.
+
+    These tests use db_conn_with_vec (real sqlite-vec) and mock_embedder
+    to test the full tool handler path including DB reads and writes.
+    """
+
+    @pytest.mark.asyncio
+    async def test_consolidate_tool_dry_run(
+        self, db_conn_with_vec: sqlite3.Connection, mock_embedder: object, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Dry run reports 1 cluster for 2 identical memories without modifying DB."""
+        import remind_me_mcp.tools as _tools_mod
+
+        monkeypatch.setattr(_tools_mod, "_embed_and_store", lambda mid, c: True)
+
+        # 2 identical content (same embedding), 1 different
+        id_a = _insert_memory_with_vec(db_conn_with_vec, mock_embedder, content="duplicate content here", vitality=0.9, access_count=5)
+        id_b = _insert_memory_with_vec(db_conn_with_vec, mock_embedder, content="duplicate content here", vitality=0.7, access_count=3)
+        _insert_memory_with_vec(db_conn_with_vec, mock_embedder, content="completely different text about something else entirely")
+
+        from remind_me_mcp.tools import remind_me_consolidate
+
+        result_str = await remind_me_consolidate(ConsolidateInput(dry_run=True, similarity_threshold=0.5))
+        result = json.loads(result_str)
+
+        assert result["clusters_found"] >= 1
+        assert result["dry_run"] is True
+
+        # Verify DB was NOT modified: no superseded_by set
+        row_a = db_conn_with_vec.execute("SELECT superseded_by FROM memories WHERE id = ?", (id_a,)).fetchone()
+        row_b = db_conn_with_vec.execute("SELECT superseded_by FROM memories WHERE id = ?", (id_b,)).fetchone()
+        assert row_a["superseded_by"] is None
+        assert row_b["superseded_by"] is None
+
+    @pytest.mark.asyncio
+    async def test_consolidate_tool_auto_merge(
+        self, db_conn_with_vec: sqlite3.Connection, mock_embedder: object, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Auto-merge updates canonical, sets superseded_by, and sums access_count."""
+        import remind_me_mcp.tools as _tools_mod
+
+        monkeypatch.setattr(_tools_mod, "_embed_and_store", lambda mid, c: True)
+
+        id_high = _insert_memory_with_vec(
+            db_conn_with_vec, mock_embedder,
+            content="important fact about Python",
+            vitality=0.9, access_count=5, decay_rate=0.05, base_weight=1.0,
+        )
+        id_low = _insert_memory_with_vec(
+            db_conn_with_vec, mock_embedder,
+            content="important fact about Python",
+            vitality=0.3, access_count=3,
+        )
+
+        from remind_me_mcp.tools import remind_me_consolidate
+
+        result_str = await remind_me_consolidate(ConsolidateInput(dry_run=False, similarity_threshold=0.5))
+        result = json.loads(result_str)
+
+        assert result["clusters_merged"] >= 1
+        assert result["dry_run"] is False
+
+        # Higher vitality memory should be canonical
+        assert id_high in result["canonical_ids"]
+
+        # Canonical access_count = 5 + 3 = 8
+        canonical_row = db_conn_with_vec.execute(
+            "SELECT access_count, content FROM memories WHERE id = ?", (id_high,)
+        ).fetchone()
+        assert canonical_row["access_count"] == 8
+
+        # Lower vitality memory should have superseded_by set
+        member_row = db_conn_with_vec.execute(
+            "SELECT superseded_by FROM memories WHERE id = ?", (id_low,)
+        ).fetchone()
+        assert member_row["superseded_by"] == id_high
+
+    @pytest.mark.asyncio
+    async def test_consolidate_tool_category_filter(
+        self, db_conn_with_vec: sqlite3.Connection, mock_embedder: object, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Category filter limits consolidation to the specified category only."""
+        import remind_me_mcp.tools as _tools_mod
+
+        monkeypatch.setattr(_tools_mod, "_embed_and_store", lambda mid, c: True)
+
+        # 2 identical in "facts" category
+        _insert_memory_with_vec(db_conn_with_vec, mock_embedder, content="shared knowledge base", category="facts")
+        _insert_memory_with_vec(db_conn_with_vec, mock_embedder, content="shared knowledge base", category="facts")
+
+        # 2 identical in "notes" category
+        _insert_memory_with_vec(db_conn_with_vec, mock_embedder, content="project meeting notes", category="notes")
+        _insert_memory_with_vec(db_conn_with_vec, mock_embedder, content="project meeting notes", category="notes")
+
+        from remind_me_mcp.tools import remind_me_consolidate
+
+        result_str = await remind_me_consolidate(ConsolidateInput(dry_run=True, similarity_threshold=0.5, category="facts"))
+        result = json.loads(result_str)
+
+        # Should find cluster(s) only from "facts"
+        assert result["clusters_found"] >= 1
+        for cluster in result["clusters"]:
+            # All IDs in the cluster should be from "facts" category
+            all_ids = [cluster["canonical"]["id"]] + [m["id"] for m in cluster["members"]]
+            for mid in all_ids:
+                row = db_conn_with_vec.execute("SELECT category FROM memories WHERE id = ?", (mid,)).fetchone()
+                assert row["category"] == "facts"
+
+    @pytest.mark.asyncio
+    async def test_consolidate_tool_skips_superseded(
+        self, db_conn_with_vec: sqlite3.Connection, mock_embedder: object, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Memories with superseded_by set are excluded from consolidation."""
+        import remind_me_mcp.tools as _tools_mod
+
+        monkeypatch.setattr(_tools_mod, "_embed_and_store", lambda mid, c: True)
+
+        # 2 identical memories, but one already superseded
+        id_active = _insert_memory_with_vec(db_conn_with_vec, mock_embedder, content="already merged content")
+        _insert_memory_with_vec(
+            db_conn_with_vec, mock_embedder,
+            content="already merged content",
+            superseded_by="some-other-id",
+        )
+
+        from remind_me_mcp.tools import remind_me_consolidate
+
+        result_str = await remind_me_consolidate(ConsolidateInput(dry_run=True, similarity_threshold=0.5))
+        result = json.loads(result_str)
+
+        # Only 1 eligible memory => no clusters possible
+        assert result["clusters_found"] == 0
+
+    @pytest.mark.asyncio
+    async def test_consolidate_tool_no_clusters(
+        self, db_conn_with_vec: sqlite3.Connection, mock_embedder: object, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Dissimilar memories produce no clusters at high threshold."""
+        import remind_me_mcp.tools as _tools_mod
+
+        monkeypatch.setattr(_tools_mod, "_embed_and_store", lambda mid, c: True)
+
+        # Very different content => different embeddings
+        _insert_memory_with_vec(db_conn_with_vec, mock_embedder, content="alpha bravo charlie delta")
+        _insert_memory_with_vec(db_conn_with_vec, mock_embedder, content="zulu yankee xray whiskey")
+
+        from remind_me_mcp.tools import remind_me_consolidate
+
+        result_str = await remind_me_consolidate(ConsolidateInput(dry_run=True, similarity_threshold=0.99))
+        result = json.loads(result_str)
+
+        assert result["clusters_found"] == 0
