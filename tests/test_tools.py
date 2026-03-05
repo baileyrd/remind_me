@@ -1618,3 +1618,268 @@ async def test_decompose_batch_input_validates_batch_size() -> None:
 
     with pytest.raises(ValidationError):
         DecomposeBatchInput(batch_size=101)
+
+
+# ---------------------------------------------------------------------------
+# Decomposition tests — Task 2 (tool handlers)
+# ---------------------------------------------------------------------------
+
+
+async def test_decompose_creates_one_memory_per_fact(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """remind_me_decompose creates one memory per fact with source_capture_id."""
+    from remind_me_mcp.models import AtomicFact, DecomposeInput
+    from remind_me_mcp.tools import remind_me_decompose
+
+    parent = memory_factory(
+        content="A conversation about Python",
+        category="dialog",
+        tags=["python", "programming"],
+        source="auto_capture",
+        capture_id="cap_001",
+    )
+
+    params = DecomposeInput(
+        capture_id="cap_001",
+        facts=[
+            AtomicFact(content="Python is dynamically typed"),
+            AtomicFact(content="Python supports async/await"),
+        ],
+    )
+    result = await remind_me_decompose(params)
+    data = json.loads(result)
+
+    assert data["created"] == 2
+    assert len(data["fact_ids"]) == 2
+    assert data["capture_id"] == "cap_001"
+
+    # Verify each fact is stored with source_capture_id
+    for fact_id in data["fact_ids"]:
+        row = db_conn.execute(
+            "SELECT source_capture_id, source, category FROM memories WHERE id = ?",
+            (fact_id,),
+        ).fetchone()
+        assert row is not None
+        assert row["source_capture_id"] == "cap_001"
+        assert row["source"] == "decomposition"
+        assert row["category"] == "fact"
+
+
+async def test_decompose_inherits_parent_tags(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """Decomposed facts inherit tags from the parent capture."""
+    from remind_me_mcp.models import AtomicFact, DecomposeInput
+    from remind_me_mcp.tools import remind_me_decompose
+
+    memory_factory(
+        content="Discussion about databases",
+        tags=["database", "sql"],
+        capture_id="cap_002",
+    )
+
+    params = DecomposeInput(
+        capture_id="cap_002",
+        facts=[AtomicFact(content="PostgreSQL supports JSONB")],
+    )
+    result = await remind_me_decompose(params)
+    data = json.loads(result)
+
+    row = db_conn.execute(
+        "SELECT tags FROM memories WHERE id = ?",
+        (data["fact_ids"][0],),
+    ).fetchone()
+    tags = json.loads(row["tags"])
+    assert "database" in tags
+    assert "sql" in tags
+    assert data["parent_tags_inherited"] == ["database", "sql"]
+
+
+async def test_decompose_merges_extra_tags(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """Extra_tags are merged with inherited tags (no duplicates)."""
+    from remind_me_mcp.models import AtomicFact, DecomposeInput
+    from remind_me_mcp.tools import remind_me_decompose
+
+    memory_factory(
+        content="Discussion about Python testing",
+        tags=["python", "testing"],
+        capture_id="cap_003",
+    )
+
+    params = DecomposeInput(
+        capture_id="cap_003",
+        facts=[
+            AtomicFact(
+                content="pytest is the standard test framework",
+                extra_tags=["pytest", "python"],  # 'python' overlaps with parent
+            ),
+        ],
+    )
+    result = await remind_me_decompose(params)
+    data = json.loads(result)
+
+    row = db_conn.execute(
+        "SELECT tags FROM memories WHERE id = ?",
+        (data["fact_ids"][0],),
+    ).fetchone()
+    tags = json.loads(row["tags"])
+    assert "python" in tags
+    assert "testing" in tags
+    assert "pytest" in tags
+    # No duplicates
+    assert len(tags) == len(set(tags))
+
+
+async def test_decompose_sets_memory_type_and_decay_rate(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """Decomposed facts get memory_type and decay_rate when specified."""
+    from remind_me_mcp.models import AtomicFact, DecomposeInput
+    from remind_me_mcp.tools import remind_me_decompose
+
+    memory_factory(content="Decisions discussion", capture_id="cap_004")
+
+    params = DecomposeInput(
+        capture_id="cap_004",
+        facts=[AtomicFact(content="Use PostgreSQL for prod", memory_type="decision")],
+    )
+    result = await remind_me_decompose(params)
+    data = json.loads(result)
+
+    row = db_conn.execute(
+        "SELECT memory_type, decay_rate FROM memories WHERE id = ?",
+        (data["fact_ids"][0],),
+    ).fetchone()
+    assert row["memory_type"] == "decision"
+    assert row["decay_rate"] == 0.02  # DECAY_RATES["decision"]
+
+
+async def test_decompose_defaults_to_unclassified(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """Decomposed facts default to memory_type='unclassified' when not specified."""
+    from remind_me_mcp.models import AtomicFact, DecomposeInput
+    from remind_me_mcp.tools import remind_me_decompose
+
+    memory_factory(content="General discussion", capture_id="cap_005")
+
+    params = DecomposeInput(
+        capture_id="cap_005",
+        facts=[AtomicFact(content="Some general fact")],
+    )
+    result = await remind_me_decompose(params)
+    data = json.loads(result)
+
+    row = db_conn.execute(
+        "SELECT memory_type, decay_rate FROM memories WHERE id = ?",
+        (data["fact_ids"][0],),
+    ).fetchone()
+    assert row["memory_type"] == "unclassified"
+    assert row["decay_rate"] == 0.10  # DECAY_RATES["unclassified"]
+
+
+async def test_decompose_returns_error_for_missing_capture(
+    db_conn: sqlite3.Connection,
+) -> None:
+    """remind_me_decompose returns error when capture_id does not exist."""
+    from remind_me_mcp.models import AtomicFact, DecomposeInput
+    from remind_me_mcp.tools import remind_me_decompose
+
+    params = DecomposeInput(
+        capture_id="nonexistent_cap",
+        facts=[AtomicFact(content="Some fact")],
+    )
+    result = await remind_me_decompose(params)
+    assert "error" in result.lower() or "not found" in result.lower()
+
+
+async def test_decompose_batch_returns_undecomposed_memories(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """remind_me_decompose_batch returns captures that have not been decomposed."""
+    from remind_me_mcp.models import DecomposeBatchInput
+    from remind_me_mcp.tools import remind_me_decompose_batch
+
+    # Create a capture that has NOT been decomposed
+    memory_factory(
+        content="Undecomposed capture content",
+        capture_id="cap_batch_001",
+        tags=["test"],
+        category="dialog",
+    )
+
+    # Create a capture that HAS been decomposed (has children)
+    memory_factory(
+        content="Already decomposed capture",
+        capture_id="cap_batch_002",
+    )
+    # Simulate a decomposed child
+    memory_factory(
+        content="Child fact from cap_batch_002",
+        source="decomposition",
+        source_capture_id="cap_batch_002",
+    )
+
+    params = DecomposeBatchInput(batch_size=10)
+    result = await remind_me_decompose_batch(params)
+    data = json.loads(result)
+
+    capture_ids = [m["capture_id"] for m in data["memories"]]
+    assert "cap_batch_001" in capture_ids
+    assert "cap_batch_002" not in capture_ids
+
+
+async def test_decompose_batch_returns_correct_fields(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """decompose_batch returns content_snippet, id, category, tags, capture_id."""
+    from remind_me_mcp.models import DecomposeBatchInput
+    from remind_me_mcp.tools import remind_me_decompose_batch
+
+    memory_factory(
+        content="A capture with metadata",
+        capture_id="cap_fields_001",
+        tags=["field_test"],
+        category="conversation",
+    )
+
+    params = DecomposeBatchInput(batch_size=10)
+    result = await remind_me_decompose_batch(params)
+    data = json.loads(result)
+
+    mem = next(m for m in data["memories"] if m["capture_id"] == "cap_fields_001")
+    assert "content_snippet" in mem
+    assert "id" in mem
+    assert "category" in mem
+    assert "tags" in mem
+    assert "capture_id" in mem
+
+
+async def test_decompose_batch_returns_total_count(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """decompose_batch returns total_undecomposed count."""
+    from remind_me_mcp.models import DecomposeBatchInput
+    from remind_me_mcp.tools import remind_me_decompose_batch
+
+    memory_factory(content="Capture 1", capture_id="cap_cnt_001")
+    memory_factory(content="Capture 2", capture_id="cap_cnt_002")
+    memory_factory(content="Capture 3", capture_id="cap_cnt_003")
+
+    params = DecomposeBatchInput(batch_size=2)
+    result = await remind_me_decompose_batch(params)
+    data = json.loads(result)
+
+    assert data["total_undecomposed"] == 3
+    assert len(data["memories"]) == 2  # limited by batch_size
