@@ -89,6 +89,12 @@ class MemorySearchInput(BaseModel):
         default=None, description="Filter: memory must have ALL of these tags"
     )
     limit: int = Field(default=20, description="Max results to return", ge=1, le=100)
+    token_budget: int = Field(
+        default=800,
+        description="Maximum token budget for results (estimate: len(content)//4). 0 means unlimited.",
+        ge=0,
+        le=10000,
+    )
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
 
 
