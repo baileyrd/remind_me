@@ -12,6 +12,8 @@ _ensure_schema(). Each migration is idempotent and guarded by a version check.
 Current schema versions:
   0 -> 1: Add capture_id column + index on memories table
   1 -> 2: Add memory_tags junction table, indexes, and sync triggers
+  4 -> 5: Add decay, vitality, and classification columns
+  5 -> 6: Add source_capture_id column for atomic decomposition
 """
 
 from __future__ import annotations
@@ -195,7 +197,7 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 # Current target schema version.  Increment when adding a new migration step.
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
 
 
 
@@ -239,6 +241,11 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         _migrate_v4_to_v5(db)
         db.execute("PRAGMA user_version = 5")
         current_version = 5
+
+    if current_version < 6:
+        _migrate_v5_to_v6(db)
+        db.execute("PRAGMA user_version = 6")
+        current_version = 6
 
     db.commit()
 
@@ -607,6 +614,93 @@ def _migrate_v4_to_v5(db: sqlite3.Connection) -> None:
             );
         END;
     """)
+
+def _migrate_v5_to_v6(db: sqlite3.Connection) -> None:
+    """v5 -> v6: Add source_capture_id column for atomic decomposition linkage.
+
+    Adds source_capture_id TEXT column linking decomposed facts back to
+    their parent capture. Creates an index for efficient lookup of children
+    by parent capture_id. Updates outbox triggers to include the new field.
+
+    Args:
+        db: An open SQLite connection.
+    """
+    with contextlib.suppress(sqlite3.OperationalError):
+        db.execute(
+            "ALTER TABLE memories ADD COLUMN source_capture_id TEXT DEFAULT NULL"
+        )
+
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_memories_source_capture_id "
+        "ON memories(source_capture_id)"
+    )
+
+    # Drop and recreate outbox triggers to include source_capture_id
+    db.executescript("""
+        DROP TRIGGER IF EXISTS memories_outbox_ai;
+        DROP TRIGGER IF EXISTS memories_outbox_au;
+
+        CREATE TRIGGER IF NOT EXISTS memories_outbox_ai
+        AFTER INSERT ON memories BEGIN
+            INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+            VALUES (
+                NEW.id, 'insert',
+                json_object(
+                    'id',                 NEW.id,
+                    'content',            NEW.content,
+                    'category',           NEW.category,
+                    'tags',               NEW.tags,
+                    'source',             NEW.source,
+                    'metadata',           NEW.metadata,
+                    'created_at',         NEW.created_at,
+                    'updated_at',         NEW.updated_at,
+                    'capture_id',         NEW.capture_id,
+                    'node_id',            NEW.node_id,
+                    'client',             NEW.client,
+                    'accessed_at',        NEW.accessed_at,
+                    'access_count',       NEW.access_count,
+                    'decay_rate',         NEW.decay_rate,
+                    'vitality',           NEW.vitality,
+                    'base_weight',        NEW.base_weight,
+                    'status',             NEW.status,
+                    'memory_type',        NEW.memory_type,
+                    'source_capture_id',  NEW.source_capture_id
+                ),
+                datetime('now', 'utc')
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS memories_outbox_au
+        AFTER UPDATE ON memories BEGIN
+            INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+            VALUES (
+                NEW.id, 'update',
+                json_object(
+                    'id',                 NEW.id,
+                    'content',            NEW.content,
+                    'category',           NEW.category,
+                    'tags',               NEW.tags,
+                    'source',             NEW.source,
+                    'metadata',           NEW.metadata,
+                    'created_at',         NEW.created_at,
+                    'updated_at',         NEW.updated_at,
+                    'capture_id',         NEW.capture_id,
+                    'node_id',            NEW.node_id,
+                    'client',             NEW.client,
+                    'accessed_at',        NEW.accessed_at,
+                    'access_count',       NEW.access_count,
+                    'decay_rate',         NEW.decay_rate,
+                    'vitality',           NEW.vitality,
+                    'base_weight',        NEW.base_weight,
+                    'status',             NEW.status,
+                    'memory_type',        NEW.memory_type,
+                    'source_capture_id',  NEW.source_capture_id
+                ),
+                datetime('now', 'utc')
+            );
+        END;
+    """)
+
 
 # ---------------------------------------------------------------------------
 # Embedding helpers

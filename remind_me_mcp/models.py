@@ -360,6 +360,78 @@ class ReclassifyBatchInput(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Decomposition models (Phase 12 Plan 01)
+# ---------------------------------------------------------------------------
+
+
+class AtomicFact(BaseModel):
+    """A single atomic fact extracted from a conversation capture."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    content: str = Field(
+        ...,
+        description="The atomic fact content to store as an individual memory",
+        min_length=1,
+        max_length=50000,
+    )
+    memory_type: str | None = Field(
+        default=None,
+        description=(
+            "Optional classification type. Must be one of: "
+            "decision, preference, fact, insight, learning, blocker, action_item. "
+            "Defaults to 'unclassified' if not provided."
+        ),
+    )
+    extra_tags: list[str] = Field(
+        default_factory=list,
+        description="Additional tags to merge with the parent capture's tags",
+    )
+
+    @field_validator("memory_type")
+    @classmethod
+    def validate_memory_type(cls, v: str | None) -> str | None:
+        """Validate that memory_type is one of the allowed values when not None."""
+        if v is not None and v not in VALID_MEMORY_TYPES:
+            raise ValueError(
+                f"Invalid memory_type '{v}'. Must be one of: "
+                f"{', '.join(sorted(VALID_MEMORY_TYPES))}"
+            )
+        return v
+
+
+class DecomposeInput(BaseModel):
+    """Input for the remind_me_decompose tool: decompose a capture into atomic facts."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    capture_id: str = Field(
+        ...,
+        description="The capture_id of the parent memory to decompose",
+        min_length=1,
+    )
+    facts: list[AtomicFact] = Field(
+        ...,
+        description="List of atomic facts extracted from the capture",
+        min_length=1,
+        max_length=50,
+    )
+
+
+class DecomposeBatchInput(BaseModel):
+    """Input for the remind_me_decompose_batch tool: fetch undecomposed captures."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    batch_size: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="Number of undecomposed captures to return",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Vitality report model (Phase 11 Plan 03)
 # ---------------------------------------------------------------------------
 
@@ -391,5 +463,8 @@ __all__ = [
     "ReclassifyInput",
     "ReclassifyBatchInput",
     "VALID_MEMORY_TYPES",
+    "AtomicFact",
+    "DecomposeInput",
+    "DecomposeBatchInput",
     "VitalityReportInput",
 ]
