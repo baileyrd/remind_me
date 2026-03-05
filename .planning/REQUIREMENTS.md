@@ -56,8 +56,8 @@ Requirements for Intelligent Retrieval milestone. Each maps to roadmap phases.
 
 ### Transparency
 
-- [ ] **TRNS-01**: Search results include debug_signals block when verbose=True (semantic_rank, keyword_rank, recency_rank, vitality_rank, days_old)
-- [ ] **TRNS-02**: Response envelope includes tier_breakdown and dormant_excluded count
+- [x] **TRNS-01**: Search results include debug_signals block when verbose=True (semantic_rank, keyword_rank, recency_rank, vitality_rank, days_old)
+- [x] **TRNS-02**: Response envelope includes tier_breakdown and dormant_excluded count
 
 ## Future Requirements
 
@@ -112,8 +112,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 | HYGN-03 | Phase 14 | Pending |
 | HYGN-04 | Phase 14 | Pending |
 | HYGN-05 | Phase 14 | Pending |
-| TRNS-01 | Phase 13 | Pending |
-| TRNS-02 | Phase 13 | Pending |
+| TRNS-01 | Phase 13 | Complete |
+| TRNS-02 | Phase 13 | Complete |
 
 **Coverage:**
 - v1.2 requirements: 31 total

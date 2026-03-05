@@ -94,7 +94,7 @@ Plans:
   2. Search detects structured query patterns (subject/predicate) and routes to indexed lookup before falling back to semantic search
   3. A superseded_by column tracks when a structured fact is replaced by a newer version
   4. Search results include a debug_signals block (semantic_rank, keyword_rank, recency_rank, vitality_rank, days_old) when verbose=True, plus tier_breakdown and dormant_excluded count in the envelope
-**Plans:** 2 plans
+**Plans:** 1/2 plans executed
 Plans:
 - [ ] 13-01-PLAN.md -- Schema migration v6->v7 (subject/predicate/object/superseded_by columns) and structured query routing
 - [ ] 13-02-PLAN.md -- Debug signals, tier breakdown, and dormant_excluded transparency in search results
@@ -128,5 +128,5 @@ Phases execute in numeric order: 10 -> 11 -> 12 -> 13 -> 14
 | 10. Retrieval Pipeline | v1.2 | 2/2 | Complete | 2026-03-05 |
 | 11. Decay, Vitality, and Classification | v1.2 | 3/3 | Complete | 2026-03-05 |
 | 12. Atomic Decomposition | v1.2 | 2/2 | Complete | 2026-03-05 |
-| 13. Structured Memory and Transparency | v1.2 | 0/2 | Not started | - |
+| 13. Structured Memory and Transparency | 1/2 | In Progress|  | - |
 | 14. Vault Hygiene | v1.2 | 0/TBD | Not started | - |

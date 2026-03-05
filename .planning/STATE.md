@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: Intelligent Retrieval
-status: completed
-stopped_at: Completed 12-02-PLAN.md (decomposition_pending hint in auto_capture)
-last_updated: "2026-03-05T18:56:05.505Z"
-last_activity: 2026-03-05 -- Plan 12-02 (decomposition_pending hint) completed
+status: executing
+stopped_at: Completed 13-02-PLAN.md (debug signals and envelope transparency)
+last_updated: "2026-03-05T19:22:59.720Z"
+last_activity: 2026-03-05 -- Plan 13-02 (debug signals and envelope transparency) completed
 progress:
   total_phases: 5
   completed_phases: 1
-  total_plans: 2
-  completed_plans: 2
-  percent: 100
+  total_plans: 4
+  completed_plans: 3
+  percent: 89
 ---
 
 # Project State
@@ -21,16 +21,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-04)
 
 **Core value:** Persistent, searchable memory across all Claude interfaces -- modular, tested, maintainable
-**Current focus:** v1.2 Intelligent Retrieval -- Phase 12: Atomic Decomposition
+**Current focus:** v1.2 Intelligent Retrieval -- Phase 13: Structured Memory and Transparency
 
 ## Current Position
 
-Phase: 12 of 14 (Atomic Decomposition)
-Plan: 2 of 2
-Status: Phase Complete
-Last activity: 2026-03-05 -- Plan 12-02 (decomposition_pending hint) completed
+Phase: 13 of 14 (Structured Memory and Transparency)
+Plan: 2 of 3
+Status: In Progress
+Last activity: 2026-03-05 -- Plan 13-02 (debug signals and envelope transparency) completed
 
-Progress: [██████████] 100%
+Progress: [█████████░] 89%
 
 ## Performance Metrics
 
@@ -49,6 +49,7 @@ Progress: [██████████] 100%
 - Phase 10: 2 plans, 2 waves
 - Phase 11: 3/3 plans complete
 - Phase 12: 2/2 plans complete
+- Phase 13: 2/3 plans complete (structured memory and transparency)
 
 ## Accumulated Context
 
@@ -78,6 +79,11 @@ Progress: [██████████] 100%
 
 Full decision log in PROJECT.md Key Decisions table.
 - [Phase 12]: Response-embedded workflow hints guide Claude tool chaining (decomposition_pending in auto_capture)
+- [Phase 13]: Debug signals use underscore-prefixed internal rank keys from RRF output
+- [Phase 13]: Tier breakdown and dormant_excluded always included in envelope (not gated by verbose)
+- [Phase 13]: Dormant exclusion count uses deduplicated IDs across FTS+semantic to avoid double-counting
+- [Phase 13]: Debug signals use underscore-prefixed internal rank keys from RRF output
+- [Phase 13]: Tier breakdown and dormant_excluded always included in envelope (not gated by verbose)
 
 ### Pending Todos
 
@@ -89,6 +95,6 @@ None.
 
 ## Session Continuity
 
-Last session: 2026-03-05T18:53:39.345Z
-Stopped at: Completed 12-02-PLAN.md (decomposition_pending hint in auto_capture)
+Last session: 2026-03-05T19:22:55.565Z
+Stopped at: Completed 13-02-PLAN.md (debug signals and envelope transparency)
 Resume file: None
