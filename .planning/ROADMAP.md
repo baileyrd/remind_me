@@ -124,6 +124,6 @@ Phases execute in numeric order: 10 -> 11 -> 12 -> 13 -> 14
 | 9. Gap Closure | v1.1 | 2/2 | Complete | 2026-02-25 |
 | 10. Retrieval Pipeline | v1.2 | 2/2 | Complete | 2026-03-05 |
 | 11. Decay, Vitality, and Classification | v1.2 | 3/3 | Complete | 2026-03-05 |
-| 12. Atomic Decomposition | 2/2 | Complete   | 2026-03-05 | - |
+| 12. Atomic Decomposition | 2/2 | Complete    | 2026-03-05 | - |
 | 13. Structured Memory and Transparency | v1.2 | 0/TBD | Not started | - |
 | 14. Vault Hygiene | v1.2 | 0/TBD | Not started | - |

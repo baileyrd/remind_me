@@ -4,8 +4,8 @@ milestone: v1.2
 milestone_name: Intelligent Retrieval
 status: completed
 stopped_at: Completed 12-02-PLAN.md (decomposition_pending hint in auto_capture)
-last_updated: "2026-03-05T18:53:39.346Z"
-last_activity: 2026-03-05 -- Plan 12-01 (Decompose tools and schema migration) completed
+last_updated: "2026-03-05T18:56:05.505Z"
+last_activity: 2026-03-05 -- Plan 12-02 (decomposition_pending hint) completed
 progress:
   total_phases: 5
   completed_phases: 1
