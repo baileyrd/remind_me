@@ -420,11 +420,11 @@ def test_migration_idempotent(db_conn: sqlite3.Connection) -> None:
 
 
 def test_v4_to_v5_schema_version_is_5(db_conn: sqlite3.Connection) -> None:
-    """After migration, _SCHEMA_VERSION and PRAGMA user_version are both 5."""
+    """After migration, _SCHEMA_VERSION is at least 5 (later migrations may bump it further)."""
     from remind_me_mcp.db import _SCHEMA_VERSION
     assert _SCHEMA_VERSION >= 5
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 5, f"Expected user_version 5, got {version}"
+    assert version >= 5, f"Expected user_version >= 5, got {version}"
 
 
 def test_v4_to_v5_new_columns_exist(db_conn: sqlite3.Connection) -> None:

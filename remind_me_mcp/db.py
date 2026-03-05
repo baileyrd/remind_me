@@ -14,6 +14,7 @@ Current schema versions:
   1 -> 2: Add memory_tags junction table, indexes, and sync triggers
   4 -> 5: Add decay, vitality, and classification columns
   5 -> 6: Add source_capture_id column for atomic decomposition
+  6 -> 7: Add subject, predicate, object, superseded_by columns for structured memory
 """
 
 from __future__ import annotations
@@ -197,7 +198,7 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 # Current target schema version.  Increment when adding a new migration step.
-_SCHEMA_VERSION = 6
+_SCHEMA_VERSION = 7
 
 
 
@@ -246,6 +247,11 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         _migrate_v5_to_v6(db)
         db.execute("PRAGMA user_version = 6")
         current_version = 6
+
+    if current_version < 7:
+        _migrate_v6_to_v7(db)
+        db.execute("PRAGMA user_version = 7")
+        current_version = 7
 
     db.commit()
 
@@ -695,6 +701,103 @@ def _migrate_v5_to_v6(db: sqlite3.Connection) -> None:
                     'status',             NEW.status,
                     'memory_type',        NEW.memory_type,
                     'source_capture_id',  NEW.source_capture_id
+                ),
+                datetime('now', 'utc')
+            );
+        END;
+    """)
+
+
+def _migrate_v6_to_v7(db: sqlite3.Connection) -> None:
+    """v6 -> v7: Add subject/predicate/object/superseded_by columns for structured memory.
+
+    Adds four nullable TEXT columns to support structured fact triples
+    (subject, predicate, object) and fact supersession tracking (superseded_by).
+    Creates an index on subject for fast structured lookups. Updates outbox
+    triggers to include the new fields in JSON payloads.
+
+    Args:
+        db: An open SQLite connection.
+    """
+    with contextlib.suppress(sqlite3.OperationalError):
+        db.execute("ALTER TABLE memories ADD COLUMN subject TEXT DEFAULT NULL")
+    with contextlib.suppress(sqlite3.OperationalError):
+        db.execute("ALTER TABLE memories ADD COLUMN predicate TEXT DEFAULT NULL")
+    with contextlib.suppress(sqlite3.OperationalError):
+        db.execute("ALTER TABLE memories ADD COLUMN object TEXT DEFAULT NULL")
+    with contextlib.suppress(sqlite3.OperationalError):
+        db.execute("ALTER TABLE memories ADD COLUMN superseded_by TEXT DEFAULT NULL")
+
+    db.execute("CREATE INDEX IF NOT EXISTS idx_memories_subject ON memories(subject)")
+
+    # Drop and recreate outbox triggers to include new columns
+    db.executescript("""
+        DROP TRIGGER IF EXISTS memories_outbox_ai;
+        DROP TRIGGER IF EXISTS memories_outbox_au;
+
+        CREATE TRIGGER IF NOT EXISTS memories_outbox_ai
+        AFTER INSERT ON memories BEGIN
+            INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+            VALUES (
+                NEW.id, 'insert',
+                json_object(
+                    'id',                 NEW.id,
+                    'content',            NEW.content,
+                    'category',           NEW.category,
+                    'tags',               NEW.tags,
+                    'source',             NEW.source,
+                    'metadata',           NEW.metadata,
+                    'created_at',         NEW.created_at,
+                    'updated_at',         NEW.updated_at,
+                    'capture_id',         NEW.capture_id,
+                    'node_id',            NEW.node_id,
+                    'client',             NEW.client,
+                    'accessed_at',        NEW.accessed_at,
+                    'access_count',       NEW.access_count,
+                    'decay_rate',         NEW.decay_rate,
+                    'vitality',           NEW.vitality,
+                    'base_weight',        NEW.base_weight,
+                    'status',             NEW.status,
+                    'memory_type',        NEW.memory_type,
+                    'source_capture_id',  NEW.source_capture_id,
+                    'subject',            NEW.subject,
+                    'predicate',          NEW.predicate,
+                    'object',             NEW.object,
+                    'superseded_by',      NEW.superseded_by
+                ),
+                datetime('now', 'utc')
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS memories_outbox_au
+        AFTER UPDATE ON memories BEGIN
+            INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+            VALUES (
+                NEW.id, 'update',
+                json_object(
+                    'id',                 NEW.id,
+                    'content',            NEW.content,
+                    'category',           NEW.category,
+                    'tags',               NEW.tags,
+                    'source',             NEW.source,
+                    'metadata',           NEW.metadata,
+                    'created_at',         NEW.created_at,
+                    'updated_at',         NEW.updated_at,
+                    'capture_id',         NEW.capture_id,
+                    'node_id',            NEW.node_id,
+                    'client',             NEW.client,
+                    'accessed_at',        NEW.accessed_at,
+                    'access_count',       NEW.access_count,
+                    'decay_rate',         NEW.decay_rate,
+                    'vitality',           NEW.vitality,
+                    'base_weight',        NEW.base_weight,
+                    'status',             NEW.status,
+                    'memory_type',        NEW.memory_type,
+                    'source_capture_id',  NEW.source_capture_id,
+                    'subject',            NEW.subject,
+                    'predicate',          NEW.predicate,
+                    'object',             NEW.object,
+                    'superseded_by',      NEW.superseded_by
                 ),
                 datetime('now', 'utc')
             );
