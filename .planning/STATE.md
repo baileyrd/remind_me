@@ -10,9 +10,9 @@ See: .planning/PROJECT.md (updated 2026-03-04)
 ## Current Position
 
 Phase: 11 of 14 (Decay, Vitality, and Classification)
-Plan: --
-Status: Ready to plan
-Last activity: 2026-03-05 -- Phase 10 (Retrieval Pipeline) completed and verified
+Plan: 1 of 3
+Status: Executing
+Last activity: 2026-03-05 -- Plan 11-01 (Schema migration v4->v5 and vitality module) completed
 
 Progress: [########################................] 60% (10/14 phases complete, 1/5 v1.2 phases)
 
@@ -29,8 +29,9 @@ Progress: [########################................] 60% (10/14 phases complete,
 - Timeline: 1 day
 
 **Velocity (v1.2 so far):**
-- Plans completed: 2
+- Plans completed: 3
 - Phase 10: 2 plans, 2 waves
+- Phase 11: 1/3 plans complete
 
 ## Accumulated Context
 
@@ -44,6 +45,9 @@ Progress: [########################................] 60% (10/14 phases complete,
 - retrieval.py is a pure-function module (rank_rrf, apply_token_budget) -- tools.py does wiring
 - Filters applied BEFORE RRF ranking (not after)
 - token_budget=0 means unlimited
+- ACT-R formula uses (access_count+1)^0.5 for diminishing returns on repeated access
+- Bridge protection at 10 accesses halves decay rate via BRIDGE_MULTIPLIER=0.5
+- 8 memory types with decay rates from 0.02 (decision) to 0.20 (action_item)
 
 Full decision log in PROJECT.md Key Decisions table.
 
@@ -58,5 +62,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-03-05
-Stopped at: Phase 10 completed, ready for Phase 11
+Stopped at: Completed 11-01-PLAN.md (schema migration v4->v5 and vitality module)
 Resume file: None
