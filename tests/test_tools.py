@@ -1911,6 +1911,243 @@ async def test_decompose_batch_returns_total_count(
 
 
 # ---------------------------------------------------------------------------
+# Structured query detection and indexed lookup tests (Phase 13 Plan 01)
+# ---------------------------------------------------------------------------
+
+
+async def test_structured_search_by_subject(db_conn: "sqlite3.Connection", memory_factory) -> None:
+    """Query 'subject:Bailey' returns memories where subject='Bailey' via indexed lookup."""
+    memory_factory(
+        content="Bailey prefers dark mode",
+        subject="Bailey",
+        predicate="prefers",
+        object="dark mode",
+    )
+    memory_factory(
+        content="Alice prefers light mode",
+        subject="Alice",
+        predicate="prefers",
+        object="light mode",
+    )
+
+    params = MemorySearchInput(query="subject:Bailey", response_format=ResponseFormat.JSON)
+    result = await memory_search(params)
+    data = json.loads(result)
+
+    assert data["returned"] >= 1
+    contents = [m["content"] for m in data["memories"]]
+    assert "Bailey prefers dark mode" in contents
+    assert "Alice prefers light mode" not in contents
+
+
+async def test_structured_search_by_subject_and_predicate(
+    db_conn: "sqlite3.Connection", memory_factory
+) -> None:
+    """Query 'subject:Bailey predicate:prefers' returns memories matching both conditions."""
+    memory_factory(
+        content="Bailey prefers dark mode",
+        subject="Bailey",
+        predicate="prefers",
+        object="dark mode",
+    )
+    memory_factory(
+        content="Bailey uses Python",
+        subject="Bailey",
+        predicate="uses",
+        object="Python",
+    )
+
+    params = MemorySearchInput(
+        query="subject:Bailey predicate:prefers", response_format=ResponseFormat.JSON
+    )
+    result = await memory_search(params)
+    data = json.loads(result)
+
+    assert data["returned"] >= 1
+    contents = [m["content"] for m in data["memories"]]
+    assert "Bailey prefers dark mode" in contents
+    assert "Bailey uses Python" not in contents
+
+
+async def test_structured_search_fallback_to_rrf(
+    db_conn: "sqlite3.Connection", memory_factory
+) -> None:
+    """Query with structured prefix but no structured results falls back to FTS/semantic."""
+    memory_factory(content="Bailey likes dark mode themes")
+
+    params = MemorySearchInput(
+        query="subject:Nonexistent predicate:nothing", response_format=ResponseFormat.JSON
+    )
+    result = await memory_search(params)
+    data = json.loads(result)
+
+    # Should not crash; may return 0 results if FTS doesn't match stripped query
+    assert "returned" in data
+
+
+async def test_structured_normal_query_no_regression(
+    db_conn: "sqlite3.Connection", memory_factory
+) -> None:
+    """Query without subject/predicate prefix goes through normal RRF pipeline."""
+    memory_factory(content="Python is a programming language")
+
+    params = MemorySearchInput(query="Python programming", response_format=ResponseFormat.JSON)
+    result = await memory_search(params)
+    data = json.loads(result)
+
+    assert data["returned"] >= 1
+    assert "Python is a programming language" in [m["content"] for m in data["memories"]]
+
+
+async def test_structured_search_respects_category_filter(
+    db_conn: "sqlite3.Connection", memory_factory
+) -> None:
+    """Structured lookup respects category filter."""
+    memory_factory(
+        content="Bailey prefers dark mode",
+        subject="Bailey",
+        predicate="prefers",
+        object="dark mode",
+        category="preference",
+    )
+    memory_factory(
+        content="Bailey mentioned dark mode",
+        subject="Bailey",
+        predicate="mentioned",
+        object="dark mode",
+        category="general",
+    )
+
+    params = MemorySearchInput(
+        query="subject:Bailey",
+        category="preference",
+        response_format=ResponseFormat.JSON,
+    )
+    result = await memory_search(params)
+    data = json.loads(result)
+
+    contents = [m["content"] for m in data["memories"]]
+    assert "Bailey prefers dark mode" in contents
+    assert "Bailey mentioned dark mode" not in contents
+
+
+async def test_structured_search_respects_dormant_filter(
+    db_conn: "sqlite3.Connection", memory_factory
+) -> None:
+    """Structured lookup respects include_dormant filter."""
+    memory_factory(
+        content="Bailey prefers vim",
+        subject="Bailey",
+        predicate="prefers",
+        object="vim",
+        status="dormant",
+        vitality=0.01,
+    )
+    memory_factory(
+        content="Bailey prefers dark mode",
+        subject="Bailey",
+        predicate="prefers",
+        object="dark mode",
+        status="active",
+        vitality=0.8,
+    )
+
+    params = MemorySearchInput(
+        query="subject:Bailey predicate:prefers",
+        include_dormant=False,
+        response_format=ResponseFormat.JSON,
+    )
+    result = await memory_search(params)
+    data = json.loads(result)
+    contents = [m["content"] for m in data["memories"]]
+    assert "Bailey prefers dark mode" in contents
+    assert "Bailey prefers vim" not in contents
+
+
+async def test_structured_search_respects_min_vitality(
+    db_conn: "sqlite3.Connection", memory_factory
+) -> None:
+    """Structured lookup respects min_vitality filter."""
+    memory_factory(
+        content="Bailey prefers tabs",
+        subject="Bailey",
+        predicate="prefers",
+        object="tabs",
+        vitality=0.3,
+    )
+    memory_factory(
+        content="Bailey prefers dark mode",
+        subject="Bailey",
+        predicate="prefers",
+        object="dark mode",
+        vitality=0.8,
+    )
+
+    params = MemorySearchInput(
+        query="subject:Bailey predicate:prefers",
+        min_vitality=0.5,
+        response_format=ResponseFormat.JSON,
+    )
+    result = await memory_search(params)
+    data = json.loads(result)
+    contents = [m["content"] for m in data["memories"]]
+    assert "Bailey prefers dark mode" in contents
+    assert "Bailey prefers tabs" not in contents
+
+
+async def test_structured_search_envelope_metadata(
+    db_conn: "sqlite3.Connection", memory_factory
+) -> None:
+    """Structured results are wrapped in SearchEnvelope with correct metadata."""
+    memory_factory(
+        content="Bailey prefers dark mode",
+        subject="Bailey",
+        predicate="prefers",
+        object="dark mode",
+    )
+
+    params = MemorySearchInput(query="subject:Bailey", response_format=ResponseFormat.JSON)
+    result = await memory_search(params)
+    data = json.loads(result)
+
+    assert "total_candidates" in data
+    assert "returned" in data
+    assert "trimmed" in data
+    assert "tokens_used" in data
+    assert "budget" in data
+    assert "memories" in data
+
+
+async def test_structured_search_excludes_superseded(
+    db_conn: "sqlite3.Connection", memory_factory
+) -> None:
+    """Structured lookup excludes memories where superseded_by IS NOT NULL."""
+    memory_factory(
+        content="Bailey prefers light mode",
+        subject="Bailey",
+        predicate="prefers",
+        object="light mode",
+        superseded_by="newer_id_123",
+    )
+    memory_factory(
+        content="Bailey prefers dark mode",
+        subject="Bailey",
+        predicate="prefers",
+        object="dark mode",
+    )
+
+    params = MemorySearchInput(
+        query="subject:Bailey predicate:prefers", response_format=ResponseFormat.JSON
+    )
+    result = await memory_search(params)
+    data = json.loads(result)
+
+    contents = [m["content"] for m in data["memories"]]
+    assert "Bailey prefers dark mode" in contents
+    assert "Bailey prefers light mode" not in contents
+
+
+# ---------------------------------------------------------------------------
 # Debug signals, tier breakdown, dormant_excluded (Phase 13 Plan 02)
 # ---------------------------------------------------------------------------
 
