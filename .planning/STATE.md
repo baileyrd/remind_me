@@ -4,15 +4,17 @@
 
 See: .planning/PROJECT.md (updated 2026-03-04)
 
-**Core value:** Persistent, searchable memory across all Claude interfaces — modular, tested, maintainable
-**Current focus:** v1.2 Intelligent Retrieval
+**Core value:** Persistent, searchable memory across all Claude interfaces -- modular, tested, maintainable
+**Current focus:** v1.2 Intelligent Retrieval -- Phase 10: Retrieval Pipeline
 
 ## Current Position
 
-Phase: Not started (defining requirements)
-Plan: —
-Status: Defining requirements
-Last activity: 2026-03-04 — Milestone v1.2 started
+Phase: 10 of 14 (Retrieval Pipeline)
+Plan: --
+Status: Ready to plan
+Last activity: 2026-03-04 -- Roadmap created for v1.2 (5 phases, 31 requirements)
+
+Progress: [####################....................] 50% (9/9 prior phases complete, 0/5 v1.2 phases)
 
 ## Performance Metrics
 
@@ -30,10 +32,11 @@ Last activity: 2026-03-04 — Milestone v1.2 started
 
 ### Decisions
 
-- Atomic decomposition and classification are Claude-driven (not server-side LLM) — server stores results, Claude does extraction
-- Structured memory uses columns on existing table (not separate structured_memories table) — simpler, same benefits
+- Atomic decomposition and classification are Claude-driven (not server-side LLM) -- server stores results, Claude does extraction
+- Structured memory uses columns on existing table (not separate structured_memories table) -- simpler, same benefits
 - RRF k=60 default, configurable via env var
 - Retroactive decomposition via batch tool loop (Claude classifies, calls back with results)
+- Phase 11 combines decay + classification because classification sets per-category decay rates
 
 Full decision log in PROJECT.md Key Decisions table.
 
@@ -48,5 +51,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-03-04
-Stopped at: Defining v1.2 requirements
+Stopped at: Roadmap created for v1.2 milestone
 Resume file: None

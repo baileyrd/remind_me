@@ -1,7 +1,7 @@
 # Requirements: Remind Me MCP
 
 **Defined:** 2026-03-04
-**Core Value:** Persistent, searchable memory across all Claude interfaces — modular, tested, maintainable
+**Core Value:** Persistent, searchable memory across all Claude interfaces -- modular, tested, maintainable
 
 ## v1.2 Requirements
 
@@ -83,43 +83,43 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| RETR-01 | — | Pending |
-| RETR-02 | — | Pending |
-| RETR-03 | — | Pending |
-| RETR-04 | — | Pending |
-| DECAY-01 | — | Pending |
-| DECAY-02 | — | Pending |
-| DECAY-03 | — | Pending |
-| DECAY-04 | — | Pending |
-| DECAY-05 | — | Pending |
-| DECAY-06 | — | Pending |
-| CLSF-01 | — | Pending |
-| CLSF-02 | — | Pending |
-| CLSF-03 | — | Pending |
-| CLSF-04 | — | Pending |
-| CLSF-05 | — | Pending |
-| ATOM-01 | — | Pending |
-| ATOM-02 | — | Pending |
-| ATOM-03 | — | Pending |
-| ATOM-04 | — | Pending |
-| ATOM-05 | — | Pending |
-| STRC-01 | — | Pending |
-| STRC-02 | — | Pending |
-| STRC-03 | — | Pending |
-| STRC-04 | — | Pending |
-| HYGN-01 | — | Pending |
-| HYGN-02 | — | Pending |
-| HYGN-03 | — | Pending |
-| HYGN-04 | — | Pending |
-| HYGN-05 | — | Pending |
-| TRNS-01 | — | Pending |
-| TRNS-02 | — | Pending |
+| RETR-01 | Phase 10 | Pending |
+| RETR-02 | Phase 10 | Pending |
+| RETR-03 | Phase 10 | Pending |
+| RETR-04 | Phase 10 | Pending |
+| DECAY-01 | Phase 11 | Pending |
+| DECAY-02 | Phase 11 | Pending |
+| DECAY-03 | Phase 11 | Pending |
+| DECAY-04 | Phase 11 | Pending |
+| DECAY-05 | Phase 11 | Pending |
+| DECAY-06 | Phase 11 | Pending |
+| CLSF-01 | Phase 11 | Pending |
+| CLSF-02 | Phase 11 | Pending |
+| CLSF-03 | Phase 11 | Pending |
+| CLSF-04 | Phase 11 | Pending |
+| CLSF-05 | Phase 11 | Pending |
+| ATOM-01 | Phase 12 | Pending |
+| ATOM-02 | Phase 12 | Pending |
+| ATOM-03 | Phase 12 | Pending |
+| ATOM-04 | Phase 12 | Pending |
+| ATOM-05 | Phase 12 | Pending |
+| STRC-01 | Phase 13 | Pending |
+| STRC-02 | Phase 13 | Pending |
+| STRC-03 | Phase 13 | Pending |
+| STRC-04 | Phase 13 | Pending |
+| HYGN-01 | Phase 14 | Pending |
+| HYGN-02 | Phase 14 | Pending |
+| HYGN-03 | Phase 14 | Pending |
+| HYGN-04 | Phase 14 | Pending |
+| HYGN-05 | Phase 14 | Pending |
+| TRNS-01 | Phase 13 | Pending |
+| TRNS-02 | Phase 13 | Pending |
 
 **Coverage:**
 - v1.2 requirements: 31 total
-- Mapped to phases: 0
-- Unmapped: 31
+- Mapped to phases: 31
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-03-04*
-*Last updated: 2026-03-04 after initial definition*
+*Last updated: 2026-03-04 after roadmap creation*
