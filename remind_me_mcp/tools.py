@@ -14,6 +14,7 @@ import logging
 import sqlite3
 from typing import Any
 
+from remind_me_mcp.config import CLIENT, NODE_ID
 from remind_me_mcp.db import (
     _embed_and_store,
     _get_db,
@@ -37,13 +38,42 @@ from remind_me_mcp.models import (
     ResponseFormat,
 )
 from remind_me_mcp.pid import get_server_status
-from remind_me_mcp.config import CLIENT, NODE_ID
+from remind_me_mcp.retrieval import apply_token_budget, rank_rrf
 from remind_me_mcp.server import mcp
 from remind_me_mcp.updater import pop_update_notice
 
 log = logging.getLogger("remind_me_mcp.tools")
 
 EMBED_BATCH_SIZE = 32
+
+
+# ---------------------------------------------------------------------------
+# Filter helper (applied before RRF ranking)
+# ---------------------------------------------------------------------------
+
+
+def _apply_filters(
+    memories: list[dict],
+    category: str | None,
+    tags: list[str] | None,
+) -> list[dict]:
+    """Filter memories by category and/or tags before ranking.
+
+    Args:
+        memories: List of memory dicts to filter.
+        category: If set, only keep memories with this category.
+        tags: If set, only keep memories that have ALL of these tags.
+
+    Returns:
+        Filtered list of memory dicts.
+    """
+    result = memories
+    if category:
+        result = [m for m in result if m["category"] == category]
+    if tags:
+        tag_set = set(tags)
+        result = [m for m in result if tag_set.issubset(set(m.get("tags", [])))]
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -171,59 +201,66 @@ async def memory_search(params: MemorySearchInput) -> str:
     # --- Semantic vector search ---
     sem_memories = await asyncio.to_thread(_semantic_search, params.query, limit=params.limit)
 
-    # --- Merge and deduplicate (hybrid ranking) ---
-    seen: dict[str, dict] = {}
-    scores: dict[str, float] = {}
+    # --- Tag search method on raw results before RRF ---
+    fts_ids = {m["id"] for m in fts_memories}
+    sem_ids = {m["id"] for m in sem_memories}
+    for m in fts_memories:
+        m["_search_method"] = "keyword"
+    for m in sem_memories:
+        m["_search_method"] = "semantic"
 
-    # FTS results get a boost (lower score = better)
-    for i, m in enumerate(fts_memories):
+    # --- Apply category/tag filters BEFORE RRF ranking ---
+    filtered_fts = _apply_filters(fts_memories, params.category, params.tags)
+    filtered_sem = _apply_filters(sem_memories, params.category, params.tags)
+
+    # --- RRF ranking ---
+    ranked = rank_rrf(filtered_fts, filtered_sem)
+
+    # Mark hybrid results (appeared in both FTS and semantic)
+    for m in ranked:
         mid = m["id"]
-        seen[mid] = m
-        scores[mid] = i * 0.5  # FTS rank position, weighted
+        if mid in fts_ids and mid in sem_ids:
+            m["_search_method"] = "hybrid"
 
-    # Semantic results scored by distance
-    for _, m in enumerate(sem_memories):
-        mid = m["id"]
-        sem_score = m.get("semantic_distance", 2.0)
-        if mid in seen:
-            # Appeared in both — big boost
-            scores[mid] = scores[mid] * 0.3 + sem_score * 0.3
-            seen[mid]["_search_method"] = "hybrid"
-        else:
-            seen[mid] = m
-            scores[mid] = sem_score + 0.5  # slight penalty for semantic-only
-            seen[mid]["_search_method"] = "semantic"
-
-    # Mark FTS-only results
-    for mid in seen:
-        if "_search_method" not in seen[mid]:
-            seen[mid]["_search_method"] = "keyword"
-
-    # Sort by combined score
-    ranked = sorted(seen.values(), key=lambda m: scores[m["id"]])
-
-    # Apply optional filters
-    if params.category:
-        ranked = [m for m in ranked if m["category"] == params.category]
-    if params.tags:
-        tag_set = set(params.tags)
-        ranked = [m for m in ranked if tag_set.issubset(set(m.get("tags", [])))]
-
+    # --- Apply limit, then token budget ---
     ranked = ranked[:params.limit]
 
-    # Add search method indicator to output
-    if params.response_format == ResponseFormat.JSON:
-        return json.dumps({"count": len(ranked), "memories": ranked}, indent=2, default=str)
+    if params.token_budget == 0:
+        envelope = apply_token_budget(ranked, 0)
+    else:
+        envelope = apply_token_budget(ranked, params.token_budget)
 
-    if not ranked:
+    # --- Format response ---
+    if params.response_format == ResponseFormat.JSON:
+        return json.dumps(
+            {
+                "total_candidates": envelope["total_candidates"],
+                "returned": envelope["returned"],
+                "trimmed": envelope["trimmed"],
+                "tokens_used": envelope["tokens_used"],
+                "budget": envelope["budget"],
+                "memories": envelope["memories"],
+            },
+            indent=2,
+            default=str,
+        )
+
+    if not envelope["memories"]:
         return "_No memories found._"
 
-    parts = []
+    parts: list[str] = []
     sem_available = len(sem_memories) > 0 or _get_embedder() is not None
     method_label = "hybrid (keyword + semantic)" if sem_available else "keyword only"
-    parts.append(f"**{len(ranked)} results** via {method_label} search\n")
+    parts.append(f"**{envelope['returned']} results** via {method_label} search")
+    if envelope["trimmed"] > 0:
+        parts.append(
+            f"_{envelope['returned']} of {envelope['total_candidates']} candidates "
+            f"(trimmed {envelope['trimmed']}, ~{envelope['tokens_used']}/{envelope['budget']} tokens)_\n"
+        )
+    else:
+        parts.append(f"_~{envelope['tokens_used']} tokens used (budget: {envelope['budget']})_\n")
 
-    for m in ranked:
+    for m in envelope["memories"]:
         method = m.pop("_search_method", "")
         dist = m.pop("semantic_distance", None)
         badge = {"hybrid": "⚡", "semantic": "🔮", "keyword": "🔤"}.get(method, "")

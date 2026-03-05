@@ -177,7 +177,7 @@ async def test_memory_search_with_category_filter(db_conn: sqlite3.Connection) -
 
 
 async def test_memory_search_json_format(db_conn: sqlite3.Connection) -> None:
-    """Search with JSON response_format returns valid JSON with 'count' and 'memories' keys."""
+    """Search with JSON response_format returns valid JSON with envelope keys and 'memories'."""
     add_params = MemoryAddInput(content="JSON format test memory", category="test")
     await memory_add(add_params)
 
@@ -188,7 +188,11 @@ async def test_memory_search_json_format(db_conn: sqlite3.Connection) -> None:
     result = await memory_search(search_params)
 
     data = json.loads(result)
-    assert "count" in data
+    assert "returned" in data
+    assert "total_candidates" in data
+    assert "trimmed" in data
+    assert "tokens_used" in data
+    assert "budget" in data
     assert "memories" in data
     assert isinstance(data["memories"], list)
 
@@ -957,3 +961,132 @@ async def test_list_tag_filter_pagination(
         assert "alpha" in mem["tags"], (
             f"Memory {mem['id']} does not have 'alpha' tag: {mem['tags']}"
         )
+
+
+# ---------------------------------------------------------------------------
+# RRF retrieval pipeline integration tests (Phase 10 Plan 02)
+# ---------------------------------------------------------------------------
+
+
+async def test_search_returns_envelope_json(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """Search with JSON format returns envelope metadata keys."""
+    memory_factory(content="Envelope test memory alpha", category="test")
+    memory_factory(content="Envelope test memory beta", category="test")
+    memory_factory(content="Envelope test memory gamma", category="test")
+
+    search_params = MemorySearchInput(
+        query="Envelope test memory",
+        response_format=ResponseFormat.JSON,
+    )
+    result = await memory_search(search_params)
+    data = json.loads(result)
+
+    # All 5 envelope keys must exist with correct types
+    assert isinstance(data["total_candidates"], int)
+    assert isinstance(data["returned"], int)
+    assert isinstance(data["trimmed"], int)
+    assert isinstance(data["tokens_used"], int)
+    assert isinstance(data["budget"], int)
+    assert isinstance(data["memories"], list)
+    assert data["returned"] == len(data["memories"])
+    assert data["budget"] == 800  # default token_budget
+
+
+async def test_search_token_budget_trims(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """With a small token_budget, fewer results are returned and trimmed > 0."""
+    # Each memory ~100 tokens (400 chars / 4)
+    for i in range(5):
+        memory_factory(
+            content=f"Budget trim test memory number {i}. " + ("x" * 380),
+            category="test",
+        )
+
+    search_params = MemorySearchInput(
+        query="Budget trim test memory",
+        token_budget=250,
+        response_format=ResponseFormat.JSON,
+    )
+    result = await memory_search(search_params)
+    data = json.loads(result)
+
+    assert data["returned"] < data["total_candidates"]
+    assert data["trimmed"] > 0
+    assert data["tokens_used"] <= 250
+
+
+async def test_search_token_budget_zero_unlimited(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """token_budget=0 returns all matching results (unlimited)."""
+    for i in range(5):
+        memory_factory(
+            content=f"Unlimited budget test memory number {i} with unique content",
+            category="test",
+        )
+
+    search_params = MemorySearchInput(
+        query="Unlimited budget test memory",
+        token_budget=0,
+        response_format=ResponseFormat.JSON,
+    )
+    result = await memory_search(search_params)
+    data = json.loads(result)
+
+    assert data["returned"] == data["total_candidates"]
+    assert data["trimmed"] == 0
+
+
+async def test_search_envelope_markdown(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """Markdown response includes token/budget info in the envelope summary line."""
+    memory_factory(content="Markdown envelope test memory alpha", category="test")
+    memory_factory(content="Markdown envelope test memory beta", category="test")
+    memory_factory(content="Markdown envelope test memory gamma", category="test")
+
+    search_params = MemorySearchInput(query="Markdown envelope test memory")
+    result = await memory_search(search_params)
+
+    assert "tokens" in result.lower()
+    assert "budget" in result.lower()
+    assert "results" in result.lower()
+
+
+async def test_search_rrf_ranking_smoke(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """RRF ranking path produces valid envelope response (smoke test)."""
+    # Create memories with different timestamps to exercise recency signal
+    for i in range(3):
+        memory_factory(
+            content=f"RRF smoke test content item {i} with searchable text",
+            category="test",
+            created_at=f"2026-01-0{i + 1}T00:00:00Z",
+        )
+
+    search_params = MemorySearchInput(
+        query="RRF smoke test content",
+        response_format=ResponseFormat.JSON,
+    )
+    result = await memory_search(search_params)
+    data = json.loads(result)
+
+    # Verify the response is a valid envelope with memories
+    assert data["returned"] >= 1
+    assert data["total_candidates"] >= 1
+    assert isinstance(data["memories"], list)
+    assert len(data["memories"]) == data["returned"]
+
+    # Verify each memory has RRF metadata attached
+    for mem in data["memories"]:
+        assert "_rrf_score" in mem
+        assert "_keyword_rank" in mem
