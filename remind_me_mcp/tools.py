@@ -43,7 +43,12 @@ from remind_me_mcp.models import (
     VitalityReportInput,
 )
 from remind_me_mcp.pid import get_server_status
-from remind_me_mcp.retrieval import apply_token_budget, rank_rrf
+from remind_me_mcp.retrieval import (
+    apply_token_budget,
+    build_debug_signals,
+    compute_tier_breakdown,
+    rank_rrf,
+)
 from remind_me_mcp.server import mcp
 from remind_me_mcp.updater import pop_update_notice
 from remind_me_mcp.vitality import DECAY_RATES, record_access
@@ -219,6 +224,13 @@ async def memory_search(params: MemorySearchInput) -> str:
     filtered_fts = _apply_filters(fts_memories, params.category, params.tags)
     filtered_sem = _apply_filters(sem_memories, params.category, params.tags)
 
+    # --- Count dormant memories BEFORE exclusion (unique by ID) ---
+    dormant_ids: set[str] = set()
+    for m in filtered_fts + filtered_sem:
+        if m.get("status") == "dormant":
+            dormant_ids.add(m["id"])
+    dormant_excluded = len(dormant_ids) if not params.include_dormant else 0
+
     # --- Dormant exclusion BEFORE RRF ranking ---
     if not params.include_dormant:
         filtered_fts = [m for m in filtered_fts if m.get("status") != "dormant"]
@@ -261,6 +273,14 @@ async def memory_search(params: MemorySearchInput) -> str:
 
         asyncio.create_task(_record_accesses(returned_ids))
 
+    # --- Attach debug signals if verbose ---
+    if params.verbose:
+        for m in envelope["memories"]:
+            m["debug_signals"] = build_debug_signals(m)
+
+    # --- Compute tier breakdown (always) ---
+    tier_breakdown = compute_tier_breakdown(envelope["memories"])
+
     # --- Format response ---
     if params.response_format == ResponseFormat.JSON:
         return json.dumps(
@@ -270,6 +290,8 @@ async def memory_search(params: MemorySearchInput) -> str:
                 "trimmed": envelope["trimmed"],
                 "tokens_used": envelope["tokens_used"],
                 "budget": envelope["budget"],
+                "tier_breakdown": tier_breakdown,
+                "dormant_excluded": dormant_excluded,
                 "memories": envelope["memories"],
             },
             indent=2,
@@ -299,7 +321,25 @@ async def memory_search(params: MemorySearchInput) -> str:
         extras = [badge + method]
         if dist is not None:
             extras.append(f"distance: {dist:.3f}")
-        parts.append(f"_{' · '.join(extras)}_\n")
+        parts.append(f"_{' · '.join(extras)}_")
+        if params.verbose:
+            signals = m.get("debug_signals", {})
+            parts.append(
+                f"_Ranks: kw={signals.get('keyword_rank', '?')} "
+                f"sem={signals.get('semantic_rank', '?')} "
+                f"rec={signals.get('recency_rank', '?')} "
+                f"vit={signals.get('vitality_rank', '?')} "
+                f"| {signals.get('days_old', '?')} days old_"
+            )
+        parts.append("")  # blank line separator
+
+    # Always append tier breakdown summary line
+    parts.append(
+        f"_Tiers: {tier_breakdown['keyword']} keyword, "
+        f"{tier_breakdown['semantic']} semantic, "
+        f"{tier_breakdown['hybrid']} hybrid "
+        f"| {dormant_excluded} dormant excluded_"
+    )
 
     return _maybe_update_notice("\n---\n".join(parts))
 
