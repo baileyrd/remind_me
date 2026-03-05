@@ -50,7 +50,10 @@
   2. Search ranking uses RRF to fuse keyword, semantic, and recency signals instead of linear score blending
   3. More recently accessed/created memories rank higher when relevance scores are close
   4. Every search response includes a metadata envelope with total_candidates, returned, trimmed, tokens_used, and budget
-**Plans**: TBD
+**Plans:** 2 plans
+Plans:
+- [ ] 10-01-PLAN.md -- Create retrieval module with RRF ranking, recency signal, token budget, and envelope
+- [ ] 10-02-PLAN.md -- Wire retrieval pipeline into memory_search tool and add integration tests
 
 ### Phase 11: Decay, Vitality, and Classification
 **Goal**: Every memory has a type, a vitality score that decays over time, and dormant memories fade out of default search
@@ -112,7 +115,7 @@ Phases execute in numeric order: 10 -> 11 -> 12 -> 13 -> 14
 | 7. API Embedding Parity | v1.1 | 1/1 | Complete | 2026-02-24 |
 | 8. Performance Improvements | v1.1 | 2/2 | Complete | 2026-02-25 |
 | 9. Gap Closure | v1.1 | 2/2 | Complete | 2026-02-25 |
-| 10. Retrieval Pipeline | v1.2 | 0/TBD | Not started | - |
+| 10. Retrieval Pipeline | v1.2 | 0/2 | Not started | - |
 | 11. Decay, Vitality, and Classification | v1.2 | 0/TBD | Not started | - |
 | 12. Atomic Decomposition | v1.2 | 0/TBD | Not started | - |
 | 13. Structured Memory and Transparency | v1.2 | 0/TBD | Not started | - |
