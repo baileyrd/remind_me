@@ -37,7 +37,7 @@
 - [x] **Phase 11: Decay, Vitality, and Classification** - Schema migration, ACT-R vitality model, memory types, and per-category decay rates -- completed 2026-03-05
 - [x] **Phase 12: Atomic Decomposition** - Claude-driven fact extraction from captures with batch processing tools (completed 2026-03-05)
 - [x] **Phase 13: Structured Memory and Transparency** - Subject/predicate/object columns, structured query routing, and debug signals (completed 2026-03-05)
-- [ ] **Phase 14: Vault Hygiene** - Semantic clustering, consolidation, and deduplication of the memory vault
+- [x] **Phase 14: Vault Hygiene** - Semantic clustering, consolidation, and deduplication of the memory vault (completed 2026-03-05)
 
 ## Phase Details
 
@@ -107,7 +107,7 @@ Plans:
   1. remind_me_consolidate clusters semantically similar memories above a configurable similarity threshold
   2. dry_run mode reports clusters without modifying any data
   3. Auto-merge mode merges cluster content into the highest-vitality canonical record, sets superseded_by on merged members, and sums access_count into the canonical record
-**Plans:** 1/2 plans executed
+**Plans:** 2/2 plans complete
 Plans:
 - [ ] 14-01-PLAN.md -- TDD consolidation module (find_clusters, pick_canonical, merge_cluster) and ConsolidateInput model
 - [ ] 14-02-PLAN.md -- Wire remind_me_consolidate MCP tool handler with integration tests
@@ -132,4 +132,4 @@ Phases execute in numeric order: 10 -> 11 -> 12 -> 13 -> 14
 | 11. Decay, Vitality, and Classification | v1.2 | 3/3 | Complete | 2026-03-05 |
 | 12. Atomic Decomposition | v1.2 | 2/2 | Complete | 2026-03-05 |
 | 13. Structured Memory and Transparency | 2/2 | Complete    | 2026-03-05 | - |
-| 14. Vault Hygiene | 1/2 | In Progress|  | - |
+| 14. Vault Hygiene | 2/2 | Complete   | 2026-03-05 | - |

@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: Intelligent Retrieval
 status: in_progress
-stopped_at: Completed 14-01-PLAN.md (consolidation module pure functions)
-last_updated: "2026-03-05T20:06:00.000Z"
-last_activity: 2026-03-05 -- Plan 14-01 (consolidation module pure functions) completed
+stopped_at: Completed 14-02-PLAN.md (consolidation tool wiring)
+last_updated: "2026-03-05T20:14:00.000Z"
+last_activity: 2026-03-05 -- Plan 14-02 (consolidation tool wiring) completed
 progress:
   total_phases: 5
-  completed_phases: 2
+  completed_phases: 5
   total_plans: 6
-  completed_plans: 5
+  completed_plans: 6
   percent: 100
 ---
 
@@ -26,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-03-04)
 ## Current Position
 
 Phase: 14 of 14 (Vault Hygiene)
-Plan: 1 of 2
-Status: Plan 01 Complete
-Last activity: 2026-03-05 -- Plan 14-01 (consolidation module pure functions) completed
+Plan: 2 of 2
+Status: Phase 14 Complete
+Last activity: 2026-03-05 -- Plan 14-02 (consolidation tool wiring) completed
 
-Progress: [█████████░] 91%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
@@ -50,7 +50,7 @@ Progress: [█████████░] 91%
 - Phase 11: 3/3 plans complete
 - Phase 12: 2/2 plans complete
 - Phase 13: 2/2 plans complete (structured memory and transparency)
-- Phase 14: 1/2 plans complete (vault hygiene consolidation)
+- Phase 14: 2/2 plans complete (vault hygiene consolidation)
 
 ## Accumulated Context
 
@@ -89,6 +89,8 @@ Full decision log in PROJECT.md Key Decisions table.
 - [Phase 14]: Union-Find for transitive clustering (A~B and B~C implies single cluster)
 - [Phase 14]: Content merge uses dict.fromkeys for order-preserving line deduplication
 - [Phase 14]: pick_canonical tiebreaks on accessed_at (most recent wins when vitality equal)
+- [Phase 14]: Consolidation tool uses deferred numpy import (function scope) to avoid top-level dependency in tools.py
+- [Phase 14]: Merge operations wrapped in single DB transaction for atomicity
 
 ### Pending Todos
 
@@ -100,6 +102,6 @@ None.
 
 ## Session Continuity
 
-Last session: 2026-03-05T20:03:26Z
-Stopped at: Completed 14-01-PLAN.md (consolidation module pure functions)
+Last session: 2026-03-05T20:08:07Z
+Stopped at: Completed 14-02-PLAN.md (consolidation tool wiring)
 Resume file: None
