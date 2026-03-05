@@ -1,3 +1,19 @@
+---
+gsd_state_version: 1.0
+milestone: v1.2
+milestone_name: Intelligent Retrieval
+status: completed
+stopped_at: Completed 12-02-PLAN.md (decomposition_pending hint in auto_capture)
+last_updated: "2026-03-05T18:53:39.346Z"
+last_activity: 2026-03-05 -- Plan 12-01 (Decompose tools and schema migration) completed
+progress:
+  total_phases: 5
+  completed_phases: 1
+  total_plans: 2
+  completed_plans: 2
+  percent: 100
+---
+
 # Project State
 
 ## Project Reference
@@ -10,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-03-04)
 ## Current Position
 
 Phase: 12 of 14 (Atomic Decomposition)
-Plan: 1 of 1
-Status: Plan Complete
-Last activity: 2026-03-05 -- Plan 12-01 (Decompose tools and schema migration) completed
+Plan: 2 of 2
+Status: Phase Complete
+Last activity: 2026-03-05 -- Plan 12-02 (decomposition_pending hint) completed
 
-Progress: [################################........] 79% (12/14 phases complete, 3/5 v1.2 phases)
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
@@ -32,7 +48,7 @@ Progress: [################################........] 79% (12/14 phases complete,
 - Plans completed: 6
 - Phase 10: 2 plans, 2 waves
 - Phase 11: 3/3 plans complete
-- Phase 12: 1/1 plan complete
+- Phase 12: 2/2 plans complete
 
 ## Accumulated Context
 
@@ -61,6 +77,7 @@ Progress: [################################........] 79% (12/14 phases complete,
 - NOT EXISTS subquery pattern for finding undecomposed captures
 
 Full decision log in PROJECT.md Key Decisions table.
+- [Phase 12]: Response-embedded workflow hints guide Claude tool chaining (decomposition_pending in auto_capture)
 
 ### Pending Todos
 
@@ -72,6 +89,6 @@ None.
 
 ## Session Continuity
 
-Last session: 2026-03-05
-Stopped at: Completed 12-01-PLAN.md (decompose tools and schema v6 migration)
+Last session: 2026-03-05T18:53:39.345Z
+Stopped at: Completed 12-02-PLAN.md (decomposition_pending hint in auto_capture)
 Resume file: None
