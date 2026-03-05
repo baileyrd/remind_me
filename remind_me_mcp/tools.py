@@ -1,5 +1,5 @@
 """
-remind_me_mcp.tools — All 19 MCP tool handlers and 2 resource handlers.
+remind_me_mcp.tools — All 20 MCP tool handlers and 2 resource handlers.
 
 All handlers are registered on the `mcp` instance imported from server.py.
 This module imports mcp from server (not the other way around) to avoid
@@ -26,10 +26,12 @@ from remind_me_mcp.db import (
 )
 from remind_me_mcp.formatting import _fmt_memories, _fmt_memory_md
 from remind_me_mcp.importer import import_chat_file, import_directory
+from remind_me_mcp.consolidation import find_clusters, merge_cluster, pick_canonical
 from remind_me_mcp.models import (
     AutoCaptureInput,
     BulkImportDirInput,
     ChatImportInput,
+    ConsolidateInput,
     DecomposeBatchInput,
     DecomposeInput,
     MemoryAddInput,
@@ -52,7 +54,7 @@ from remind_me_mcp.retrieval import (
 )
 from remind_me_mcp.server import mcp
 from remind_me_mcp.updater import pop_update_notice
-from remind_me_mcp.vitality import DECAY_RATES, record_access
+from remind_me_mcp.vitality import DECAY_RATES, compute_vitality, get_effective_decay_rate, record_access
 
 log = logging.getLogger("remind_me_mcp.tools")
 
@@ -1645,6 +1647,214 @@ async def remind_me_decompose_batch(params: DecomposeBatchInput) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Consolidation tools (Phase 14 Plan 02)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool(
+    name="remind_me_consolidate",
+    annotations={
+        "title": "Consolidate Duplicate Memories",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def remind_me_consolidate(params: ConsolidateInput) -> str:
+    """Find clusters of semantically similar memories and optionally merge them.
+
+    In dry_run mode (default), reports clusters with canonical and member details
+    without modifying data. In auto-merge mode (dry_run=False), merges content
+    into the canonical memory, sets superseded_by on members, sums access counts,
+    recalculates vitality, and re-embeds the canonical.
+
+    Only active, non-superseded memories are considered for consolidation.
+
+    Args:
+        params: Consolidation parameters (similarity_threshold, dry_run, category, limit).
+
+    Returns:
+        JSON string with cluster report (dry_run) or merge results (auto-merge).
+    """
+    db = _get_db()
+
+    # Build query to fetch active, non-superseded memories with embeddings
+    sql = """
+        SELECT m.id, m.content, m.vitality, m.access_count, m.accessed_at,
+               m.category, m.tags, m.memory_type, m.decay_rate, m.base_weight,
+               mv.embedding
+        FROM memories m
+        JOIN memories_vec mv ON mv.rowid = m.rowid
+        WHERE m.status = 'active'
+          AND m.superseded_by IS NULL
+    """
+    query_params: list[Any] = []
+
+    if params.category is not None:
+        sql += "  AND m.category = ?\n"
+        query_params.append(params.category)
+
+    sql += "  LIMIT ?"
+    query_params.append(params.limit)
+
+    rows = db.execute(sql, query_params).fetchall()
+
+    if not rows:
+        return json.dumps({"clusters_found": 0, "message": "No eligible memories found"})
+
+    # Build memories list and embeddings dict
+    memories: list[dict[str, Any]] = []
+    embeddings: dict[str, bytes] = {}
+
+    for row in rows:
+        raw_tags = row["tags"]
+        if isinstance(raw_tags, str):
+            try:
+                tags = json.loads(raw_tags)
+            except (json.JSONDecodeError, TypeError):
+                tags = []
+        else:
+            tags = raw_tags if raw_tags else []
+
+        mem = {
+            "id": row["id"],
+            "content": row["content"],
+            "vitality": row["vitality"],
+            "access_count": row["access_count"],
+            "accessed_at": row["accessed_at"],
+            "category": row["category"],
+            "tags": tags,
+            "memory_type": row["memory_type"],
+            "decay_rate": row["decay_rate"],
+            "base_weight": row["base_weight"],
+        }
+        memories.append(mem)
+        embeddings[row["id"]] = bytes(row["embedding"])
+
+    # Find clusters
+    clusters = find_clusters(memories, embeddings, params.similarity_threshold)
+
+    if not clusters:
+        return json.dumps({"clusters_found": 0, "message": "No similar memories found above threshold"})
+
+    # --- Dry run mode ---
+    if params.dry_run:
+        cluster_reports: list[dict[str, Any]] = []
+
+        import numpy as np
+
+        for cluster in clusters:
+            canonical = pick_canonical(cluster)
+            members = [m for m in cluster if m["id"] != canonical["id"]]
+
+            # Compute similarity between canonical and each member for display
+            canonical_emb = embeddings[canonical["id"]]
+            dim = len(canonical_emb) // 4  # float32 = 4 bytes
+            canonical_vec = np.frombuffer(canonical_emb, dtype=np.float32).reshape(dim)
+
+            member_reports: list[dict[str, Any]] = []
+            for member in members:
+                member_emb = embeddings[member["id"]]
+                member_vec = np.frombuffer(member_emb, dtype=np.float32).reshape(dim)
+                similarity = float(np.dot(canonical_vec, member_vec))
+
+                member_reports.append({
+                    "id": member["id"],
+                    "content": member["content"][:200],
+                    "vitality": member["vitality"],
+                    "similarity": round(similarity, 4),
+                })
+
+            cluster_reports.append({
+                "canonical": {
+                    "id": canonical["id"],
+                    "content": canonical["content"][:200],
+                    "vitality": canonical["vitality"],
+                },
+                "members": member_reports,
+                "cluster_size": len(cluster),
+            })
+
+        result = {
+            "clusters_found": len(clusters),
+            "dry_run": True,
+            "clusters": cluster_reports,
+        }
+        return json.dumps(result, indent=2)
+
+    # --- Auto-merge mode ---
+    now = _now_iso()
+    total_superseded = 0
+    canonical_ids: list[str] = []
+
+    for cluster in clusters:
+        canonical = pick_canonical(cluster)
+        members = [m for m in cluster if m["id"] != canonical["id"]]
+
+        merged = merge_cluster(canonical, members)
+
+        # Update canonical: content, access_count, tags, updated_at
+        db.execute(
+            """UPDATE memories
+               SET content = ?, access_count = ?, tags = ?, updated_at = ?
+               WHERE id = ?""",
+            (
+                merged["merged_content"],
+                merged["total_access_count"],
+                json.dumps(merged["merged_tags"]),
+                now,
+                canonical["id"],
+            ),
+        )
+
+        # Recalculate vitality for canonical with new access_count
+        effective_rate = get_effective_decay_rate(
+            canonical["decay_rate"], merged["total_access_count"]
+        )
+        new_vitality = compute_vitality(
+            base_weight=canonical["base_weight"],
+            access_count=merged["total_access_count"],
+            decay_rate=effective_rate,
+            days_since_last_access=0.0,
+        )
+
+        db.execute(
+            """UPDATE memories
+               SET vitality = ?, status = 'active'
+               WHERE id = ?""",
+            (new_vitality, canonical["id"]),
+        )
+
+        # Set superseded_by on each member
+        for member in members:
+            db.execute(
+                """UPDATE memories
+                   SET superseded_by = ?, updated_at = ?
+                   WHERE id = ?""",
+                (canonical["id"], now, member["id"]),
+            )
+
+        total_superseded += len(members)
+        canonical_ids.append(canonical["id"])
+
+        # Fire-and-forget re-embed canonical with merged content
+        asyncio.create_task(
+            asyncio.to_thread(_embed_and_store, canonical["id"], merged["merged_content"])
+        )
+
+    db.commit()
+
+    result = {
+        "clusters_merged": len(clusters),
+        "memories_superseded": total_superseded,
+        "canonical_ids": canonical_ids,
+        "dry_run": False,
+    }
+    return json.dumps(result, indent=2)
+
+
+# ---------------------------------------------------------------------------
 # Resource handlers
 # ---------------------------------------------------------------------------
 
@@ -1692,6 +1902,7 @@ __all__ = [
     "remind_me_vitality_report",
     "remind_me_decompose",
     "remind_me_decompose_batch",
+    "remind_me_consolidate",
     "resource_stats",
     "resource_categories",
 ]
