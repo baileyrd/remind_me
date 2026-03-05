@@ -46,10 +46,14 @@ Persistent, searchable memory that works seamlessly across all Claude interfaces
 
 ### Active
 
-- [ ] REST API semantic search endpoint (`/api/memories/semantic-search`)
-- [ ] mypy strict mode enforcement
-- [ ] HTTPS/TLS support for dashboard
-- [ ] Rate limiting on API endpoints
+- [ ] Token budget cap on retrieval (800-token default ceiling)
+- [ ] Reciprocal Rank Fusion (RRF) replacing linear score blend + recency signal
+- [ ] ACT-R decay / vitality model with per-category decay rates
+- [ ] Atomic fact decomposition at capture (Claude-driven, not server-side LLM)
+- [ ] Retroactive corpus classification and batch decomposition tools
+- [ ] Structured memory columns (subject/predicate/object) on existing table
+- [ ] Memory consolidation and deduplication tool
+- [ ] Retrieval transparency (debug signals, response envelope metadata)
 
 ### Out of Scope
 
@@ -60,6 +64,24 @@ Persistent, searchable memory that works seamlessly across all Claude interfaces
 - Full OAuth2/JWT auth — static bearer token sufficient for personal localhost tool
 - Rate limiting — single-user personal tool; no multi-tenant scenario
 - HTTPS/TLS — localhost traffic; self-signed certs add complexity with no benefit
+- Separate structured_memories table — subject/predicate/object columns on existing table sufficient; avoids dual-table complexity
+- Server-side LLM calls — decomposition and classification are Claude's job, server stores results
+- REST API semantic search endpoint — deferred; MCP tool covers this
+- mypy strict mode — deferred; not retrieval-related
+
+## Current Milestone: v1.2 Intelligent Retrieval
+
+**Goal:** Transform retrieval from naive hybrid search to a precision pipeline with token budgets, rank fusion, memory decay, and atomic fact storage.
+
+**Target features:**
+- Token budget cap on search results (800-token default)
+- RRF fusion replacing linear blend, with recency as third signal
+- ACT-R vitality/decay model with per-category rates
+- Claude-driven atomic fact decomposition at capture time
+- Retroactive classification and batch decomposition of 589 existing blobs
+- Structured memory columns (subject/predicate/object) on existing table
+- Consolidation/dedup tool for vault hygiene
+- Retrieval transparency with debug signal breakdown
 
 ## Context
 
@@ -68,9 +90,10 @@ Tech stack: Python 3.11+, FastMCP, SQLite (WAL), Pydantic, Starlette, ONNX Runti
 10-module package: config, db, embeddings, models, formatting, importer, pid, server, tools, api, plus dashboard/ subpackage.
 234 tests passing at 80.19% line coverage.
 15 MCP tools + 2 resource handlers registered.
-Schema at version 2 (PRAGMA user_version) with migration support.
+Schema at version 4 (PRAGMA user_version) with migration support.
 GitHub Actions CI validates every push/PR with lint + test + coverage gates.
 Security: CORS localhost-only, import path guard, optional Bearer token auth.
+Vault: 663 memories, 18.1 MB — 589 (89%) are undifferentiated chat_import blobs.
 
 ## Constraints
 
@@ -99,4 +122,4 @@ Security: CORS localhost-only, import path guard, optional Bearer token auth.
 | sqlite-vec knn fix (AND mv.k = ?) | LIMIT doesn't push through JOIN in sqlite-vec 0.1.6 | ✓ Good — fixed semantic search for all code paths |
 
 ---
-*Last updated: 2026-02-25 after v1.1 milestone*
+*Last updated: 2026-03-04 after v1.2 milestone started*
