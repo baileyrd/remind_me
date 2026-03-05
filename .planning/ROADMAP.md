@@ -65,7 +65,11 @@ Plans:
   3. Memories below vitality 0.05 are flagged dormant and excluded from default search (but retrievable with include_dormant)
   4. Claude can call remind_me_reclassify to classify memories in batches, and classification sets the appropriate decay rate
   5. remind_me_vitality_report surfaces dormant count, vault health metrics, and decay distribution
-**Plans**: TBD
+**Plans:** 3 plans
+Plans:
+- [ ] 11-01-PLAN.md -- Schema migration v4->v5 (decay/vitality/classification columns) and ACT-R vitality module
+- [ ] 11-02-PLAN.md -- Classification tools (remind_me_reclassify and remind_me_reclassify_batch)
+- [ ] 11-03-PLAN.md -- Wire vitality into search (4th RRF signal, dormant exclusion) and vitality report tool
 
 ### Phase 12: Atomic Decomposition
 **Goal**: Claude can decompose captured conversations into atomic facts that are individually searchable and linked to their source
@@ -116,7 +120,7 @@ Phases execute in numeric order: 10 -> 11 -> 12 -> 13 -> 14
 | 8. Performance Improvements | v1.1 | 2/2 | Complete | 2026-02-25 |
 | 9. Gap Closure | v1.1 | 2/2 | Complete | 2026-02-25 |
 | 10. Retrieval Pipeline | v1.2 | 2/2 | Complete | 2026-03-05 |
-| 11. Decay, Vitality, and Classification | v1.2 | 0/TBD | Not started | - |
+| 11. Decay, Vitality, and Classification | v1.2 | 0/3 | Not started | - |
 | 12. Atomic Decomposition | v1.2 | 0/TBD | Not started | - |
 | 13. Structured Memory and Transparency | v1.2 | 0/TBD | Not started | - |
 | 14. Vault Hygiene | v1.2 | 0/TBD | Not started | - |
