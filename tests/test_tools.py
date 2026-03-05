@@ -1495,3 +1495,126 @@ async def test_vitality_report_vault_health_score(
     data = json.loads(result)
 
     assert data["vault_health_score"] == "50%"
+
+
+# ---------------------------------------------------------------------------
+# Decomposition tests — Task 1 (schema + models)
+# ---------------------------------------------------------------------------
+
+
+async def test_migration_v5_to_v6_adds_source_capture_id(
+    db_conn: sqlite3.Connection,
+) -> None:
+    """Migration adds source_capture_id column to memories table."""
+    cols = {
+        row[1]
+        for row in db_conn.execute("PRAGMA table_info(memories)").fetchall()
+    }
+    assert "source_capture_id" in cols
+
+
+async def test_migration_v5_to_v6_creates_index(
+    db_conn: sqlite3.Connection,
+) -> None:
+    """Migration creates idx_memories_source_capture_id index."""
+    indexes = {
+        row[1]
+        for row in db_conn.execute("PRAGMA index_list(memories)").fetchall()
+    }
+    assert "idx_memories_source_capture_id" in indexes
+
+
+async def test_schema_version_is_6(db_conn: sqlite3.Connection) -> None:
+    """Schema version is 6 after migration."""
+    version = db_conn.execute("PRAGMA user_version").fetchone()[0]
+    assert version == 6
+
+
+async def test_decompose_input_validates_capture_id() -> None:
+    """DecomposeInput requires capture_id with min_length=1."""
+    from pydantic import ValidationError
+
+    from remind_me_mcp.models import AtomicFact, DecomposeInput
+
+    # Valid
+    inp = DecomposeInput(
+        capture_id="abc123",
+        facts=[AtomicFact(content="A fact")],
+    )
+    assert inp.capture_id == "abc123"
+
+    # Empty capture_id should fail
+    with pytest.raises(ValidationError):
+        DecomposeInput(capture_id="", facts=[AtomicFact(content="A fact")])
+
+
+async def test_decompose_input_requires_facts() -> None:
+    """DecomposeInput requires at least one fact."""
+    from pydantic import ValidationError
+
+    from remind_me_mcp.models import DecomposeInput
+
+    with pytest.raises(ValidationError):
+        DecomposeInput(capture_id="abc123", facts=[])
+
+
+async def test_atomic_fact_validates_content() -> None:
+    """AtomicFact requires content with min_length=1."""
+    from pydantic import ValidationError
+
+    from remind_me_mcp.models import AtomicFact
+
+    fact = AtomicFact(content="Valid content")
+    assert fact.content == "Valid content"
+
+    with pytest.raises(ValidationError):
+        AtomicFact(content="")
+
+
+async def test_atomic_fact_validates_memory_type() -> None:
+    """AtomicFact.memory_type must be in VALID_MEMORY_TYPES when not None."""
+    from pydantic import ValidationError
+
+    from remind_me_mcp.models import AtomicFact
+
+    # None is fine (default)
+    fact = AtomicFact(content="A fact")
+    assert fact.memory_type is None
+
+    # Valid type
+    fact = AtomicFact(content="A fact", memory_type="decision")
+    assert fact.memory_type == "decision"
+
+    # Invalid type
+    with pytest.raises(ValidationError):
+        AtomicFact(content="A fact", memory_type="invalid_type")
+
+
+async def test_atomic_fact_validates_extra_tags() -> None:
+    """AtomicFact.extra_tags defaults to empty list and accepts list of strings."""
+    from remind_me_mcp.models import AtomicFact
+
+    fact = AtomicFact(content="A fact")
+    assert fact.extra_tags == []
+
+    fact = AtomicFact(content="A fact", extra_tags=["tag1", "tag2"])
+    assert fact.extra_tags == ["tag1", "tag2"]
+
+
+async def test_decompose_batch_input_validates_batch_size() -> None:
+    """DecomposeBatchInput validates batch_size (default=20, ge=1, le=100)."""
+    from pydantic import ValidationError
+
+    from remind_me_mcp.models import DecomposeBatchInput
+
+    inp = DecomposeBatchInput()
+    assert inp.batch_size == 20
+
+    inp = DecomposeBatchInput(batch_size=50)
+    assert inp.batch_size == 50
+
+    with pytest.raises(ValidationError):
+        DecomposeBatchInput(batch_size=0)
+
+    with pytest.raises(ValidationError):
+        DecomposeBatchInput(batch_size=101)
