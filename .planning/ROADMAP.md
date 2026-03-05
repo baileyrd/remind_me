@@ -107,7 +107,10 @@ Plans:
   1. remind_me_consolidate clusters semantically similar memories above a configurable similarity threshold
   2. dry_run mode reports clusters without modifying any data
   3. Auto-merge mode merges cluster content into the highest-vitality canonical record, sets superseded_by on merged members, and sums access_count into the canonical record
-**Plans**: TBD
+**Plans:** 2 plans
+Plans:
+- [ ] 14-01-PLAN.md -- TDD consolidation module (find_clusters, pick_canonical, merge_cluster) and ConsolidateInput model
+- [ ] 14-02-PLAN.md -- Wire remind_me_consolidate MCP tool handler with integration tests
 
 ## Progress
 
@@ -129,4 +132,4 @@ Phases execute in numeric order: 10 -> 11 -> 12 -> 13 -> 14
 | 11. Decay, Vitality, and Classification | v1.2 | 3/3 | Complete | 2026-03-05 |
 | 12. Atomic Decomposition | v1.2 | 2/2 | Complete | 2026-03-05 |
 | 13. Structured Memory and Transparency | 2/2 | Complete    | 2026-03-05 | - |
-| 14. Vault Hygiene | v1.2 | 0/TBD | Not started | - |
+| 14. Vault Hygiene | v1.2 | 0/2 | Not started | - |
