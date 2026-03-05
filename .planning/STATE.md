@@ -1,19 +1,3 @@
----
-gsd_state_version: 1.0
-milestone: v1.2
-milestone_name: Intelligent Retrieval
-status: executing
-stopped_at: Completed 10-02-PLAN.md
-last_updated: "2026-03-05T12:28:35.619Z"
-last_activity: 2026-03-05 -- Completed 10-01 retrieval pipeline module
-progress:
-  total_phases: 5
-  completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
-  percent: 100
----
-
 # Project State
 
 ## Project Reference
@@ -21,16 +5,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-04)
 
 **Core value:** Persistent, searchable memory across all Claude interfaces -- modular, tested, maintainable
-**Current focus:** v1.2 Intelligent Retrieval -- Phase 10: Retrieval Pipeline
+**Current focus:** v1.2 Intelligent Retrieval -- Phase 11: Decay, Vitality, and Classification
 
 ## Current Position
 
-Phase: 10 of 14 (Retrieval Pipeline)
-Plan: 01 complete, 02 pending
-Status: Executing phase 10
-Last activity: 2026-03-05 -- Completed 10-01 retrieval pipeline module
+Phase: 11 of 14 (Decay, Vitality, and Classification)
+Plan: --
+Status: Ready to plan
+Last activity: 2026-03-05 -- Phase 10 (Retrieval Pipeline) completed and verified
 
-Progress: [██████████] 100%
+Progress: [########################................] 60% (10/14 phases complete, 1/5 v1.2 phases)
 
 ## Performance Metrics
 
@@ -44,18 +28,24 @@ Progress: [██████████] 100%
 - Phases: 6
 - Timeline: 1 day
 
+**Velocity (v1.2 so far):**
+- Plans completed: 2
+- Phase 10: 2 plans, 2 waves
+
 ## Accumulated Context
 
 ### Decisions
 
 - Atomic decomposition and classification are Claude-driven (not server-side LLM) -- server stores results, Claude does extraction
 - Structured memory uses columns on existing table (not separate structured_memories table) -- simpler, same benefits
-- RRF k=60 default, configurable via env var
+- RRF k=60 default, configurable via env var (REMIND_ME_RRF_K)
 - Retroactive decomposition via batch tool loop (Claude classifies, calls back with results)
 - Phase 11 combines decay + classification because classification sets per-category decay rates
+- retrieval.py is a pure-function module (rank_rrf, apply_token_budget) -- tools.py does wiring
+- Filters applied BEFORE RRF ranking (not after)
+- token_budget=0 means unlimited
 
 Full decision log in PROJECT.md Key Decisions table.
-- [Phase 10]: Filters applied BEFORE RRF ranking to avoid ranking irrelevant results
 
 ### Pending Todos
 
@@ -67,6 +57,6 @@ None.
 
 ## Session Continuity
 
-Last session: 2026-03-05T12:28:35.618Z
-Stopped at: Completed 10-02-PLAN.md
+Last session: 2026-03-05
+Stopped at: Phase 10 completed, ready for Phase 11
 Resume file: None

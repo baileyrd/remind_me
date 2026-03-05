@@ -33,7 +33,7 @@
 
 **Milestone Goal:** Transform retrieval from naive hybrid search to a precision pipeline with token budgets, rank fusion, memory decay, atomic fact storage, and vault hygiene.
 
-- [ ] **Phase 10: Retrieval Pipeline** - RRF fusion, recency signal, token budget, and response envelope
+- [x] **Phase 10: Retrieval Pipeline** - RRF fusion, recency signal, token budget, and response envelope -- completed 2026-03-05
 - [ ] **Phase 11: Decay, Vitality, and Classification** - Schema migration, ACT-R vitality model, memory types, and per-category decay rates
 - [ ] **Phase 12: Atomic Decomposition** - Claude-driven fact extraction from captures with batch processing tools
 - [ ] **Phase 13: Structured Memory and Transparency** - Subject/predicate/object columns, structured query routing, and debug signals
@@ -115,7 +115,7 @@ Phases execute in numeric order: 10 -> 11 -> 12 -> 13 -> 14
 | 7. API Embedding Parity | v1.1 | 1/1 | Complete | 2026-02-24 |
 | 8. Performance Improvements | v1.1 | 2/2 | Complete | 2026-02-25 |
 | 9. Gap Closure | v1.1 | 2/2 | Complete | 2026-02-25 |
-| 10. Retrieval Pipeline | v1.2 | 0/2 | Not started | - |
+| 10. Retrieval Pipeline | v1.2 | 2/2 | Complete | 2026-03-05 |
 | 11. Decay, Vitality, and Classification | v1.2 | 0/TBD | Not started | - |
 | 12. Atomic Decomposition | v1.2 | 0/TBD | Not started | - |
 | 13. Structured Memory and Transparency | v1.2 | 0/TBD | Not started | - |
