@@ -360,6 +360,19 @@ class ReclassifyBatchInput(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Vitality report model (Phase 11 Plan 03)
+# ---------------------------------------------------------------------------
+
+
+class VitalityReportInput(BaseModel):
+    """Input for the remind_me_vitality_report tool: vault health metrics."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
+
+
+# ---------------------------------------------------------------------------
 # Exports
 # ---------------------------------------------------------------------------
 
@@ -378,4 +391,5 @@ __all__ = [
     "ReclassifyInput",
     "ReclassifyBatchInput",
     "VALID_MEMORY_TYPES",
+    "VitalityReportInput",
 ]

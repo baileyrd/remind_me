@@ -38,6 +38,7 @@ from remind_me_mcp.models import (
     ReclassifyBatchInput,
     ReclassifyInput,
     ResponseFormat,
+    VitalityReportInput,
 )
 from remind_me_mcp.pid import get_server_status
 from remind_me_mcp.retrieval import apply_token_budget, rank_rrf
@@ -921,6 +922,113 @@ async def remind_me_server_status() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Vitality report tool (Phase 11 Plan 03)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool(
+    name="remind_me_vitality_report",
+    annotations={
+        "title": "Vitality Report",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def remind_me_vitality_report(params: VitalityReportInput) -> str:
+    """Generate a vault health report with vitality metrics, dormant counts, and decay distribution.
+
+    Provides an overview of the memory vault's health including active/dormant
+    counts, average vitality, vitality distribution across buckets, and a
+    breakdown by memory type.
+
+    Args:
+        params: Report options including response format.
+
+    Returns:
+        str: Vault health report in the requested format (JSON or markdown).
+    """
+    db = _get_db()
+
+    # Core counts
+    total = db.execute("SELECT COUNT(*) as cnt FROM memories").fetchone()["cnt"]
+    active_count = db.execute(
+        "SELECT COUNT(*) as cnt FROM memories WHERE status = 'active'"
+    ).fetchone()["cnt"]
+    dormant_count = db.execute(
+        "SELECT COUNT(*) as cnt FROM memories WHERE status = 'dormant'"
+    ).fetchone()["cnt"]
+
+    # Average vitality
+    avg_row = db.execute("SELECT AVG(vitality) as avg_v FROM memories").fetchone()
+    avg_vitality = round(avg_row["avg_v"], 2) if avg_row["avg_v"] is not None else 0.0
+
+    # Decay distribution by memory_type
+    type_rows = db.execute(
+        "SELECT memory_type, COUNT(*) as cnt FROM memories GROUP BY memory_type"
+    ).fetchall()
+    decay_distribution = {r["memory_type"]: r["cnt"] for r in type_rows}
+
+    # Vitality buckets
+    bucket_ranges = [
+        ("0.00-0.05", 0.0, 0.05),
+        ("0.05-0.25", 0.05, 0.25),
+        ("0.25-0.50", 0.25, 0.50),
+        ("0.50-0.75", 0.50, 0.75),
+        ("0.75-1.00", 0.75, 1.01),  # 1.01 to include vitality=1.0
+    ]
+    vitality_buckets: dict[str, int] = {}
+    for label, low, high in bucket_ranges:
+        count = db.execute(
+            "SELECT COUNT(*) as cnt FROM memories WHERE vitality >= ? AND vitality < ?",
+            (low, high),
+        ).fetchone()["cnt"]
+        vitality_buckets[label] = count
+
+    # Vault health score
+    health_pct = round(active_count / total * 100) if total > 0 else 0
+    vault_health_score = f"{health_pct}%"
+
+    data = {
+        "total_memories": total,
+        "active_count": active_count,
+        "dormant_count": dormant_count,
+        "average_vitality": avg_vitality,
+        "vault_health_score": vault_health_score,
+        "decay_distribution": decay_distribution,
+        "vitality_buckets": vitality_buckets,
+    }
+
+    if params.response_format == ResponseFormat.JSON:
+        return json.dumps(data, indent=2, default=str)
+
+    # Markdown format
+    lines = [
+        "## Vault Vitality Report",
+        "",
+        f"**Total memories:** {total}",
+        f"**Active:** {active_count}",
+        f"**Dormant:** {dormant_count}",
+        f"**Vault health:** {vault_health_score}",
+        f"**Average vitality:** {avg_vitality:.2f}",
+        "",
+        "### Vitality Distribution",
+        "",
+    ]
+    for label, count in vitality_buckets.items():
+        bar = "#" * min(count, 40)
+        lines.append(f"  {label}: {bar} ({count})")
+    lines.append("")
+    lines.append("### Memory Type Distribution")
+    lines.append("")
+    for mtype, count in sorted(decay_distribution.items()):
+        lines.append(f"- **{mtype}**: {count}")
+
+    return _maybe_update_notice("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
 # Update tools
 # ---------------------------------------------------------------------------
 
@@ -1190,6 +1298,7 @@ __all__ = [
     "remind_me_self_update",
     "remind_me_reclassify",
     "remind_me_reclassify_batch",
+    "remind_me_vitality_report",
     "resource_stats",
     "resource_categories",
 ]
