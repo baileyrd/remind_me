@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
+import pytest
+
 from remind_me_mcp.models import (
     AutoCaptureInput,
     BulkImportDirInput,
@@ -1384,3 +1386,112 @@ async def test_search_record_access_called(
     await asyncio.sleep(0.1)
 
     assert mem["id"] in called_ids
+
+
+# ---------------------------------------------------------------------------
+# remind_me_vitality_report tests (Phase 11 Plan 03)
+# ---------------------------------------------------------------------------
+
+
+async def test_vitality_report_basic_counts(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """remind_me_vitality_report returns total_memories, active_count, dormant_count."""
+    from remind_me_mcp.models import VitalityReportInput
+    from remind_me_mcp.tools import remind_me_vitality_report
+
+    memory_factory(content="Active report test 1", status="active", vitality=0.8)
+    memory_factory(content="Active report test 2", status="active", vitality=0.6)
+    memory_factory(content="Dormant report test 1", status="dormant", vitality=0.01)
+
+    params = VitalityReportInput()
+    result = await remind_me_vitality_report(params)
+    data = json.loads(result)
+
+    assert data["total_memories"] == 3
+    assert data["active_count"] == 2
+    assert data["dormant_count"] == 1
+
+
+async def test_vitality_report_average_vitality(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """Report includes average_vitality across all memories."""
+    from remind_me_mcp.models import VitalityReportInput
+    from remind_me_mcp.tools import remind_me_vitality_report
+
+    memory_factory(content="Avg test 1", status="active", vitality=1.0)
+    memory_factory(content="Avg test 2", status="active", vitality=0.5)
+
+    params = VitalityReportInput()
+    result = await remind_me_vitality_report(params)
+    data = json.loads(result)
+
+    assert abs(data["average_vitality"] - 0.75) < 0.01
+
+
+async def test_vitality_report_decay_distribution(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """Report includes decay_distribution (count per memory_type)."""
+    from remind_me_mcp.models import VitalityReportInput
+    from remind_me_mcp.tools import remind_me_vitality_report
+
+    memory_factory(content="Decision type 1", memory_type="decision", status="active", vitality=0.9)
+    memory_factory(content="Decision type 2", memory_type="decision", status="active", vitality=0.8)
+    memory_factory(content="Fact type 1", memory_type="fact", status="active", vitality=0.7)
+
+    params = VitalityReportInput()
+    result = await remind_me_vitality_report(params)
+    data = json.loads(result)
+
+    assert data["decay_distribution"]["decision"] == 2
+    assert data["decay_distribution"]["fact"] == 1
+
+
+async def test_vitality_report_vitality_buckets(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """Report includes vitality_buckets with counts in defined ranges."""
+    from remind_me_mcp.models import VitalityReportInput
+    from remind_me_mcp.tools import remind_me_vitality_report
+
+    memory_factory(content="Bucket test 1", status="dormant", vitality=0.01)   # 0.00-0.05
+    memory_factory(content="Bucket test 2", status="active", vitality=0.10)    # 0.05-0.25
+    memory_factory(content="Bucket test 3", status="active", vitality=0.30)    # 0.25-0.50
+    memory_factory(content="Bucket test 4", status="active", vitality=0.60)    # 0.50-0.75
+    memory_factory(content="Bucket test 5", status="active", vitality=0.90)    # 0.75-1.00
+
+    params = VitalityReportInput()
+    result = await remind_me_vitality_report(params)
+    data = json.loads(result)
+
+    assert data["vitality_buckets"]["0.00-0.05"] == 1
+    assert data["vitality_buckets"]["0.05-0.25"] == 1
+    assert data["vitality_buckets"]["0.25-0.50"] == 1
+    assert data["vitality_buckets"]["0.50-0.75"] == 1
+    assert data["vitality_buckets"]["0.75-1.00"] == 1
+
+
+async def test_vitality_report_vault_health_score(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """Report includes vault_health_score (active_count / total as percentage)."""
+    from remind_me_mcp.models import VitalityReportInput
+    from remind_me_mcp.tools import remind_me_vitality_report
+
+    memory_factory(content="Health test 1", status="active", vitality=0.8)
+    memory_factory(content="Health test 2", status="active", vitality=0.7)
+    memory_factory(content="Health test 3", status="dormant", vitality=0.01)
+    memory_factory(content="Health test 4", status="dormant", vitality=0.02)
+
+    params = VitalityReportInput()
+    result = await remind_me_vitality_report(params)
+    data = json.loads(result)
+
+    assert data["vault_health_score"] == "50%"

@@ -1,5 +1,5 @@
 """
-remind_me_mcp.tools — All 15 MCP tool handlers and 2 resource handlers.
+remind_me_mcp.tools — All 17 MCP tool handlers and 2 resource handlers.
 
 All handlers are registered on the `mcp` instance imported from server.py.
 This module imports mcp from server (not the other way around) to avoid
@@ -1188,6 +1188,8 @@ __all__ = [
     "remind_me_server_status",
     "remind_me_check_update",
     "remind_me_self_update",
+    "remind_me_reclassify",
+    "remind_me_reclassify_batch",
     "resource_stats",
     "resource_categories",
 ]
