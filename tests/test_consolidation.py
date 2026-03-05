@@ -100,10 +100,10 @@ class TestFindClusters:
         base = np.random.default_rng(42).standard_normal(dim).astype(np.float32)
         base /= np.linalg.norm(base)
 
-        # Small perturbation
+        # Very small perturbation to stay above 0.85 similarity
         rng = np.random.default_rng(99)
-        noise1 = rng.standard_normal(dim).astype(np.float32) * 0.05
-        noise2 = rng.standard_normal(dim).astype(np.float32) * 0.05
+        noise1 = rng.standard_normal(dim).astype(np.float32) * 0.01
+        noise2 = rng.standard_normal(dim).astype(np.float32) * 0.01
 
         vec_a = base.copy()
         vec_b = base + noise1

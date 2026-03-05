@@ -436,6 +436,38 @@ class DecomposeBatchInput(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Consolidation models (Phase 14 Plan 01)
+# ---------------------------------------------------------------------------
+
+
+class ConsolidateInput(BaseModel):
+    """Input for the remind_me_consolidate tool: find and merge duplicate memories."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    similarity_threshold: float = Field(
+        default=0.85,
+        ge=0.5,
+        le=1.0,
+        description="Minimum cosine similarity to cluster memories together. Higher = stricter.",
+    )
+    dry_run: bool = Field(
+        default=True,
+        description="If True, report clusters without modifying data. Set False to auto-merge.",
+    )
+    category: str | None = Field(
+        default=None,
+        description="Limit consolidation to this category",
+    )
+    limit: int = Field(
+        default=500,
+        ge=10,
+        le=5000,
+        description="Maximum memories to consider (prevents runaway on large vaults)",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Vitality report model (Phase 11 Plan 03)
 # ---------------------------------------------------------------------------
 
@@ -470,5 +502,6 @@ __all__ = [
     "AtomicFact",
     "DecomposeInput",
     "DecomposeBatchInput",
+    "ConsolidateInput",
     "VitalityReportInput",
 ]
