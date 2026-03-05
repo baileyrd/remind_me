@@ -642,6 +642,31 @@ async def test_auto_capture_with_tags(db_conn: sqlite3.Connection) -> None:
         assert "test" in tags
 
 
+async def test_auto_capture_decomposition_pending(db_conn: sqlite3.Connection) -> None:
+    """auto_capture response includes decomposition_pending hint with capture_id."""
+    import re
+
+    params = AutoCaptureInput(
+        conversation="Human: I prefer dark mode.\nAssistant: Noted, dark mode preference.",
+        summary="User prefers dark mode for all interfaces.",
+        tags=["preferences"],
+    )
+    result = await remind_me_auto_capture(params)
+
+    # Extract capture_id from the standard part of the response
+    m = re.search(r"Capture ID.*?`([a-f0-9]+)`", result)
+    assert m is not None, "Expected capture_id in response"
+    capture_id = m.group(1)
+
+    # The response must include decomposition_pending hint
+    assert "decomposition_pending" in result
+    # The hint must reference the remind_me_decompose tool
+    assert "remind_me_decompose" in result
+    # The hint must include the capture_id so Claude knows what to pass
+    hint_section = result.split("decomposition_pending")[1]
+    assert capture_id in hint_section
+
+
 # ---------------------------------------------------------------------------
 # remind_me_get_capture tests
 # ---------------------------------------------------------------------------
