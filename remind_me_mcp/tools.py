@@ -725,6 +725,11 @@ async def remind_me_auto_capture(params: AutoCaptureInput) -> str:
         f"**Capture ID:** `{capture_id}` (links both memories)\n\n"
         f"The full dialog and summary are linked — search for either and "
         f"use `remind_me_get_capture` with capture_id `{capture_id}` to retrieve both."
+        f"\n\n---\n"
+        f"**decomposition_pending**: This capture can be decomposed into atomic facts. "
+        f"Call `remind_me_decompose` with capture_id `{capture_id}` and an array of "
+        f"extracted facts (decisions, preferences, learnings, action items, etc.) to "
+        f"make each fact individually searchable."
     )
 
 
