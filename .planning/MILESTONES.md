@@ -1,5 +1,34 @@
 # Milestones
 
+## v1.2 Intelligent Retrieval (Shipped: 2026-03-05)
+
+**Phases completed:** 5 phases, 11 plans
+**Lines of code:** 13,867 Python (package + tests)
+**Timeline:** 2 days (2026-03-04 to 2026-03-05)
+**Git range:** 6fb8cef..31f101d (49 files, 10,242 insertions)
+**Tests:** 308 passing
+**Requirements:** 31/31 satisfied
+
+**Key accomplishments:**
+- Replaced naive linear score blending with RRF ranking (k=60) fusing keyword, semantic, recency, and vitality signals with token budget cap (RETR-01 to RETR-04)
+- ACT-R vitality/decay model with per-category decay rates, bridge protection, and dormant memory exclusion (DECAY-01 to DECAY-06)
+- Memory classification system with 7 types, batch reclassification tools, and vitality report (CLSF-01 to CLSF-05)
+- Claude-driven atomic fact decomposition with parent-child linking via source_capture_id and batch processing (ATOM-01 to ATOM-05)
+- Structured memory columns (subject/predicate/object) with indexed query routing and supersession tracking (STRC-01 to STRC-04)
+- Vault hygiene consolidation with semantic clustering, dry-run mode, and auto-merge into highest-vitality canonical (HYGN-01 to HYGN-05)
+- Search transparency with debug signals, tier breakdown, and dormant exclusion count (TRNS-01 to TRNS-02)
+
+**Tech debt (non-blocking):**
+- SUMMARY frontmatter missing requirements_completed for phases 10-11 (metadata only; verified in VERIFICATION.md)
+- formatting.py does not surface vitality, memory_type, structured columns in markdown output (cosmetic)
+
+**Archives:**
+- milestones/v1.2-ROADMAP.md
+- milestones/v1.2-REQUIREMENTS.md
+- milestones/v1.2-MILESTONE-AUDIT.md
+
+---
+
 ## v1.0 Full Refactor (Shipped: 2026-02-24)
 
 **Phases completed:** 3 phases, 12 plans

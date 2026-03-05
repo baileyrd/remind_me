@@ -2,7 +2,7 @@
 
 ## What This Is
 
-A personal memory server for Claude that persists facts, preferences, and conversations across sessions. Works with Claude.ai, Claude Code, and Claude Desktop via MCP (Model Context Protocol). Features hybrid search (FTS5 + semantic vectors), auto-capture of conversations, chat import, and an optional web dashboard. Structured as a well-tested 10-module Python package with security hardening, CI/CD, and 80%+ test coverage.
+A personal memory server for Claude that persists facts, preferences, and conversations across sessions. Works with Claude.ai, Claude Code, and Claude Desktop via MCP (Model Context Protocol). Features precision retrieval with RRF rank fusion, token budgets, ACT-R memory decay, atomic fact decomposition, structured triples, vault consolidation, and search transparency. Structured as a well-tested 10-module Python package with security hardening, CI/CD, and 308 tests.
 
 ## Core Value
 
@@ -43,17 +43,22 @@ Persistent, searchable memory that works seamlessly across all Claude interfaces
 - ✓ REST API embedding parity (POST/PUT generate embeddings) — v1.1
 - ✓ Batch reindex (32 at a time) — v1.1
 - ✓ Concurrent directory import with semaphore-bounded parallelism — v1.1
+- ✓ Token budget cap on retrieval (800-token default) — v1.2
+- ✓ RRF rank fusion (k=60) with recency as third signal — v1.2
+- ✓ ACT-R decay/vitality model with per-category decay rates and bridge protection — v1.2
+- ✓ Dormant memory exclusion from default search — v1.2
+- ✓ Memory classification with 7 types and batch reclassification tools — v1.2
+- ✓ Vitality report tool — v1.2
+- ✓ Claude-driven atomic fact decomposition with parent-child linking — v1.2
+- ✓ Batch decomposition and decomposition_pending hints — v1.2
+- ✓ Structured memory columns (subject/predicate/object) with indexed query routing — v1.2
+- ✓ Supersession tracking (superseded_by column) — v1.2
+- ✓ Search transparency: debug signals, tier breakdown, dormant exclusion count — v1.2
+- ✓ Vault hygiene: semantic clustering, consolidation, dry-run mode — v1.2
 
 ### Active
 
-- [ ] Token budget cap on retrieval (800-token default ceiling)
-- [ ] Reciprocal Rank Fusion (RRF) replacing linear score blend + recency signal
-- [ ] ACT-R decay / vitality model with per-category decay rates
-- [ ] Atomic fact decomposition at capture (Claude-driven, not server-side LLM)
-- [ ] Retroactive corpus classification and batch decomposition tools
-- [ ] Structured memory columns (subject/predicate/object) on existing table
-- [ ] Memory consolidation and deduplication tool
-- [ ] Retrieval transparency (debug signals, response envelope metadata)
+(None yet — define in next milestone)
 
 ### Out of Scope
 
@@ -64,36 +69,28 @@ Persistent, searchable memory that works seamlessly across all Claude interfaces
 - Full OAuth2/JWT auth — static bearer token sufficient for personal localhost tool
 - Rate limiting — single-user personal tool; no multi-tenant scenario
 - HTTPS/TLS — localhost traffic; self-signed certs add complexity with no benefit
-- Separate structured_memories table — subject/predicate/object columns on existing table sufficient; avoids dual-table complexity
 - Server-side LLM calls — decomposition and classification are Claude's job, server stores results
 - REST API semantic search endpoint — deferred; MCP tool covers this
 - mypy strict mode — deferred; not retrieval-related
+- Automatic consolidation — requires human review; dry_run + manual approval by design
 
-## Current Milestone: v1.2 Intelligent Retrieval
+## Current State
 
-**Goal:** Transform retrieval from naive hybrid search to a precision pipeline with token budgets, rank fusion, memory decay, and atomic fact storage.
-
-**Target features:**
-- Token budget cap on search results (800-token default)
-- RRF fusion replacing linear blend, with recency as third signal
-- ACT-R vitality/decay model with per-category rates
-- Claude-driven atomic fact decomposition at capture time
-- Retroactive classification and batch decomposition of 589 existing blobs
-- Structured memory columns (subject/predicate/object) on existing table
-- Consolidation/dedup tool for vault hygiene
-- Retrieval transparency with debug signal breakdown
+**Last shipped:** v1.2 Intelligent Retrieval (2026-03-05)
+**Next milestone:** TBD — run `/gsd:new-milestone` to define
 
 ## Context
 
-Shipped v1.1 with 8,216 lines of Python (package + tests).
+Shipped v1.2 with 13,867 lines of Python (package + tests).
 Tech stack: Python 3.11+, FastMCP, SQLite (WAL), Pydantic, Starlette, ONNX Runtime (optional), React/Babel (dashboard).
 10-module package: config, db, embeddings, models, formatting, importer, pid, server, tools, api, plus dashboard/ subpackage.
-234 tests passing at 80.19% line coverage.
-15 MCP tools + 2 resource handlers registered.
-Schema at version 4 (PRAGMA user_version) with migration support.
+New modules: retrieval.py (RRF/token budget), vitality.py (ACT-R decay), consolidation.py (semantic clustering).
+308 tests passing.
+20 MCP tools + 2 resource handlers registered.
+Schema at version 7 (PRAGMA user_version) with gapless migration chain v0-v7.
 GitHub Actions CI validates every push/PR with lint + test + coverage gates.
 Security: CORS localhost-only, import path guard, optional Bearer token auth.
-Vault: 663 memories, 18.1 MB — 589 (89%) are undifferentiated chat_import blobs.
+Search pipeline: RRF fusion (keyword + semantic + recency + vitality), token budget cap, dormant exclusion, structured query routing, debug signals.
 
 ## Constraints
 
@@ -120,6 +117,13 @@ Vault: 663 memories, 18.1 MB — 589 (89%) are undifferentiated chat_import blob
 | hmac.compare_digest for token comparison | Timing-safe comparison prevents side-channel attacks | ✓ Good — stdlib, no extra dependencies |
 | threading.Lock for concurrent SQLite writes | Serializes DB writes while allowing concurrent file I/O | ✓ Good — prevents InterfaceError under 8-worker concurrency |
 | sqlite-vec knn fix (AND mv.k = ?) | LIMIT doesn't push through JOIN in sqlite-vec 0.1.6 | ✓ Good — fixed semantic search for all code paths |
+| RRF over linear blending | RRF is rank-based, not score-based — more robust to signal scale differences | ✓ Good — 4-signal fusion without normalization |
+| Token budget via len//4 estimation | Avoids tokenizer dependency; close enough for retrieval trimming | ✓ Good — no extra dependency |
+| ACT-R vitality formula | Cognitive science model for memory strength; natural decay with access reinforcement | ✓ Good — intuitive behavior, bridge protection works |
+| Claude-driven decomposition | Server stores results; Claude does extraction — no server-side LLM dependency | ✓ Good — keeps server lightweight |
+| Columns on existing table (not separate) | subject/predicate/object as nullable columns avoids dual-table complexity | ✓ Good — zero migration issues |
+| Union-Find for transitive clustering | A~B and B~C implies single cluster; correct graph semantics | ✓ Good — handles chains properly |
+| Filters before RRF ranking | Category/dormant filters narrow candidate set before expensive ranking | ✓ Good — consistent, predictable filtering |
 
 ---
-*Last updated: 2026-03-04 after v1.2 milestone started*
+*Last updated: 2026-03-05 after v1.2 milestone completed*
