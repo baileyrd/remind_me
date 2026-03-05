@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sqlite3
 from typing import Any
 
@@ -56,6 +57,98 @@ from remind_me_mcp.vitality import DECAY_RATES, record_access
 log = logging.getLogger("remind_me_mcp.tools")
 
 EMBED_BATCH_SIZE = 32
+
+
+# ---------------------------------------------------------------------------
+# Structured query detection and lookup
+# ---------------------------------------------------------------------------
+
+# Regex for structured query patterns: subject:VALUE or predicate:VALUE
+# Values can be quoted ("multi word") or unquoted single words.
+_STRUCTURED_PATTERN = re.compile(
+    r'(subject|predicate):"([^"]+)"|(subject|predicate):(\S+)'
+)
+
+
+def _detect_structured_query(query: str) -> dict[str, str] | None:
+    """Parse query for subject:VALUE and/or predicate:VALUE structured patterns.
+
+    Values can be quoted (subject:"Bailey Robertson") or unquoted single words
+    (subject:Bailey). Returns a dict with found fields, or None if no structured
+    pattern is detected.
+
+    Args:
+        query: The raw search query string.
+
+    Returns:
+        Dict with 'subject' and/or 'predicate' keys if structured patterns found,
+        None otherwise.
+    """
+    result: dict[str, str] = {}
+    for match in _STRUCTURED_PATTERN.finditer(query):
+        if match.group(1):
+            # Quoted value
+            result[match.group(1)] = match.group(2)
+        elif match.group(3):
+            # Unquoted value
+            result[match.group(3)] = match.group(4)
+    return result if result else None
+
+
+def _structured_lookup(
+    db: sqlite3.Connection,
+    subject: str | None,
+    predicate: str | None,
+    limit: int,
+) -> list[dict]:
+    """Perform indexed SQL lookup for structured fact triples.
+
+    Builds a WHERE clause dynamically based on which fields are provided.
+    Always excludes superseded facts (superseded_by IS NOT NULL).
+
+    Args:
+        db: An open SQLite connection.
+        subject: Subject value to match, or None to skip.
+        predicate: Predicate value to match, or None to skip.
+        limit: Maximum number of results to return.
+
+    Returns:
+        List of memory dicts from matching rows.
+    """
+    conditions: list[str] = ["superseded_by IS NULL"]
+    bindings: list[Any] = []
+
+    if subject is not None:
+        conditions.append("subject = ?")
+        bindings.append(subject)
+    if predicate is not None:
+        conditions.append("predicate = ?")
+        bindings.append(predicate)
+
+    where_clause = " AND ".join(conditions)
+    bindings.append(limit)
+
+    rows = db.execute(
+        f"SELECT * FROM memories WHERE {where_clause} LIMIT ?",
+        bindings,
+    ).fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
+def _strip_structured_prefixes(query: str) -> str:
+    """Remove subject:VALUE and predicate:VALUE patterns from a query string.
+
+    Used when structured lookup returns no results and we fall back to FTS/semantic.
+
+    Args:
+        query: The raw search query string containing structured prefixes.
+
+    Returns:
+        The query with structured prefixes removed and extra whitespace cleaned.
+    """
+    stripped = _STRUCTURED_PATTERN.sub("", query).strip()
+    # Collapse multiple spaces
+    return re.sub(r"\s+", " ", stripped)
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +285,74 @@ async def memory_search(params: MemorySearchInput) -> str:
     from remind_me_mcp.embeddings import _get_embedder
 
     db = _get_db()
+
+    # --- Structured query detection (subject:X, predicate:Y) ---
+    structured_fields = _detect_structured_query(params.query)
+    if structured_fields:
+        structured_results = _structured_lookup(
+            db,
+            subject=structured_fields.get("subject"),
+            predicate=structured_fields.get("predicate"),
+            limit=params.limit,
+        )
+        if structured_results:
+            # Apply filters (category, tags, dormant, vitality)
+            filtered = _apply_filters(structured_results, params.category, params.tags)
+            if not params.include_dormant:
+                filtered = [m for m in filtered if m.get("status") != "dormant"]
+            if params.min_vitality > 0:
+                filtered = [
+                    m for m in filtered
+                    if (m.get("vitality") or 1.0) >= params.min_vitality
+                ]
+
+            # Wrap in token budget envelope and return
+            envelope = apply_token_budget(filtered, params.token_budget)
+
+            # Record access for returned results (fire-and-forget)
+            returned_ids = [m["id"] for m in envelope["memories"]]
+            if returned_ids:
+                async def _record_accesses(ids: list[str]) -> None:
+                    for mid in ids:
+                        await asyncio.to_thread(record_access, mid)
+                asyncio.create_task(_record_accesses(returned_ids))
+
+            if params.response_format == ResponseFormat.JSON:
+                return json.dumps(
+                    {
+                        "total_candidates": envelope["total_candidates"],
+                        "returned": envelope["returned"],
+                        "trimmed": envelope["trimmed"],
+                        "tokens_used": envelope["tokens_used"],
+                        "budget": envelope["budget"],
+                        "memories": envelope["memories"],
+                    },
+                    indent=2,
+                    default=str,
+                )
+
+            if not envelope["memories"]:
+                return "_No memories found._"
+
+            parts: list[str] = []
+            parts.append(f"**{envelope['returned']} results** via structured lookup")
+            parts.append(f"_~{envelope['tokens_used']} tokens used (budget: {envelope['budget']})_\n")
+            for m in envelope["memories"]:
+                parts.append(_fmt_memory_md(m).rstrip())
+                parts.append("")
+            return _maybe_update_notice("\n---\n".join(parts))
+
+        # Structured query detected but no results -- fall through to normal search
+        # Strip structured prefixes from query before passing to FTS
+        params = params.model_copy(update={"query": _strip_structured_prefixes(params.query)})
+        if not params.query:
+            # Nothing left after stripping -- return empty
+            if params.response_format == ResponseFormat.JSON:
+                return json.dumps(
+                    {"total_candidates": 0, "returned": 0, "trimmed": 0, "tokens_used": 0, "budget": params.token_budget, "memories": []},
+                    indent=2,
+                )
+            return "_No memories found._"
 
     # --- FTS5 keyword search ---
     fts_memories: list[dict] = []

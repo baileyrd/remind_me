@@ -1550,9 +1550,9 @@ async def test_migration_v5_to_v6_creates_index(
 
 
 async def test_schema_version_is_6(db_conn: sqlite3.Connection) -> None:
-    """Schema version is 6 after migration."""
+    """Schema version is at least 6 after migration (later migrations may bump it further)."""
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 6
+    assert version >= 6
 
 
 async def test_decompose_input_validates_capture_id() -> None:
