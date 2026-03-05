@@ -9,10 +9,10 @@ Requirements for Intelligent Retrieval milestone. Each maps to roadmap phases.
 
 ### Retrieval Pipeline
 
-- [ ] **RETR-01**: Search respects a configurable token_budget parameter (default 800) and trims results that exceed the budget
-- [ ] **RETR-02**: Search uses Reciprocal Rank Fusion (RRF, k=60 configurable) to combine signals instead of linear score blending
-- [ ] **RETR-03**: Recency is added as a third retrieval signal ranked by age ascending
-- [ ] **RETR-04**: Response envelope includes metadata (total_candidates, returned, trimmed, tokens_used, budget)
+- [x] **RETR-01**: Search respects a configurable token_budget parameter (default 800) and trims results that exceed the budget
+- [x] **RETR-02**: Search uses Reciprocal Rank Fusion (RRF, k=60 configurable) to combine signals instead of linear score blending
+- [x] **RETR-03**: Recency is added as a third retrieval signal ranked by age ascending
+- [x] **RETR-04**: Response envelope includes metadata (total_candidates, returned, trimmed, tokens_used, budget)
 
 ### Decay & Vitality
 
@@ -83,10 +83,10 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| RETR-01 | Phase 10 | Pending |
-| RETR-02 | Phase 10 | Pending |
-| RETR-03 | Phase 10 | Pending |
-| RETR-04 | Phase 10 | Pending |
+| RETR-01 | Phase 10 | Complete |
+| RETR-02 | Phase 10 | Complete |
+| RETR-03 | Phase 10 | Complete |
+| RETR-04 | Phase 10 | Complete |
 | DECAY-01 | Phase 11 | Pending |
 | DECAY-02 | Phase 11 | Pending |
 | DECAY-03 | Phase 11 | Pending |
