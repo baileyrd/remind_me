@@ -255,6 +255,20 @@ def memory_factory(db_conn: sqlite3.Connection):
                 defaults["updated_at"],
             ),
         )
+
+        # Update v5 schema columns if provided (status, vitality, memory_type, etc.)
+        v5_cols = {
+            k: defaults[k]
+            for k in ("status", "vitality", "memory_type", "decay_rate", "base_weight", "access_count", "accessed_at")
+            if k in defaults
+        }
+        if v5_cols:
+            set_clause = ", ".join(f"{col} = ?" for col in v5_cols)
+            db_conn.execute(
+                f"UPDATE memories SET {set_clause} WHERE id = ?",
+                (*v5_cols.values(), defaults["id"]),
+            )
+
         db_conn.commit()
 
         # Return with deserialised fields

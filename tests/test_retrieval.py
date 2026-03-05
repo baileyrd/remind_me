@@ -290,3 +290,72 @@ class TestSearchEnvelope:
 
         required_keys = {"memories", "total_candidates", "returned", "trimmed", "tokens_used", "budget"}
         assert required_keys.issubset(set(env.keys()))
+
+
+# ---------------------------------------------------------------------------
+# 4-signal RRF with vitality
+# ---------------------------------------------------------------------------
+
+
+class TestRankRRFVitality:
+    """Tests for the 4th RRF signal: vitality ranking."""
+
+    def test_vitality_rank_assigned(self):
+        """rank_rrf assigns _vitality_rank to each result."""
+        from remind_me_mcp.retrieval import rank_rrf
+
+        a = _mem("A", created_at=_ts(0), vitality=0.8)
+        b = _mem("B", created_at=_ts(0), vitality=0.5)
+
+        result = rank_rrf([a, b], [a, b], k=60)
+
+        for m in result:
+            assert "_vitality_rank" in m, f"Missing _vitality_rank on {m['id']}"
+
+    def test_higher_vitality_gets_better_rank(self):
+        """Higher vitality memories get lower (better) vitality_rank."""
+        from remind_me_mcp.retrieval import rank_rrf
+
+        high = _mem("HIGH", created_at=_ts(0), vitality=0.9)
+        low = _mem("LOW", created_at=_ts(0), vitality=0.1)
+
+        result = rank_rrf([high, low], [high, low], k=60)
+
+        ranks = {m["id"]: m["_vitality_rank"] for m in result}
+        assert ranks["HIGH"] < ranks["LOW"], (
+            f"HIGH vitality should rank better: HIGH={ranks['HIGH']} LOW={ranks['LOW']}"
+        )
+
+    def test_rrf_score_includes_vitality_signal(self):
+        """RRF score sums 4 reciprocal ranks (keyword, semantic, recency, vitality).
+
+        Two memories with identical keyword/semantic/recency should differ
+        in RRF score when vitality differs.
+        """
+        from remind_me_mcp.retrieval import rank_rrf
+
+        # Same created_at so recency is a toss-up; same list positions
+        high_v = _mem("HV", created_at=_ts(0), vitality=1.0)
+        low_v = _mem("LV", created_at=_ts(0), vitality=0.01)
+
+        result = rank_rrf([high_v, low_v], [high_v, low_v], k=60)
+        scores = {m["id"]: m["_rrf_score"] for m in result}
+
+        # HV has better vitality rank, so its RRF score should be higher
+        assert scores["HV"] > scores["LV"], (
+            f"Higher vitality should produce higher RRF: HV={scores['HV']} LV={scores['LV']}"
+        )
+
+    def test_vitality_default_1_for_missing_field(self):
+        """Memories without a 'vitality' field default to 1.0 (backwards compatible)."""
+        from remind_me_mcp.retrieval import rank_rrf
+
+        # No vitality key at all
+        a = _mem("A", created_at=_ts(0))
+        b = _mem("B", created_at=_ts(0), vitality=0.5)
+
+        result = rank_rrf([a, b], [a, b], k=60)
+
+        ranks = {m["id"]: m["_vitality_rank"] for m in result}
+        # A defaults to 1.0 which is higher than B's 0.5
+        assert ranks["A"] < ranks["B"]

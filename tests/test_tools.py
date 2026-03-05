@@ -1090,3 +1090,297 @@ async def test_search_rrf_ranking_smoke(
     for mem in data["memories"]:
         assert "_rrf_score" in mem
         assert "_keyword_rank" in mem
+
+
+# ---------------------------------------------------------------------------
+# remind_me_reclassify tests (Phase 11 Plan 02)
+# ---------------------------------------------------------------------------
+
+
+async def test_reclassify_updates_memory_type_and_decay(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """remind_me_reclassify accepts [{id, memory_type}] and updates each memory's memory_type and decay_rate."""
+    from remind_me_mcp.models import ReclassifyInput
+    from remind_me_mcp.tools import remind_me_reclassify
+    from remind_me_mcp.vitality import DECAY_RATES
+
+    mem = memory_factory(content="Reclassify test: I prefer dark mode")
+
+    params = ReclassifyInput(
+        classifications=[{"memory_id": mem["id"], "memory_type": "preference"}],
+    )
+    result = await remind_me_reclassify(params)
+    data = json.loads(result)
+
+    assert data["updated"] == 1
+    assert data["not_found"] == []
+
+    row = db_conn.execute(
+        "SELECT memory_type, decay_rate FROM memories WHERE id = ?",
+        (mem["id"],),
+    ).fetchone()
+    assert row["memory_type"] == "preference"
+    assert row["decay_rate"] == DECAY_RATES["preference"]
+
+
+async def test_reclassify_rejects_invalid_memory_type() -> None:
+    """remind_me_reclassify rejects invalid memory_type values not in the allowed set."""
+    from pydantic import ValidationError
+
+    from remind_me_mcp.models import ReclassifyInput
+
+    with pytest.raises(ValidationError, match="memory_type"):
+        ReclassifyInput(
+            classifications=[{"memory_id": "abc", "memory_type": "invalid_type"}],
+        )
+
+
+async def test_reclassify_returns_counts(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """remind_me_reclassify returns count of updated, not_found, and total results."""
+    from remind_me_mcp.models import ReclassifyInput
+    from remind_me_mcp.tools import remind_me_reclassify
+
+    mem1 = memory_factory(content="Reclassify count test A")
+    mem2 = memory_factory(content="Reclassify count test B")
+
+    params = ReclassifyInput(
+        classifications=[
+            {"memory_id": mem1["id"], "memory_type": "fact"},
+            {"memory_id": mem2["id"], "memory_type": "decision"},
+            {"memory_id": "nonexistent_id", "memory_type": "insight"},
+        ],
+    )
+    result = await remind_me_reclassify(params)
+    data = json.loads(result)
+
+    assert data["updated"] == 2
+    assert data["not_found"] == ["nonexistent_id"]
+    assert data["total"] == 3
+
+
+async def test_reclassify_sets_correct_decay_rate(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """After reclassification, memory's decay_rate matches DECAY_RATES[memory_type]."""
+    from remind_me_mcp.models import ReclassifyInput
+    from remind_me_mcp.tools import remind_me_reclassify
+    from remind_me_mcp.vitality import DECAY_RATES
+
+    mem = memory_factory(content="Decay rate test memory")
+
+    params = ReclassifyInput(
+        classifications=[{"memory_id": mem["id"], "memory_type": "action_item"}],
+    )
+    await remind_me_reclassify(params)
+
+    row = db_conn.execute(
+        "SELECT decay_rate FROM memories WHERE id = ?", (mem["id"],)
+    ).fetchone()
+    assert row["decay_rate"] == DECAY_RATES["action_item"]
+    assert row["decay_rate"] == 0.20
+
+
+# ---------------------------------------------------------------------------
+# remind_me_reclassify_batch tests (Phase 11 Plan 02)
+# ---------------------------------------------------------------------------
+
+
+async def test_reclassify_batch_returns_unclassified(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """remind_me_reclassify_batch returns up to N unclassified memories with id, content_snippet, category, tags."""
+    from remind_me_mcp.models import ReclassifyBatchInput
+    from remind_me_mcp.tools import remind_me_reclassify_batch
+
+    # Create unclassified memories (memory_type defaults to 'unclassified' from schema)
+    for i in range(5):
+        memory_factory(content=f"Unclassified memory number {i} for batch test")
+
+    params = ReclassifyBatchInput(batch_size=3)
+    result = await remind_me_reclassify_batch(params)
+    data = json.loads(result)
+
+    assert len(data["memories"]) == 3
+    assert data["total_unclassified"] == 5
+
+    for mem in data["memories"]:
+        assert "id" in mem
+        assert "content_snippet" in mem
+        assert "category" in mem
+        assert "tags" in mem
+
+
+async def test_reclassify_batch_respects_batch_size(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """remind_me_reclassify_batch respects batch_size parameter (default 20)."""
+    from remind_me_mcp.models import ReclassifyBatchInput
+    from remind_me_mcp.tools import remind_me_reclassify_batch
+
+    for i in range(25):
+        memory_factory(content=f"Batch size test memory {i}")
+
+    # Default batch_size=20
+    params_default = ReclassifyBatchInput()
+    result = await remind_me_reclassify_batch(params_default)
+    data = json.loads(result)
+
+    assert len(data["memories"]) == 20
+    assert data["total_unclassified"] == 25
+
+
+async def test_reclassify_batch_empty_when_all_classified(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """remind_me_reclassify_batch returns empty list when no unclassified memories remain."""
+    from remind_me_mcp.models import ReclassifyBatchInput, ReclassifyInput
+    from remind_me_mcp.tools import remind_me_reclassify, remind_me_reclassify_batch
+
+    mem = memory_factory(content="Already classified memory for empty test")
+
+    # Reclassify it so none remain unclassified
+    classify_params = ReclassifyInput(
+        classifications=[{"memory_id": mem["id"], "memory_type": "fact"}],
+    )
+    await remind_me_reclassify(classify_params)
+
+    params = ReclassifyBatchInput()
+    result = await remind_me_reclassify_batch(params)
+    data = json.loads(result)
+
+    assert data["memories"] == []
+    assert data["total_unclassified"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Dormant filtering and vitality in search (Phase 11 Plan 03)
+# ---------------------------------------------------------------------------
+
+
+async def test_search_excludes_dormant_by_default(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """Dormant memories (status='dormant') are excluded from search by default."""
+    memory_factory(
+        content="Active vitality test memory alpha",
+        category="test",
+        status="active",
+        vitality=0.8,
+    )
+    memory_factory(
+        content="Dormant vitality test memory beta",
+        category="test",
+        status="dormant",
+        vitality=0.01,
+    )
+
+    search_params = MemorySearchInput(query="vitality test memory")
+    result = await memory_search(search_params)
+
+    assert "alpha" in result.lower()
+    assert "beta" not in result.lower()
+
+
+async def test_search_include_dormant_shows_all(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """include_dormant=True includes dormant memories in search results."""
+    memory_factory(
+        content="Active include dormant test gamma",
+        category="test",
+        status="active",
+        vitality=0.8,
+    )
+    memory_factory(
+        content="Dormant include dormant test delta",
+        category="test",
+        status="dormant",
+        vitality=0.01,
+    )
+
+    search_params = MemorySearchInput(
+        query="include dormant test",
+        include_dormant=True,
+        response_format=ResponseFormat.JSON,
+    )
+    result = await memory_search(search_params)
+    data = json.loads(result)
+
+    ids_content = [m["content"] for m in data["memories"]]
+    assert any("gamma" in c.lower() for c in ids_content)
+    assert any("delta" in c.lower() for c in ids_content)
+
+
+async def test_search_min_vitality_filter(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """min_vitality=0.5 excludes memories with vitality below 0.5."""
+    memory_factory(
+        content="High vitality filter test epsilon",
+        category="test",
+        status="active",
+        vitality=0.8,
+    )
+    memory_factory(
+        content="Low vitality filter test zeta",
+        category="test",
+        status="active",
+        vitality=0.3,
+    )
+
+    search_params = MemorySearchInput(
+        query="vitality filter test",
+        min_vitality=0.5,
+        response_format=ResponseFormat.JSON,
+    )
+    result = await memory_search(search_params)
+    data = json.loads(result)
+
+    contents = [m["content"].lower() for m in data["memories"]]
+    assert any("epsilon" in c for c in contents)
+    assert not any("zeta" in c for c in contents)
+
+
+async def test_search_record_access_called(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+    monkeypatch: "pytest.MonkeyPatch",
+) -> None:
+    """record_access is called for returned search results."""
+    import remind_me_mcp.tools as _tools_mod
+
+    mem = memory_factory(
+        content="Record access test eta unique content",
+        category="test",
+        status="active",
+        vitality=0.8,
+    )
+
+    called_ids: list[str] = []
+
+    def fake_record_access(mid: str) -> float | None:
+        called_ids.append(mid)
+        return 0.9
+
+    monkeypatch.setattr(_tools_mod, "record_access", fake_record_access)
+
+    search_params = MemorySearchInput(query="record access test eta")
+    await memory_search(search_params)
+
+    # Give fire-and-forget task a moment to execute
+    import asyncio
+    await asyncio.sleep(0.1)
+
+    assert mem["id"] in called_ids
