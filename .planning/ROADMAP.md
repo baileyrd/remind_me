@@ -36,7 +36,7 @@
 - [x] **Phase 10: Retrieval Pipeline** - RRF fusion, recency signal, token budget, and response envelope -- completed 2026-03-05
 - [x] **Phase 11: Decay, Vitality, and Classification** - Schema migration, ACT-R vitality model, memory types, and per-category decay rates -- completed 2026-03-05
 - [x] **Phase 12: Atomic Decomposition** - Claude-driven fact extraction from captures with batch processing tools (completed 2026-03-05)
-- [ ] **Phase 13: Structured Memory and Transparency** - Subject/predicate/object columns, structured query routing, and debug signals
+- [x] **Phase 13: Structured Memory and Transparency** - Subject/predicate/object columns, structured query routing, and debug signals (completed 2026-03-05)
 - [ ] **Phase 14: Vault Hygiene** - Semantic clustering, consolidation, and deduplication of the memory vault
 
 ## Phase Details
@@ -94,7 +94,7 @@ Plans:
   2. Search detects structured query patterns (subject/predicate) and routes to indexed lookup before falling back to semantic search
   3. A superseded_by column tracks when a structured fact is replaced by a newer version
   4. Search results include a debug_signals block (semantic_rank, keyword_rank, recency_rank, vitality_rank, days_old) when verbose=True, plus tier_breakdown and dormant_excluded count in the envelope
-**Plans:** 1/2 plans executed
+**Plans:** 2/2 plans complete
 Plans:
 - [ ] 13-01-PLAN.md -- Schema migration v6->v7 (subject/predicate/object/superseded_by columns) and structured query routing
 - [ ] 13-02-PLAN.md -- Debug signals, tier breakdown, and dormant_excluded transparency in search results
@@ -128,5 +128,5 @@ Phases execute in numeric order: 10 -> 11 -> 12 -> 13 -> 14
 | 10. Retrieval Pipeline | v1.2 | 2/2 | Complete | 2026-03-05 |
 | 11. Decay, Vitality, and Classification | v1.2 | 3/3 | Complete | 2026-03-05 |
 | 12. Atomic Decomposition | v1.2 | 2/2 | Complete | 2026-03-05 |
-| 13. Structured Memory and Transparency | 1/2 | In Progress|  | - |
+| 13. Structured Memory and Transparency | 2/2 | Complete   | 2026-03-05 | - |
 | 14. Vault Hygiene | v1.2 | 0/TBD | Not started | - |

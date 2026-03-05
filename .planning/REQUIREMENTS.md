@@ -41,10 +41,10 @@ Requirements for Intelligent Retrieval milestone. Each maps to roadmap phases.
 
 ### Structured Memory
 
-- [ ] **STRC-01**: memories table has subject, predicate, object columns (nullable)
-- [ ] **STRC-02**: Indexes on subject, memory_type for fast structured lookups
-- [ ] **STRC-03**: Search routes structured queries (subject/predicate patterns) to indexed lookup before falling back to semantic search
-- [ ] **STRC-04**: superseded_by column tracks when a structured fact is replaced by a newer version
+- [x] **STRC-01**: memories table has subject, predicate, object columns (nullable)
+- [x] **STRC-02**: Indexes on subject, memory_type for fast structured lookups
+- [x] **STRC-03**: Search routes structured queries (subject/predicate patterns) to indexed lookup before falling back to semantic search
+- [x] **STRC-04**: superseded_by column tracks when a structured fact is replaced by a newer version
 
 ### Vault Hygiene
 
@@ -103,10 +103,10 @@ Which phases cover which requirements. Updated during roadmap creation.
 | ATOM-03 | Phase 12 | Complete |
 | ATOM-04 | Phase 12 | Complete |
 | ATOM-05 | Phase 12 | Complete |
-| STRC-01 | Phase 13 | Pending |
-| STRC-02 | Phase 13 | Pending |
-| STRC-03 | Phase 13 | Pending |
-| STRC-04 | Phase 13 | Pending |
+| STRC-01 | Phase 13 | Complete |
+| STRC-02 | Phase 13 | Complete |
+| STRC-03 | Phase 13 | Complete |
+| STRC-04 | Phase 13 | Complete |
 | HYGN-01 | Phase 14 | Pending |
 | HYGN-02 | Phase 14 | Pending |
 | HYGN-03 | Phase 14 | Pending |

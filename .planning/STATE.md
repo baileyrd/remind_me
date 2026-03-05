@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.2
 milestone_name: Intelligent Retrieval
 status: executing
-stopped_at: Completed 13-02-PLAN.md (debug signals and envelope transparency)
-last_updated: "2026-03-05T19:22:59.720Z"
-last_activity: 2026-03-05 -- Plan 13-02 (debug signals and envelope transparency) completed
+stopped_at: Completed 13-01-PLAN.md (structured memory columns and query routing)
+last_updated: "2026-03-05T19:23:03Z"
+last_activity: 2026-03-05 -- Plan 13-01 (structured memory columns and query routing) completed
 progress:
   total_phases: 5
   completed_phases: 1
   total_plans: 4
-  completed_plans: 3
-  percent: 89
+  completed_plans: 4
+  percent: 100
 ---
 
 # Project State
@@ -26,11 +26,11 @@ See: .planning/PROJECT.md (updated 2026-03-04)
 ## Current Position
 
 Phase: 13 of 14 (Structured Memory and Transparency)
-Plan: 2 of 3
-Status: In Progress
-Last activity: 2026-03-05 -- Plan 13-02 (debug signals and envelope transparency) completed
+Plan: 2 of 2
+Status: Phase Complete
+Last activity: 2026-03-05 -- Plan 13-01 (structured memory columns and query routing) completed
 
-Progress: [█████████░] 89%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
@@ -49,7 +49,7 @@ Progress: [█████████░] 89%
 - Phase 10: 2 plans, 2 waves
 - Phase 11: 3/3 plans complete
 - Phase 12: 2/2 plans complete
-- Phase 13: 2/3 plans complete (structured memory and transparency)
+- Phase 13: 2/2 plans complete (structured memory and transparency)
 
 ## Accumulated Context
 
@@ -82,8 +82,9 @@ Full decision log in PROJECT.md Key Decisions table.
 - [Phase 13]: Debug signals use underscore-prefixed internal rank keys from RRF output
 - [Phase 13]: Tier breakdown and dormant_excluded always included in envelope (not gated by verbose)
 - [Phase 13]: Dormant exclusion count uses deduplicated IDs across FTS+semantic to avoid double-counting
-- [Phase 13]: Debug signals use underscore-prefixed internal rank keys from RRF output
-- [Phase 13]: Tier breakdown and dormant_excluded always included in envelope (not gated by verbose)
+- [Phase 13]: Structured query uses regex for subject:/predicate: prefix parsing with quoted and unquoted values
+- [Phase 13]: Superseded memories excluded via SQL WHERE clause (superseded_by IS NULL)
+- [Phase 13]: Structured results bypass RRF pipeline entirely; fall back to FTS/semantic with stripped query when no results
 
 ### Pending Todos
 
@@ -95,6 +96,6 @@ None.
 
 ## Session Continuity
 
-Last session: 2026-03-05T19:22:55.565Z
-Stopped at: Completed 13-02-PLAN.md (debug signals and envelope transparency)
+Last session: 2026-03-05T19:23:03Z
+Stopped at: Completed 13-01-PLAN.md (structured memory columns and query routing)
 Resume file: None
