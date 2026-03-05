@@ -195,7 +195,7 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 # Current target schema version.  Increment when adding a new migration step.
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 
 
 
@@ -234,6 +234,11 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         _migrate_v3_to_v4(db)
         db.execute("PRAGMA user_version = 4")
         current_version = 4
+
+    if current_version < 5:
+        _migrate_v4_to_v5(db)
+        db.execute("PRAGMA user_version = 5")
+        current_version = 5
 
     db.commit()
 
@@ -490,6 +495,113 @@ def _migrate_v3_to_v4(db: sqlite3.Connection) -> None:
                     'capture_id', NEW.capture_id,
                     'node_id',    NEW.node_id,
                     'client',     NEW.client
+                ),
+                datetime('now', 'utc')
+            );
+        END;
+    """)
+
+
+def _migrate_v4_to_v5(db: sqlite3.Connection) -> None:
+    """v4 -> v5: Add decay, vitality, and classification columns to memories.
+
+    Adds seven new columns for the ACT-R vitality model and memory classification:
+      - accessed_at: timestamp of last access (backfilled from created_at)
+      - access_count: number of times the memory has been accessed
+      - decay_rate: per-memory decay rate (set by memory_type)
+      - vitality: current vitality score (ACT-R formula output)
+      - base_weight: base importance weight for vitality computation
+      - status: 'active' or 'dormant' based on vitality threshold
+      - memory_type: classification label (e.g., 'fact', 'decision', 'preference')
+
+    Also creates indexes on status, memory_type, and vitality for efficient filtering,
+    and updates outbox triggers to include all new fields in the JSON payload.
+
+    Args:
+        db: An open SQLite connection.
+    """
+    # Add new columns (idempotent via suppress)
+    with contextlib.suppress(sqlite3.OperationalError):
+        db.execute("ALTER TABLE memories ADD COLUMN accessed_at TEXT DEFAULT NULL")
+    with contextlib.suppress(sqlite3.OperationalError):
+        db.execute("ALTER TABLE memories ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0")
+    with contextlib.suppress(sqlite3.OperationalError):
+        db.execute("ALTER TABLE memories ADD COLUMN decay_rate REAL NOT NULL DEFAULT 0.1")
+    with contextlib.suppress(sqlite3.OperationalError):
+        db.execute("ALTER TABLE memories ADD COLUMN vitality REAL NOT NULL DEFAULT 1.0")
+    with contextlib.suppress(sqlite3.OperationalError):
+        db.execute("ALTER TABLE memories ADD COLUMN base_weight REAL NOT NULL DEFAULT 1.0")
+    with contextlib.suppress(sqlite3.OperationalError):
+        db.execute("ALTER TABLE memories ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+    with contextlib.suppress(sqlite3.OperationalError):
+        db.execute("ALTER TABLE memories ADD COLUMN memory_type TEXT NOT NULL DEFAULT 'unclassified'")
+
+    # Create indexes for efficient filtering
+    db.execute("CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_memories_memory_type ON memories(memory_type)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_memories_vitality ON memories(vitality)")
+
+    # Backfill accessed_at from created_at for existing records
+    db.execute("UPDATE memories SET accessed_at = created_at WHERE accessed_at IS NULL")
+
+    # Drop and recreate outbox triggers to include new fields
+    db.executescript("""
+        DROP TRIGGER IF EXISTS memories_outbox_ai;
+        DROP TRIGGER IF EXISTS memories_outbox_au;
+
+        CREATE TRIGGER IF NOT EXISTS memories_outbox_ai
+        AFTER INSERT ON memories BEGIN
+            INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+            VALUES (
+                NEW.id, 'insert',
+                json_object(
+                    'id',           NEW.id,
+                    'content',      NEW.content,
+                    'category',     NEW.category,
+                    'tags',         NEW.tags,
+                    'source',       NEW.source,
+                    'metadata',     NEW.metadata,
+                    'created_at',   NEW.created_at,
+                    'updated_at',   NEW.updated_at,
+                    'capture_id',   NEW.capture_id,
+                    'node_id',      NEW.node_id,
+                    'client',       NEW.client,
+                    'accessed_at',  NEW.accessed_at,
+                    'access_count', NEW.access_count,
+                    'decay_rate',   NEW.decay_rate,
+                    'vitality',     NEW.vitality,
+                    'base_weight',  NEW.base_weight,
+                    'status',       NEW.status,
+                    'memory_type',  NEW.memory_type
+                ),
+                datetime('now', 'utc')
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS memories_outbox_au
+        AFTER UPDATE ON memories BEGIN
+            INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+            VALUES (
+                NEW.id, 'update',
+                json_object(
+                    'id',           NEW.id,
+                    'content',      NEW.content,
+                    'category',     NEW.category,
+                    'tags',         NEW.tags,
+                    'source',       NEW.source,
+                    'metadata',     NEW.metadata,
+                    'created_at',   NEW.created_at,
+                    'updated_at',   NEW.updated_at,
+                    'capture_id',   NEW.capture_id,
+                    'node_id',      NEW.node_id,
+                    'client',       NEW.client,
+                    'accessed_at',  NEW.accessed_at,
+                    'access_count', NEW.access_count,
+                    'decay_rate',   NEW.decay_rate,
+                    'vitality',     NEW.vitality,
+                    'base_weight',  NEW.base_weight,
+                    'status',       NEW.status,
+                    'memory_type',  NEW.memory_type
                 ),
                 datetime('now', 'utc')
             );

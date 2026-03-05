@@ -412,3 +412,86 @@ def test_migration_idempotent(db_conn: sqlite3.Connection) -> None:
 
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
     assert version == _SCHEMA_VERSION, f"user_version should still be {_SCHEMA_VERSION} after re-run, got {version}"
+
+
+# ---------------------------------------------------------------------------
+# Migration v4 -> v5 — decay, vitality, and classification columns
+# ---------------------------------------------------------------------------
+
+
+def test_v4_to_v5_schema_version_is_5(db_conn: sqlite3.Connection) -> None:
+    """After migration, _SCHEMA_VERSION and PRAGMA user_version are both 5."""
+    from remind_me_mcp.db import _SCHEMA_VERSION
+    assert _SCHEMA_VERSION == 5
+    version = db_conn.execute("PRAGMA user_version").fetchone()[0]
+    assert version == 5, f"Expected user_version 5, got {version}"
+
+
+def test_v4_to_v5_new_columns_exist(db_conn: sqlite3.Connection) -> None:
+    """Fresh database has all 7 new columns from v4->v5 migration."""
+    columns = [row[1] for row in db_conn.execute("PRAGMA table_info(memories)").fetchall()]
+    for col in ("accessed_at", "access_count", "decay_rate", "vitality", "base_weight", "status", "memory_type"):
+        assert col in columns, f"Column {col} missing from memories table"
+
+
+def test_v4_to_v5_defaults(db_conn: sqlite3.Connection) -> None:
+    """Migration from v4 sets sensible defaults for new columns."""
+    now = _now_iso()
+    mem_id = _make_id("v5-defaults-test")
+    db_conn.execute(
+        """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (mem_id, "Defaults test", "general", "[]", "manual", "{}", now, now),
+    )
+    db_conn.commit()
+    row = db_conn.execute(
+        "SELECT vitality, base_weight, decay_rate, access_count, status, memory_type FROM memories WHERE id = ?",
+        (mem_id,),
+    ).fetchone()
+    assert row is not None
+    assert row[0] == 1.0, f"Expected vitality=1.0, got {row[0]}"
+    assert row[1] == 1.0, f"Expected base_weight=1.0, got {row[1]}"
+    assert row[2] == 0.1, f"Expected decay_rate=0.1, got {row[2]}"
+    assert row[3] == 0, f"Expected access_count=0, got {row[3]}"
+    assert row[4] == "active", f"Expected status='active', got {row[4]}"
+    assert row[5] == "unclassified", f"Expected memory_type='unclassified', got {row[5]}"
+
+
+def test_v4_to_v5_accessed_at_backfill(db_conn: sqlite3.Connection) -> None:
+    """accessed_at is backfilled from created_at for existing records."""
+    now = _now_iso()
+    mem_id = _make_id("v5-backfill-test")
+    db_conn.execute(
+        """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (mem_id, "Backfill test", "general", "[]", "manual", "{}", now, now),
+    )
+    db_conn.commit()
+
+    # Force re-run of migration to simulate upgrade from v4
+    db_conn.execute("PRAGMA user_version = 4")
+    db_conn.commit()
+    # Set accessed_at to NULL to simulate pre-v5 record
+    db_conn.execute("UPDATE memories SET accessed_at = NULL WHERE id = ?", (mem_id,))
+    db_conn.commit()
+
+    _migrate_schema(db_conn)
+
+    row = db_conn.execute(
+        "SELECT accessed_at, created_at FROM memories WHERE id = ?", (mem_id,),
+    ).fetchone()
+    assert row is not None
+    assert row[0] == row[1], f"accessed_at should equal created_at after backfill, got {row[0]!r} vs {row[1]!r}"
+
+
+def test_v4_to_v5_indexes_exist(db_conn: sqlite3.Connection) -> None:
+    """Index exists on status, memory_type, and vitality columns."""
+    indexes = [
+        row[0]
+        for row in db_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+        ).fetchall()
+    ]
+    assert "idx_memories_status" in indexes, "idx_memories_status index is missing"
+    assert "idx_memories_memory_type" in indexes, "idx_memories_memory_type index is missing"
+    assert "idx_memories_vitality" in indexes, "idx_memories_vitality index is missing"
