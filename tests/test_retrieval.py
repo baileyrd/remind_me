@@ -359,3 +359,130 @@ class TestRankRRFVitality:
         ranks = {m["id"]: m["_vitality_rank"] for m in result}
         # A defaults to 1.0 which is higher than B's 0.5
         assert ranks["A"] < ranks["B"]
+
+
+# ---------------------------------------------------------------------------
+# build_debug_signals
+# ---------------------------------------------------------------------------
+
+
+class TestBuildDebugSignals:
+    """Tests for build_debug_signals function."""
+
+    def test_extracts_rank_signals(self):
+        """build_debug_signals extracts _keyword_rank, _semantic_rank, _recency_rank, _vitality_rank."""
+        from remind_me_mcp.retrieval import build_debug_signals
+
+        mem = _mem("A", created_at=_ts(5))
+        mem["_keyword_rank"] = 3
+        mem["_semantic_rank"] = 1
+        mem["_recency_rank"] = 2
+        mem["_vitality_rank"] = 4
+
+        signals = build_debug_signals(mem)
+
+        assert signals["keyword_rank"] == 3
+        assert signals["semantic_rank"] == 1
+        assert signals["recency_rank"] == 2
+        assert signals["vitality_rank"] == 4
+
+    def test_computes_days_old(self):
+        """build_debug_signals computes days_old from created_at ISO string."""
+        from remind_me_mcp.retrieval import build_debug_signals
+
+        mem = _mem("A", created_at=_ts(10))
+        mem["_keyword_rank"] = 1
+        mem["_semantic_rank"] = 1
+        mem["_recency_rank"] = 1
+        mem["_vitality_rank"] = 1
+
+        signals = build_debug_signals(mem)
+
+        assert signals["days_old"] == 10
+
+    def test_returns_correct_keys(self):
+        """build_debug_signals returns dict with exactly the 5 expected keys."""
+        from remind_me_mcp.retrieval import build_debug_signals
+
+        mem = _mem("A", created_at=_ts(0))
+        mem["_keyword_rank"] = 1
+        mem["_semantic_rank"] = 1
+        mem["_recency_rank"] = 1
+        mem["_vitality_rank"] = 1
+
+        signals = build_debug_signals(mem)
+
+        assert set(signals.keys()) == {
+            "semantic_rank", "keyword_rank", "recency_rank", "vitality_rank", "days_old"
+        }
+
+    def test_missing_created_at_returns_none_days_old(self):
+        """build_debug_signals handles missing created_at gracefully (days_old=None)."""
+        from remind_me_mcp.retrieval import build_debug_signals
+
+        mem = {"id": "A", "content": "test", "_keyword_rank": 1, "_semantic_rank": 1, "_recency_rank": 1, "_vitality_rank": 1}
+        # No created_at key
+
+        signals = build_debug_signals(mem)
+
+        assert signals["days_old"] is None
+
+    def test_unparseable_created_at_returns_none_days_old(self):
+        """build_debug_signals handles unparseable created_at gracefully."""
+        from remind_me_mcp.retrieval import build_debug_signals
+
+        mem = _mem("A", created_at="not-a-date")
+        mem["_keyword_rank"] = 1
+        mem["_semantic_rank"] = 1
+        mem["_recency_rank"] = 1
+        mem["_vitality_rank"] = 1
+
+        signals = build_debug_signals(mem)
+
+        assert signals["days_old"] is None
+
+
+# ---------------------------------------------------------------------------
+# compute_tier_breakdown
+# ---------------------------------------------------------------------------
+
+
+class TestComputeTierBreakdown:
+    """Tests for compute_tier_breakdown function."""
+
+    def test_counts_by_search_method(self):
+        """compute_tier_breakdown counts memories by _search_method."""
+        from remind_me_mcp.retrieval import compute_tier_breakdown
+
+        mems = [
+            {**_mem("A"), "_search_method": "keyword"},
+            {**_mem("B"), "_search_method": "semantic"},
+            {**_mem("C"), "_search_method": "hybrid"},
+            {**_mem("D"), "_search_method": "keyword"},
+        ]
+
+        result = compute_tier_breakdown(mems)
+
+        assert result["keyword"] == 2
+        assert result["semantic"] == 1
+        assert result["hybrid"] == 1
+
+    def test_defaults_to_zero_for_missing_tiers(self):
+        """compute_tier_breakdown returns 0 for tiers with no memories."""
+        from remind_me_mcp.retrieval import compute_tier_breakdown
+
+        mems = [{**_mem("A"), "_search_method": "keyword"}]
+
+        result = compute_tier_breakdown(mems)
+
+        assert result["keyword"] == 1
+        assert result["semantic"] == 0
+        assert result["hybrid"] == 0
+
+    def test_empty_list_returns_all_zeros(self):
+        """compute_tier_breakdown on empty list returns all zeros."""
+        from remind_me_mcp.retrieval import compute_tier_breakdown
+
+        result = compute_tier_breakdown([])
+
+        assert result == {"keyword": 0, "semantic": 0, "hybrid": 0}
