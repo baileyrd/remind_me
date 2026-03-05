@@ -1908,3 +1908,147 @@ async def test_decompose_batch_returns_total_count(
 
     assert data["total_undecomposed"] == 3
     assert len(data["memories"]) == 2  # limited by batch_size
+
+
+# ---------------------------------------------------------------------------
+# Debug signals, tier breakdown, dormant_excluded (Phase 13 Plan 02)
+# ---------------------------------------------------------------------------
+
+
+async def test_search_verbose_json_includes_debug_signals(
+    db_conn: "sqlite3.Connection",
+) -> None:
+    """Search with verbose=True and response_format=JSON includes debug_signals block per memory."""
+    await memory_add(MemoryAddInput(content="Verbose debug test memory"))
+
+    params = MemorySearchInput(
+        query="Verbose debug test",
+        response_format=ResponseFormat.JSON,
+        verbose=True,
+    )
+    result = await memory_search(params)
+    data = json.loads(result)
+
+    assert data["returned"] >= 1
+    mem = data["memories"][0]
+    assert "debug_signals" in mem
+    signals = mem["debug_signals"]
+    assert "semantic_rank" in signals
+    assert "keyword_rank" in signals
+    assert "recency_rank" in signals
+    assert "vitality_rank" in signals
+    assert "days_old" in signals
+
+
+async def test_search_verbose_false_no_debug_signals(
+    db_conn: "sqlite3.Connection",
+) -> None:
+    """Search with verbose=False (default) does NOT include debug_signals."""
+    await memory_add(MemoryAddInput(content="No verbose test memory"))
+
+    params = MemorySearchInput(
+        query="No verbose test",
+        response_format=ResponseFormat.JSON,
+        verbose=False,
+    )
+    result = await memory_search(params)
+    data = json.loads(result)
+
+    assert data["returned"] >= 1
+    mem = data["memories"][0]
+    assert "debug_signals" not in mem
+
+
+async def test_search_json_always_includes_tier_breakdown(
+    db_conn: "sqlite3.Connection",
+) -> None:
+    """JSON envelope always includes tier_breakdown with keyword/semantic/hybrid counts."""
+    await memory_add(MemoryAddInput(content="Tier breakdown test memory"))
+
+    params = MemorySearchInput(
+        query="Tier breakdown test",
+        response_format=ResponseFormat.JSON,
+    )
+    result = await memory_search(params)
+    data = json.loads(result)
+
+    assert "tier_breakdown" in data
+    tb = data["tier_breakdown"]
+    assert "keyword" in tb
+    assert "semantic" in tb
+    assert "hybrid" in tb
+
+
+async def test_search_json_always_includes_dormant_excluded(
+    db_conn: "sqlite3.Connection",
+) -> None:
+    """JSON envelope always includes dormant_excluded count."""
+    await memory_add(MemoryAddInput(content="Dormant excluded test memory"))
+
+    params = MemorySearchInput(
+        query="Dormant excluded test",
+        response_format=ResponseFormat.JSON,
+    )
+    result = await memory_search(params)
+    data = json.loads(result)
+
+    assert "dormant_excluded" in data
+    assert isinstance(data["dormant_excluded"], int)
+
+
+async def test_search_dormant_excluded_count_accurate(
+    db_conn: "sqlite3.Connection",
+    memory_factory,
+) -> None:
+    """dormant_excluded count matches actual number of dormant memories excluded."""
+    # Create 2 active, 1 dormant memory
+    memory_factory(content="Active memory alpha")
+    memory_factory(content="Active memory beta")
+    memory_factory(content="Dormant memory gamma", status="dormant", vitality=0.01)
+
+    params = MemorySearchInput(
+        query="memory",
+        response_format=ResponseFormat.JSON,
+        include_dormant=False,
+    )
+    result = await memory_search(params)
+    data = json.loads(result)
+
+    # Dormant memory should be excluded and counted
+    assert data["dormant_excluded"] >= 1
+
+
+async def test_search_markdown_verbose_shows_ranking_info(
+    db_conn: "sqlite3.Connection",
+) -> None:
+    """Markdown response with verbose=True shows ranking info per result."""
+    await memory_add(MemoryAddInput(content="Markdown verbose ranking info test"))
+
+    params = MemorySearchInput(
+        query="Markdown verbose ranking",
+        response_format=ResponseFormat.MARKDOWN,
+        verbose=True,
+    )
+    result = await memory_search(params)
+
+    # Should contain per-result ranking info
+    assert "Ranks:" in result
+    assert "kw=" in result
+    assert "sem=" in result
+    assert "days old" in result
+
+
+async def test_search_markdown_always_shows_tier_line(
+    db_conn: "sqlite3.Connection",
+) -> None:
+    """Markdown response always includes tier breakdown summary line."""
+    await memory_add(MemoryAddInput(content="Markdown tier summary line test"))
+
+    params = MemorySearchInput(
+        query="Markdown tier summary",
+        response_format=ResponseFormat.MARKDOWN,
+    )
+    result = await memory_search(params)
+
+    assert "Tiers:" in result
+    assert "dormant excluded" in result

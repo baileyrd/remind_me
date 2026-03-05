@@ -106,6 +106,10 @@ class MemorySearchInput(BaseModel):
         le=1.0,
         description="Minimum vitality score filter. 0.0 means no filter (except dormant exclusion).",
     )
+    verbose: bool = Field(
+        default=False,
+        description="Include debug ranking signals (semantic_rank, keyword_rank, recency_rank, vitality_rank, days_old) per result",
+    )
 
 
 class MemoryListInput(BaseModel):
