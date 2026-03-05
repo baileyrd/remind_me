@@ -18,9 +18,9 @@ Requirements for Intelligent Retrieval milestone. Each maps to roadmap phases.
 
 - [x] **DECAY-01**: memories table has accessed_at, access_count, decay_rate, vitality, base_weight, and status columns
 - [x] **DECAY-02**: Vitality is recomputed on every access using ACT-R formula: base_weight * (access_count+1)^0.5 * e^(-decay_rate * days_since_last_access)
-- [ ] **DECAY-03**: Memories below vitality floor (< 0.05) are flagged status='dormant' and excluded from default search
-- [ ] **DECAY-04**: Search accepts include_dormant and min_vitality parameters
-- [ ] **DECAY-05**: Vitality is a fourth RRF signal in search ranking
+- [x] **DECAY-03**: Memories below vitality floor (< 0.05) are flagged status='dormant' and excluded from default search
+- [x] **DECAY-04**: Search accepts include_dormant and min_vitality parameters
+- [x] **DECAY-05**: Vitality is a fourth RRF signal in search ranking
 - [x] **DECAY-06**: Bridge protection: memories with high access_count get decay_rate multiplied by 0.5
 
 ### Classification
@@ -29,7 +29,7 @@ Requirements for Intelligent Retrieval milestone. Each maps to roadmap phases.
 - [x] **CLSF-02**: remind_me_reclassify tool accepts batch of memory IDs with classifications from Claude and applies them
 - [x] **CLSF-03**: remind_me_reclassify returns unclassified memories in configurable batch sizes for Claude to classify
 - [x] **CLSF-04**: Classification sets appropriate decay_rate per category from the decay rate table
-- [ ] **CLSF-05**: remind_me_vitality_report tool surfaces dormant count, vault health metrics, and decay distribution
+- [x] **CLSF-05**: remind_me_vitality_report tool surfaces dormant count, vault health metrics, and decay distribution
 
 ### Atomic Decomposition
 
@@ -89,15 +89,15 @@ Which phases cover which requirements. Updated during roadmap creation.
 | RETR-04 | Phase 10 | Complete |
 | DECAY-01 | Phase 11, Plan 01 | Complete |
 | DECAY-02 | Phase 11, Plan 01 | Complete |
-| DECAY-03 | Phase 11 | Pending |
-| DECAY-04 | Phase 11 | Pending |
-| DECAY-05 | Phase 11 | Pending |
+| DECAY-03 | Phase 11 | Complete |
+| DECAY-04 | Phase 11 | Complete |
+| DECAY-05 | Phase 11 | Complete |
 | DECAY-06 | Phase 11, Plan 01 | Complete |
 | CLSF-01 | Phase 11 | Complete |
 | CLSF-02 | Phase 11 | Complete |
 | CLSF-03 | Phase 11 | Complete |
 | CLSF-04 | Phase 11 | Complete |
-| CLSF-05 | Phase 11 | Pending |
+| CLSF-05 | Phase 11 | Complete |
 | ATOM-01 | Phase 12 | Pending |
 | ATOM-02 | Phase 12 | Pending |
 | ATOM-03 | Phase 12 | Pending |

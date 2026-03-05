@@ -10,11 +10,11 @@ See: .planning/PROJECT.md (updated 2026-03-04)
 ## Current Position
 
 Phase: 11 of 14 (Decay, Vitality, and Classification)
-Plan: 2 of 3
-Status: Executing
-Last activity: 2026-03-05 -- Plan 11-02 (Classification tools) completed
+Plan: 3 of 3
+Status: Phase Complete
+Last activity: 2026-03-05 -- Plan 11-03 (Wire vitality into search and vitality report) completed
 
-Progress: [########################................] 60% (10/14 phases complete, 1/5 v1.2 phases)
+Progress: [#############################...........] 71% (11/14 phases complete, 2/5 v1.2 phases)
 
 ## Performance Metrics
 
@@ -29,9 +29,9 @@ Progress: [########################................] 60% (10/14 phases complete,
 - Timeline: 1 day
 
 **Velocity (v1.2 so far):**
-- Plans completed: 4
+- Plans completed: 5
 - Phase 10: 2 plans, 2 waves
-- Phase 11: 2/3 plans complete
+- Phase 11: 3/3 plans complete
 
 ## Accumulated Context
 
@@ -50,6 +50,9 @@ Progress: [########################................] 60% (10/14 phases complete,
 - 8 memory types with decay rates from 0.02 (decision) to 0.20 (action_item)
 - Classification excludes 'unclassified' from valid types -- it is the default state, not a classification
 - Batch classification pattern: fetch unclassified -> Claude classifies -> reclassify with results
+- Vitality defaults to 1.0 for memories without the field (backwards compatible with pre-v5 data)
+- Dormant filtering applied BEFORE RRF ranking (consistent with category/tag filter pattern)
+- record_access uses fire-and-forget asyncio.create_task to avoid blocking search response
 
 Full decision log in PROJECT.md Key Decisions table.
 
@@ -64,5 +67,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-03-05
-Stopped at: Completed 11-02-PLAN.md (classification tools)
+Stopped at: Completed 11-03-PLAN.md (wire vitality into search and vitality report)
 Resume file: None
