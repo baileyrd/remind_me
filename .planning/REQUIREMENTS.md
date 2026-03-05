@@ -33,11 +33,11 @@ Requirements for Intelligent Retrieval milestone. Each maps to roadmap phases.
 
 ### Atomic Decomposition
 
-- [ ] **ATOM-01**: remind_me_decompose tool accepts capture_id and array of extracted atomic facts, stores each as a linked memory
-- [ ] **ATOM-02**: Each decomposed fact is linked to parent via source_capture_id column
-- [ ] **ATOM-03**: remind_me_decompose_batch returns N undecomposed memories for Claude to process
+- [x] **ATOM-01**: remind_me_decompose tool accepts capture_id and array of extracted atomic facts, stores each as a linked memory
+- [x] **ATOM-02**: Each decomposed fact is linked to parent via source_capture_id column
+- [x] **ATOM-03**: remind_me_decompose_batch returns N undecomposed memories for Claude to process
 - [ ] **ATOM-04**: remind_me_auto_capture response includes decomposition_pending hint when summary is stored
-- [ ] **ATOM-05**: Decomposed facts inherit tags from parent capture plus type-specific tags
+- [x] **ATOM-05**: Decomposed facts inherit tags from parent capture plus type-specific tags
 
 ### Structured Memory
 
@@ -98,11 +98,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CLSF-03 | Phase 11 | Complete |
 | CLSF-04 | Phase 11 | Complete |
 | CLSF-05 | Phase 11 | Complete |
-| ATOM-01 | Phase 12 | Pending |
-| ATOM-02 | Phase 12 | Pending |
-| ATOM-03 | Phase 12 | Pending |
+| ATOM-01 | Phase 12 | Complete |
+| ATOM-02 | Phase 12 | Complete |
+| ATOM-03 | Phase 12 | Complete |
 | ATOM-04 | Phase 12 | Pending |
-| ATOM-05 | Phase 12 | Pending |
+| ATOM-05 | Phase 12 | Complete |
 | STRC-01 | Phase 13 | Pending |
 | STRC-02 | Phase 13 | Pending |
 | STRC-03 | Phase 13 | Pending |

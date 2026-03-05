@@ -80,7 +80,7 @@ Plans:
   2. remind_me_decompose_batch returns undecomposed memories for Claude to process in configurable batch sizes
   3. After remind_me_auto_capture stores a summary, the response includes a decomposition_pending hint
   4. Decomposed facts inherit tags from the parent capture plus any type-specific tags
-**Plans:** 2 plans
+**Plans:** 1/2 plans executed
 Plans:
 - [ ] 12-01-PLAN.md -- Schema migration v5->v6 (source_capture_id), decompose models, and decompose/decompose_batch tools
 - [ ] 12-02-PLAN.md -- Wire decomposition_pending hint into auto_capture response
@@ -124,6 +124,6 @@ Phases execute in numeric order: 10 -> 11 -> 12 -> 13 -> 14
 | 9. Gap Closure | v1.1 | 2/2 | Complete | 2026-02-25 |
 | 10. Retrieval Pipeline | v1.2 | 2/2 | Complete | 2026-03-05 |
 | 11. Decay, Vitality, and Classification | v1.2 | 3/3 | Complete | 2026-03-05 |
-| 12. Atomic Decomposition | v1.2 | 0/2 | Not started | - |
+| 12. Atomic Decomposition | 1/2 | In Progress|  | - |
 | 13. Structured Memory and Transparency | v1.2 | 0/TBD | Not started | - |
 | 14. Vault Hygiene | v1.2 | 0/TBD | Not started | - |

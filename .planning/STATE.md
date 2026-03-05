@@ -5,16 +5,16 @@
 See: .planning/PROJECT.md (updated 2026-03-04)
 
 **Core value:** Persistent, searchable memory across all Claude interfaces -- modular, tested, maintainable
-**Current focus:** v1.2 Intelligent Retrieval -- Phase 11: Decay, Vitality, and Classification
+**Current focus:** v1.2 Intelligent Retrieval -- Phase 12: Atomic Decomposition
 
 ## Current Position
 
-Phase: 11 of 14 (Decay, Vitality, and Classification)
-Plan: 3 of 3
-Status: Phase Complete
-Last activity: 2026-03-05 -- Plan 11-03 (Wire vitality into search and vitality report) completed
+Phase: 12 of 14 (Atomic Decomposition)
+Plan: 1 of 1
+Status: Plan Complete
+Last activity: 2026-03-05 -- Plan 12-01 (Decompose tools and schema migration) completed
 
-Progress: [#############################...........] 71% (11/14 phases complete, 2/5 v1.2 phases)
+Progress: [################################........] 79% (12/14 phases complete, 3/5 v1.2 phases)
 
 ## Performance Metrics
 
@@ -29,9 +29,10 @@ Progress: [#############################...........] 71% (11/14 phases complete,
 - Timeline: 1 day
 
 **Velocity (v1.2 so far):**
-- Plans completed: 5
+- Plans completed: 6
 - Phase 10: 2 plans, 2 waves
 - Phase 11: 3/3 plans complete
+- Phase 12: 1/1 plan complete
 
 ## Accumulated Context
 
@@ -54,6 +55,11 @@ Progress: [#############################...........] 71% (11/14 phases complete,
 - Dormant filtering applied BEFORE RRF ranking (consistent with category/tag filter pattern)
 - record_access uses fire-and-forget asyncio.create_task to avoid blocking search response
 
+- Decomposed facts get category='fact' and source='decomposition' for consistent filtering
+- source_capture_id is NULL default (backward compatible); decomposed children have capture_id=NULL
+- Tag deduplication uses dict.fromkeys for order-preserving uniqueness
+- NOT EXISTS subquery pattern for finding undecomposed captures
+
 Full decision log in PROJECT.md Key Decisions table.
 
 ### Pending Todos
@@ -67,5 +73,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-03-05
-Stopped at: Completed 11-03-PLAN.md (wire vitality into search and vitality report)
+Stopped at: Completed 12-01-PLAN.md (decompose tools and schema v6 migration)
 Resume file: None
