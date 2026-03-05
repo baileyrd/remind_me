@@ -10,9 +10,9 @@ See: .planning/PROJECT.md (updated 2026-03-04)
 ## Current Position
 
 Phase: 11 of 14 (Decay, Vitality, and Classification)
-Plan: 1 of 3
+Plan: 2 of 3
 Status: Executing
-Last activity: 2026-03-05 -- Plan 11-01 (Schema migration v4->v5 and vitality module) completed
+Last activity: 2026-03-05 -- Plan 11-02 (Classification tools) completed
 
 Progress: [########################................] 60% (10/14 phases complete, 1/5 v1.2 phases)
 
@@ -29,9 +29,9 @@ Progress: [########################................] 60% (10/14 phases complete,
 - Timeline: 1 day
 
 **Velocity (v1.2 so far):**
-- Plans completed: 3
+- Plans completed: 4
 - Phase 10: 2 plans, 2 waves
-- Phase 11: 1/3 plans complete
+- Phase 11: 2/3 plans complete
 
 ## Accumulated Context
 
@@ -48,6 +48,8 @@ Progress: [########################................] 60% (10/14 phases complete,
 - ACT-R formula uses (access_count+1)^0.5 for diminishing returns on repeated access
 - Bridge protection at 10 accesses halves decay rate via BRIDGE_MULTIPLIER=0.5
 - 8 memory types with decay rates from 0.02 (decision) to 0.20 (action_item)
+- Classification excludes 'unclassified' from valid types -- it is the default state, not a classification
+- Batch classification pattern: fetch unclassified -> Claude classifies -> reclassify with results
 
 Full decision log in PROJECT.md Key Decisions table.
 
@@ -62,5 +64,5 @@ None.
 ## Session Continuity
 
 Last session: 2026-03-05
-Stopped at: Completed 11-01-PLAN.md (schema migration v4->v5 and vitality module)
+Stopped at: Completed 11-02-PLAN.md (classification tools)
 Resume file: None

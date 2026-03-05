@@ -25,10 +25,10 @@ Requirements for Intelligent Retrieval milestone. Each maps to roadmap phases.
 
 ### Classification
 
-- [ ] **CLSF-01**: memories table has memory_type column (decision, preference, fact, insight, learning, blocker, action_item)
-- [ ] **CLSF-02**: remind_me_reclassify tool accepts batch of memory IDs with classifications from Claude and applies them
-- [ ] **CLSF-03**: remind_me_reclassify returns unclassified memories in configurable batch sizes for Claude to classify
-- [ ] **CLSF-04**: Classification sets appropriate decay_rate per category from the decay rate table
+- [x] **CLSF-01**: memories table has memory_type column (decision, preference, fact, insight, learning, blocker, action_item)
+- [x] **CLSF-02**: remind_me_reclassify tool accepts batch of memory IDs with classifications from Claude and applies them
+- [x] **CLSF-03**: remind_me_reclassify returns unclassified memories in configurable batch sizes for Claude to classify
+- [x] **CLSF-04**: Classification sets appropriate decay_rate per category from the decay rate table
 - [ ] **CLSF-05**: remind_me_vitality_report tool surfaces dormant count, vault health metrics, and decay distribution
 
 ### Atomic Decomposition
@@ -93,10 +93,10 @@ Which phases cover which requirements. Updated during roadmap creation.
 | DECAY-04 | Phase 11 | Pending |
 | DECAY-05 | Phase 11 | Pending |
 | DECAY-06 | Phase 11, Plan 01 | Complete |
-| CLSF-01 | Phase 11 | Pending |
-| CLSF-02 | Phase 11 | Pending |
-| CLSF-03 | Phase 11 | Pending |
-| CLSF-04 | Phase 11 | Pending |
+| CLSF-01 | Phase 11 | Complete |
+| CLSF-02 | Phase 11 | Complete |
+| CLSF-03 | Phase 11 | Complete |
+| CLSF-04 | Phase 11 | Complete |
 | CLSF-05 | Phase 11 | Pending |
 | ATOM-01 | Phase 12 | Pending |
 | ATOM-02 | Phase 12 | Pending |
