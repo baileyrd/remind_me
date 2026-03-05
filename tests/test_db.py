@@ -422,7 +422,7 @@ def test_migration_idempotent(db_conn: sqlite3.Connection) -> None:
 def test_v4_to_v5_schema_version_is_5(db_conn: sqlite3.Connection) -> None:
     """After migration, _SCHEMA_VERSION and PRAGMA user_version are both 5."""
     from remind_me_mcp.db import _SCHEMA_VERSION
-    assert _SCHEMA_VERSION == 5
+    assert _SCHEMA_VERSION >= 5
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
     assert version == 5, f"Expected user_version 5, got {version}"
 
@@ -495,3 +495,137 @@ def test_v4_to_v5_indexes_exist(db_conn: sqlite3.Connection) -> None:
     assert "idx_memories_status" in indexes, "idx_memories_status index is missing"
     assert "idx_memories_memory_type" in indexes, "idx_memories_memory_type index is missing"
     assert "idx_memories_vitality" in indexes, "idx_memories_vitality index is missing"
+
+
+# ---------------------------------------------------------------------------
+# Migration v6 -> v7 — subject/predicate/object/superseded_by columns
+# ---------------------------------------------------------------------------
+
+
+def test_v6_to_v7_schema_version_is_7(db_conn: sqlite3.Connection) -> None:
+    """After migration, _SCHEMA_VERSION and PRAGMA user_version are both 7."""
+    from remind_me_mcp.db import _SCHEMA_VERSION
+    assert _SCHEMA_VERSION == 7
+    version = db_conn.execute("PRAGMA user_version").fetchone()[0]
+    assert version == 7, f"Expected user_version 7, got {version}"
+
+
+def test_v6_to_v7_new_columns_exist(db_conn: sqlite3.Connection) -> None:
+    """Fresh database has subject, predicate, object, superseded_by columns from v6->v7."""
+    columns = [row[1] for row in db_conn.execute("PRAGMA table_info(memories)").fetchall()]
+    for col in ("subject", "predicate", "object", "superseded_by"):
+        assert col in columns, f"Column {col} missing from memories table"
+
+
+def test_v6_to_v7_columns_default_null(db_conn: sqlite3.Connection) -> None:
+    """New columns default to NULL for existing memories."""
+    now = _now_iso()
+    mem_id = _make_id("v7-defaults-test")
+    db_conn.execute(
+        """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (mem_id, "V7 defaults test", "general", "[]", "manual", "{}", now, now),
+    )
+    db_conn.commit()
+    row = db_conn.execute(
+        "SELECT subject, predicate, object, superseded_by FROM memories WHERE id = ?",
+        (mem_id,),
+    ).fetchone()
+    assert row is not None
+    assert row[0] is None, f"Expected subject=NULL, got {row[0]}"
+    assert row[1] is None, f"Expected predicate=NULL, got {row[1]}"
+    assert row[2] is None, f"Expected object=NULL, got {row[2]}"
+    assert row[3] is None, f"Expected superseded_by=NULL, got {row[3]}"
+
+
+def test_v6_to_v7_subject_index_exists(db_conn: sqlite3.Connection) -> None:
+    """Index idx_memories_subject exists on the subject column."""
+    indexes = [
+        row[0]
+        for row in db_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+        ).fetchall()
+    ]
+    assert "idx_memories_subject" in indexes, "idx_memories_subject index is missing"
+
+
+def test_v6_to_v7_memory_type_index_still_present(db_conn: sqlite3.Connection) -> None:
+    """Index idx_memories_memory_type from v5 is still present after v7 migration."""
+    indexes = [
+        row[0]
+        for row in db_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+        ).fetchall()
+    ]
+    assert "idx_memories_memory_type" in indexes, "idx_memories_memory_type index missing after v7"
+
+
+def test_v6_to_v7_insert_with_subject_predicate_object(db_conn: sqlite3.Connection) -> None:
+    """Can INSERT a memory with subject/predicate/object triple values."""
+    now = _now_iso()
+    mem_id = _make_id("v7-spo-test")
+    db_conn.execute(
+        """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at,
+                                 subject, predicate, object)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (mem_id, "Bailey prefers dark mode", "preference", "[]", "decomposition", "{}",
+         now, now, "Bailey", "prefers", "dark mode"),
+    )
+    db_conn.commit()
+    row = db_conn.execute(
+        "SELECT subject, predicate, object FROM memories WHERE id = ?", (mem_id,)
+    ).fetchone()
+    assert row[0] == "Bailey", f"Expected subject='Bailey', got {row[0]}"
+    assert row[1] == "prefers", f"Expected predicate='prefers', got {row[1]}"
+    assert row[2] == "dark mode", f"Expected object='dark mode', got {row[2]}"
+
+
+def test_v6_to_v7_update_superseded_by(db_conn: sqlite3.Connection) -> None:
+    """Can UPDATE superseded_by to point to a newer memory ID."""
+    now = _now_iso()
+    old_id = _make_id("v7-old-fact")
+    new_id = _make_id("v7-new-fact")
+
+    for mid, content in [(old_id, "Old fact"), (new_id, "New fact")]:
+        db_conn.execute(
+            """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at,
+                                     subject, predicate, object)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (mid, content, "fact", "[]", "decomposition", "{}", now, now, "Bailey", "prefers", "dark mode"),
+        )
+    db_conn.commit()
+
+    db_conn.execute("UPDATE memories SET superseded_by = ? WHERE id = ?", (new_id, old_id))
+    db_conn.commit()
+
+    row = db_conn.execute("SELECT superseded_by FROM memories WHERE id = ?", (old_id,)).fetchone()
+    assert row[0] == new_id, f"Expected superseded_by='{new_id}', got {row[0]}"
+
+
+def test_v6_to_v7_outbox_triggers_include_new_columns(db_conn: sqlite3.Connection) -> None:
+    """Outbox triggers include subject, predicate, object, superseded_by in JSON payload."""
+    now = _now_iso()
+    mem_id = _make_id("v7-outbox-test")
+    db_conn.execute(
+        """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at,
+                                 subject, predicate, object, superseded_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (mem_id, "Outbox test", "general", "[]", "manual", "{}", now, now,
+         "Alice", "likes", "Python", None),
+    )
+    db_conn.commit()
+
+    outbox_row = db_conn.execute(
+        "SELECT payload FROM sync_outbox WHERE memory_id = ? ORDER BY id DESC LIMIT 1",
+        (mem_id,),
+    ).fetchone()
+    assert outbox_row is not None, "No outbox row found for insert"
+    import json
+    payload = json.loads(outbox_row[0])
+    assert "subject" in payload, "subject missing from outbox payload"
+    assert "predicate" in payload, "predicate missing from outbox payload"
+    assert "object" in payload, "object missing from outbox payload"
+    assert "superseded_by" in payload, "superseded_by missing from outbox payload"
+    assert payload["subject"] == "Alice"
+    assert payload["predicate"] == "likes"
+    assert payload["object"] == "Python"
