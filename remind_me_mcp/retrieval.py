@@ -40,14 +40,16 @@ def rank_rrf(
     *,
     k: int | None = None,
 ) -> list[dict]:
-    """Fuse keyword, semantic, and recency ranked lists via Reciprocal Rank Fusion.
+    """Fuse keyword, semantic, recency, and vitality ranked lists via Reciprocal Rank Fusion.
 
-    Each memory receives three rank signals:
+    Each memory receives four rank signals:
       - keyword_rank: position in *keyword_results* (1-indexed)
       - semantic_rank: position in *semantic_results* (1-indexed)
       - recency_rank: position when all unique memories are sorted by created_at DESC
+      - vitality_rank: position when all unique memories are sorted by vitality DESC
+        (higher vitality = better rank). Memories without a ``vitality`` key default to 1.0.
 
-    The RRF score is ``sum(1 / (k + rank))`` across all three signals.
+    The RRF score is ``sum(1 / (k + rank))`` across all four signals.
     Memories absent from a list receive a penalty rank of ``len(list) + 1``.
 
     Args:
@@ -58,7 +60,7 @@ def rank_rrf(
     Returns:
         De-duplicated list of memory dicts sorted by RRF score descending,
         each augmented with ``_rrf_score``, ``_keyword_rank``,
-        ``_semantic_rank``, and ``_recency_rank`` keys.
+        ``_semantic_rank``, ``_recency_rank``, and ``_vitality_rank`` keys.
     """
     if k is None:
         k = RRF_K
@@ -97,19 +99,36 @@ def rank_rrf(
         mem["id"]: i + 1 for i, mem in enumerate(all_mems)
     }
 
-    # Compute RRF scores
+    # Vitality ranking: sort all unique memories by vitality DESC (default 1.0)
+    vitality_sorted = sorted(
+        seen.values(),
+        key=lambda m: m.get("vitality", 1.0),
+        reverse=True,
+    )
+    vitality_rank: dict[str, int] = {
+        mem["id"]: i + 1 for i, mem in enumerate(vitality_sorted)
+    }
+
+    # Compute RRF scores (4 signals)
     results: list[dict] = []
     for mid, mem in seen.items():
         kr = keyword_rank.get(mid, kw_penalty)
         sr = semantic_rank.get(mid, sem_penalty)
         rr = recency_rank[mid]
+        vr = vitality_rank[mid]
 
-        score = 1.0 / (k + kr) + 1.0 / (k + sr) + 1.0 / (k + rr)
+        score = (
+            1.0 / (k + kr)
+            + 1.0 / (k + sr)
+            + 1.0 / (k + rr)
+            + 1.0 / (k + vr)
+        )
 
         mem["_rrf_score"] = score
         mem["_keyword_rank"] = kr
         mem["_semantic_rank"] = sr
         mem["_recency_rank"] = rr
+        mem["_vitality_rank"] = vr
         results.append(mem)
 
     # Sort by RRF score descending (stable sort preserves insertion order for ties)

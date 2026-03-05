@@ -35,12 +35,15 @@ from remind_me_mcp.models import (
     MemorySearchInput,
     MemoryStatsInput,
     MemoryUpdateInput,
+    ReclassifyBatchInput,
+    ReclassifyInput,
     ResponseFormat,
 )
 from remind_me_mcp.pid import get_server_status
 from remind_me_mcp.retrieval import apply_token_budget, rank_rrf
 from remind_me_mcp.server import mcp
 from remind_me_mcp.updater import pop_update_notice
+from remind_me_mcp.vitality import DECAY_RATES, record_access
 
 log = logging.getLogger("remind_me_mcp.tools")
 
@@ -213,6 +216,22 @@ async def memory_search(params: MemorySearchInput) -> str:
     filtered_fts = _apply_filters(fts_memories, params.category, params.tags)
     filtered_sem = _apply_filters(sem_memories, params.category, params.tags)
 
+    # --- Dormant exclusion BEFORE RRF ranking ---
+    if not params.include_dormant:
+        filtered_fts = [m for m in filtered_fts if m.get("status") != "dormant"]
+        filtered_sem = [m for m in filtered_sem if m.get("status") != "dormant"]
+
+    # --- Min vitality filter ---
+    if params.min_vitality > 0:
+        filtered_fts = [
+            m for m in filtered_fts
+            if (m.get("vitality") or 1.0) >= params.min_vitality
+        ]
+        filtered_sem = [
+            m for m in filtered_sem
+            if (m.get("vitality") or 1.0) >= params.min_vitality
+        ]
+
     # --- RRF ranking ---
     ranked = rank_rrf(filtered_fts, filtered_sem)
 
@@ -229,6 +248,15 @@ async def memory_search(params: MemorySearchInput) -> str:
         envelope = apply_token_budget(ranked, 0)
     else:
         envelope = apply_token_budget(ranked, params.token_budget)
+
+    # --- Record access for returned results (fire-and-forget) ---
+    returned_ids = [m["id"] for m in envelope["memories"]]
+    if returned_ids:
+        async def _record_accesses(ids: list[str]) -> None:
+            for mid in ids:
+                await asyncio.to_thread(record_access, mid)
+
+        asyncio.create_task(_record_accesses(returned_ids))
 
     # --- Format response ---
     if params.response_format == ResponseFormat.JSON:
@@ -993,6 +1021,128 @@ async def remind_me_self_update(force: bool = False) -> str:
         )
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Classification tools (Phase 11 Plan 02)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool(
+    name="remind_me_reclassify",
+    annotations={
+        "title": "Reclassify Memories",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def remind_me_reclassify(params: ReclassifyInput) -> str:
+    """Apply memory type classifications to one or more memories.
+
+    For each classification, sets the memory's memory_type and updates its
+    decay_rate to match the per-category rate from the DECAY_RATES table.
+    Classification is idempotent -- reclassifying a memory overwrites its
+    previous type and decay rate.
+
+    Args:
+        params: List of {memory_id, memory_type} classification pairs.
+
+    Returns:
+        JSON string with updated count, not_found IDs, and total processed.
+    """
+    db = _get_db()
+    now = _now_iso()
+    updated = 0
+    not_found: list[str] = []
+
+    for classification in params.classifications:
+        row = db.execute(
+            "SELECT id FROM memories WHERE id = ?",
+            (classification.memory_id,),
+        ).fetchone()
+
+        if row is None:
+            not_found.append(classification.memory_id)
+            continue
+
+        decay_rate = DECAY_RATES.get(classification.memory_type, 0.10)
+        db.execute(
+            "UPDATE memories SET memory_type = ?, decay_rate = ?, updated_at = ? WHERE id = ?",
+            (classification.memory_type, decay_rate, now, classification.memory_id),
+        )
+        updated += 1
+
+    db.commit()
+
+    result = {
+        "updated": updated,
+        "not_found": not_found,
+        "total": len(params.classifications),
+    }
+    return json.dumps(result)
+
+
+@mcp.tool(
+    name="remind_me_reclassify_batch",
+    annotations={
+        "title": "Get Unclassified Memories",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def remind_me_reclassify_batch(params: ReclassifyBatchInput) -> str:
+    """Fetch a batch of unclassified memories for Claude to classify.
+
+    Returns memories with memory_type='unclassified' so Claude can review
+    their content and call remind_me_reclassify with appropriate types.
+    Each memory includes its id, a content snippet (first 500 chars),
+    category, and tags.
+
+    Args:
+        params: Batch size (default 20, max 100).
+
+    Returns:
+        JSON string with memories array and total_unclassified count.
+    """
+    db = _get_db()
+
+    # Get total count of unclassified memories
+    total_row = db.execute(
+        "SELECT COUNT(*) as cnt FROM memories WHERE memory_type = 'unclassified'",
+    ).fetchone()
+    total_unclassified = total_row["cnt"]
+
+    # Fetch batch
+    rows = db.execute(
+        "SELECT id, substr(content, 1, 500) as content_snippet, category, tags "
+        "FROM memories WHERE memory_type = 'unclassified' LIMIT ?",
+        (params.batch_size,),
+    ).fetchall()
+
+    memories = []
+    for row in rows:
+        tags = row["tags"]
+        if isinstance(tags, str):
+            try:
+                tags = json.loads(tags)
+            except (json.JSONDecodeError, TypeError):
+                tags = []
+        memories.append({
+            "id": row["id"],
+            "content_snippet": row["content_snippet"],
+            "category": row["category"],
+            "tags": tags,
+        })
+
+    result = {
+        "memories": memories,
+        "total_unclassified": total_unclassified,
+    }
+    return json.dumps(result, indent=2)
 
 
 # ---------------------------------------------------------------------------

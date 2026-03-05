@@ -96,6 +96,16 @@ class MemorySearchInput(BaseModel):
         le=10000,
     )
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
+    include_dormant: bool = Field(
+        default=False,
+        description="Include dormant memories (vitality < 0.05) in results",
+    )
+    min_vitality: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Minimum vitality score filter. 0.0 means no filter (except dormant exclusion).",
+    )
 
 
 class MemoryListInput(BaseModel):
@@ -280,6 +290,76 @@ class AutoCaptureInput(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Classification models (Phase 11 Plan 02)
+# ---------------------------------------------------------------------------
+
+VALID_MEMORY_TYPES: set[str] = {
+    "decision",
+    "preference",
+    "fact",
+    "insight",
+    "learning",
+    "blocker",
+    "action_item",
+}
+"""Allowed memory_type values for classification (excludes 'unclassified')."""
+
+
+class MemoryClassification(BaseModel):
+    """A single memory classification: maps a memory ID to a memory type."""
+
+    memory_id: str = Field(
+        ...,
+        description="The ID of the memory to classify",
+        min_length=1,
+    )
+    memory_type: str = Field(
+        ...,
+        description=(
+            "The classification type. Must be one of: "
+            "decision, preference, fact, insight, learning, blocker, action_item"
+        ),
+    )
+
+    @field_validator("memory_type")
+    @classmethod
+    def validate_memory_type(cls, v: str) -> str:
+        """Validate that memory_type is one of the allowed classification values."""
+        if v not in VALID_MEMORY_TYPES:
+            raise ValueError(
+                f"Invalid memory_type '{v}'. Must be one of: "
+                f"{', '.join(sorted(VALID_MEMORY_TYPES))}"
+            )
+        return v
+
+
+class ReclassifyInput(BaseModel):
+    """Input for the remind_me_reclassify tool: apply classifications to memories."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    classifications: list[MemoryClassification] = Field(
+        ...,
+        description="List of {memory_id, memory_type} pairs to classify",
+        min_length=1,
+        max_length=100,
+    )
+
+
+class ReclassifyBatchInput(BaseModel):
+    """Input for the remind_me_reclassify_batch tool: fetch unclassified memories."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    batch_size: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="Number of unclassified memories to return",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Exports
 # ---------------------------------------------------------------------------
 
@@ -294,4 +374,8 @@ __all__ = [
     "MemoryStatsInput",
     "BulkImportDirInput",
     "AutoCaptureInput",
+    "MemoryClassification",
+    "ReclassifyInput",
+    "ReclassifyBatchInput",
+    "VALID_MEMORY_TYPES",
 ]
