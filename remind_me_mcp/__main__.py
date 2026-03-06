@@ -24,7 +24,7 @@ import sys
 
 import remind_me_mcp.tools  # noqa: F401 — ensure tools are registered before mcp.run()
 from remind_me_mcp.api import _build_api_app
-from remind_me_mcp.config import SERVE_UI, UI_PORT
+from remind_me_mcp.config import SERVE_UI, SERVE_MCP, UI_PORT, MCP_HTTP_PORT, MCP_HTTP_HOST
 from remind_me_mcp.pid import (
     _check_ui_server_health,
     _read_pid_file,
@@ -37,6 +37,53 @@ from remind_me_mcp.server import mcp
 log = logging.getLogger("remind_me_mcp.__main__")
 
 __all__ = ["main"]
+
+
+def _run_combined(args) -> None:
+    """Run dashboard API and MCP HTTP transport on the same Uvicorn instance."""
+    import uvicorn
+    from starlette.applications import Starlette
+    from starlette.routing import Mount
+
+    from remind_me_mcp.config import MCP_HTTP_SECRET
+
+    dashboard_app = _build_api_app()
+    mcp_http_app = mcp.streamable_http_app()
+
+    # Wrap with bearer auth if secret is configured
+    if MCP_HTTP_SECRET:
+        from starlette.middleware.base import BaseHTTPMiddleware
+        from starlette.responses import Response
+
+        secret = MCP_HTTP_SECRET
+
+        class _BearerAuth(BaseHTTPMiddleware):
+            async def dispatch(self, request, call_next):
+                auth = request.headers.get("Authorization", "")
+                if auth != f"Bearer {secret}":
+                    return Response("Unauthorized", status_code=401)
+                return await call_next(request)
+
+        from starlette.applications import Starlette as _S
+
+        mcp_http_app = _S(routes=list(mcp_http_app.routes))
+        mcp_http_app.add_middleware(_BearerAuth)
+
+    combined = Starlette(
+        routes=[
+            Mount("/mcp", app=mcp_http_app),
+            Mount("/", app=dashboard_app),
+        ]
+    )
+
+    log.info(
+        "Combined server starting — dashboard: http://%s:%d  MCP HTTP: http://%s:%d/mcp",
+        args.ui_host,
+        args.ui_port,
+        args.ui_host,
+        args.ui_port,
+    )
+    uvicorn.run(combined, host=args.ui_host, port=args.ui_port)
 
 
 def main() -> None:
@@ -60,6 +107,14 @@ def main() -> None:
         default="127.0.0.1",
         help="Host to bind the UI server (default: 127.0.0.1)",
     )
+    parser.add_argument(
+        "--serve-mcp",
+        action="store_true",
+        default=SERVE_MCP,
+        help="Run MCP server over Streamable HTTP transport (port 8767 by default)",
+    )
+    parser.add_argument("--mcp-port", type=int, default=MCP_HTTP_PORT, help="MCP HTTP port")
+    parser.add_argument("--mcp-host", default=MCP_HTTP_HOST, help="MCP HTTP host")
     parser.add_argument(
         "--status",
         action="store_true",
@@ -144,6 +199,21 @@ def main() -> None:
             print("\u2717 Dashboard not running")
         print(f"  Database: {status['db_path']} ({'exists' if status['db_exists'] else 'missing'})")
         sys.exit(0)
+
+    # -- MCP HTTP + UI combined mode --
+    if args.serve_mcp and args.serve_ui:
+        _run_combined(args)
+        return
+
+    # -- MCP HTTP standalone mode --
+    if args.serve_mcp:
+        log.info("Starting MCP HTTP transport on %s:%d", args.mcp_host, args.mcp_port)
+        mcp.run(
+            transport="streamable-http",
+            host=args.mcp_host,
+            port=args.mcp_port,
+        )
+        return
 
     # -- UI server mode --
     if args.serve_ui:

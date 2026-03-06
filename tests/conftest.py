@@ -174,7 +174,7 @@ def db_conn_with_vec(monkeypatch: pytest.MonkeyPatch) -> sqlite3.Connection:
 
     Yields the connection; closes it in teardown.
     """
-    import sqlite_vec
+    sqlite_vec = pytest.importorskip("sqlite_vec", reason="sqlite-vec not installed")
 
     db = sqlite3.connect(":memory:", check_same_thread=False)
     db.row_factory = sqlite3.Row

@@ -42,6 +42,12 @@ MODEL_DIR = MEMORY_DIR / "models"
 SERVE_UI = os.environ.get("REMIND_ME_MCP_SERVE_UI", "").lower() in ("true", "1", "yes")
 UI_PORT = int(os.environ.get("REMIND_ME_MCP_UI_PORT", "5199"))
 
+# MCP HTTP transport
+SERVE_MCP: bool = os.environ.get("REMIND_ME_MCP_SERVE_HTTP", "").lower() in ("true", "1", "yes")
+MCP_HTTP_PORT: int = int(os.environ.get("REMIND_ME_MCP_HTTP_PORT", "8767"))
+MCP_HTTP_HOST: str = os.environ.get("REMIND_ME_MCP_HTTP_HOST", "127.0.0.1")
+MCP_HTTP_SECRET: str | None = os.environ.get("REMIND_ME_MCP_HTTP_SECRET") or None
+
 # ---------------------------------------------------------------------------
 # Security
 # ---------------------------------------------------------------------------
@@ -78,6 +84,10 @@ __all__ = [
     "MODEL_DIR",
     "SERVE_UI",
     "UI_PORT",
+    "SERVE_MCP",
+    "MCP_HTTP_PORT",
+    "MCP_HTTP_HOST",
+    "MCP_HTTP_SECRET",
     "API_KEY",
     "IMPORT_ROOTS",
 ]

@@ -410,6 +410,49 @@ Set `REMIND_ME_MCP_DIR` to any path:
 export REMIND_ME_MCP_DIR="/mnt/synced-drive/remind-me"
 ```
 
+## Remote Access via HTTP Transport
+
+The `--serve-mcp` flag runs the MCP server over Streamable HTTP transport, making it accessible remotely without spawning a subprocess.
+
+Claude Code config (remote machine via Tailscale):
+```json
+{
+  "mcpServers": {
+    "remind-me": {
+      "type": "http",
+      "url": "http://100.x.x.x:8767/mcp",
+      "headers": {
+        "Authorization": "Bearer your-secret-here"
+      }
+    }
+  }
+}
+```
+
+SSH tunnel for restricted networks (e.g. work laptop):
+```bash
+ssh -L 8767:localhost:8767 home-pc-wsl
+# then point client at http://localhost:8767/mcp
+```
+
+Systemd user service (`~/.config/systemd/user/remind-me-mcp-http.service`):
+```ini
+[Unit]
+Description=Remind Me MCP HTTP Transport
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/nano/.venv/bin/remind-me-mcp --serve-mcp --mcp-host 0.0.0.0
+Environment=REMIND_ME_MCP_HTTP_SECRET=your-secret
+Environment=REMIND_ME_MCP_HTTP_PORT=8767
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
 ## Search Syntax
 
 The search tool uses SQLite FTS5. Examples:
@@ -429,6 +472,10 @@ The search tool uses SQLite FTS5. Examples:
 | `REMIND_ME_MCP_DIR` | `~/.remind-me` | Directory for the SQLite database |
 | `REMIND_ME_MCP_SERVE_UI` | `false` | Start the HTTP dashboard server instead of stdio MCP |
 | `REMIND_ME_MCP_UI_PORT` | `5199` | Port for the dashboard server |
+| `REMIND_ME_MCP_SERVE_HTTP` | `false` | Run MCP server over Streamable HTTP transport |
+| `REMIND_ME_MCP_HTTP_PORT` | `8767` | Port for the MCP HTTP transport |
+| `REMIND_ME_MCP_HTTP_HOST` | `127.0.0.1` | Host to bind the MCP HTTP transport |
+| `REMIND_ME_MCP_HTTP_SECRET` | *(unset)* | Bearer token for MCP HTTP transport authentication |
 | `REMIND_ME_EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | HuggingFace model for semantic embeddings |
 | `REMIND_ME_API_KEY` | *(unset)* | Bearer token for `/api/*` routes (auth disabled when unset) |
 | `REMIND_ME_IMPORT_ROOTS` | `$HOME` | Colon-separated allowed filesystem roots for import operations |
@@ -484,6 +531,9 @@ remind-me-mcp/
 remind-me-mcp                        # MCP stdio mode (default)
 remind-me-mcp --serve-ui             # Start dashboard UI server
 remind-me-mcp --serve-ui --ui-port 8080 --ui-host 0.0.0.0
+remind-me-mcp --serve-mcp                        # MCP HTTP transport on port 8767
+remind-me-mcp --serve-mcp --mcp-host 0.0.0.0     # Bind to all interfaces
+remind-me-mcp --serve-mcp --serve-ui              # Combined: dashboard + MCP HTTP
 remind-me-mcp --status               # Check if dashboard is running
 remind-me-mcp --version              # Print installed version
 remind-me-mcp --check-update         # Check for available updates
@@ -508,7 +558,7 @@ The server uses:
 - **Peer-to-peer sync** — direct machine-to-machine sync via Tailscale peer discovery
 - **WAL journal mode** for safe concurrent access
 - **Content-based hashing** for deduplication
-- **stdio transport** for MCP compatibility with all Claude interfaces
+- **stdio + Streamable HTTP transports** — stdio for local Claude interfaces; HTTP for remote access via Tailscale or SSH tunnel
 - **Starlette + Uvicorn** for the optional HTTP dashboard and REST API
 - **Self-contained HTML** — the dashboard is served as a single inline page with no build step
 - **Graceful degradation** — semantic search, vitality scoring, and distributed sync are all optional; core functionality works with just FTS5 and local storage
