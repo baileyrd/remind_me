@@ -48,8 +48,6 @@ if TYPE_CHECKING:
     import sqlite3
     from pathlib import Path
 
-    import pytest
-
 # ---------------------------------------------------------------------------
 # memory_add tests
 # ---------------------------------------------------------------------------
@@ -1383,7 +1381,7 @@ async def test_search_min_vitality_filter(
 async def test_search_record_access_called(
     db_conn: sqlite3.Connection,
     memory_factory,
-    monkeypatch: "pytest.MonkeyPatch",
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """record_access is called for returned search results."""
     import remind_me_mcp.tools as _tools_mod
@@ -1658,7 +1656,7 @@ async def test_decompose_creates_one_memory_per_fact(
     from remind_me_mcp.models import AtomicFact, DecomposeInput
     from remind_me_mcp.tools import remind_me_decompose
 
-    parent = memory_factory(
+    memory_factory(
         content="A conversation about Python",
         category="dialog",
         tags=["python", "programming"],
@@ -1915,7 +1913,7 @@ async def test_decompose_batch_returns_total_count(
 # ---------------------------------------------------------------------------
 
 
-async def test_structured_search_by_subject(db_conn: "sqlite3.Connection", memory_factory) -> None:
+async def test_structured_search_by_subject(db_conn: sqlite3.Connection, memory_factory) -> None:
     """Query 'subject:Bailey' returns memories where subject='Bailey' via indexed lookup."""
     memory_factory(
         content="Bailey prefers dark mode",
@@ -1941,7 +1939,7 @@ async def test_structured_search_by_subject(db_conn: "sqlite3.Connection", memor
 
 
 async def test_structured_search_by_subject_and_predicate(
-    db_conn: "sqlite3.Connection", memory_factory
+    db_conn: sqlite3.Connection, memory_factory
 ) -> None:
     """Query 'subject:Bailey predicate:prefers' returns memories matching both conditions."""
     memory_factory(
@@ -1970,7 +1968,7 @@ async def test_structured_search_by_subject_and_predicate(
 
 
 async def test_structured_search_fallback_to_rrf(
-    db_conn: "sqlite3.Connection", memory_factory
+    db_conn: sqlite3.Connection, memory_factory
 ) -> None:
     """Query with structured prefix but no structured results falls back to FTS/semantic."""
     memory_factory(content="Bailey likes dark mode themes")
@@ -1986,7 +1984,7 @@ async def test_structured_search_fallback_to_rrf(
 
 
 async def test_structured_normal_query_no_regression(
-    db_conn: "sqlite3.Connection", memory_factory
+    db_conn: sqlite3.Connection, memory_factory
 ) -> None:
     """Query without subject/predicate prefix goes through normal RRF pipeline."""
     memory_factory(content="Python is a programming language")
@@ -2000,7 +1998,7 @@ async def test_structured_normal_query_no_regression(
 
 
 async def test_structured_search_respects_category_filter(
-    db_conn: "sqlite3.Connection", memory_factory
+    db_conn: sqlite3.Connection, memory_factory
 ) -> None:
     """Structured lookup respects category filter."""
     memory_factory(
@@ -2032,7 +2030,7 @@ async def test_structured_search_respects_category_filter(
 
 
 async def test_structured_search_respects_dormant_filter(
-    db_conn: "sqlite3.Connection", memory_factory
+    db_conn: sqlite3.Connection, memory_factory
 ) -> None:
     """Structured lookup respects include_dormant filter."""
     memory_factory(
@@ -2065,7 +2063,7 @@ async def test_structured_search_respects_dormant_filter(
 
 
 async def test_structured_search_respects_min_vitality(
-    db_conn: "sqlite3.Connection", memory_factory
+    db_conn: sqlite3.Connection, memory_factory
 ) -> None:
     """Structured lookup respects min_vitality filter."""
     memory_factory(
@@ -2096,7 +2094,7 @@ async def test_structured_search_respects_min_vitality(
 
 
 async def test_structured_search_envelope_metadata(
-    db_conn: "sqlite3.Connection", memory_factory
+    db_conn: sqlite3.Connection, memory_factory
 ) -> None:
     """Structured results are wrapped in SearchEnvelope with correct metadata."""
     memory_factory(
@@ -2119,7 +2117,7 @@ async def test_structured_search_envelope_metadata(
 
 
 async def test_structured_search_excludes_superseded(
-    db_conn: "sqlite3.Connection", memory_factory
+    db_conn: sqlite3.Connection, memory_factory
 ) -> None:
     """Structured lookup excludes memories where superseded_by IS NOT NULL."""
     memory_factory(
@@ -2153,7 +2151,7 @@ async def test_structured_search_excludes_superseded(
 
 
 async def test_search_verbose_json_includes_debug_signals(
-    db_conn: "sqlite3.Connection",
+    db_conn: sqlite3.Connection,
 ) -> None:
     """Search with verbose=True and response_format=JSON includes debug_signals block per memory."""
     await memory_add(MemoryAddInput(content="Verbose debug test memory"))
@@ -2178,7 +2176,7 @@ async def test_search_verbose_json_includes_debug_signals(
 
 
 async def test_search_verbose_false_no_debug_signals(
-    db_conn: "sqlite3.Connection",
+    db_conn: sqlite3.Connection,
 ) -> None:
     """Search with verbose=False (default) does NOT include debug_signals."""
     await memory_add(MemoryAddInput(content="No verbose test memory"))
@@ -2197,7 +2195,7 @@ async def test_search_verbose_false_no_debug_signals(
 
 
 async def test_search_json_always_includes_tier_breakdown(
-    db_conn: "sqlite3.Connection",
+    db_conn: sqlite3.Connection,
 ) -> None:
     """JSON envelope always includes tier_breakdown with keyword/semantic/hybrid counts."""
     await memory_add(MemoryAddInput(content="Tier breakdown test memory"))
@@ -2217,7 +2215,7 @@ async def test_search_json_always_includes_tier_breakdown(
 
 
 async def test_search_json_always_includes_dormant_excluded(
-    db_conn: "sqlite3.Connection",
+    db_conn: sqlite3.Connection,
 ) -> None:
     """JSON envelope always includes dormant_excluded count."""
     await memory_add(MemoryAddInput(content="Dormant excluded test memory"))
@@ -2234,7 +2232,7 @@ async def test_search_json_always_includes_dormant_excluded(
 
 
 async def test_search_dormant_excluded_count_accurate(
-    db_conn: "sqlite3.Connection",
+    db_conn: sqlite3.Connection,
     memory_factory,
 ) -> None:
     """dormant_excluded count matches actual number of dormant memories excluded."""
@@ -2256,7 +2254,7 @@ async def test_search_dormant_excluded_count_accurate(
 
 
 async def test_search_markdown_verbose_shows_ranking_info(
-    db_conn: "sqlite3.Connection",
+    db_conn: sqlite3.Connection,
 ) -> None:
     """Markdown response with verbose=True shows ranking info per result."""
     await memory_add(MemoryAddInput(content="Markdown verbose ranking info test"))
@@ -2276,7 +2274,7 @@ async def test_search_markdown_verbose_shows_ranking_info(
 
 
 async def test_search_markdown_always_shows_tier_line(
-    db_conn: "sqlite3.Connection",
+    db_conn: sqlite3.Connection,
 ) -> None:
     """Markdown response always includes tier breakdown summary line."""
     await memory_add(MemoryAddInput(content="Markdown tier summary line test"))

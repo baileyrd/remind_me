@@ -2,18 +2,26 @@
 
 [![CI](https://github.com/baileyrd/remind_me/actions/workflows/ci.yml/badge.svg)](https://github.com/baileyrd/remind_me/actions/workflows/ci.yml)
 
-Persistent, searchable memory that works across **Claude.ai**, **Claude Code**, and **Claude Desktop** — with multi-machine sync support and a built-in dashboard UI.
+Persistent, searchable memory that works across **Claude.ai**, **Claude Code**, and **Claude Desktop** — with intelligent retrieval, multi-machine sync, and a built-in dashboard UI.
 
 ## Features
 
 - **Full-text search** via SQLite FTS5 — fast, offline, no external services
 - **Hybrid semantic search** — FTS5 keyword matching + vector similarity via `sqlite-vec` and a local ONNX embedding model
+- **RRF rank fusion** — Reciprocal Rank Fusion merges keyword, semantic, recency, and vitality signals for best-match retrieval
+- **Token budget** — search results are trimmed to fit within an 800-token default cap (configurable), preventing context overflow
+- **ACT-R vitality model** — cognitive-science-inspired memory decay with per-category rates, access-based reinforcement, and bridge protection for high-value memories
+- **Atomic decomposition** — Claude-driven extraction of atomic facts from conversations, linked to parent memories
+- **Structured triples** — optional subject/predicate/object columns for precise query routing
+- **Vault consolidation** — semantic clustering with Union-Find, canonical selection, and dry-run merge previews
+- **Memory classification** — 7 memory types with single and batch reclassification tools
 - **Distributed sync** — offline-first with outbox pattern, Postgres hub, and peer-to-peer sync over Tailscale
 - **Dashboard UI** — browse, search, add, edit, and delete memories from a web interface
 - **Chat export import** — ingest JSON, JSONL, or Markdown exports from Claude, ChatGPT, or custom formats
 - **Bulk directory import** — point at a folder of exports and import them all
 - **Deduplication** — re-importing the same file is a safe no-op (tracked by file hash)
 - **Tagging & categorization** — organize memories with categories and tags
+- **Search transparency** — debug signals, tier breakdown, and dormant exclusion counts in search results
 - **WAL mode** — SQLite Write-Ahead Logging ensures safe concurrent reads
 
 ## Quick Start
@@ -202,7 +210,7 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | Tool | Description |
 |------|-------------|
 | `remind_me_add` | Store a new memory with content, category, tags, and metadata |
-| `remind_me_search` | Full-text search with FTS5 syntax (AND, OR, NOT, "phrases", prefix*) |
+| `remind_me_search` | Hybrid search with RRF rank fusion, token budget, and dormant exclusion |
 | `remind_me_list` | List memories with filters (category, tags, source) and pagination |
 | `remind_me_get` | Retrieve a single memory by ID |
 | `remind_me_update` | Update a memory's content, category, tags, or metadata |
@@ -212,12 +220,18 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_stats` | View statistics: counts, categories, recent activity |
 | `remind_me_auto_capture` | Capture a full conversation dialog + distilled summary as two linked memories |
 | `remind_me_get_capture` | Retrieve a linked dialog/summary pair by their shared capture_id |
+| `remind_me_reclassify` | Apply a memory type classification to a single memory |
+| `remind_me_reclassify_batch` | Batch-classify unclassified memories by type |
+| `remind_me_decompose` | Break a conversation capture into atomic facts with parent-child linking |
+| `remind_me_decompose_batch` | Batch decomposition of undecomposed captures |
+| `remind_me_consolidate` | Find semantically similar memories, preview clusters, and merge duplicates |
+| `remind_me_vitality_report` | Generate vault health metrics with decay and vitality scores |
+| `remind_me_reindex` | Build vector embeddings for any memories missing them |
 | `remind_me_server_status` | Check if the dashboard UI is running, get its URL, and verify DB connectivity |
-| `remind_me_reindex` | Build vector embeddings for any memories missing them (run after enabling semantic search) |
 | `remind_me_check_update` | Check if a newer version is available on origin/main |
 | `remind_me_self_update` | Pull latest changes from origin and reinstall the package |
 
-16 tools + 2 resources (`stats` and `categories`).
+21 tools + 2 resources (`stats` and `categories`).
 
 ### Auto-Capture: Persisting Full Conversations
 
@@ -418,6 +432,8 @@ The search tool uses SQLite FTS5. Examples:
 | `REMIND_ME_EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | HuggingFace model for semantic embeddings |
 | `REMIND_ME_API_KEY` | *(unset)* | Bearer token for `/api/*` routes (auth disabled when unset) |
 | `REMIND_ME_IMPORT_ROOTS` | `$HOME` | Colon-separated allowed filesystem roots for import operations |
+| `REMIND_ME_RRF_K` | `60` | Smoothing constant for Reciprocal Rank Fusion scoring |
+| `REMIND_ME_CLIENT` | `unknown` | Client identifier reported in server status |
 | `REMIND_ME_NODE_ID` | *(unset)* | Unique identifier for this machine (enables sync when set with HUB_URL and SYNC_SECRET) |
 | `REMIND_ME_HUB_URL` | *(unset)* | URL of the sync hub (e.g., `http://100.x.x.x:8765`) |
 | `REMIND_ME_SYNC_SECRET` | *(unset)* | Shared bearer token for hub and peer authentication |
@@ -430,31 +446,34 @@ The search tool uses SQLite FTS5. Examples:
 
 ```
 remind-me-mcp/
-├── remind_me_mcp/              # Main package
+├── remind_me_mcp/              # Main package (13 modules + dashboard subpackage)
 │   ├── __init__.py             # Package exports, version
 │   ├── __main__.py             # CLI entry point, mode dispatch
 │   ├── server.py               # FastMCP instance, app lifespan
-│   ├── tools.py                # 16 MCP tools + 2 resources
+│   ├── tools.py                # 21 MCP tools + 2 resources
 │   ├── models.py               # Pydantic input models
 │   ├── config.py               # Environment configuration, constants
-│   ├── db.py                   # SQLite schema, migrations, helpers
+│   ├── db.py                   # SQLite schema, migrations (v0–v7), helpers
 │   ├── api.py                  # Starlette HTTP API + dashboard HTML
 │   ├── importer.py             # Chat export parser & import engine
 │   ├── embeddings.py           # ONNX embedding engine
 │   ├── formatting.py           # Memory markdown/JSON formatters
+│   ├── retrieval.py            # RRF rank fusion, recency signals, token budget
+│   ├── vitality.py             # ACT-R decay model, access recording, bridge protection
+│   ├── consolidation.py        # Semantic clustering (Union-Find), canonical selection, merge
 │   ├── pid.py                  # PID file management, instance detection
 │   ├── updater.py              # Version checking, self-update logic
 │   ├── sync.py                 # Background sync engine (hub + peer push/pull)
 │   ├── peer_server.py          # Lightweight HTTP server for peer-to-peer sync
 │   └── dashboard/
 │       └── App.jsx             # React dashboard component
-├── tests/                      # Test suite (pytest + pytest-asyncio)
+├── tests/                      # Test suite — 308 tests (pytest + pytest-asyncio)
 ├── remind_me_dashboard.jsx     # Standalone React artifact for Claude.ai preview
 ├── pyproject.toml              # Package configuration and dependencies
 └── README.md                   # This file
 
 ~/.remind-me/                   # Data directory (synced across machines)
-├── memory.db                   # SQLite database with FTS5 + sqlite-vec
+├── memory.db                   # SQLite database with FTS5 + sqlite-vec (schema v7)
 ├── models/                     # Cached ONNX embedding model (~80MB, auto-downloaded)
 └── server.pid                  # PID file when dashboard is running
 ```
@@ -479,7 +498,11 @@ The server uses:
 - **SQLite FTS5** for keyword full-text search (inverted index, boolean queries)
 - **sqlite-vec** for semantic vector search (cosine similarity on embeddings)
 - **all-MiniLM-L6-v2** via ONNX Runtime for local embedding generation (~80MB model, no API keys)
-- **Hybrid ranking** merges keyword and semantic results with deduplication and score fusion
+- **RRF rank fusion** (k=60) — merges keyword, semantic, recency, and vitality signals without score normalization
+- **Token budget** — search results are trimmed to an 800-token default cap to prevent LLM context overflow
+- **ACT-R vitality model** — cognitive-science decay with per-category rates, access reinforcement, and bridge protection
+- **Structured triples** — optional subject/predicate/object columns with indexed query routing
+- **Union-Find clustering** — transitive semantic similarity grouping for vault consolidation
 - **Outbox-based sync** — local writes are captured in `sync_outbox`, pushed to hub/peers in background
 - **Postgres hub** — central sync point with last-write-wins conflict resolution
 - **Peer-to-peer sync** — direct machine-to-machine sync via Tailscale peer discovery
@@ -488,4 +511,4 @@ The server uses:
 - **stdio transport** for MCP compatibility with all Claude interfaces
 - **Starlette + Uvicorn** for the optional HTTP dashboard and REST API
 - **Self-contained HTML** — the dashboard is served as a single inline page with no build step
-- **Graceful degradation** — semantic search and distributed sync are both optional; core functionality works with just FTS5 and local storage
+- **Graceful degradation** — semantic search, vitality scoring, and distributed sync are all optional; core functionality works with just FTS5 and local storage

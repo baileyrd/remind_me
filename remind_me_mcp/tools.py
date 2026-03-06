@@ -16,6 +16,7 @@ import sqlite3
 from typing import Any
 
 from remind_me_mcp.config import CLIENT, NODE_ID
+from remind_me_mcp.consolidation import find_clusters, merge_cluster, pick_canonical
 from remind_me_mcp.db import (
     _embed_and_store,
     _get_db,
@@ -26,7 +27,6 @@ from remind_me_mcp.db import (
 )
 from remind_me_mcp.formatting import _fmt_memories, _fmt_memory_md
 from remind_me_mcp.importer import import_chat_file, import_directory
-from remind_me_mcp.consolidation import find_clusters, merge_cluster, pick_canonical
 from remind_me_mcp.models import (
     AutoCaptureInput,
     BulkImportDirInput,

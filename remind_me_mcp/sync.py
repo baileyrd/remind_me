@@ -17,10 +17,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import socket
-import sqlite3
-from datetime import UTC, datetime
-from typing import Any
+import threading
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import sqlite3
 
 import httpx
 
@@ -321,8 +322,6 @@ async def sync_loop() -> None:
 # ---------------------------------------------------------------------------
 # Thread runner
 # ---------------------------------------------------------------------------
-
-import threading
 
 
 def start_sync_thread() -> threading.Thread:

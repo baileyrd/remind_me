@@ -8,16 +8,18 @@ Covers requirements HYGN-01 through HYGN-05.
 from __future__ import annotations
 
 import json
-import sqlite3
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
 from pydantic import ValidationError
 
+if TYPE_CHECKING:
+    import sqlite3
+
 from remind_me_mcp.consolidation import find_clusters, merge_cluster, pick_canonical
 from remind_me_mcp.db import _make_id, _now_iso
 from remind_me_mcp.models import ConsolidateInput
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -471,7 +473,7 @@ class TestConsolidateToolIntegration:
         monkeypatch.setattr(_tools_mod, "_embed_and_store", lambda mid, c: True)
 
         # 2 identical memories, but one already superseded
-        id_active = _insert_memory_with_vec(db_conn_with_vec, mock_embedder, content="already merged content")
+        _insert_memory_with_vec(db_conn_with_vec, mock_embedder, content="already merged content")
         _insert_memory_with_vec(
             db_conn_with_vec, mock_embedder,
             content="already merged content",

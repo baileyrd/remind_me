@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh run list --limit 5)",
+      "Bash(gh run view 22744757280 --log-failed)",
+      "Bash(ruff check --output-format=concise .)",
+      "Bash(ruff check --fix .)"
+    ]
+  }
+}

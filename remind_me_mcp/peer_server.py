@@ -7,6 +7,7 @@ through the hub. Uses the same push/pull protocol as the hub.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from datetime import UTC, datetime
@@ -82,10 +83,8 @@ class PeerHandler(BaseHTTPRequestHandler):
                 # Ensure tags/metadata are parsed for JSON serialization
                 for field in ("tags", "metadata"):
                     if isinstance(d.get(field), str):
-                        try:
+                        with contextlib.suppress(json.JSONDecodeError):
                             d[field] = json.loads(d[field])
-                        except json.JSONDecodeError:
-                            pass
                 records.append(d)
 
             self._send_json(200, {"records": records, "count": len(records)})

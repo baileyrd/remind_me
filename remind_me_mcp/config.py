@@ -7,6 +7,7 @@ sensible defaults. No magic globals; every constant is exported via __all__.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -81,11 +82,9 @@ __all__ = [
     "IMPORT_ROOTS",
 ]
 
-
-import json
-import os
-
+# ---------------------------------------------------------------------------
 # Sync configuration
+# ---------------------------------------------------------------------------
 NODE_ID = os.environ.get("REMIND_ME_NODE_ID", "")
 CLIENT: str = os.getenv("REMIND_ME_CLIENT", "unknown")
 HUB_URL = os.environ.get("REMIND_ME_HUB_URL", "")

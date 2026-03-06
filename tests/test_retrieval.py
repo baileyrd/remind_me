@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 
-import pytest
-
+if TYPE_CHECKING:
+    from remind_me_mcp.retrieval import SearchEnvelope
 
 # ---------------------------------------------------------------------------
 # Helpers to build fake memory dicts
@@ -14,7 +15,7 @@ import pytest
 
 def _mem(mid: str, content: str = "x", created_at: str | None = None, **extra) -> dict:
     """Build a minimal memory dict for testing."""
-    now = datetime.now(tz=timezone.utc)
+    now = datetime.now(tz=UTC)
     return {
         "id": mid,
         "content": content,
@@ -28,7 +29,7 @@ def _mem(mid: str, content: str = "x", created_at: str | None = None, **extra) -
     }
 
 
-_NOW = datetime.now(tz=timezone.utc)
+_NOW = datetime.now(tz=UTC)
 
 
 def _ts(days_ago: int) -> str:
@@ -172,6 +173,7 @@ class TestRRFKConfig:
         # Ensure env var not set, then reimport
         os.environ.pop("REMIND_ME_RRF_K", None)
         import importlib
+
         import remind_me_mcp.retrieval as mod
         importlib.reload(mod)
         assert mod.RRF_K == 60
@@ -181,6 +183,7 @@ class TestRRFKConfig:
         os.environ["REMIND_ME_RRF_K"] = "42"
         try:
             import importlib
+
             import remind_me_mcp.retrieval as mod
             importlib.reload(mod)
             assert mod.RRF_K == 42
@@ -269,8 +272,6 @@ class TestSearchEnvelope:
 
     def test_envelope_has_required_fields(self):
         """SearchEnvelope should have all 5 metadata fields plus memories."""
-        from remind_me_mcp.retrieval import SearchEnvelope
-
         env: SearchEnvelope = {
             "memories": [],
             "total_candidates": 0,

@@ -101,10 +101,8 @@ def _close_db() -> None:
     global _schema_ready
     with _connections_lock:
         for conn in _all_connections:
-            try:
+            with contextlib.suppress(Exception):
                 conn.close()
-            except Exception:
-                pass
         _all_connections.clear()
         _schema_ready = False
     # Clear the calling thread's local reference
@@ -227,12 +225,12 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         _migrate_v1_to_v2(db)
         db.execute("PRAGMA user_version = 2")
         current_version = 2
-    
+
     if current_version < 3:
         _migrate_v2_to_v3(db)
         db.execute("PRAGMA user_version = 3")
         current_version = 3
-    
+
     if current_version < 4:
         _migrate_v3_to_v4(db)
         db.execute("PRAGMA user_version = 4")
