@@ -28,17 +28,33 @@ Persistent, searchable memory that works across **Claude.ai**, **Claude Code**, 
 
 ### 1. Install
 
+Pick **one** install method below. Each puts the `remind-me-mcp` entrypoint at a known, stable path — reference that exact path in your MCP client config (see step 2/3) so the launcher can find it.
+
+#### Option A — `uv tool install` (recommended, isolated, no venv to manage)
+
 ```bash
-# Clone the repository
+git clone https://github.com/baileyrd/remind_me.git ~/remind-me-mcp
+cd ~/remind-me-mcp
+uv tool install -e .
+```
+
+Entrypoint lands at `~/.local/bin/remind-me-mcp` (i.e. `/home/<user>/.local/bin/remind-me-mcp`).
+
+#### Option B — project-local `.venv`
+
+```bash
 git clone https://github.com/baileyrd/remind_me.git ~/remind-me-mcp
 cd ~/remind-me-mcp
 
-# Install with uv (recommended)
-uv pip install -e .
-
-# Or with pip
-pip install -e .
+# Create the venv first — without this, `uv pip install -e .` may install
+# into the system Python and leave .venv/bin/remind-me-mcp missing.
+uv venv                       # or: python3.11 -m venv .venv
+uv pip install -e .            # or: .venv/bin/pip install -e .
 ```
+
+Entrypoint lands at `~/remind-me-mcp/.venv/bin/remind-me-mcp`.
+
+> **Heads up — the MCP client config must reference an absolute path that actually exists.** A common failure mode is to put `/path/to/repo/.venv/bin/remind-me-mcp` in `claude_desktop_config.json` while the install actually went to `~/.local/bin/remind-me-mcp` (or vice versa). The server then silently fails to launch and no tools are discovered. Run `ls -l <the-path-from-your-config>` to confirm it exists before debugging anything else.
 
 ### 2. Configure for Claude Code
 
