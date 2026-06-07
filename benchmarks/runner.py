@@ -143,13 +143,20 @@ async def run(args: argparse.Namespace) -> int:
         file=sys.stderr,
     )
 
-    by_mode_results: dict[str, list[QueryResult]] = {}
-    for mode in modes:
-        t0 = time.time()
-        by_mode_results[mode] = await _run_mode(
-            items, mode, args.embedder, ks, args.limit, args.skip_abstention, args.progress
-        )
-        print(f"  mode '{mode}' done in {time.time() - t0:.1f}s", file=sys.stderr)
+    import remind_me_mcp.tools as tools_mod
+
+    saved_sanitize = tools_mod.FTS_SANITIZE_FALLBACK
+    tools_mod.FTS_SANITIZE_FALLBACK = not args.no_sanitize
+    try:
+        by_mode_results: dict[str, list[QueryResult]] = {}
+        for mode in modes:
+            t0 = time.time()
+            by_mode_results[mode] = await _run_mode(
+                items, mode, args.embedder, ks, args.limit, args.skip_abstention, args.progress
+            )
+            print(f"  mode '{mode}' done in {time.time() - t0:.1f}s", file=sys.stderr)
+    finally:
+        tools_mod.FTS_SANITIZE_FALLBACK = saved_sanitize
 
     by_mode_buckets = {
         mode: metrics_mod.aggregate(results, ks) for mode, results in by_mode_results.items()
@@ -205,6 +212,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--progress", action="store_true", help="Print progress to stderr")
     p.add_argument("--out", type=str, help="Write detailed results JSON to this path")
+    p.add_argument(
+        "--no-sanitize",
+        action="store_true",
+        help="Disable the FTS5 query-sanitization fallback (legacy behavior; for before/after)",
+    )
     p.set_defaults(skip_abstention=True)
     return p
 

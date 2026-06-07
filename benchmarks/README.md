@@ -119,10 +119,27 @@ its name to `--ingest`.
   full `sqlite-vec` path offline but its scores are **not** meaningful for
   quality — the runner prints a reminder when you use it.
 
+## Before/after: the FTS5 sanitization fix
+
+`remind_me_search` previously dropped the keyword tier on any natural-language
+question with punctuation (invalid FTS5 syntax). To quantify the fix that
+recovers it:
+
+```bash
+python -m benchmarks.before_after --ks 1,3,5            # bundled sample, FTS-only
+python -m benchmarks.before_after --data benchmarks/data/longmemeval_oracle.json --embedder real
+```
+
+It runs the same dataset with the sanitization fallback off (legacy) and on
+(shipped default), printing a side-by-side table and the deltas. Measured
+results are in [`RESULTS.md`](RESULTS.md) — on the bundled sample the keyword
+tier goes from **R@3 0.000 → 1.000**. The same toggle is available on the main
+runner via `--no-sanitize`.
+
 ## Tests
 
 ```bash
-pytest tests/test_benchmarks.py -q
+pytest tests/test_benchmarks.py tests/test_search_sanitize.py -q
 ```
 
 These are fully offline (the end-to-end test uses `--embedder none`).

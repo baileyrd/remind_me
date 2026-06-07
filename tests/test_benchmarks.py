@@ -255,6 +255,24 @@ def test_harness_ingest_and_search_fts():
         assert memories[0]["metadata"]["session_id"] == sid
 
 
+async def test_before_after_sample_shows_improvement():
+    """On the bundled punctuated sample, sanitization lifts keyword-only recall."""
+    from pathlib import Path
+
+    from benchmarks.before_after import _score
+    from benchmarks.longmemeval import load_dataset
+
+    sample = Path(__file__).resolve().parents[1] / "benchmarks" / "sample" / "longmemeval_sample.json"
+    items = load_dataset(sample)
+    ks = [1, 3, 5]
+
+    before = await _score(items, "verbatim", "none", ks, limit=100, sanitize=False)
+    after = await _score(items, "verbatim", "none", ks, limit=100, sanitize=True)
+
+    assert before["overall"].recall(3) == 0.0  # punctuated NL queries can't match raw FTS5
+    assert after["overall"].recall(3) > 0.9    # sanitized OR-of-terms recovers them
+
+
 async def test_end_to_end_synthetic_recall_perfect():
     """FTS-only retrieval on the synthetic set is deterministic Recall@1 == 1.0."""
     items = make_dataset(6)

@@ -75,6 +75,24 @@ async def test_raw_question_alone_would_not_match_without_sanitization(db_conn, 
         ).fetchall()
 
 
+async def test_toggle_disables_fallback(db_conn, memory_factory, _no_semantic, monkeypatch):
+    """With FTS_SANITIZE_FALLBACK off, a punctuated NL query yields no keyword hits."""
+    memory_factory(content="The capstone degree project covered marine biology.")
+    params = MemorySearchInput(
+        query="What degree did I graduate with?",
+        response_format=ResponseFormat.JSON,
+        token_budget=0,
+    )
+
+    monkeypatch.setattr("remind_me_mcp.tools.FTS_SANITIZE_FALLBACK", False)
+    payload_off = json.loads(await memory_search(params))
+    assert payload_off["memories"] == []
+
+    monkeypatch.setattr("remind_me_mcp.tools.FTS_SANITIZE_FALLBACK", True)
+    payload_on = json.loads(await memory_search(params))
+    assert payload_on["memories"], "fallback on should recover keyword matches"
+
+
 async def test_valid_fts_syntax_still_works(db_conn, memory_factory, _no_semantic):
     memory_factory(content="Notes on biology coursework.")
     memory_factory(content="Notes on chemistry coursework.")

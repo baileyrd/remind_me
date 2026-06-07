@@ -60,6 +60,12 @@ log = logging.getLogger("remind_me_mcp.tools")
 
 EMBED_BATCH_SIZE = 32
 
+# When True, a query that isn't valid FTS5 (e.g. a natural-language question with
+# punctuation) is retried as a sanitized OR-of-terms expression instead of being
+# dropped. Disable to restore the legacy "skip keyword tier on syntax error"
+# behavior — used by the before/after benchmark to quantify the fix's impact.
+FTS_SANITIZE_FALLBACK = True
+
 
 # ---------------------------------------------------------------------------
 # Structured query detection and lookup
@@ -399,17 +405,20 @@ async def memory_search(params: MemorySearchInput) -> str:
         # Try the query as-is first so documented FTS5 syntax (OR, NOT, "phrase",
         # prefix*) keeps working for power users.
         fts_memories = _run_fts(params.query)
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as raw_err:
         # Raw query isn't valid FTS5 (typical for natural-language questions with
         # punctuation). Retry with a sanitized OR-of-terms expression instead of
         # giving up — this keeps the keyword tier contributing to hybrid ranking.
-        safe_query = _sanitize_fts_query(params.query)
+        # The fallback can be disabled (e.g. for benchmarking) via FTS_SANITIZE_FALLBACK.
+        safe_query = _sanitize_fts_query(params.query) if FTS_SANITIZE_FALLBACK else ""
         if safe_query:
             try:
                 fts_memories = _run_fts(safe_query)
             except sqlite3.OperationalError as e:
                 log.warning("FTS5 query syntax error for query %r (sanitized %r): %s",
                             params.query, safe_query, e)
+        else:
+            log.warning("FTS5 query syntax error for query %r: %s", params.query, raw_err)
 
     # --- Semantic vector search ---
     sem_memories = await asyncio.to_thread(_semantic_search, params.query, limit=params.limit)
