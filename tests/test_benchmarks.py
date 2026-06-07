@@ -12,6 +12,7 @@ import json
 
 import pytest
 
+from benchmarks import download_data
 from benchmarks import ingest as ingest_mod
 from benchmarks import metrics as metrics_mod
 from benchmarks.harness import Harness
@@ -197,6 +198,45 @@ def test_make_dataset_includes_abstention():
     items = make_dataset(5)
     assert len(items) == 6  # 5 answerable + 1 abstention
     assert any(it.is_abstention for it in items)
+
+
+# ---------------------------------------------------------------------------
+# download helper (offline pieces only)
+# ---------------------------------------------------------------------------
+
+
+def test_download_datasets_registry():
+    assert set(download_data.DATASETS) == {"oracle", "s", "m"}
+    assert download_data.DATASETS["oracle"] == "longmemeval_oracle.json"
+
+
+def test_download_human_readable_sizes():
+    assert download_data._human(512) == "512.0B"
+    assert download_data._human(1536) == "1.5KB"
+    assert download_data._human(5 * 1024 * 1024) == "5.0MB"
+
+
+def test_download_validate_json(tmp_path):
+    good = tmp_path / "good.json"
+    good.write_text(json.dumps([{"question_id": "a"}, {"question_id": "b"}]))
+    assert download_data._validate_json(good) == 2
+
+    wrapped = tmp_path / "wrapped.json"
+    wrapped.write_text(json.dumps({"data": [{"question_id": "a"}]}))
+    assert download_data._validate_json(wrapped) == 1
+
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"nope": 1}))
+    with pytest.raises(ValueError, match="not a JSON list"):
+        download_data._validate_json(bad)
+
+
+def test_download_fetch_skips_existing(tmp_path, capsys):
+    existing = tmp_path / download_data.DATASETS["oracle"]
+    existing.write_text("[]")
+    # force=False and file present -> returns without any network call.
+    result = download_data.fetch("oracle", tmp_path, force=False)
+    assert result == existing
 
 
 # ---------------------------------------------------------------------------

@@ -47,14 +47,20 @@ before downloading the real data.
 
 ## Run on LongMemEval
 
-1. Download the dataset from the
-   [LongMemEval repo](https://github.com/xiaowu0162/LongMemEval) (e.g.
-   `longmemeval_s.json` or `longmemeval_oracle.json`).
-2. Run:
+1. **Download the dataset** (one command — fetches from the official cleaned
+   HuggingFace repo into `benchmarks/data/`, git-ignored):
+
+```bash
+python -m benchmarks.download_data --dataset oracle    # smallest, start here
+# or: --dataset s   (standard 115k-token haystacks)
+# or: --dataset m   (largest)   |   --dataset all
+```
+
+2. **Run the benchmark:**
 
 ```bash
 python -m benchmarks.runner \
-  --data /path/to/longmemeval_s.json \
+  --data benchmarks/data/longmemeval_oracle.json \
   --ingest verbatim,atomic \
   --embedder real \
   --ks 1,3,5,10 \
@@ -65,6 +71,10 @@ python -m benchmarks.runner \
 `--embedder real` downloads `all-MiniLM-L6-v2` (~80 MB) on first use and needs
 HuggingFace access. The output is a Markdown table (stdout) plus a detailed
 JSON file (`--out`) containing per-question scores.
+
+> Dataset filenames: `download_data` saves `longmemeval_oracle.json`,
+> `longmemeval_s_cleaned.json`, and `longmemeval_m_cleaned.json`. Point
+> `--data` at whichever you fetched.
 
 ### Useful flags
 
