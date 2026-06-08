@@ -496,6 +496,10 @@ The search tool uses SQLite FTS5. Examples:
 | `REMIND_ME_API_KEY` | *(unset)* | Bearer token for `/api/*` routes (auth disabled when unset) |
 | `REMIND_ME_IMPORT_ROOTS` | `$HOME` | Colon-separated allowed filesystem roots for import operations |
 | `REMIND_ME_RRF_K` | `60` | Smoothing constant for Reciprocal Rank Fusion scoring |
+| `REMIND_ME_RRF_W_KEYWORD` | `1.0` | RRF weight for the keyword (FTS5) signal |
+| `REMIND_ME_RRF_W_SEMANTIC` | `1.0` | RRF weight for the semantic (vector) signal |
+| `REMIND_ME_RRF_W_RECENCY` | `1.0` | RRF weight for the recency signal (set `0` for a pure-retrieval profile) |
+| `REMIND_ME_RRF_W_VITALITY` | `1.0` | RRF weight for the vitality signal (set `0` for a pure-retrieval profile) |
 | `REMIND_ME_CLIENT` | `unknown` | Client identifier reported in server status |
 | `REMIND_ME_NODE_ID` | *(unset)* | Unique identifier for this machine (enables sync when set with HUB_URL and SYNC_SECRET) |
 | `REMIND_ME_HUB_URL` | *(unset)* | URL of the sync hub (e.g., `http://100.x.x.x:8765`) |

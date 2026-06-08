@@ -24,7 +24,7 @@ import sys
 
 import remind_me_mcp.tools  # noqa: F401 — ensure tools are registered before mcp.run()
 from remind_me_mcp.api import _build_api_app
-from remind_me_mcp.config import SERVE_UI, SERVE_MCP, UI_PORT, MCP_HTTP_PORT, MCP_HTTP_HOST
+from remind_me_mcp.config import MCP_HTTP_HOST, MCP_HTTP_PORT, SERVE_MCP, SERVE_UI, UI_PORT
 from remind_me_mcp.pid import (
     _check_ui_server_health,
     _read_pid_file,
@@ -64,9 +64,7 @@ def _run_combined(args) -> None:
                     return Response("Unauthorized", status_code=401)
                 return await call_next(request)
 
-        from starlette.applications import Starlette as _S
-
-        mcp_http_app = _S(routes=list(mcp_http_app.routes))
+        mcp_http_app = Starlette(routes=list(mcp_http_app.routes))
         mcp_http_app.add_middleware(_BearerAuth)
 
     combined = Starlette(

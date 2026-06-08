@@ -1,0 +1,160 @@
+[
+  {
+    "question_id": "sample_1",
+    "question_type": "single-session-user",
+    "question": "What degree did I graduate with, and from where?",
+    "answer": "A Bachelor of Science in Marine Biology from Cornell.",
+    "haystack_session_ids": ["s1a", "s1b", "s1c", "s1d"],
+    "answer_session_ids": ["s1c"],
+    "haystack_sessions": [
+      [{"role": "user", "content": "Any tips for roasting coffee beans at home?"}, {"role": "assistant", "content": "Start with a light roast and a popcorn popper."}],
+      [{"role": "user", "content": "I need to fix a squeaky bicycle chain."}, {"role": "assistant", "content": "Degrease it and apply a wet lubricant."}],
+      [{"role": "user", "content": "I finally framed my diploma today."}, {"role": "assistant", "content": "Congrats! Your degree, a Bachelor of Science in Marine Biology from Cornell, deserves a nice frame.", "has_answer": true}],
+      [{"role": "user", "content": "What's a good documentary about the ocean?"}, {"role": "assistant", "content": "My Octopus Teacher is wonderful."}]
+    ]
+  },
+  {
+    "question_id": "sample_2",
+    "question_type": "single-session-assistant",
+    "question": "What Jamaican snapper dish did you recommend I try?",
+    "answer": "Escovitch fish with pineapple salsa.",
+    "haystack_session_ids": ["s2a", "s2b", "s2c"],
+    "answer_session_ids": ["s2b"],
+    "haystack_sessions": [
+      [{"role": "user", "content": "Recommend a hiking trail near the coast."}, {"role": "assistant", "content": "Try the cliffside loop at sunrise."}],
+      [{"role": "user", "content": "I'm cooking Caribbean food this weekend."}, {"role": "assistant", "content": "For Jamaican flavors, try Escovitch snapper with a pineapple salsa.", "has_answer": true}],
+      [{"role": "user", "content": "How do I descale my espresso machine?"}, {"role": "assistant", "content": "Run a citric acid solution through it."}]
+    ]
+  },
+  {
+    "question_id": "sample_3",
+    "question_type": "single-session-preference",
+    "question": "What color did I repaint my bedroom walls?",
+    "answer": "Sage green.",
+    "haystack_session_ids": ["s3a", "s3b", "s3c"],
+    "answer_session_ids": ["s3a"],
+    "haystack_sessions": [
+      [{"role": "user", "content": "I just repainted my bedroom this weekend."}, {"role": "assistant", "content": "Sage green walls sound calming and modern.", "has_answer": true}],
+      [{"role": "user", "content": "What's a good playlist for focus?"}, {"role": "assistant", "content": "Lo-fi beats or ambient piano."}],
+      [{"role": "user", "content": "My tomato plants have yellow leaves."}, {"role": "assistant", "content": "Could be overwatering or nitrogen deficiency."}]
+    ]
+  },
+  {
+    "question_id": "sample_4",
+    "question_type": "temporal-reasoning",
+    "question": "When did I volunteer at the animal shelter's fundraising dinner?",
+    "answer": "Last March.",
+    "haystack_session_ids": ["s4a", "s4b", "s4c"],
+    "answer_session_ids": ["s4b"],
+    "haystack_sessions": [
+      [{"role": "user", "content": "Suggest a board game for four players."}, {"role": "assistant", "content": "Ticket to Ride is a great pick."}],
+      [{"role": "user", "content": "Back in March I helped out at a charity event."}, {"role": "assistant", "content": "Volunteering at the animal shelter's fundraising dinner last March was generous of you.", "has_answer": true}],
+      [{"role": "user", "content": "How long should I bake sourdough?"}, {"role": "assistant", "content": "About 45 minutes at 230C."}]
+    ]
+  },
+  {
+    "question_id": "sample_5",
+    "question_type": "knowledge-update",
+    "question": "What is my current job title now that I switched roles?",
+    "answer": "Staff Data Engineer.",
+    "haystack_session_ids": ["s5a", "s5b", "s5c", "s5d"],
+    "answer_session_ids": ["s5d"],
+    "haystack_sessions": [
+      [{"role": "user", "content": "I used to be a junior analyst."}, {"role": "assistant", "content": "Analyst roles build great fundamentals."}],
+      [{"role": "user", "content": "Any tips for a tennis serve?"}, {"role": "assistant", "content": "Toss consistently and follow through."}],
+      [{"role": "user", "content": "Then I was promoted to senior analyst last year."}, {"role": "assistant", "content": "Senior analyst is a solid step up."}],
+      [{"role": "user", "content": "I just changed jobs again this month."}, {"role": "assistant", "content": "Congrats on the new title, Staff Data Engineer!", "has_answer": true}]
+    ]
+  },
+  {
+    "question_id": "sample_6",
+    "question_type": "single-session-user",
+    "question": "Where did I redeem a $5 coupon on coffee creamer?",
+    "answer": "At the Westside grocery store.",
+    "haystack_session_ids": ["s6a", "s6b", "s6c"],
+    "answer_session_ids": ["s6c"],
+    "haystack_sessions": [
+      [{"role": "user", "content": "Recommend a noise-cancelling headphone."}, {"role": "assistant", "content": "The Sony WH-1000 series is excellent."}],
+      [{"role": "user", "content": "How do I prune a rose bush?"}, {"role": "assistant", "content": "Cut above an outward-facing bud."}],
+      [{"role": "user", "content": "I used that coupon for coffee creamer earlier."}, {"role": "assistant", "content": "Nice — redeeming the $5 creamer coupon at the Westside grocery store saved you money.", "has_answer": true}]
+    ]
+  },
+  {
+    "question_id": "sample_7",
+    "question_type": "single-session-preference",
+    "question": "Where do I take my yoga classes?",
+    "answer": "At the Riverside community center.",
+    "haystack_session_ids": ["s7a", "s7b", "s7c"],
+    "answer_session_ids": ["s7a"],
+    "haystack_sessions": [
+      [{"role": "user", "content": "I signed up for yoga again this season."}, {"role": "assistant", "content": "Classes at the Riverside community center are well reviewed.", "has_answer": true}],
+      [{"role": "user", "content": "What's the capital of Australia?"}, {"role": "assistant", "content": "Canberra."}],
+      [{"role": "user", "content": "How do I unclog a slow drain?"}, {"role": "assistant", "content": "Try baking soda and vinegar first."}]
+    ]
+  },
+  {
+    "question_id": "sample_8",
+    "question_type": "multi-session",
+    "question": "What was the name of the playlist I created on Spotify?",
+    "answer": "Deep Focus Mornings.",
+    "haystack_session_ids": ["s8a", "s8b", "s8c"],
+    "answer_session_ids": ["s8b"],
+    "haystack_sessions": [
+      [{"role": "user", "content": "I love listening to music while coding."}, {"role": "assistant", "content": "Instrumental music helps many people focus."}],
+      [{"role": "user", "content": "I made a new Spotify playlist last night."}, {"role": "assistant", "content": "Great name — 'Deep Focus Mornings' fits a coding soundtrack perfectly.", "has_answer": true}],
+      [{"role": "user", "content": "What's a quick weeknight pasta?"}, {"role": "assistant", "content": "Cacio e pepe takes ten minutes."}]
+    ]
+  },
+  {
+    "question_id": "sample_9",
+    "question_type": "single-session-user",
+    "question": "What play did I attend at the local community theater?",
+    "answer": "Our Town.",
+    "haystack_session_ids": ["s9a", "s9b", "s9c"],
+    "answer_session_ids": ["s9c"],
+    "haystack_sessions": [
+      [{"role": "user", "content": "Recommend a beginner road bike."}, {"role": "assistant", "content": "A used aluminum frame is a great start."}],
+      [{"role": "user", "content": "How do I keep basil alive indoors?"}, {"role": "assistant", "content": "Bright light and regular watering."}],
+      [{"role": "user", "content": "I went to the community theater on Friday."}, {"role": "assistant", "content": "Hope you enjoyed the play — 'Our Town' is a classic.", "has_answer": true}]
+    ]
+  },
+  {
+    "question_id": "sample_10",
+    "question_type": "single-session-user",
+    "question": "How much did I spend on a designer handbag?",
+    "answer": "$420.",
+    "haystack_session_ids": ["s10a", "s10b", "s10c"],
+    "answer_session_ids": ["s10b"],
+    "haystack_sessions": [
+      [{"role": "user", "content": "What's a good first language to learn to code?"}, {"role": "assistant", "content": "Python is beginner-friendly."}],
+      [{"role": "user", "content": "I splurged on a handbag this weekend."}, {"role": "assistant", "content": "Spending $420 on a designer handbag is a treat — enjoy it!", "has_answer": true}],
+      [{"role": "user", "content": "How do I defrost a windshield fast?"}, {"role": "assistant", "content": "Use lukewarm water, never boiling."}]
+    ]
+  },
+  {
+    "question_id": "sample_11",
+    "question_type": "temporal-reasoning",
+    "question": "What was my last name before I changed it?",
+    "answer": "Whitfield.",
+    "haystack_session_ids": ["s11a", "s11b", "s11c"],
+    "answer_session_ids": ["s11a"],
+    "haystack_sessions": [
+      [{"role": "user", "content": "I legally changed my surname after the wedding."}, {"role": "assistant", "content": "Going from Whitfield to your new last name is a big milestone.", "has_answer": true}],
+      [{"role": "user", "content": "What's a fun card game for two?"}, {"role": "assistant", "content": "Try Gin Rummy."}],
+      [{"role": "user", "content": "How do I clean cast iron?"}, {"role": "assistant", "content": "Hot water, a brush, and re-season with oil."}]
+    ]
+  },
+  {
+    "question_id": "sample_12",
+    "question_type": "single-session-user",
+    "question": "Where did I buy my new tennis racket from?",
+    "answer": "From the downtown pro shop.",
+    "haystack_session_ids": ["s12a", "s12b", "s12c"],
+    "answer_session_ids": ["s12c"],
+    "haystack_sessions": [
+      [{"role": "user", "content": "Suggest a podcast about history."}, {"role": "assistant", "content": "Hardcore History is gripping."}],
+      [{"role": "user", "content": "How do I store fresh herbs longer?"}, {"role": "assistant", "content": "Wrap them in a damp paper towel."}],
+      [{"role": "user", "content": "I picked up a new racket for the season."}, {"role": "assistant", "content": "The downtown pro shop is a great place to buy a tennis racket.", "has_answer": true}]
+    ]
+  }
+]

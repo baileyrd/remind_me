@@ -60,6 +60,12 @@ log = logging.getLogger("remind_me_mcp.tools")
 
 EMBED_BATCH_SIZE = 32
 
+# When True, a query that isn't valid FTS5 (e.g. a natural-language question with
+# punctuation) is retried as a sanitized OR-of-terms expression instead of being
+# dropped. Disable to restore the legacy "skip keyword tier on syntax error"
+# behavior — used by the before/after benchmark to quantify the fix's impact.
+FTS_SANITIZE_FALLBACK = True
+
 
 # ---------------------------------------------------------------------------
 # Structured query detection and lookup
@@ -202,6 +208,31 @@ def _maybe_update_notice(response: str) -> str:
     if notice:
         return response + "\n\n---\n" + notice
     return response
+
+
+def _sanitize_fts_query(query: str) -> str:
+    """Convert an arbitrary query into a safe FTS5 MATCH expression.
+
+    Natural-language questions contain characters that FTS5 treats as operator
+    syntax (``?``, ``,``, ``'``, ``$``, ``.`` …), which makes the raw query an
+    invalid MATCH expression. This helper extracts the word tokens, wraps each
+    in double quotes (so a token like ``or``/``and``/``near`` can't be parsed as
+    an operator), and joins them with ``OR`` so any term can match. BM25 ranking
+    still orders results by term importance, so common words don't dominate.
+
+    Returns an empty string if the query has no usable tokens.
+
+    Args:
+        query: The raw user query.
+
+    Returns:
+        A valid FTS5 MATCH string, or "" when nothing is searchable.
+    """
+    tokens = re.findall(r"\w+", query, flags=re.UNICODE)
+    if not tokens:
+        return ""
+    # Escape any embedded double quotes per FTS5 string rules ("" = literal ").
+    return " OR ".join(f'"{t.replace(chr(34), chr(34) * 2)}"' for t in tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -358,19 +389,36 @@ async def memory_search(params: MemorySearchInput) -> str:
 
     # --- FTS5 keyword search ---
     fts_memories: list[dict] = []
-    try:
+
+    def _run_fts(match_query: str) -> list[dict]:
         rows = db.execute(
             """SELECT m.* FROM memories m
                JOIN memories_fts fts ON m.rowid = fts.rowid
                WHERE memories_fts MATCH ?
                ORDER BY rank
                LIMIT ?""",
-            (params.query, params.limit),
+            (match_query, params.limit),
         ).fetchall()
-        fts_memories = [_row_to_dict(r) for r in rows]
-    except sqlite3.OperationalError as e:
-        # FTS query syntax error — fall through to semantic-only
-        log.warning("FTS5 query syntax error for query %r: %s", params.query, e)
+        return [_row_to_dict(r) for r in rows]
+
+    try:
+        # Try the query as-is first so documented FTS5 syntax (OR, NOT, "phrase",
+        # prefix*) keeps working for power users.
+        fts_memories = _run_fts(params.query)
+    except sqlite3.OperationalError as raw_err:
+        # Raw query isn't valid FTS5 (typical for natural-language questions with
+        # punctuation). Retry with a sanitized OR-of-terms expression instead of
+        # giving up — this keeps the keyword tier contributing to hybrid ranking.
+        # The fallback can be disabled (e.g. for benchmarking) via FTS_SANITIZE_FALLBACK.
+        safe_query = _sanitize_fts_query(params.query) if FTS_SANITIZE_FALLBACK else ""
+        if safe_query:
+            try:
+                fts_memories = _run_fts(safe_query)
+            except sqlite3.OperationalError as e:
+                log.warning("FTS5 query syntax error for query %r (sanitized %r): %s",
+                            params.query, safe_query, e)
+        else:
+            log.warning("FTS5 query syntax error for query %r: %s", params.query, raw_err)
 
     # --- Semantic vector search ---
     sem_memories = await asyncio.to_thread(_semantic_search, params.query, limit=params.limit)
