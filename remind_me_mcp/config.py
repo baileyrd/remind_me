@@ -32,8 +32,17 @@ MEMORY_DIR.mkdir(parents=True, exist_ok=True)
 EMBEDDING_MODEL = os.environ.get(
     "REMIND_ME_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
 )
-EMBEDDING_DIM = 384  # all-MiniLM-L6-v2 output dimension
+EMBEDDING_DIM = int(os.environ.get("REMIND_ME_EMBEDDING_DIM", "384"))
+"""Embedding vector dimension. MUST match the chosen model (all-MiniLM-L6-v2=384,
+nomic-embed-text=768, bge-m3/mxbai-embed-large=1024). Changing this on an existing
+database requires recreating the memories_vec table and running remind_me_reindex."""
 MODEL_DIR = MEMORY_DIR / "models"
+
+# Embedding backend selection: "onnx" (default, in-process ONNX Runtime) or
+# "ollama" (a local Ollama daemon serving an embedding model).
+EMBEDDING_BACKEND = os.environ.get("REMIND_ME_EMBEDDING_BACKEND", "onnx").lower()
+OLLAMA_URL = os.environ.get("REMIND_ME_OLLAMA_URL", "http://localhost:11434")
+OLLAMA_EMBED_MODEL = os.environ.get("REMIND_ME_OLLAMA_EMBED_MODEL", "nomic-embed-text")
 
 # ---------------------------------------------------------------------------
 # UI / dashboard
@@ -81,6 +90,9 @@ __all__ = [
     "PID_FILE",
     "EMBEDDING_MODEL",
     "EMBEDDING_DIM",
+    "EMBEDDING_BACKEND",
+    "OLLAMA_URL",
+    "OLLAMA_EMBED_MODEL",
     "MODEL_DIR",
     "SERVE_UI",
     "UI_PORT",

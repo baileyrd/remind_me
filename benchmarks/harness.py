@@ -132,7 +132,15 @@ class Harness:
             self._patch("remind_me_mcp.embeddings", "_get_embedder", lambda: fake)
             self._patch("remind_me_mcp.embeddings", "_embedder", fake)
             return
-        raise ValueError(f"Unknown embedder mode {self.embedder_mode!r} (real|fake|none)")
+        if self.embedder_mode == "ollama":
+            from remind_me_mcp.embeddings import OllamaEmbedder
+
+            emb = OllamaEmbedder()
+            resolved = emb if emb.available else None  # None => FTS-only fallback
+            self._patch("remind_me_mcp.db", "_get_embedder", lambda: resolved)
+            self._patch("remind_me_mcp.embeddings", "_get_embedder", lambda: resolved)
+            return
+        raise ValueError(f"Unknown embedder mode {self.embedder_mode!r} (real|fake|none|ollama)")
 
     # -- operations --------------------------------------------------------
 

@@ -204,9 +204,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--embedder",
-        choices=["real", "fake", "none"],
+        choices=["real", "fake", "none", "ollama"],
         default="real",
-        help="Embedder: real ONNX model, deterministic fake (offline plumbing), or none/FTS-only",
+        help="Embedder: real ONNX model, ollama (local daemon), deterministic fake, or none/FTS-only",
     )
     p.add_argument("--ks", default="1,3,5,10", help="Comma-separated recall cutoffs (default: 1,3,5,10)")
     p.add_argument("--limit", type=int, default=100, help="Candidate pool size per query (default: 100)")
