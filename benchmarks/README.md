@@ -136,6 +136,23 @@ results are in [`RESULTS.md`](RESULTS.md) — on the bundled sample the keyword
 tier goes from **R@3 0.000 → 1.000**. The same toggle is available on the main
 runner via `--no-sanitize`.
 
+## Before/after: the RRF retrieval profile
+
+RRF fuses four equally-weighted signals (keyword, semantic, recency, vitality);
+recency and vitality are irrelevant on a retrieval benchmark and dilute the real
+signals. The weights are now configurable (env:
+`REMIND_ME_RRF_W_KEYWORD|SEMANTIC|RECENCY|VITALITY`, default `1.0`). Measure the
+effect of dropping recency+vitality:
+
+```bash
+python -m benchmarks.before_after --compare rrf \
+  --data benchmarks/data/longmemeval_s_cleaned.json --ingest atomic --embedder real --ks 1,3,5,10
+```
+
+A full per-type run under the profile is available via
+`python -m benchmarks.runner --rrf-profile retrieval ...`. See
+[`RESULTS.md`](RESULTS.md) for context and the deterministic proof of the lever.
+
 ## Tests
 
 ```bash

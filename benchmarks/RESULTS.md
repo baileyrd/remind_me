@@ -92,6 +92,41 @@ Two caveats worth noting:
    category for both ingest modes.
 3. **Atomic-with-parent-expansion** — combine atomic R@1 with verbatim coverage.
 
+## RRF retrieval profile — dropping recency + vitality
+
+`rank_rrf` fused **four equally-weighted** signals: keyword, semantic, recency,
+and vitality. Recency and vitality are the right features for a *living*
+personal memory, but on a retrieval benchmark every memory is ingested at once
+(recency ≈ ingest order) with vitality ≈ 1.0 — so those two signals are
+relevance-irrelevant noise that together made up **half** of the fused score and
+could demote correct evidence.
+
+The signals are now individually weighted (defaults all `1.0`, so behavior is
+unchanged), configurable per deployment via env vars
+(`REMIND_ME_RRF_W_KEYWORD|SEMANTIC|RECENCY|VITALITY`) and selectable as a
+profile in the benchmark.
+
+**The lever is proven deterministically** in `tests/test_rrf_weights.py`: a
+less-relevant but newer/higher-vitality memory ranks #1 under the default
+weights, and the relevant memory reclaims #1 once recency+vitality are dropped.
+
+Measure the effect on real data (one command, runs the same set with the signals
+on then off, prints Recall@k/MRR deltas):
+
+```bash
+python -m benchmarks.before_after \
+  --compare rrf \
+  --data benchmarks/data/longmemeval_s_cleaned.json \
+  --ingest atomic --embedder real --ks 1,3,5,10
+```
+
+> Not yet run on `longmemeval_s` here — measuring it requires the embedding model
+> and dataset (network access). Expect the gain to concentrate in **R@1 / MRR**,
+> where precise ordering matters; R@5/R@10 should be roughly unchanged since the
+> right session is usually already in the candidate pool. Paste the resulting
+> table here once you've run it. A full per-type run under the profile is also
+> available via `python -m benchmarks.runner --rrf-profile retrieval ...`.
+
 ## FTS5 query-sanitization fix — before/after
 
 Natural-language questions contain punctuation (`?`, `,`, `'`, `$`, `.`) that

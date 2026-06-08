@@ -266,8 +266,8 @@ async def test_before_after_sample_shows_improvement():
     items = load_dataset(sample)
     ks = [1, 3, 5]
 
-    before = await _score(items, "verbatim", "none", ks, limit=100, sanitize=False)
-    after = await _score(items, "verbatim", "none", ks, limit=100, sanitize=True)
+    before = await _score(items, "verbatim", "none", ks, 100, "sanitize", "before")
+    after = await _score(items, "verbatim", "none", ks, 100, "sanitize", "after")
 
     assert before["overall"].recall(3) == 0.0  # punctuated NL queries can't match raw FTS5
     assert after["overall"].recall(3) > 0.9    # sanitized OR-of-terms recovers them

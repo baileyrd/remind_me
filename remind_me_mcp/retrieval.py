@@ -13,6 +13,16 @@ from typing import TypedDict
 RRF_K: int = int(os.environ.get("REMIND_ME_RRF_K", "60"))
 """Reciprocal Rank Fusion smoothing constant. Higher values produce more uniform scores."""
 
+# Per-signal RRF weights. The default (all 1.0) reproduces the original
+# four-signal fusion. Recency and vitality are valuable for a *living* personal
+# memory, but they are relevance-irrelevant on a pure retrieval benchmark and
+# dilute the keyword/semantic signals — set their weights to 0 for a
+# retrieval-quality profile (e.g. REMIND_ME_RRF_W_RECENCY=0).
+RRF_W_KEYWORD: float = float(os.environ.get("REMIND_ME_RRF_W_KEYWORD", "1.0"))
+RRF_W_SEMANTIC: float = float(os.environ.get("REMIND_ME_RRF_W_SEMANTIC", "1.0"))
+RRF_W_RECENCY: float = float(os.environ.get("REMIND_ME_RRF_W_RECENCY", "1.0"))
+RRF_W_VITALITY: float = float(os.environ.get("REMIND_ME_RRF_W_VITALITY", "1.0"))
+
 
 # ---------------------------------------------------------------------------
 # Types
@@ -40,6 +50,10 @@ def rank_rrf(
     semantic_results: list[dict],
     *,
     k: int | None = None,
+    w_keyword: float | None = None,
+    w_semantic: float | None = None,
+    w_recency: float | None = None,
+    w_vitality: float | None = None,
 ) -> list[dict]:
     """Fuse keyword, semantic, recency, and vitality ranked lists via Reciprocal Rank Fusion.
 
@@ -50,13 +64,16 @@ def rank_rrf(
       - vitality_rank: position when all unique memories are sorted by vitality DESC
         (higher vitality = better rank). Memories without a ``vitality`` key default to 1.0.
 
-    The RRF score is ``sum(1 / (k + rank))`` across all four signals.
+    The RRF score is ``sum(weight / (k + rank))`` across all four signals.
     Memories absent from a list receive a penalty rank of ``len(list) + 1``.
 
     Args:
         keyword_results: Memories ranked by keyword/FTS relevance (best first).
         semantic_results: Memories ranked by semantic similarity (best first).
         k: RRF smoothing constant. Defaults to module-level ``RRF_K``.
+        w_keyword, w_semantic, w_recency, w_vitality: Per-signal weights. Each
+            defaults to its module-level ``RRF_W_*`` constant. Set a weight to 0
+            to drop that signal (e.g. recency/vitality for a retrieval profile).
 
     Returns:
         De-duplicated list of memory dicts sorted by RRF score descending,
@@ -65,6 +82,14 @@ def rank_rrf(
     """
     if k is None:
         k = RRF_K
+    if w_keyword is None:
+        w_keyword = RRF_W_KEYWORD
+    if w_semantic is None:
+        w_semantic = RRF_W_SEMANTIC
+    if w_recency is None:
+        w_recency = RRF_W_RECENCY
+    if w_vitality is None:
+        w_vitality = RRF_W_VITALITY
 
     # Collect unique memories by id, preserving dict contents
     seen: dict[str, dict] = {}
@@ -119,10 +144,10 @@ def rank_rrf(
         vr = vitality_rank[mid]
 
         score = (
-            1.0 / (k + kr)
-            + 1.0 / (k + sr)
-            + 1.0 / (k + rr)
-            + 1.0 / (k + vr)
+            w_keyword / (k + kr)
+            + w_semantic / (k + sr)
+            + w_recency / (k + rr)
+            + w_vitality / (k + vr)
         )
 
         mem["_rrf_score"] = score
