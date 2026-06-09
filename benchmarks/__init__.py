@@ -16,6 +16,13 @@ See ``benchmarks/README.md`` for download, run, and interpretation notes.
 
 from __future__ import annotations
 
-__all__ = ["__version__"]
+import logging
+
+__all__ = ["__version__", "quiet_dependency_logs"]
 
 __version__ = "0.1.0"
+
+
+def quiet_dependency_logs() -> None:
+    """Silence httpx's per-request INFO logs (one line per Ollama embedding call)."""
+    logging.getLogger("httpx").setLevel(logging.WARNING)

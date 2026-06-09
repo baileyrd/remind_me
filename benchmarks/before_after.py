@@ -152,6 +152,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point."""
+    from benchmarks import quiet_dependency_logs
+
+    quiet_dependency_logs()
     args = build_parser().parse_args(argv)
     return asyncio.run(run(args))
 
