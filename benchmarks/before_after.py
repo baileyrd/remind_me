@@ -36,6 +36,8 @@ _SAMPLE = Path(__file__).resolve().parent / "sample" / "longmemeval_sample.json"
 _COMPARISONS = {
     "sanitize": ("before (no sanitize)", "after (sanitize)"),
     "rrf": ("before (recency+vitality on)", "after (recency+vitality dropped)"),
+    "rerank": ("before (no reranker)", "after (cross-encoder rerank)"),
+    "hyde": ("before (plain query)", "after (HyDE expansion)"),
 }
 
 
@@ -52,6 +54,14 @@ def _apply_stage(compare: str, stage: str) -> None:
         weight = 0.0 if stage == "after" else 1.0
         retr.RRF_W_RECENCY = weight
         retr.RRF_W_VITALITY = weight
+    elif compare == "rerank":
+        import remind_me_mcp.reranker as rr_mod
+
+        rr_mod.RERANK_BACKEND = "onnx" if stage == "after" else ""
+    elif compare == "hyde":
+        import remind_me_mcp.query_expansion as qe_mod
+
+        qe_mod.EXPANSION_MODE = "hyde" if stage == "after" else ""
 
 
 def _capture_state(compare: str) -> dict:
@@ -60,6 +70,14 @@ def _capture_state(compare: str) -> dict:
         import remind_me_mcp.tools as tools_mod
 
         return {"FTS_SANITIZE_FALLBACK": tools_mod.FTS_SANITIZE_FALLBACK}
+    if compare == "rerank":
+        import remind_me_mcp.reranker as rr_mod
+
+        return {"RERANK_BACKEND": rr_mod.RERANK_BACKEND}
+    if compare == "hyde":
+        import remind_me_mcp.query_expansion as qe_mod
+
+        return {"EXPANSION_MODE": qe_mod.EXPANSION_MODE}
     import remind_me_mcp.retrieval as retr
 
     return {"RRF_W_RECENCY": retr.RRF_W_RECENCY, "RRF_W_VITALITY": retr.RRF_W_VITALITY}
@@ -71,6 +89,14 @@ def _restore_state(compare: str, state: dict) -> None:
         import remind_me_mcp.tools as tools_mod
 
         tools_mod.FTS_SANITIZE_FALLBACK = state["FTS_SANITIZE_FALLBACK"]
+    elif compare == "rerank":
+        import remind_me_mcp.reranker as rr_mod
+
+        rr_mod.RERANK_BACKEND = state["RERANK_BACKEND"]
+    elif compare == "hyde":
+        import remind_me_mcp.query_expansion as qe_mod
+
+        qe_mod.EXPANSION_MODE = state["EXPANSION_MODE"]
     else:
         import remind_me_mcp.retrieval as retr
 
@@ -105,24 +131,62 @@ async def run(args: argparse.Namespace) -> int:
     if args.max_questions:
         items = items[: args.max_questions]
 
+    # Fail loudly when the "after" stage can't actually take effect — a silent
+    # degradation would print a misleading before==after table.
+    if args.compare == "rerank":
+        from remind_me_mcp.reranker import _get_reranker
+
+        if _get_reranker() is None:
+            print(
+                "error: reranker model unavailable (see warnings above) - the "
+                "'after' stage would silently equal 'before'.",
+                file=sys.stderr,
+            )
+            return 2
+    if args.compare == "hyde":
+        from remind_me_mcp.query_expansion import hyde_passage
+
+        if hyde_passage("ping") is None:
+            print(
+                "error: HyDE generation unavailable (is Ollama running with the "
+                "REMIND_ME_HYDE_MODEL model pulled?) - the 'after' stage would "
+                "silently equal 'before'.",
+                file=sys.stderr,
+            )
+            return 2
+
     before_label, after_label = _COMPARISONS[args.compare]
     print(
         f"Before/after [{args.compare}] on {len(items)} questions | ingest={args.ingest} | "
-        f"embedder={args.embedder} | ks={ks}",
+        f"embedder={args.embedder} | rrf-profile={args.rrf_profile} | ks={ks}",
         file=sys.stderr,
     )
 
-    before = await _score(items, args.ingest, args.embedder, ks, args.limit, args.compare, "before")
-    after = await _score(items, args.ingest, args.embedder, ks, args.limit, args.compare, "after")
+    # Both stages run under the chosen RRF profile, so a comparison can be
+    # measured on top of the semantic-only baseline (the headline protocol).
+    import remind_me_mcp.retrieval as retr
+
+    saved_weights = (retr.RRF_W_KEYWORD, retr.RRF_W_RECENCY, retr.RRF_W_VITALITY)
+    if args.rrf_profile in ("retrieval", "semantic"):
+        retr.RRF_W_RECENCY = 0.0
+        retr.RRF_W_VITALITY = 0.0
+    if args.rrf_profile == "semantic":
+        retr.RRF_W_KEYWORD = 0.0
+    try:
+        before = await _score(items, args.ingest, args.embedder, ks, args.limit, args.compare, "before")
+        after = await _score(items, args.ingest, args.embedder, ks, args.limit, args.compare, "after")
+    finally:
+        retr.RRF_W_KEYWORD, retr.RRF_W_RECENCY, retr.RRF_W_VITALITY = saved_weights
 
     table = metrics_mod.format_markdown_table({before_label: before, after_label: after}, ks)
     print("\n" + table + "\n")
 
     b, a = before["overall"], after["overall"]
-    print("Overall deltas (after − before):")
+    # ASCII only: Windows consoles often use cp1252, which can't encode -/arrow glyphs.
+    print("Overall deltas (after - before):")
     for k in ks:
-        print(f"  R@{k}: {b.recall(k):.3f} → {a.recall(k):.3f}  (Δ {a.recall(k) - b.recall(k):+.3f})")
-    print(f"  MRR : {b.mrr:.3f} → {a.mrr:.3f}  (Δ {a.mrr - b.mrr:+.3f})")
+        print(f"  R@{k}: {b.recall(k):.3f} -> {a.recall(k):.3f}  (delta {a.recall(k) - b.recall(k):+.3f})")
+    print(f"  MRR : {b.mrr:.3f} -> {a.mrr:.3f}  (delta {a.mrr - b.mrr:+.3f})")
     return 0
 
 
@@ -139,13 +203,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--compare",
         choices=sorted(_COMPARISONS),
         default="sanitize",
-        help="Which change to measure: 'sanitize' (FTS5 fix) or 'rrf' (drop recency+vitality)",
+        help=(
+            "Which change to measure: 'sanitize' (FTS5 fix), 'rrf' (drop "
+            "recency+vitality), 'rerank' (cross-encoder over top-k), or "
+            "'hyde' (query expansion via Ollama)"
+        ),
     )
     p.add_argument("--ingest", default="verbatim", help="Ingest mode (default: verbatim)")
     p.add_argument("--embedder", choices=["real", "fake", "none", "ollama"], default="none")
     p.add_argument("--ks", default="1,3,5", help="Recall cutoffs (default: 1,3,5)")
     p.add_argument("--limit", type=int, default=100, help="Candidate pool size (default: 100)")
     p.add_argument("--max-questions", type=int, default=0, help="Cap number of questions")
+    p.add_argument(
+        "--rrf-profile",
+        choices=["default", "retrieval", "semantic"],
+        default="default",
+        help=(
+            "RRF signal profile applied to BOTH stages (see benchmarks.runner). "
+            "Use 'semantic' to A/B a change on top of the semantic-only headline "
+            "baseline. Not meaningful together with --compare rrf."
+        ),
+    )
     p.set_defaults(sample=True)
     return p
 

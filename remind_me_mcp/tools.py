@@ -47,6 +47,8 @@ from remind_me_mcp.models import (
     VitalityReportInput,
 )
 from remind_me_mcp.pid import get_server_status
+from remind_me_mcp.query_expansion import expand_query
+from remind_me_mcp.reranker import maybe_rerank
 from remind_me_mcp.retrieval import (
     apply_token_budget,
     build_debug_signals,
@@ -421,8 +423,11 @@ async def memory_search(params: MemorySearchInput) -> str:
         else:
             log.warning("FTS5 query syntax error for query %r: %s", params.query, raw_err)
 
-    # --- Semantic vector search ---
-    sem_memories = await asyncio.to_thread(_semantic_search, params.query, limit=params.limit)
+    # --- Semantic vector search (optionally HyDE-expanded) ---
+    extra_texts = await asyncio.to_thread(expand_query, params.query)
+    sem_memories = await asyncio.to_thread(
+        _semantic_search, params.query, limit=params.limit, extra_texts=extra_texts
+    )
 
     # --- Tag search method on raw results before RRF ---
     fts_ids = {m["id"] for m in fts_memories}
@@ -470,6 +475,9 @@ async def memory_search(params: MemorySearchInput) -> str:
 
     # --- Apply limit, then token budget ---
     ranked = ranked[:params.limit]
+
+    # --- Optional cross-encoder rerank of the top candidates (lever D) ---
+    ranked = await asyncio.to_thread(maybe_rerank, params.query, ranked)
 
     if params.token_budget == 0:
         envelope = apply_token_budget(ranked, 0)

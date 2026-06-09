@@ -942,7 +942,33 @@ def _embed_and_store(memory_id: str, content: str) -> bool:
     return _embed_and_store_rows([(row[0], content)]) > 0
 
 
-def _semantic_search(query: str, limit: int = 20) -> list[dict]:
+def _fuse_query_embedding(embedder, texts: list[str]) -> bytes:
+    """Embed *texts* and average them into one L2-normalised search vector.
+
+    With a single text this is exactly ``embed_one``. With several (e.g. the
+    query plus a HyDE passage), the mean vector blends question-space and
+    document-space so candidates near either phrasing rank well.
+
+    Args:
+        embedder: Any embedder exposing ``embed(list[str]) -> np.ndarray``.
+        texts: One or more texts to fuse (must be non-empty).
+
+    Returns:
+        Raw float32 bytes of the fused vector for sqlite-vec.
+    """
+    import numpy as np
+
+    vecs = embedder.embed(texts)
+    fused = vecs.mean(axis=0)
+    norm = float(np.linalg.norm(fused))
+    if norm > 1e-9:
+        fused = fused / norm
+    return fused.astype(np.float32).tobytes()
+
+
+def _semantic_search(
+    query: str, limit: int = 20, extra_texts: list[str] | None = None
+) -> list[dict]:
     """Search memories by semantic similarity using the chunked vector index.
 
     Embeds the query, runs KNN over the per-chunk vectors in ``memories_vec``,
@@ -955,6 +981,8 @@ def _semantic_search(query: str, limit: int = 20) -> list[dict]:
     Args:
         query: The search query text to embed and compare.
         limit: Maximum number of distinct memories to return.
+        extra_texts: Optional expansion texts (e.g. a HyDE passage) whose
+            embeddings are averaged with the query's before the KNN.
 
     Returns:
         List of memory dicts (from _row_to_dict) with an added
@@ -965,7 +993,10 @@ def _semantic_search(query: str, limit: int = 20) -> list[dict]:
         return []
     try:
         db = _get_db()
-        query_bytes = embedder.embed_one(query)
+        if extra_texts:
+            query_bytes = _fuse_query_embedding(embedder, [query, *extra_texts])
+        else:
+            query_bytes = embedder.embed_one(query)
         knn_k = max(limit, limit * _CHUNK_KNN_FANOUT)
         rows = db.execute(
             """SELECT m.*, MIN(mv.distance) AS distance
@@ -1061,6 +1092,7 @@ __all__ = [
     "_migrate_schema",
     "_embed_and_store",
     "_embed_and_store_rows",
+    "_fuse_query_embedding",
     "_semantic_search",
     "_now_iso",
     "_make_id",
