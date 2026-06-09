@@ -223,6 +223,62 @@ python -m benchmarks.before_after \
 > table here once you've run it. A full per-type run under the profile is also
 > available via `python -m benchmarks.runner --rrf-profile retrieval ...`.
 
+## Cross-encoder reranker over top-k (lever D)
+
+RRF fuses independent rank lists, so it never scores the query and a candidate
+*together* — the precision ceiling at rank 1. The shipped reranker
+(`remind_me_mcp/reranker.py`) rescores the top `REMIND_ME_RERANK_TOP_K`
+(default 20) RRF candidates with an ONNX cross-encoder
+(`cross-encoder/ms-marco-MiniLM-L6-v2` by default — the reranker sibling of the
+embedding model, CPU-friendly) and reorders only that head; the tail keeps its
+RRF order, so reranking can never lose a candidate, only promote one. Off by
+default; enable with `REMIND_ME_RERANK=onnx`. The reordering logic is proven
+deterministically in `tests/test_reranker.py` with an injected scorer.
+
+Measure the effect on real data (A/B on the chunked semantic-only baseline):
+
+```bash
+python -m benchmarks.before_after \
+  --compare rerank \
+  --data benchmarks/data/longmemeval_s_cleaned.json \
+  --ingest verbatim --embedder real --rrf-profile semantic --ks 1,3,5,10
+```
+
+> Not yet run on `longmemeval_s` here — the cross-encoder model downloads from
+> HuggingFace on first use. Expect the gain to concentrate in **R@1 / MRR**
+> (the cross-encoder reorders the head; R@k for k ≥ top-k is unchanged by
+> construction). This is the most direct path to close the remaining gap to
+> MemPalace's LLM-reranked ≥0.99 / 1.000. Watch `single-session-preference`
+> in particular. Paste the resulting table here once run. A full per-type run
+> is available via `python -m benchmarks.runner --rerank ...`.
+
+## HyDE query expansion (lever E)
+
+The weakest categories (`single-session-preference`, multi-hop
+`temporal-reasoning`) are questions phrased nothing like the memory that
+answers them. HyDE (`remind_me_mcp/query_expansion.py`) has a small local LLM
+(Ollama, `REMIND_ME_HYDE_MODEL`, default `llama3.2`) write a short hypothetical
+answer passage; the passage embedding — which lives in document-space, not
+question-space — is averaged with the query embedding before the KNN. Off by
+default; enable with `REMIND_ME_QUERY_EXPANSION=hyde`. Any generation failure
+falls back to the plain query. The retrieval mechanism is proven
+deterministically in `tests/test_query_expansion.py`.
+
+Measure the effect on real data (requires an Ollama daemon with the model pulled):
+
+```bash
+python -m benchmarks.before_after \
+  --compare hyde \
+  --data benchmarks/data/longmemeval_s_cleaned.json \
+  --ingest verbatim --embedder real --rrf-profile semantic --ks 1,3,5,10
+```
+
+> Not yet run on `longmemeval_s` here. This is the lower-confidence lever:
+> A/B it against the chunked semantic-only baseline and keep it only if the
+> weak categories move without hurting the strong ones. Note the generation
+> step adds one LLM call per query, so the run is slower than the other
+> comparisons. Paste the resulting table here once run.
+
 ## FTS5 query-sanitization fix — before/after
 
 Natural-language questions contain punctuation (`?`, `,`, `'`, `$`, `.`) that

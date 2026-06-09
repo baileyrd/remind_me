@@ -181,6 +181,30 @@ A full per-type run under the profile is available via
 `python -m benchmarks.runner --rrf-profile retrieval ...`. See
 [`RESULTS.md`](RESULTS.md) for context and the deterministic proof of the lever.
 
+## Before/after: cross-encoder reranker and HyDE expansion
+
+Two further levers ship behind flags (off by default in the product):
+
+- **Rerank (lever D)** — an ONNX cross-encoder rescores the top RRF candidates
+  (`REMIND_ME_RERANK=onnx`; model `REMIND_ME_RERANK_MODEL`, head size
+  `REMIND_ME_RERANK_TOP_K`).
+- **HyDE (lever E)** — a local Ollama model writes a hypothetical answer
+  passage that is averaged into the query embedding
+  (`REMIND_ME_QUERY_EXPANSION=hyde`; needs an Ollama daemon with
+  `REMIND_ME_HYDE_MODEL` pulled).
+
+Measure either on top of the semantic-only headline baseline:
+
+```bash
+python -m benchmarks.before_after --compare rerank --rrf-profile semantic \
+  --data benchmarks/data/longmemeval_s_cleaned.json --ingest verbatim --embedder real --ks 1,3,5,10
+python -m benchmarks.before_after --compare hyde --rrf-profile semantic \
+  --data benchmarks/data/longmemeval_s_cleaned.json --ingest verbatim --embedder real --ks 1,3,5,10
+```
+
+The same toggles are available on the main runner via `--rerank`
+(`--rerank-top-k`) and `--expand hyde`.
+
 ## Tests
 
 ```bash

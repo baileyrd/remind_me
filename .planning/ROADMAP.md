@@ -10,8 +10,8 @@
 ## Backlog -- Retrieval Quality (candidate v1.3, unscheduled)
 
 Lever labels (A-E) reference the analysis in `benchmarks/RESULTS.md`. Levers A
-(model-matched equal-footing) and B (sliding-window chunking) are shipped; C's
-code shipped but its measurement is outstanding; D and E are not started.
+(model-matched equal-footing) and B (sliding-window chunking) are shipped; C, D,
+and E have shipped code but their empirical measurements are outstanding.
 
 - [ ] **C -- Measure the RRF recency+vitality rebalance on real data.** Code is
   shipped (configurable `RRF_W_*` weights + `retrieval`/`semantic` profiles, commit
@@ -22,14 +22,25 @@ code shipped but its measurement is outstanding; D and E are not started.
   "RRF retrieval profile" section of `RESULTS.md`. Note: the equal-footing/chunking
   headline runs already use `--rrf-profile semantic` (recency+vitality zeroed), so
   they bake in C's effect; this task isolates and quantifies it in the hybrid path.
-- [ ] **D -- Reranker over top-k.** Cross-encoder (e.g. `bge-reranker`) or an LLM
-  rerank of the top-k candidates -- the most direct path to close the remaining gap
-  to MemPalace's LLM-reranked >=0.99 / 1.000. Highest-leverage remaining quality
-  lever; medium effort. Measure R@1/MRR lift, especially on the weak categories.
-- [ ] **E -- Query-side expansion / HyDE.** Expand or hypothesize the query before
-  retrieval to help the weakest categories -- `single-session-preference` (short,
-  scattered, phrased unlike the question) and multi-hop `temporal-reasoning`.
-  Lower-confidence lever; A/B against the chunked semantic-only baseline.
+- [ ] **D -- Reranker over top-k.** Code is shipped: ONNX cross-encoder
+  (`remind_me_mcp/reranker.py`, default `cross-encoder/ms-marco-MiniLM-L6-v2`)
+  rescores the top `REMIND_ME_RERANK_TOP_K` RRF candidates when
+  `REMIND_ME_RERANK=onnx`; proven deterministically in `tests/test_reranker.py`.
+  Outstanding: the empirical before/after on `longmemeval_s` -- run
+  `benchmarks.before_after --compare rerank --rrf-profile semantic` and fill the
+  pending table in the "Cross-encoder reranker" section of `RESULTS.md`. The most
+  direct path to close the remaining gap to MemPalace's LLM-reranked >=0.99 /
+  1.000; expect the lift in R@1/MRR, especially on the weak categories.
+- [ ] **E -- Query-side expansion / HyDE.** Code is shipped: Ollama-generated
+  hypothetical answer passage averaged into the query embedding
+  (`remind_me_mcp/query_expansion.py`, enabled via
+  `REMIND_ME_QUERY_EXPANSION=hyde`); proven deterministically in
+  `tests/test_query_expansion.py`. Outstanding: the A/B on `longmemeval_s` -- run
+  `benchmarks.before_after --compare hyde --rrf-profile semantic` (needs a local
+  Ollama daemon) and fill the pending table in the "HyDE query expansion" section
+  of `RESULTS.md`. Lower-confidence lever; keep only if the weak categories
+  (`single-session-preference`, multi-hop `temporal-reasoning`) move without
+  hurting the strong ones.
 
 ## Phases
 

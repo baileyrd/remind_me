@@ -140,12 +140,22 @@ async def run(args: argparse.Namespace) -> int:
         file=sys.stderr,
     )
 
+    import remind_me_mcp.query_expansion as qe_mod
+    import remind_me_mcp.reranker as rr_mod
     import remind_me_mcp.retrieval as retr
     import remind_me_mcp.tools as tools_mod
 
     saved_sanitize = tools_mod.FTS_SANITIZE_FALLBACK
     saved_weights = (retr.RRF_W_KEYWORD, retr.RRF_W_RECENCY, retr.RRF_W_VITALITY)
+    saved_rerank = (rr_mod.RERANK_BACKEND, rr_mod.RERANK_TOP_K)
+    saved_expand = qe_mod.EXPANSION_MODE
     tools_mod.FTS_SANITIZE_FALLBACK = not args.no_sanitize
+    if args.rerank:
+        rr_mod.RERANK_BACKEND = "onnx"
+        if args.rerank_top_k:
+            rr_mod.RERANK_TOP_K = args.rerank_top_k
+    if args.expand == "hyde":
+        qe_mod.EXPANSION_MODE = "hyde"
     if args.rrf_profile in ("retrieval", "semantic"):
         # Drop the relevance-irrelevant signals for a pure-retrieval ranking.
         retr.RRF_W_RECENCY = 0.0
@@ -166,6 +176,8 @@ async def run(args: argparse.Namespace) -> int:
     finally:
         tools_mod.FTS_SANITIZE_FALLBACK = saved_sanitize
         retr.RRF_W_KEYWORD, retr.RRF_W_RECENCY, retr.RRF_W_VITALITY = saved_weights
+        rr_mod.RERANK_BACKEND, rr_mod.RERANK_TOP_K = saved_rerank
+        qe_mod.EXPANSION_MODE = saved_expand
 
     by_mode_buckets = {
         mode: metrics_mod.aggregate(results, ks) for mode, results in by_mode_results.items()
@@ -235,6 +247,23 @@ def build_parser() -> argparse.ArgumentParser:
             "recency+vitality), or 'semantic' (semantic vector search only — drop "
             "keyword+recency+vitality; mirrors MemPalace's ChromaDB headline protocol)"
         ),
+    )
+    p.add_argument(
+        "--rerank",
+        action="store_true",
+        help="Rerank the top candidates with the ONNX cross-encoder (lever D)",
+    )
+    p.add_argument(
+        "--rerank-top-k",
+        type=int,
+        default=0,
+        help="How many head candidates the reranker rescores (0 = REMIND_ME_RERANK_TOP_K default)",
+    )
+    p.add_argument(
+        "--expand",
+        choices=["none", "hyde"],
+        default="none",
+        help="Query-side expansion: 'hyde' generates a hypothetical answer passage via Ollama (lever E)",
     )
     p.set_defaults(skip_abstention=True)
     return p

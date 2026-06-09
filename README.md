@@ -504,6 +504,12 @@ The search tool uses SQLite FTS5. Examples:
 | `REMIND_ME_RRF_W_SEMANTIC` | `1.0` | RRF weight for the semantic (vector) signal |
 | `REMIND_ME_RRF_W_RECENCY` | `1.0` | RRF weight for the recency signal (set `0` for a pure-retrieval profile) |
 | `REMIND_ME_RRF_W_VITALITY` | `1.0` | RRF weight for the vitality signal (set `0` for a pure-retrieval profile) |
+| `REMIND_ME_RERANK` | *(unset)* | Set to `onnx` to rerank the top search candidates with a cross-encoder |
+| `REMIND_ME_RERANK_MODEL` | `cross-encoder/ms-marco-MiniLM-L6-v2` | HuggingFace cross-encoder repo (must ship `onnx/model.onnx`) |
+| `REMIND_ME_RERANK_TOP_K` | `20` | How many top RRF candidates the reranker rescores |
+| `REMIND_ME_QUERY_EXPANSION` | *(unset)* | Set to `hyde` to expand queries with a hypothetical answer passage before vector search |
+| `REMIND_ME_HYDE_MODEL` | `llama3.2` | Ollama model that writes the HyDE passage |
+| `REMIND_ME_HYDE_TIMEOUT` | `15` | Seconds to wait for HyDE generation before falling back to the plain query |
 | `REMIND_ME_CLIENT` | `unknown` | Client identifier reported in server status |
 | `REMIND_ME_NODE_ID` | *(unset)* | Unique identifier for this machine (enables sync when set with HUB_URL and SYNC_SECRET) |
 | `REMIND_ME_HUB_URL` | *(unset)* | URL of the sync hub (e.g., `http://100.x.x.x:8765`) |
