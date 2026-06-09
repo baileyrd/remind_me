@@ -61,10 +61,7 @@ async def _run_mode(
                 continue
 
             harness.reset()
-            id_to_session: dict[str, str] = {}
-            for unit in strategy(item):
-                mem_id = harness.ingest(unit.content, unit.session_id)
-                id_to_session[mem_id] = unit.session_id
+            id_to_session = harness.ingest_batch(strategy(item))
 
             memories = await harness.search(item.question, limit=limit)
             ranked_sessions = metrics_mod.dedup_preserve_order(

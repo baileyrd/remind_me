@@ -191,6 +191,71 @@ class Harness:
             _embed_and_store(mem_id, content)
         return mem_id
 
+    def ingest_batch(
+        self,
+        units: list,
+        *,
+        embed: bool = True,
+        batch_size: int = 64,
+    ) -> dict[str, str]:
+        """Store many memories, embedding them in **batched** calls; return id→session.
+
+        Equivalent to calling :meth:`ingest` per unit, but all vectors for the
+        batch are generated with the embedder's batch ``embed()`` (one Ollama
+        ``/api/embed`` request / one ONNX forward pass per *batch_size* chunk)
+        instead of one call per memory. Same rows, same vectors — just far fewer
+        round-trips, which dominates wall-clock when embedding over HTTP.
+
+        Each ``unit`` must expose ``.content`` and ``.session_id``.
+        """
+        from remind_me_mcp.db import _now_iso
+        from remind_me_mcp.embeddings import _get_embedder
+
+        assert self._db is not None
+        now = _now_iso()
+        id_to_session: dict[str, str] = {}
+        rows: list[tuple[int, str]] = []  # (rowid, content) for embedding
+
+        cur = self._db.cursor()
+        for unit in units:
+            mem_id = self._new_id(unit.content)
+            cur.execute(
+                """INSERT INTO memories
+                   (id, content, category, tags, source, metadata, created_at, updated_at, node_id, client)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    mem_id,
+                    unit.content,
+                    "benchmark",
+                    json.dumps([]),
+                    "benchmark",
+                    json.dumps({"session_id": unit.session_id}),
+                    now,
+                    now,
+                    "",
+                    "benchmark",
+                ),
+            )
+            rows.append((cur.lastrowid, unit.content))
+            id_to_session[mem_id] = unit.session_id
+        self._db.commit()
+
+        if embed and self.has_vec and rows:
+            embedder = _get_embedder()
+            if embedder is not None:
+                for start in range(0, len(rows), batch_size):
+                    chunk = rows[start : start + batch_size]
+                    # Mirror _embed_and_store's 2000-char truncation for parity.
+                    vectors = embedder.embed([content[:2000] for _, content in chunk])
+                    for (rowid, _), vec in zip(chunk, vectors, strict=True):
+                        self._db.execute(
+                            "INSERT INTO memories_vec(rowid, embedding) VALUES (?, ?)",
+                            (rowid, vec.astype("float32").tobytes()),
+                        )
+                self._db.commit()
+
+        return id_to_session
+
     async def search(self, query: str, limit: int = 100) -> list[dict[str, Any]]:
         """Run the real remind_me_search and return ranked memory dicts.
 

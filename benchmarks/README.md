@@ -67,6 +67,12 @@ on an existing database means recreating the vector table and running
 `remind_me_reindex`.) If the daemon is unreachable, the harness logs a warning
 and degrades to FTS5-only rather than crashing.
 
+The harness **batches embedding calls** — all of a question's memories are
+embedded in chunks via one `/api/embed` request each (default 64 per chunk),
+not one request per memory — so Ollama runs are much faster than the per-memory
+round-trips would suggest. A smaller model (`snowflake-arctic-embed:33m`,
+`all-minilm` — both 384-d) speeds each call further.
+
 ## Run on LongMemEval
 
 1. **Download the dataset** (one command — fetches from the official cleaned
