@@ -5,6 +5,31 @@
 - **v1.0 Full Refactor** -- Phases 1-3 (shipped 2026-02-24)
 - **v1.1 Address 1.0 Tech Debt** -- Phases 4-9 (shipped 2026-02-25)
 - **v1.2 Intelligent Retrieval** -- Phases 10-14 (shipped 2026-03-05)
+- **v1.3 Retrieval Quality** -- Backlog (unscheduled) -- see Backlog below
+
+## Backlog -- Retrieval Quality (candidate v1.3, unscheduled)
+
+Lever labels (A-E) reference the analysis in `benchmarks/RESULTS.md`. Levers A
+(model-matched equal-footing) and B (sliding-window chunking) are shipped; C's
+code shipped but its measurement is outstanding; D and E are not started.
+
+- [ ] **C -- Measure the RRF recency+vitality rebalance on real data.** Code is
+  shipped (configurable `RRF_W_*` weights + `retrieval`/`semantic` profiles, commit
+  `e2c40ae`; proven deterministically in `tests/test_rrf_weights.py`). Outstanding:
+  the empirical before/after on `longmemeval_s` -- run
+  `benchmarks.before_after --compare rrf` (default 4-signal vs. recency+vitality
+  dropped), expect the gain in R@1/MRR, and fill the pending table in the
+  "RRF retrieval profile" section of `RESULTS.md`. Note: the equal-footing/chunking
+  headline runs already use `--rrf-profile semantic` (recency+vitality zeroed), so
+  they bake in C's effect; this task isolates and quantifies it in the hybrid path.
+- [ ] **D -- Reranker over top-k.** Cross-encoder (e.g. `bge-reranker`) or an LLM
+  rerank of the top-k candidates -- the most direct path to close the remaining gap
+  to MemPalace's LLM-reranked >=0.99 / 1.000. Highest-leverage remaining quality
+  lever; medium effort. Measure R@1/MRR lift, especially on the weak categories.
+- [ ] **E -- Query-side expansion / HyDE.** Expand or hypothesize the query before
+  retrieval to help the weakest categories -- `single-session-preference` (short,
+  scattered, phrased unlike the question) and multi-hop `temporal-reasoning`.
+  Lower-confidence lever; A/B against the chunked semantic-only baseline.
 
 ## Phases
 
