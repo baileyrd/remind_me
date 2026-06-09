@@ -67,12 +67,13 @@ retrieval.
 **The result: it was the retrieval unit, not the model.** Matched on model and
 scored at session level, semantic-only:
 
-- **Verbatim → 0.923, about 4 points under MemPalace's 0.966.** Remind Me stores
+- **Verbatim → 0.923, about 4 points under MemPalace's 0.966.** Remind Me stored
   **one embedding per whole session**, and MiniLM truncates at ~256 tokens, so on
-  LongMemEval-S's long, distractor-padded sessions the vector often never sees the
+  LongMemEval-S's long, distractor-padded sessions the vector often never saw the
   evidence. MemPalace's verbatim path embeds each session as **multiple
   chunks/rounds** (any chunk hitting = a session hit), giving it more shots. Same
-  model, different granularity — that is the whole gap.
+  model, different granularity — that was the whole gap. **This is now fixed —
+  see "Sliding-window chunking" below.**
 - **Atomic → 0.991, above MemPalace's 0.966 headline and 0.984 held-out, and level
   with their LLM-reranked 1.000 — with no LLM at write or rerank time** (R@1 also
   jumps to 0.926). Remind Me's `atomic` decomposition (sentence-level embeddings) is
@@ -96,6 +97,28 @@ atomic 0.953) come from an earlier run whose embedding backend was not verified 
 MiniLM — don't mix them into this model-matched comparison without re-running. That
 clean semantic-only atomic (0.991) *exceeds* that prior hybrid atomic (0.953) is
 itself consistent with the recency+vitality dilution documented below.
+
+### Sliding-window chunking (lever B) — closing the verbatim gap
+
+The verbatim gap above was a **granularity** artifact: one truncated vector per
+session. That is now fixed. Long content is split into overlapping character
+windows (`chunk_text`, defaults 1600 chars / 200 overlap, ≤16 windows), each
+embedded as its own vector and linked to the parent memory via the new
+`vec_chunks` map; the tokenizer cap was also raised 256 → 512. Semantic search
+runs KNN over the per-chunk vectors and dedupes to the best chunk per memory —
+**any-chunk-hit**, exactly MemPalace's "any chunk matching = a session hit". A
+memory whose evidence sits in the tail is now retrievable (regression-tested in
+`tests/test_chunking.py`). `atomic` is unaffected: its facts are short, so they
+still yield a single chunk.
+
+Tunable via `REMIND_ME_EMBED_CHUNK_CHARS` / `_OVERLAP` / `REMIND_ME_EMBED_MAX_CHUNKS`.
+
+> **Not yet re-measured on `longmemeval_s` here** (needs the dataset + MiniLM /
+> network). Re-run the model-matched semantic-only command above and expect
+> **verbatim R@5 to rise from 0.923 toward/above MemPalace's 0.966**, with
+> **atomic ≈ unchanged**. Paste the before/after table here once run. Existing DBs
+> migrate automatically (v7 → v8: legacy 1:1 vectors backfill as chunk 0);
+> `remind_me_reindex` re-chunks them with the new windows.
 
 ### Verbatim vs. atomic — the main finding
 

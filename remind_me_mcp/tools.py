@@ -19,6 +19,7 @@ from remind_me_mcp.config import CLIENT, NODE_ID
 from remind_me_mcp.consolidation import find_clusters, merge_cluster, pick_canonical
 from remind_me_mcp.db import (
     _embed_and_store,
+    _embed_and_store_rows,
     _get_db,
     _make_id,
     _now_iso,
@@ -964,7 +965,7 @@ async def remind_me_auto_capture(params: AutoCaptureInput) -> str:
 
     # Embed both for semantic search (summary is more searchable, dialog has full context)
     await asyncio.to_thread(_embed_and_store, summary_id, params.summary)
-    await asyncio.to_thread(_embed_and_store, dialog_id, params.conversation[:2000])
+    await asyncio.to_thread(_embed_and_store, dialog_id, params.conversation)
 
     tag_str = ", ".join(params.tags) if params.tags else "none"
     return (
@@ -1081,16 +1082,20 @@ async def remind_me_reindex() -> str:
         )
 
     db = _get_db()
-    # Find memories without embeddings
+    # Find memories without chunk embeddings (a memory is "embedded" once it owns
+    # at least one row in vec_chunks).
     all_rows = db.execute("SELECT id, rowid, content FROM memories").fetchall()
-    existing_vecs = set()
+    embedded_rowids = set()
     try:
-        vec_rows = db.execute("SELECT rowid FROM memories_vec").fetchall()
-        existing_vecs = {r[0] for r in vec_rows}
+        embedded_rowids = {
+            r[0] for r in db.execute("SELECT DISTINCT memory_rowid FROM vec_chunks").fetchall()
+        }
     except sqlite3.OperationalError as e:
-        log.debug("memories_vec table not available: %s", e)
+        log.debug("vec_chunks table not available: %s", e)
 
-    missing = [(r["id"], r["rowid"], r["content"]) for r in all_rows if r["rowid"] not in existing_vecs]
+    missing = [
+        (r["rowid"], r["content"]) for r in all_rows if r["rowid"] not in embedded_rowids
+    ]
 
     if not missing:
         return f"✓ All {len(all_rows)} memories already have embeddings."
@@ -1098,26 +1103,12 @@ async def remind_me_reindex() -> str:
     created = 0
     for batch_start in range(0, len(missing), EMBED_BATCH_SIZE):
         batch = missing[batch_start : batch_start + EMBED_BATCH_SIZE]
-        ids = [item[0] for item in batch]
-        rowids = [item[1] for item in batch]
-        texts = [item[2][:2000] for item in batch]
-        try:
-            vecs = await asyncio.to_thread(embedder.embed, texts)
-            for i, (_mem_id, rowid) in enumerate(zip(ids, rowids, strict=True)):
-                vec_bytes = vecs[i].tobytes()
-                db.execute(
-                    "INSERT OR REPLACE INTO memories_vec(rowid, embedding) VALUES (?, ?)",
-                    (rowid, vec_bytes),
-                )
-                created += 1
-        except (sqlite3.OperationalError, ValueError, TypeError) as e:
-            log.warning("Failed to embed batch starting at %s: %s", ids[0], e)
+        created += await asyncio.to_thread(_embed_and_store_rows, batch)
 
-    db.commit()
     return (
         f"✓ Reindex complete.\n\n"
         f"**Total memories:** {len(all_rows)}\n"
-        f"**Already embedded:** {len(existing_vecs)}\n"
+        f"**Already embedded:** {len(embedded_rowids)}\n"
         f"**Newly embedded:** {created}\n"
         f"**Failed:** {len(missing) - created}"
     )
@@ -1165,9 +1156,11 @@ async def remind_me_server_status() -> str:
         db = _get_db()
         total_mems = db.execute("SELECT COUNT(*) as cnt FROM memories").fetchone()["cnt"]
         try:
-            total_vecs = db.execute("SELECT COUNT(*) as cnt FROM memories_vec").fetchone()["cnt"]
+            total_vecs = db.execute(
+                "SELECT COUNT(DISTINCT memory_rowid) as cnt FROM vec_chunks"
+            ).fetchone()["cnt"]
         except sqlite3.OperationalError as e:
-            log.debug("memories_vec table not available for status check: %s", e)
+            log.debug("vec_chunks table not available for status check: %s", e)
             total_vecs = 0
         lines.append(f"\n**Semantic search:** ✓ Enabled ({EMBEDDING_MODEL})")
         lines.append(f"**Embeddings:** {total_vecs}/{total_mems} memories indexed")
@@ -1733,7 +1726,8 @@ async def remind_me_consolidate(params: ConsolidateInput) -> str:
                m.category, m.tags, m.memory_type, m.decay_rate, m.base_weight,
                mv.embedding
         FROM memories m
-        JOIN memories_vec mv ON mv.rowid = m.rowid
+        JOIN vec_chunks vc ON vc.memory_rowid = m.rowid AND vc.chunk_ix = 0
+        JOIN memories_vec mv ON mv.rowid = vc.vec_rowid
         WHERE m.status = 'active'
           AND m.superseded_by IS NULL
     """

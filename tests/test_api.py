@@ -667,14 +667,14 @@ def test_api_add_creates_embedding(db_conn_with_vec, mock_embedder, monkeypatch)
     assert rowid_row is not None, "Memory row should exist in memories table"
     rowid = rowid_row[0]
 
-    vec_row = db_conn_with_vec.execute(
-        "SELECT rowid FROM memories_vec WHERE rowid = ?", (rowid,)
-    ).fetchone()
-    assert vec_row is not None, "memories_vec row should exist after POST /api/memories"
+    vec_count = db_conn_with_vec.execute(
+        "SELECT COUNT(*) FROM vec_chunks WHERE memory_rowid = ?", (rowid,)
+    ).fetchone()[0]
+    assert vec_count >= 1, "chunk vectors should exist after POST /api/memories"
 
 
-def test_api_add_embedding_rowid_matches_memory(db_conn_with_vec, mock_embedder, monkeypatch) -> None:
-    """EMBD-01: The memories_vec rowid matches the memory's SQLite rowid (foreign key integrity)."""
+def test_api_add_creates_chunk_vectors(db_conn_with_vec, mock_embedder, monkeypatch) -> None:
+    """EMBD-01: Adding a memory links its chunk vectors to the memory via vec_chunks."""
     import remind_me_mcp.api as _api_mod
     import remind_me_mcp.config as _cfg
     import remind_me_mcp.importer as _importer_mod
@@ -693,11 +693,15 @@ def test_api_add_embedding_rowid_matches_memory(db_conn_with_vec, mock_embedder,
     mem_rowid = db_conn_with_vec.execute(
         "SELECT rowid FROM memories WHERE id = ?", (mem_id,)
     ).fetchone()[0]
-    vec_rowid = db_conn_with_vec.execute(
-        "SELECT rowid FROM memories_vec WHERE rowid = ?", (mem_rowid,)
-    ).fetchone()
-    assert vec_rowid is not None, "memories_vec rowid should match memory rowid"
-    assert vec_rowid[0] == mem_rowid, "memories_vec rowid must equal memory's SQLite rowid"
+    # Every chunk vector for this memory is mapped through vec_chunks to a real
+    # memories_vec row (no dangling references).
+    chunk_vecs = db_conn_with_vec.execute(
+        """SELECT mv.rowid FROM vec_chunks vc
+           JOIN memories_vec mv ON mv.rowid = vc.vec_rowid
+           WHERE vc.memory_rowid = ?""",
+        (mem_rowid,),
+    ).fetchall()
+    assert len(chunk_vecs) >= 1, "memory should own at least one chunk vector"
 
 
 def test_api_update_content_regenerates_embedding(db_conn_with_vec, mock_embedder, monkeypatch) -> None:
@@ -726,11 +730,12 @@ def test_api_update_content_regenerates_embedding(db_conn_with_vec, mock_embedde
     update_resp = client.put(f"/api/memories/{mem_id}", json={"content": "updated content for embedding test"})
     assert update_resp.status_code == 200
 
-    # Vec row should still be present (upsert by rowid — content changed, rowid unchanged)
-    vec_row = db_conn_with_vec.execute(
-        "SELECT rowid FROM memories_vec WHERE rowid = ?", (mem_rowid,)
-    ).fetchone()
-    assert vec_row is not None, "memories_vec row should still exist after content update"
+    # The memory should still own chunk vectors after re-embedding its new content
+    # (old chunks are replaced; the parent link in vec_chunks persists).
+    chunk_count = db_conn_with_vec.execute(
+        "SELECT COUNT(*) FROM vec_chunks WHERE memory_rowid = ?", (mem_rowid,)
+    ).fetchone()[0]
+    assert chunk_count >= 1, "memory should still have chunk vectors after content update"
 
 
 def test_api_update_no_content_preserves_embedding(db_conn_with_vec, mock_embedder, monkeypatch) -> None:
@@ -755,21 +760,21 @@ def test_api_update_no_content_preserves_embedding(db_conn_with_vec, mock_embedd
         "SELECT rowid FROM memories WHERE id = ?", (mem_id,)
     ).fetchone()[0]
 
-    # Verify initial vec row exists
-    initial_vec = db_conn_with_vec.execute(
-        "SELECT rowid FROM memories_vec WHERE rowid = ?", (mem_rowid,)
-    ).fetchone()
-    assert initial_vec is not None, "Initial embedding should exist after POST"
+    # Verify initial chunk vectors exist
+    initial_vecs = db_conn_with_vec.execute(
+        "SELECT vec_rowid FROM vec_chunks WHERE memory_rowid = ? ORDER BY chunk_ix", (mem_rowid,)
+    ).fetchall()
+    assert initial_vecs, "Initial embedding should exist after POST"
 
     # Update with only tags (no content)
     update_resp = client.put(f"/api/memories/{mem_id}", json={"tags": ["new-tag"]})
     assert update_resp.status_code == 200
 
-    # Vec row should still be present and unchanged
-    vec_row = db_conn_with_vec.execute(
-        "SELECT rowid FROM memories_vec WHERE rowid = ?", (mem_rowid,)
-    ).fetchone()
-    assert vec_row is not None, "memories_vec row should be preserved on tag-only update"
+    # Chunk vectors should be preserved and unchanged (no re-embed on tag-only update)
+    after_vecs = db_conn_with_vec.execute(
+        "SELECT vec_rowid FROM vec_chunks WHERE memory_rowid = ? ORDER BY chunk_ix", (mem_rowid,)
+    ).fetchall()
+    assert after_vecs == initial_vecs, "chunk vectors should be unchanged on tag-only update"
 
 
 def test_rest_and_mcp_memories_equally_findable_by_semantic_search(

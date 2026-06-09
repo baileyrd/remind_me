@@ -15,6 +15,9 @@ import logging
 import numpy as np
 
 from remind_me_mcp.config import (
+    EMBED_CHUNK_CHARS,
+    EMBED_CHUNK_OVERLAP,
+    EMBED_MAX_CHUNKS,
     EMBEDDING_BACKEND,
     EMBEDDING_DIM,
     EMBEDDING_MODEL,
@@ -24,6 +27,69 @@ from remind_me_mcp.config import (
 )
 
 log = logging.getLogger("remind_me_mcp.embeddings")
+
+
+# ---------------------------------------------------------------------------
+# Sliding-window chunking
+# ---------------------------------------------------------------------------
+
+
+def chunk_text(
+    text: str,
+    *,
+    max_chars: int = EMBED_CHUNK_CHARS,
+    overlap: int = EMBED_CHUNK_OVERLAP,
+    max_chunks: int = EMBED_MAX_CHUNKS,
+) -> list[str]:
+    """Split text into overlapping character windows for multi-vector embedding.
+
+    Content at or under ``max_chars`` returns a single chunk ``[text]`` — so
+    short memories (and ``atomic`` facts) embed exactly as before. Longer content
+    is cut into windows of up to ``max_chars`` characters that overlap by
+    ``overlap`` characters, so evidence straddling a boundary still lands whole in
+    at least one window. Each cut prefers the nearest whitespace before the limit
+    to avoid splitting mid-word. At most ``max_chunks`` windows are produced; any
+    remaining tail is dropped (callers should log when truncation is possible).
+
+    Args:
+        text: The content to split.
+        max_chars: Maximum characters per window.
+        overlap: Characters of overlap between consecutive windows.
+        max_chunks: Hard cap on the number of windows returned.
+
+    Returns:
+        A list of non-empty chunk strings (always at least one for non-blank text).
+    """
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+
+    # Clamp overlap to a sane range so the window always advances.
+    step = max(1, max_chars - max(0, min(overlap, max_chars - 1)))
+    chunks: list[str] = []
+    start = 0
+    n = len(text)
+    while start < n and len(chunks) < max_chunks:
+        end = min(start + max_chars, n)
+        # Prefer to break on whitespace before the hard limit (but not so early
+        # that the window becomes tiny).
+        if end < n:
+            ws = text.rfind(" ", start + step, end)
+            if ws != -1:
+                end = ws
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if end >= n:
+            break
+        # Advance with overlap, then snap the new start to a word boundary so the
+        # next window never begins mid-word (which would emit junk fragments).
+        next_start = end - overlap if end - overlap > start else end
+        sp = text.rfind(" ", start, next_start)
+        start = sp + 1 if sp > start else next_start
+    return chunks
 
 # ---------------------------------------------------------------------------
 # Embedder class
@@ -74,7 +140,7 @@ class _Embedder:
             )
             self._tokenizer = Tokenizer.from_file(tokenizer_path)
             self._tokenizer.enable_padding(pad_id=0, pad_token="[PAD]")
-            self._tokenizer.enable_truncation(max_length=256)
+            self._tokenizer.enable_truncation(max_length=512)
             self._ready = True
             log.info("Embedding model loaded (%d dimensions)", self.dim)
 
@@ -100,7 +166,8 @@ class _Embedder:
         result so cosine similarity equals dot product.
 
         Args:
-            texts: List of strings to embed (will be truncated to 256 tokens).
+            texts: List of strings to embed (each truncated to 512 tokens; use
+                chunk_text() upstream to embed longer content as several windows).
 
         Returns:
             Float32 numpy array of shape (N, dim), L2-normalised.
@@ -258,4 +325,5 @@ __all__ = [
     "OllamaEmbedder",
     "_Embedder",
     "_get_embedder",
+    "chunk_text",
 ]

@@ -44,6 +44,14 @@ EMBEDDING_BACKEND = os.environ.get("REMIND_ME_EMBEDDING_BACKEND", "onnx").lower(
 OLLAMA_URL = os.environ.get("REMIND_ME_OLLAMA_URL", "http://localhost:11434")
 OLLAMA_EMBED_MODEL = os.environ.get("REMIND_ME_OLLAMA_EMBED_MODEL", "nomic-embed-text")
 
+# Sliding-window chunking for embedding. Long content is split into overlapping
+# character windows, each embedded as its own vector linked to the parent memory,
+# so the whole text is searchable instead of only the first ~256 tokens. Short
+# content (<= CHUNK_CHARS) yields a single chunk — identical to the old behavior.
+EMBED_CHUNK_CHARS = int(os.environ.get("REMIND_ME_EMBED_CHUNK_CHARS", "1600"))
+EMBED_CHUNK_OVERLAP = int(os.environ.get("REMIND_ME_EMBED_CHUNK_OVERLAP", "200"))
+EMBED_MAX_CHUNKS = int(os.environ.get("REMIND_ME_EMBED_MAX_CHUNKS", "16"))
+
 # ---------------------------------------------------------------------------
 # UI / dashboard
 # ---------------------------------------------------------------------------
@@ -93,6 +101,9 @@ __all__ = [
     "EMBEDDING_BACKEND",
     "OLLAMA_URL",
     "OLLAMA_EMBED_MODEL",
+    "EMBED_CHUNK_CHARS",
+    "EMBED_CHUNK_OVERLAP",
+    "EMBED_MAX_CHUNKS",
     "MODEL_DIR",
     "SERVE_UI",
     "UI_PORT",
