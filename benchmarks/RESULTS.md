@@ -32,22 +32,70 @@ python -m benchmarks.runner \
 | atomic | single-session-user | 64 | 0.828 | 0.953 | 0.969 | 1.000 | 0.897 |
 | atomic | temporal-reasoning | 127 | 0.827 | 0.945 | 0.945 | 0.961 | 0.887 |
 
-### Comparison with MemPalace (R@5)
+### Equal-footing comparison with MemPalace (R@5)
 
-| System | R@5 |
-|---|---|
-| MemPalace — semantic only | 0.966 |
-| MemPalace — hybrid v4 | 0.984 |
-| MemPalace — + LLM rerank | ≥0.99 |
-| **Remind Me — verbatim** | **0.970** |
-| **Remind Me — atomic** | 0.953 |
+All Remind Me rows below are **measured, model-matched** (`all-MiniLM-L6-v2`, ONNX),
+semantic-only, session-level R@5 over the same 470 scored LongMemEval-S questions
+(`results_onnx_semantic.json`).
 
-Remind Me's verbatim R@5 (**0.970**) is on par with MemPalace's semantic-only
-figure and just under their hybrid-v4 — with **no LLM reranker**, which is
-exactly the lever that takes MemPalace from 0.984 → ≥0.99. Treat this as "same
-ballpark," not a precise win/loss: this harness scores **session-level** recall,
-and if MemPalace's R@5 uses a different retrieval unit (rounds/drawers) the
-denominators aren't identical.
+| System | R@5 | Retrieval |
+|---|---|---|
+| MemPalace — headline ("zero API") | 0.966 | verbatim sessions + ChromaDB vector search, semantic-only, `all-MiniLM-L6-v2` |
+| MemPalace — held-out (450 q) | 0.984 | same |
+| MemPalace — + Claude Haiku rerank | 1.000 | + LLM reranker (their words: "teaching to the test") |
+| Plain keyword search (their baseline) | 0.938 | BM25-style, no embeddings |
+| **Remind Me — atomic, semantic-only** | **0.991** | many small embeddings per session — beats headline, ties reranked, no LLM |
+| **Remind Me — verbatim, semantic-only** | **0.923** | one embedding per whole session — ~4 pts under headline |
+| Remind Me — verbatim, semantic-only, `snowflake-arctic-embed:33m` | 0.821 | secondary: this branch's tiny 33M Ollama model (not model-matched) |
+
+Full per-type breakdown of the two model-matched runs:
+
+| Mode | N | R@1 | R@3 | R@5 | R@10 | MRR |
+|---|---|---|---|---|---|---|
+| verbatim (semantic-only) | 470 | 0.760 | 0.896 | 0.923 | 0.968 | 0.834 |
+| atomic (semantic-only) | 470 | 0.926 | 0.989 | 0.991 | 0.996 | 0.956 |
+
+**What MemPalace's headline actually measures.** Their 96.6% R@5 run stores each
+session verbatim and retrieves with a plain ChromaDB `collection.query()` using
+the **`all-MiniLM-L6-v2`** embedding model — *no* palace-specific logic (wings /
+rooms / drawers are not exercised), no write-time LLM, and no reranker. It is, in
+effect, a vector-search baseline over ~50 candidate sessions per question. On the
+same data **plain keyword search already scores 0.938**, so R@5 here barely
+separates memory systems — it mostly measures the embedding model and the unit of
+retrieval.
+
+**The result: it was the retrieval unit, not the model.** Matched on model and
+scored at session level, semantic-only:
+
+- **Verbatim → 0.923, about 4 points under MemPalace's 0.966.** Remind Me stores
+  **one embedding per whole session**, and MiniLM truncates at ~256 tokens, so on
+  LongMemEval-S's long, distractor-padded sessions the vector often never sees the
+  evidence. MemPalace's verbatim path embeds each session as **multiple
+  chunks/rounds** (any chunk hitting = a session hit), giving it more shots. Same
+  model, different granularity — that is the whole gap.
+- **Atomic → 0.991, above MemPalace's 0.966 headline and 0.984 held-out, and level
+  with their LLM-reranked 1.000 — with no LLM at write or rerank time** (R@1 also
+  jumps to 0.926). Remind Me's `atomic` decomposition (sentence-level embeddings) is
+  the architectural analog to MemPalace's chunking, taken further, and on the
+  identical model it wins.
+
+**How to reproduce** (force the ONNX backend so the flag isn't overridden by a local
+`REMIND_ME_EMBEDDING_BACKEND=ollama`, then use the semantic profile):
+
+```bash
+REMIND_ME_EMBEDDING_BACKEND=onnx python -m benchmarks.runner \
+  --data benchmarks/data/longmemeval_s_cleaned.json \
+  --ingest verbatim,atomic --embedder real --ks 1,3,5,10 --rrf-profile semantic
+```
+
+Caveats: (a) the task is easy — keyword-only is already 0.938 — so absolute R@5 is
+not very discriminating; (b) denominator is 470 (30 abstention questions skipped) vs.
+MemPalace's ~500 / 450 held-out, so match the abstention handling before reading
+exact decimals; (c) the **hybrid** numbers elsewhere in this file (verbatim 0.970,
+atomic 0.953) come from an earlier run whose embedding backend was not verified to be
+MiniLM — don't mix them into this model-matched comparison without re-running. That
+clean semantic-only atomic (0.991) *exceeds* that prior hybrid atomic (0.953) is
+itself consistent with the recency+vitality dilution documented below.
 
 ### Verbatim vs. atomic — the main finding
 

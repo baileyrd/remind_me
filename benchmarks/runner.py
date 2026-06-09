@@ -144,12 +144,17 @@ async def run(args: argparse.Namespace) -> int:
     import remind_me_mcp.tools as tools_mod
 
     saved_sanitize = tools_mod.FTS_SANITIZE_FALLBACK
-    saved_weights = (retr.RRF_W_RECENCY, retr.RRF_W_VITALITY)
+    saved_weights = (retr.RRF_W_KEYWORD, retr.RRF_W_RECENCY, retr.RRF_W_VITALITY)
     tools_mod.FTS_SANITIZE_FALLBACK = not args.no_sanitize
-    if args.rrf_profile == "retrieval":
+    if args.rrf_profile in ("retrieval", "semantic"):
         # Drop the relevance-irrelevant signals for a pure-retrieval ranking.
         retr.RRF_W_RECENCY = 0.0
         retr.RRF_W_VITALITY = 0.0
+    if args.rrf_profile == "semantic":
+        # Semantic-only: also drop the keyword tier so ranking is pure vector
+        # search — the apples-to-apples mirror of MemPalace's ChromaDB headline
+        # protocol (verbatim sessions + all-MiniLM-L6-v2). See RESULTS.md.
+        retr.RRF_W_KEYWORD = 0.0
     try:
         by_mode_results: dict[str, list[QueryResult]] = {}
         for mode in modes:
@@ -160,7 +165,7 @@ async def run(args: argparse.Namespace) -> int:
             print(f"  mode '{mode}' done in {time.time() - t0:.1f}s", file=sys.stderr)
     finally:
         tools_mod.FTS_SANITIZE_FALLBACK = saved_sanitize
-        retr.RRF_W_RECENCY, retr.RRF_W_VITALITY = saved_weights
+        retr.RRF_W_KEYWORD, retr.RRF_W_RECENCY, retr.RRF_W_VITALITY = saved_weights
 
     by_mode_buckets = {
         mode: metrics_mod.aggregate(results, ks) for mode, results in by_mode_results.items()
@@ -223,9 +228,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--rrf-profile",
-        choices=["default", "retrieval"],
+        choices=["default", "retrieval", "semantic"],
         default="default",
-        help="RRF signal profile: 'default' (all four signals) or 'retrieval' (drop recency+vitality)",
+        help=(
+            "RRF signal profile: 'default' (all four signals), 'retrieval' (drop "
+            "recency+vitality), or 'semantic' (semantic vector search only — drop "
+            "keyword+recency+vitality; mirrors MemPalace's ChromaDB headline protocol)"
+        ),
     )
     p.set_defaults(skip_abstention=True)
     return p
