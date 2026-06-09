@@ -61,10 +61,7 @@ async def _run_mode(
                 continue
 
             harness.reset()
-            id_to_session: dict[str, str] = {}
-            for unit in strategy(item):
-                mem_id = harness.ingest(unit.content, unit.session_id)
-                id_to_session[mem_id] = unit.session_id
+            id_to_session = harness.ingest_batch(strategy(item))
 
             memories = await harness.search(item.question, limit=limit)
             ranked_sessions = metrics_mod.dedup_preserve_order(
@@ -147,12 +144,17 @@ async def run(args: argparse.Namespace) -> int:
     import remind_me_mcp.tools as tools_mod
 
     saved_sanitize = tools_mod.FTS_SANITIZE_FALLBACK
-    saved_weights = (retr.RRF_W_RECENCY, retr.RRF_W_VITALITY)
+    saved_weights = (retr.RRF_W_KEYWORD, retr.RRF_W_RECENCY, retr.RRF_W_VITALITY)
     tools_mod.FTS_SANITIZE_FALLBACK = not args.no_sanitize
-    if args.rrf_profile == "retrieval":
+    if args.rrf_profile in ("retrieval", "semantic"):
         # Drop the relevance-irrelevant signals for a pure-retrieval ranking.
         retr.RRF_W_RECENCY = 0.0
         retr.RRF_W_VITALITY = 0.0
+    if args.rrf_profile == "semantic":
+        # Semantic-only: also drop the keyword tier so ranking is pure vector
+        # search — the apples-to-apples mirror of MemPalace's ChromaDB headline
+        # protocol (verbatim sessions + all-MiniLM-L6-v2). See RESULTS.md.
+        retr.RRF_W_KEYWORD = 0.0
     try:
         by_mode_results: dict[str, list[QueryResult]] = {}
         for mode in modes:
@@ -163,7 +165,7 @@ async def run(args: argparse.Namespace) -> int:
             print(f"  mode '{mode}' done in {time.time() - t0:.1f}s", file=sys.stderr)
     finally:
         tools_mod.FTS_SANITIZE_FALLBACK = saved_sanitize
-        retr.RRF_W_RECENCY, retr.RRF_W_VITALITY = saved_weights
+        retr.RRF_W_KEYWORD, retr.RRF_W_RECENCY, retr.RRF_W_VITALITY = saved_weights
 
     by_mode_buckets = {
         mode: metrics_mod.aggregate(results, ks) for mode, results in by_mode_results.items()
@@ -204,9 +206,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--embedder",
-        choices=["real", "fake", "none"],
+        choices=["real", "fake", "none", "ollama"],
         default="real",
-        help="Embedder: real ONNX model, deterministic fake (offline plumbing), or none/FTS-only",
+        help="Embedder: real ONNX model, ollama (local daemon), deterministic fake, or none/FTS-only",
     )
     p.add_argument("--ks", default="1,3,5,10", help="Comma-separated recall cutoffs (default: 1,3,5,10)")
     p.add_argument("--limit", type=int, default=100, help="Candidate pool size per query (default: 100)")
@@ -226,9 +228,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--rrf-profile",
-        choices=["default", "retrieval"],
+        choices=["default", "retrieval", "semantic"],
         default="default",
-        help="RRF signal profile: 'default' (all four signals) or 'retrieval' (drop recency+vitality)",
+        help=(
+            "RRF signal profile: 'default' (all four signals), 'retrieval' (drop "
+            "recency+vitality), or 'semantic' (semantic vector search only — drop "
+            "keyword+recency+vitality; mirrors MemPalace's ChromaDB headline protocol)"
+        ),
     )
     p.set_defaults(skip_abstention=True)
     return p
@@ -236,6 +242,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point."""
+    from benchmarks import quiet_dependency_logs
+
+    quiet_dependency_logs()
     args = build_parser().parse_args(argv)
     return asyncio.run(run(args))
 

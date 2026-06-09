@@ -255,6 +255,53 @@ def test_harness_ingest_and_search_fts():
         assert memories[0]["metadata"]["session_id"] == sid
 
 
+def test_ingest_batch_stores_vectors_and_searches():
+    """Batched ingest embeds every unit (chunked) and the vectors are searchable."""
+    from benchmarks.ingest import MemoryUnit
+
+    with Harness(embedder_mode="fake") as h:
+        if not h.has_vec:
+            pytest.skip("sqlite-vec not available")
+        h.reset()
+        units = [
+            MemoryUnit("alpha content about pumpkins", "s1"),
+            MemoryUnit("beta content about turbines", "s2"),
+            MemoryUnit("gamma content about pumpkins again", "s1"),
+        ]
+        id_to_session = h.ingest_batch(units, batch_size=2)  # force >1 chunk
+
+        assert len(id_to_session) == 3
+        assert set(id_to_session.values()) == {"s1", "s2"}
+        n_mem = h._db.execute("SELECT count(*) FROM memories").fetchone()[0]
+        n_vec = h._db.execute("SELECT count(*) FROM memories_vec").fetchone()[0]
+        assert n_mem == 3
+        assert n_vec == 3  # every unit embedded despite chunking
+
+        assert h.search_sync("pumpkins", limit=10)
+
+
+def test_ingest_batch_matches_single_ingest_fts():
+    """Batched and per-unit ingest return the same keyword hit (FTS path)."""
+    from benchmarks.ingest import MemoryUnit
+
+    content = "The codename quetzalcoatl maps to project 7."
+    with Harness(embedder_mode="none") as single:
+        single.reset()
+        single.ingest(content, "sess-A")
+        single.ingest("unrelated lunch chatter", "sess-B")
+        single_hit = single.search_sync("quetzalcoatl", limit=5)
+
+    with Harness(embedder_mode="none") as batched:
+        batched.reset()
+        batched.ingest_batch(
+            [MemoryUnit(content, "sess-A"), MemoryUnit("unrelated lunch chatter", "sess-B")]
+        )
+        batched_hit = batched.search_sync("quetzalcoatl", limit=5)
+
+    assert single_hit[0]["metadata"]["session_id"] == "sess-A"
+    assert batched_hit[0]["metadata"]["session_id"] == "sess-A"
+
+
 async def test_before_after_sample_shows_improvement():
     """On the bundled punctuated sample, sanitization lifts keyword-only recall."""
     from pathlib import Path

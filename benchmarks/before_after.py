@@ -142,7 +142,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Which change to measure: 'sanitize' (FTS5 fix) or 'rrf' (drop recency+vitality)",
     )
     p.add_argument("--ingest", default="verbatim", help="Ingest mode (default: verbatim)")
-    p.add_argument("--embedder", choices=["real", "fake", "none"], default="none")
+    p.add_argument("--embedder", choices=["real", "fake", "none", "ollama"], default="none")
     p.add_argument("--ks", default="1,3,5", help="Recall cutoffs (default: 1,3,5)")
     p.add_argument("--limit", type=int, default=100, help="Candidate pool size (default: 100)")
     p.add_argument("--max-questions", type=int, default=0, help="Cap number of questions")
@@ -152,6 +152,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point."""
+    from benchmarks import quiet_dependency_logs
+
+    quiet_dependency_logs()
     args = build_parser().parse_args(argv)
     return asyncio.run(run(args))
 

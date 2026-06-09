@@ -45,6 +45,34 @@ The synthetic dataset is built so FTS5 alone finds the gold session
 deterministically (Recall@1 == 1.0). Use it to confirm the pipeline works
 before downloading the real data.
 
+## Using an Ollama embedding model (`--embedder ollama`)
+
+To benchmark a stronger/local retriever instead of the ONNX MiniLM model, run a
+local Ollama daemon and pull an embedding model, then set the dimension to match:
+
+```bash
+ollama pull nomic-embed-text                    # 768-d (bge-m3 / mxbai-embed-large are 1024-d)
+export REMIND_ME_EMBEDDING_BACKEND=ollama
+export REMIND_ME_EMBEDDING_DIM=768              # MUST match the model's output dim
+export REMIND_ME_OLLAMA_EMBED_MODEL=nomic-embed-text
+
+python -m benchmarks.runner --data benchmarks/data/longmemeval_s_cleaned.json \
+  --ingest verbatim,atomic --embedder ollama --ks 1,3,5,10 --out results_ollama.json
+```
+
+`REMIND_ME_EMBEDDING_DIM` is baked into the `sqlite-vec` table at creation, so it
+must equal the model's output dimension; the harness builds a fresh table each
+run, so there's nothing to migrate here. (In the live server, changing the model
+on an existing database means recreating the vector table and running
+`remind_me_reindex`.) If the daemon is unreachable, the harness logs a warning
+and degrades to FTS5-only rather than crashing.
+
+The harness **batches embedding calls** — all of a question's memories are
+embedded in chunks via one `/api/embed` request each (default 64 per chunk),
+not one request per memory — so Ollama runs are much faster than the per-memory
+round-trips would suggest. A smaller model (`snowflake-arctic-embed:33m`,
+`all-minilm` — both 384-d) speeds each call further.
+
 ## Run on LongMemEval
 
 1. **Download the dataset** (one command — fetches from the official cleaned

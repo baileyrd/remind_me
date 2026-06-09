@@ -14,7 +14,14 @@ import logging
 
 import numpy as np
 
-from remind_me_mcp.config import EMBEDDING_DIM, EMBEDDING_MODEL, MODEL_DIR
+from remind_me_mcp.config import (
+    EMBEDDING_BACKEND,
+    EMBEDDING_DIM,
+    EMBEDDING_MODEL,
+    MODEL_DIR,
+    OLLAMA_EMBED_MODEL,
+    OLLAMA_URL,
+)
 
 log = logging.getLogger("remind_me_mcp.embeddings")
 
@@ -147,17 +154,95 @@ class _Embedder:
 
 
 # ---------------------------------------------------------------------------
+# Ollama embedding backend
+# ---------------------------------------------------------------------------
+
+
+class OllamaEmbedder:
+    """Embedding engine backed by a local Ollama daemon.
+
+    Calls Ollama's batch embedding endpoint (``POST /api/embed``) instead of
+    running a model in-process. This unlocks stronger/multilingual retrievers
+    (e.g. ``nomic-embed-text``, ``bge-m3``) and avoids any HuggingFace download.
+
+    The returned vector length MUST equal :data:`EMBEDDING_DIM` (which is baked
+    into the sqlite-vec table); a mismatch raises a clear error so the user fixes
+    ``REMIND_ME_EMBEDDING_DIM`` and reindexes rather than silently corrupting the
+    index.
+    """
+
+    def __init__(
+        self,
+        model: str = OLLAMA_EMBED_MODEL,
+        url: str = OLLAMA_URL,
+        dim: int = EMBEDDING_DIM,
+        timeout: float = 60.0,
+    ) -> None:
+        """Configure the Ollama embedder (no network call until first embed)."""
+        self.model = model
+        self.url = url.rstrip("/")
+        self.dim = dim
+        self.timeout = timeout
+
+    def embed(self, texts: list[str]) -> np.ndarray:
+        """Embed a batch of texts via Ollama, returning L2-normalised float32 vectors."""
+        import httpx
+
+        resp = httpx.post(
+            f"{self.url}/api/embed",
+            json={"model": self.model, "input": texts},
+            timeout=self.timeout,
+        )
+        resp.raise_for_status()
+        vectors = resp.json().get("embeddings")
+        if not vectors:
+            raise ValueError(f"Ollama returned no embeddings for model {self.model!r}")
+
+        arr = np.asarray(vectors, dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[1] != self.dim:
+            raise ValueError(
+                f"Ollama model {self.model!r} returned dim {arr.shape[-1]}, "
+                f"but REMIND_ME_EMBEDDING_DIM is {self.dim}. Set the dimension to match "
+                "the model and run remind_me_reindex on a fresh vector table."
+            )
+        norms = np.linalg.norm(arr, axis=1, keepdims=True).clip(min=1e-9)
+        return (arr / norms).astype(np.float32)
+
+    def embed_one(self, text: str) -> bytes:
+        """Embed a single text and return raw float32 bytes for sqlite-vec storage."""
+        return self.embed([text])[0].tobytes()
+
+    @property
+    def available(self) -> bool:
+        """Return True if the Ollama daemon answers an embedding request."""
+        try:
+            self.embed(["ping"])
+            return True
+        except Exception as e:  # Broad catch: any connection/HTTP/dim error => unavailable
+            log.warning("Ollama embedder unavailable (%s). Semantic search disabled.", e)
+            return False
+
+
+# ---------------------------------------------------------------------------
 # Module-level singleton
 # ---------------------------------------------------------------------------
 
-_embedder: _Embedder | None = None
+_embedder: _Embedder | OllamaEmbedder | None = None
 
 
-def _get_embedder() -> _Embedder | None:
-    """Get or create the global embedder. Returns None if dependencies missing."""
+def _get_embedder() -> _Embedder | OllamaEmbedder | None:
+    """Get or create the global embedder for the configured backend.
+
+    Returns None when the backend is unavailable (missing ONNX deps, or an
+    unreachable Ollama daemon), so callers degrade to FTS5 keyword search.
+    """
     global _embedder
     if _embedder is None:
-        _embedder = _Embedder()
+        _embedder = OllamaEmbedder() if EMBEDDING_BACKEND == "ollama" else _Embedder()
+
+    if isinstance(_embedder, OllamaEmbedder):
+        return _embedder if _embedder.available else None
+
     try:
         _embedder._ensure_loaded()
         return _embedder
@@ -170,6 +255,7 @@ def _get_embedder() -> _Embedder | None:
 # ---------------------------------------------------------------------------
 
 __all__ = [
+    "OllamaEmbedder",
     "_Embedder",
     "_get_embedder",
 ]
