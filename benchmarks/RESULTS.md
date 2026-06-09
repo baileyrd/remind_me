@@ -6,6 +6,12 @@ Run on `longmemeval_s_cleaned.json` (the standard ~115k-token haystacks *with
 distractor sessions*), 470 scored questions (30 abstention questions skipped),
 hybrid retrieval (`--embedder real`), session-level Recall@k / MRR.
 
+> ⚠️ **This headline table predates the sliding-window chunking change** (it is the
+> hybrid `--rrf-profile default` run, one vector per session). Chunking has not been
+> re-measured under the hybrid profile here — expect verbatim to improve as it does
+> in the model-matched semantic-only run below. For current, chunked numbers see
+> **"Equal-footing comparison with MemPalace"**.
+
 Reproduce:
 
 ```bash
@@ -44,16 +50,16 @@ semantic-only, session-level R@5 over the same 470 scored LongMemEval-S question
 | MemPalace — held-out (450 q) | 0.984 | same |
 | MemPalace — + Claude Haiku rerank | 1.000 | + LLM reranker (their words: "teaching to the test") |
 | Plain keyword search (their baseline) | 0.938 | BM25-style, no embeddings |
-| **Remind Me — atomic, semantic-only** | **0.991** | many small embeddings per session — beats headline, ties reranked, no LLM |
-| **Remind Me — verbatim, semantic-only** | **0.923** | one embedding per whole session — ~4 pts under headline |
+| **Remind Me — atomic, semantic-only** | **0.992** | many small embeddings per session — beats headline, ties reranked, no LLM |
+| **Remind Me — verbatim, semantic-only (chunked)** | **0.964** | sliding-window chunks, any-chunk-hit — ties the headline (was 0.923 with one vector/session; see "Sliding-window chunking" below) |
 | Remind Me — verbatim, semantic-only, `snowflake-arctic-embed:33m` | 0.821 | secondary: this branch's tiny 33M Ollama model (not model-matched) |
 
-Full per-type breakdown of the two model-matched runs:
+Full per-type breakdown of the two model-matched runs (verbatim is now **chunked**):
 
 | Mode | N | R@1 | R@3 | R@5 | R@10 | MRR |
 |---|---|---|---|---|---|---|
-| verbatim (semantic-only) | 470 | 0.760 | 0.896 | 0.923 | 0.968 | 0.834 |
-| atomic (semantic-only) | 470 | 0.926 | 0.989 | 0.991 | 0.996 | 0.956 |
+| verbatim (semantic-only, chunked) | 470 | 0.851 | 0.940 | 0.964 | 0.983 | 0.901 |
+| atomic (semantic-only) | 470 | 0.925 | 0.989 | 0.992 | 0.996 | 0.956 |
 
 **What MemPalace's headline actually measures.** Their 96.6% R@5 run stores each
 session verbatim and retrieves with a plain ChromaDB `collection.query()` using
@@ -67,13 +73,14 @@ retrieval.
 **The result: it was the retrieval unit, not the model.** Matched on model and
 scored at session level, semantic-only:
 
-- **Verbatim → 0.923, about 4 points under MemPalace's 0.966.** Remind Me stored
-  **one embedding per whole session**, and MiniLM truncates at ~256 tokens, so on
-  LongMemEval-S's long, distractor-padded sessions the vector often never saw the
-  evidence. MemPalace's verbatim path embeds each session as **multiple
-  chunks/rounds** (any chunk hitting = a session hit), giving it more shots. Same
-  model, different granularity — that was the whole gap. **This is now fixed —
-  see "Sliding-window chunking" below.**
+- **Verbatim → 0.964 after chunking (was 0.923), now level with MemPalace's 0.966.**
+  Remind Me originally stored **one embedding per whole session**, and MiniLM
+  truncates at ~256 tokens, so on LongMemEval-S's long, distractor-padded sessions
+  the single vector often never saw the evidence — capping verbatim at 0.923, ~4 pts
+  under. MemPalace's verbatim path embeds each session as **multiple chunks/rounds**
+  (any chunk hitting = a session hit). Once Remind Me does the same (see
+  "Sliding-window chunking" below), verbatim rises to **0.964 R@5 — a statistical tie
+  with the 0.966 headline**, confirming the gap was purely granularity, same model.
 - **Atomic → 0.991, above MemPalace's 0.966 headline and 0.984 held-out, and level
   with their LLM-reranked 1.000 — with no LLM at write or rerank time** (R@1 also
   jumps to 0.926). Remind Me's `atomic` decomposition (sentence-level embeddings) is
@@ -113,12 +120,30 @@ still yield a single chunk.
 
 Tunable via `REMIND_ME_EMBED_CHUNK_CHARS` / `_OVERLAP` / `REMIND_ME_EMBED_MAX_CHUNKS`.
 
-> **Not yet re-measured on `longmemeval_s` here** (needs the dataset + MiniLM /
-> network). Re-run the model-matched semantic-only command above and expect
-> **verbatim R@5 to rise from 0.923 toward/above MemPalace's 0.966**, with
-> **atomic ≈ unchanged**. Paste the before/after table here once run. Existing DBs
-> migrate automatically (v7 → v8: legacy 1:1 vectors backfill as chunk 0);
-> `remind_me_reindex` re-chunks them with the new windows.
+**Measured before/after** (model-matched, semantic-only, 470 scored questions,
+`--rrf-profile semantic`). "Before" = one vector per session; "after" = chunked:
+
+| Mode | Metric | Before | After | Δ |
+|---|---|---|---|---|
+| verbatim | R@1 | 0.760 | **0.851** | **+0.091** |
+| verbatim | R@3 | 0.896 | 0.940 | +0.044 |
+| verbatim | R@5 | 0.923 | **0.964** | **+0.041** |
+| verbatim | R@10 | 0.968 | 0.983 | +0.015 |
+| verbatim | MRR | 0.834 | 0.901 | +0.068 |
+| atomic | R@5 | 0.991 | 0.992 | +0.001 |
+| atomic | MRR | 0.956 | 0.956 | 0.000 |
+
+The prediction held exactly: **verbatim R@5 0.923 → 0.964** (now a statistical tie
+with MemPalace's 0.966 headline on 470 questions), with the largest gains at the top
+of the ranking (**R@1 +0.091, MRR +0.068**) where the truncated tail used to lose the
+evidence. **Atomic is unchanged** (±0.001 noise) — its facts are short, so they were
+already single-chunk. The previously weakest category also recovered sharply:
+verbatim `single-session-preference` went **R@1 0.433 → 0.700, R@5 0.900 → 0.967**.
+
+Cost note: chunking multiplied verbatim's embedding work ~16× (up to 16 windows per
+long session), so the model-matched verbatim run took ~2.4 h on CPU ONNX; atomic is
+unaffected. Existing DBs migrate automatically (v7 → v8: legacy 1:1 vectors backfill
+as chunk 0); `remind_me_reindex` re-chunks them with the new windows.
 
 ### Verbatim vs. atomic — the main finding
 
