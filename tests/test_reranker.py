@@ -122,6 +122,68 @@ def test_maybe_rerank_respects_top_k(monkeypatch):
     assert [m["id"] for m in ranked] == ["B", "A", "C"]
 
 
+class _StubEncoding:
+    """Mimics a tokenizers Encoding for one (query, doc) pair."""
+
+    def __init__(self, n: int) -> None:
+        self.ids = [1] * n
+        self.attention_mask = [1] * n
+        self.type_ids = [0] * (n // 2) + [1] * (n - n // 2)
+
+
+class _StubTokenizer:
+    def encode_batch(self, pairs):
+        return [_StubEncoding(8) for _ in pairs]
+
+
+class _StubSession:
+    """Returns one logit per pair: the running pair index, so order is checkable."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.seen_feeds: list[set] = []
+        self._next = 0
+
+    def run(self, _outputs, feeds):
+        self.calls += 1
+        self.seen_feeds.append(set(feeds))
+        n = feeds["input_ids"].shape[0]
+        logits = np.arange(self._next, self._next + n, dtype=np.float32).reshape(n, 1)
+        self._next += n
+        return [logits]
+
+
+def _stubbed_engine(input_names: set[str]) -> rr.CrossEncoderReranker:
+    engine = rr.CrossEncoderReranker(model_name="stub")
+    engine._session = _StubSession()
+    engine._tokenizer = _StubTokenizer()
+    engine._input_names = input_names
+    engine._ready = True
+    return engine
+
+
+def test_score_batches_and_concatenates(monkeypatch):
+    monkeypatch.setattr(rr, "_RERANK_BATCH", 4)
+    engine = _stubbed_engine({"input_ids", "attention_mask", "token_type_ids"})
+    scores = engine.score("q", [f"doc {i}" for i in range(10)])
+    # 10 docs at batch size 4 -> 3 forward passes, scores in input order.
+    assert engine._session.calls == 3
+    assert scores.tolist() == list(range(10))
+    assert all("token_type_ids" in f for f in engine._session.seen_feeds)
+
+
+def test_score_omits_token_type_ids_when_graph_lacks_them():
+    engine = _stubbed_engine({"input_ids", "attention_mask"})
+    scores = engine.score("q", ["a", "b"])
+    assert scores.tolist() == [0.0, 1.0]
+    assert all("token_type_ids" not in f for f in engine._session.seen_feeds)
+
+
+def test_score_empty_input_returns_empty():
+    engine = _stubbed_engine({"input_ids", "attention_mask"})
+    assert engine.score("q", []).shape == (0,)
+
+
 async def test_memory_search_applies_reranker(monkeypatch, db_conn, memory_factory):
     """End-to-end: an enabled reranker reorders memory_search results."""
     import json
