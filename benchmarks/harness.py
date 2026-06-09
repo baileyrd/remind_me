@@ -151,6 +151,7 @@ class Harness:
         if self.has_vec:
             with contextlib.suppress(sqlite3.Error):
                 self._db.execute("DELETE FROM memories_vec")
+                self._db.execute("DELETE FROM vec_chunks")
         self._db.commit()
 
     def _new_id(self, content: str) -> str:
@@ -208,8 +209,7 @@ class Harness:
 
         Each ``unit`` must expose ``.content`` and ``.session_id``.
         """
-        from remind_me_mcp.db import _now_iso
-        from remind_me_mcp.embeddings import _get_embedder
+        from remind_me_mcp.db import _embed_and_store_rows, _now_iso
 
         assert self._db is not None
         now = _now_iso()
@@ -241,18 +241,11 @@ class Harness:
         self._db.commit()
 
         if embed and self.has_vec and rows:
-            embedder = _get_embedder()
-            if embedder is not None:
-                for start in range(0, len(rows), batch_size):
-                    chunk = rows[start : start + batch_size]
-                    # Mirror _embed_and_store's 2000-char truncation for parity.
-                    vectors = embedder.embed([content[:2000] for _, content in chunk])
-                    for (rowid, _), vec in zip(chunk, vectors, strict=True):
-                        self._db.execute(
-                            "INSERT INTO memories_vec(rowid, embedding) VALUES (?, ?)",
-                            (rowid, vec.astype("float32").tobytes()),
-                        )
-                self._db.commit()
+            # Same chunked, multi-vector write as remind_me_add — batched in
+            # slices to bound each embed() round-trip (one ONNX pass / Ollama
+            # request per slice).
+            for start in range(0, len(rows), batch_size):
+                _embed_and_store_rows(rows[start : start + batch_size])
 
         return id_to_session
 

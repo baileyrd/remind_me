@@ -280,6 +280,10 @@ class TestConsolidateInput:
 # Integration tests — consolidation tool handler (Phase 14 Plan 02)
 # ---------------------------------------------------------------------------
 
+# Monotonic salt so _insert_memory_with_vec generates unique ids even for
+# identical content (see note in the helper).
+_vec_helper_counter = 0
+
 
 def _insert_memory_with_vec(
     db: sqlite3.Connection,
@@ -321,7 +325,11 @@ def _insert_memory_with_vec(
     if tags is None:
         tags = []
     if memory_id is None:
-        memory_id = _make_id(content)
+        # _make_id is timestamp-salted and collides for same-content calls within
+        # one clock tick (coarse on Windows); add a counter so duplicates differ.
+        global _vec_helper_counter
+        _vec_helper_counter += 1
+        memory_id = _make_id(f"{content}|{_vec_helper_counter}")
     now = _now_iso()
 
     db.execute(
@@ -340,14 +348,19 @@ def _insert_memory_with_vec(
         ),
     )
 
-    # Store embedding in memories_vec
+    # Store embedding as a single chunk vector, mapped via vec_chunks (the
+    # post-v8 layout the consolidate query reads). chunk_ix=0 mirrors how the
+    # migration backfills legacy 1:1 vectors.
     emb_bytes = mock_embedder.embed_one(content)  # type: ignore[union-attr]
     rowid = db.execute(
         "SELECT rowid FROM memories WHERE id = ?", (memory_id,)
     ).fetchone()[0]
+    cur = db.execute(
+        "INSERT INTO memories_vec(embedding) VALUES (?)", (emb_bytes,)
+    )
     db.execute(
-        "INSERT INTO memories_vec(rowid, embedding) VALUES (?, ?)",
-        (rowid, emb_bytes),
+        "INSERT INTO vec_chunks(vec_rowid, memory_rowid, chunk_ix) VALUES (?, ?, ?)",
+        (cur.lastrowid, rowid, 0),
     )
 
     db.commit()

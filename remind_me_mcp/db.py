@@ -15,6 +15,7 @@ Current schema versions:
   4 -> 5: Add decay, vitality, and classification columns
   5 -> 6: Add source_capture_id column for atomic decomposition
   6 -> 7: Add subject, predicate, object, superseded_by columns for structured memory
+  7 -> 8: Add vec_chunks map for multi-vector (sliding-window) embeddings
 """
 
 from __future__ import annotations
@@ -29,7 +30,12 @@ from datetime import UTC, datetime
 from typing import Any
 
 from remind_me_mcp.config import DB_PATH, EMBEDDING_DIM
-from remind_me_mcp.embeddings import _get_embedder
+from remind_me_mcp.embeddings import _get_embedder, chunk_text
+
+# Over-fetch factor for chunked KNN: a single memory may own several chunk
+# vectors, so we ask sqlite-vec for limit * this many chunk hits and then dedupe
+# to distinct parent memories before truncating to the caller's limit.
+_CHUNK_KNN_FANOUT = 4
 
 log = logging.getLogger("remind_me_mcp.db")
 
@@ -196,7 +202,7 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 # Current target schema version.  Increment when adding a new migration step.
-_SCHEMA_VERSION = 7
+_SCHEMA_VERSION = 8
 
 
 
@@ -250,6 +256,11 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         _migrate_v6_to_v7(db)
         db.execute("PRAGMA user_version = 7")
         current_version = 7
+
+    if current_version < 8:
+        _migrate_v7_to_v8(db)
+        db.execute("PRAGMA user_version = 8")
+        current_version = 8
 
     db.commit()
 
@@ -803,65 +814,147 @@ def _migrate_v6_to_v7(db: sqlite3.Connection) -> None:
     """)
 
 
+def _migrate_v7_to_v8(db: sqlite3.Connection) -> None:
+    """v7 -> v8: Add the vec_chunks map for multi-vector (chunked) embeddings.
+
+    Previously each memory stored exactly one vector in ``memories_vec`` keyed by
+    the memory's own rowid (1:1). To embed long content as several overlapping
+    sliding windows, ``memories_vec`` now holds one row per *chunk* (its own
+    auto-assigned rowid) and ``vec_chunks`` maps each chunk vector back to its
+    parent memory. Existing single vectors are backfilled as ``chunk_ix = 0`` so
+    they keep working unchanged until the memory is re-embedded (or reindexed).
+
+    Args:
+        db: An open SQLite connection.
+    """
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS vec_chunks (
+               vec_rowid    INTEGER PRIMARY KEY,
+               memory_rowid INTEGER NOT NULL,
+               chunk_ix     INTEGER NOT NULL
+           )"""
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_vec_chunks_memory ON vec_chunks(memory_rowid)"
+    )
+    # Backfill existing 1:1 vectors (vec rowid == memory rowid) as chunk 0. Guard
+    # for deployments where sqlite-vec isn't loaded (memories_vec absent).
+    with contextlib.suppress(sqlite3.OperationalError):
+        db.execute(
+            """INSERT OR IGNORE INTO vec_chunks(vec_rowid, memory_rowid, chunk_ix)
+               SELECT rowid, rowid, 0 FROM memories_vec"""
+        )
+
+
 # ---------------------------------------------------------------------------
 # Embedding helpers
 # ---------------------------------------------------------------------------
 
 
-def _embed_and_store(memory_id: str, content: str) -> bool:
-    """Generate embedding for content and store in the vector table.
+def _delete_chunks(db: sqlite3.Connection, memory_rowid: int) -> None:
+    """Remove all chunk vectors (and map rows) belonging to one memory."""
+    old = db.execute(
+        "SELECT vec_rowid FROM vec_chunks WHERE memory_rowid = ?", (memory_rowid,)
+    ).fetchall()
+    for (vec_rowid,) in old:
+        db.execute("DELETE FROM memories_vec WHERE rowid = ?", (vec_rowid,))
+    db.execute("DELETE FROM vec_chunks WHERE memory_rowid = ?", (memory_rowid,))
 
-    Acquires its own per-thread database connection via ``_get_db()``, looks
-    up the memory's rowid, generates a float32 embedding vector via the ONNX
-    engine, and upserts it into memories_vec. If the embedder is unavailable
-    or the vector table is missing, returns False silently.
+
+def _embed_and_store_rows(rows: list[tuple[int, str]]) -> int:
+    """Embed and store sliding-window chunk vectors for several memories at once.
+
+    Each memory's content is split via :func:`chunk_text` into one or more
+    overlapping windows; every window is embedded as its own vector in
+    ``memories_vec`` (auto-assigned rowid) and linked to the parent memory in
+    ``vec_chunks``. All windows across all memories are embedded in a single
+    batched ``embedder.embed()`` call. Any pre-existing chunks for a memory are
+    replaced (so this is safe for updates and re-embeds).
 
     Args:
-        memory_id: The text primary key of the memory to embed.
-        content: The text content to embed (truncated to 2000 chars).
+        rows: ``(memory_rowid, content)`` pairs to embed.
 
     Returns:
-        True if the embedding was stored successfully, False otherwise.
+        The number of memories that had at least one chunk stored.
     """
     embedder = _get_embedder()
     if embedder is None:
-        return False
+        return 0
+    # Split every memory into chunks, flattening into one batch for embedding.
+    plan: list[tuple[int, int, int]] = []  # (memory_rowid, offset, count)
+    flat_chunks: list[str] = []
+    for memory_rowid, content in rows:
+        chunks = chunk_text(content or "")
+        if not chunks:
+            continue
+        plan.append((memory_rowid, len(flat_chunks), len(chunks)))
+        flat_chunks.extend(chunks)
+    if not flat_chunks:
+        return 0
     try:
         db = _get_db()
-        rowid = db.execute(
-            "SELECT rowid FROM memories WHERE id = ?", (memory_id,)
-        ).fetchone()
-        if rowid is None:
-            return False
-        vec_bytes = embedder.embed_one(content[:2000])  # truncate very long content for embedding
-        # Delete existing vector if any (for updates)
-        db.execute("DELETE FROM memories_vec WHERE rowid = ?", (rowid[0],))
-        db.execute(
-            "INSERT INTO memories_vec(rowid, embedding) VALUES (?, ?)",
-            (rowid[0], vec_bytes),
-        )
+        vecs = embedder.embed(flat_chunks)
+        stored = 0
+        for memory_rowid, offset, count in plan:
+            _delete_chunks(db, memory_rowid)
+            for ci in range(count):
+                cur = db.execute(
+                    "INSERT INTO memories_vec(embedding) VALUES (?)",
+                    (vecs[offset + ci].tobytes(),),
+                )
+                db.execute(
+                    "INSERT INTO vec_chunks(vec_rowid, memory_rowid, chunk_ix) "
+                    "VALUES (?, ?, ?)",
+                    (cur.lastrowid, memory_rowid, ci),
+                )
+            stored += 1
         db.commit()
-        return True
+        return stored
     except sqlite3.DatabaseError as e:
-        log.warning("Database error storing embedding for %s: %s", memory_id, e)
-        return False
+        log.warning("Database error storing chunk embeddings: %s", e)
+        return 0
     except (ValueError, TypeError) as e:
-        log.warning("Embedding computation failed for %s: %s", memory_id, e)
+        log.warning("Embedding computation failed: %s", e)
+        return 0
+
+
+def _embed_and_store(memory_id: str, content: str) -> bool:
+    """Generate sliding-window embeddings for one memory and store them.
+
+    Looks up the memory's rowid, splits ``content`` into overlapping chunks,
+    embeds each, and stores them as chunk vectors linked to the memory (see
+    :func:`_embed_and_store_rows`). Returns False silently when the embedder is
+    unavailable, the memory is unknown, or the vector table is missing.
+
+    Args:
+        memory_id: The text primary key of the memory to embed.
+        content: The full text content to embed (chunked, not truncated).
+
+    Returns:
+        True if at least one chunk vector was stored, False otherwise.
+    """
+    db = _get_db()
+    row = db.execute(
+        "SELECT rowid FROM memories WHERE id = ?", (memory_id,)
+    ).fetchone()
+    if row is None:
         return False
+    return _embed_and_store_rows([(row[0], content)]) > 0
 
 
 def _semantic_search(query: str, limit: int = 20) -> list[dict]:
-    """Search memories by semantic similarity using the vector index.
+    """Search memories by semantic similarity using the chunked vector index.
 
-    Acquires its own per-thread database connection via ``_get_db()``, embeds
-    the query text, and performs an approximate nearest-neighbour search
-    against the memories_vec virtual table. Results include a
-    'semantic_distance' key (lower = more similar). Returns an empty list
-    if the embedder is unavailable or the vector table does not exist.
+    Embeds the query, runs KNN over the per-chunk vectors in ``memories_vec``,
+    then deduplicates to distinct parent memories — keeping each memory's best
+    (smallest-distance) chunk. Because one memory may own several chunks, the
+    KNN over-fetches ``limit * _CHUNK_KNN_FANOUT`` chunk hits so enough distinct
+    memories survive the dedupe. Results carry a 'semantic_distance' key (lower =
+    more similar). Returns [] when the embedder or vector table is unavailable.
 
     Args:
         query: The search query text to embed and compare.
-        limit: Maximum number of results to return.
+        limit: Maximum number of distinct memories to return.
 
     Returns:
         List of memory dicts (from _row_to_dict) with an added
@@ -873,17 +966,20 @@ def _semantic_search(query: str, limit: int = 20) -> list[dict]:
     try:
         db = _get_db()
         query_bytes = embedder.embed_one(query)
+        knn_k = max(limit, limit * _CHUNK_KNN_FANOUT)
         rows = db.execute(
-            """SELECT m.*, mv.distance
+            """SELECT m.*, MIN(mv.distance) AS distance
                FROM memories_vec mv
-               JOIN memories m ON m.rowid = mv.rowid
+               JOIN vec_chunks vc ON vc.vec_rowid = mv.rowid
+               JOIN memories m ON m.rowid = vc.memory_rowid
                WHERE mv.embedding MATCH ?
                AND mv.k = ?
-               ORDER BY mv.distance""",
-            (query_bytes, limit),
+               GROUP BY m.rowid
+               ORDER BY distance""",
+            (query_bytes, knn_k),
         ).fetchall()
         results = []
-        for r in rows:
+        for r in rows[:limit]:
             d = _row_to_dict(r)
             d["semantic_distance"] = d.pop("distance", None)
             results.append(d)
@@ -964,6 +1060,7 @@ __all__ = [
     "_ensure_schema",
     "_migrate_schema",
     "_embed_and_store",
+    "_embed_and_store_rows",
     "_semantic_search",
     "_now_iso",
     "_make_id",
