@@ -326,6 +326,74 @@ async def test_memory_delete_exists(db_conn: sqlite3.Connection, memory_factory)
     assert "not found" in get_result.lower()
 
 
+async def test_memory_delete_removes_chunk_vectors(
+    db_conn_with_vec: sqlite3.Connection,
+    mock_embedder,
+) -> None:
+    """Deleting a memory removes its chunk vectors from vec_chunks/memories_vec (DI-01)."""
+    await memory_add(MemoryAddInput(content="Chunk cleanup test memory"))
+    row = db_conn_with_vec.execute("SELECT rowid, id FROM memories").fetchone()
+
+    chunk_count = db_conn_with_vec.execute(
+        "SELECT COUNT(*) FROM vec_chunks WHERE memory_rowid = ?", (row["rowid"],)
+    ).fetchone()[0]
+    assert chunk_count > 0, "precondition: memory was embedded"
+
+    result = await memory_delete(MemoryDeleteInput(memory_id=row["id"]))
+    assert "deleted" in result
+
+    assert db_conn_with_vec.execute("SELECT COUNT(*) FROM vec_chunks").fetchone()[0] == 0
+    assert db_conn_with_vec.execute("SELECT COUNT(*) FROM memories_vec").fetchone()[0] == 0
+
+
+async def test_reindex_prunes_orphaned_chunks_for_reused_rowid(
+    db_conn_with_vec: sqlite3.Connection,
+    mock_embedder,
+) -> None:
+    """Reindex prunes vec_chunks rows whose memory no longer exists (DI-01).
+
+    SQLite reuses freed rowids: without pruning, a new memory inherits the
+    deleted memory's embedding and reindex skips it forever.
+    """
+    from remind_me_mcp.db import _make_id, _now_iso, _semantic_search
+
+    await memory_add(MemoryAddInput(content="Old deleted memory about sailing boats"))
+    old = db_conn_with_vec.execute("SELECT rowid, id FROM memories").fetchone()
+
+    # Simulate the historical buggy delete: row removed, chunk vectors orphaned.
+    db_conn_with_vec.execute("DELETE FROM memories WHERE id = ?", (old["id"],))
+    db_conn_with_vec.commit()
+    assert db_conn_with_vec.execute("SELECT COUNT(*) FROM vec_chunks").fetchone()[0] > 0
+
+    # Reindex must prune the orphaned chunk vectors.
+    await remind_me_reindex()
+    assert db_conn_with_vec.execute("SELECT COUNT(*) FROM vec_chunks").fetchone()[0] == 0
+    assert db_conn_with_vec.execute("SELECT COUNT(*) FROM memories_vec").fetchone()[0] == 0
+
+    # Insert a new memory directly (no embedding) — it reuses the freed rowid.
+    new_content = "Brand new memory about quantum chess strategies"
+    new_id = _make_id(new_content)
+    now = _now_iso()
+    db_conn_with_vec.execute(
+        """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
+           VALUES (?, ?, 'general', '[]', 'manual', '{}', ?, ?)""",
+        (new_id, new_content, now, now),
+    )
+    db_conn_with_vec.commit()
+    new_rowid = db_conn_with_vec.execute(
+        "SELECT rowid FROM memories WHERE id = ?", (new_id,)
+    ).fetchone()[0]
+    assert new_rowid == old["rowid"], "precondition: rowid was reused"
+
+    # Without the prune, reindex would have seen this rowid as already embedded
+    # and the new memory would keep the deleted memory's embedding forever.
+    await remind_me_reindex()
+    results = _semantic_search(new_content, limit=1)
+    assert results, "new memory should have a real embedding after reindex"
+    assert results[0]["id"] == new_id
+    assert results[0]["semantic_distance"] < 0.1
+
+
 async def test_memory_delete_not_found(db_conn: sqlite3.Connection) -> None:
     """Deleting a nonexistent memory ID returns a not-found message."""
     delete_params = MemoryDeleteInput(memory_id="ghost_id_xyz")

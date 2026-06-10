@@ -9,6 +9,7 @@ circular imports.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -18,11 +19,13 @@ from typing import Any
 from remind_me_mcp.config import CLIENT, NODE_ID
 from remind_me_mcp.consolidation import find_clusters, merge_cluster, pick_canonical
 from remind_me_mcp.db import (
+    _delete_chunks,
     _embed_and_store,
     _embed_and_store_rows,
     _get_db,
     _make_id,
     _now_iso,
+    _prune_orphan_chunks,
     _row_to_dict,
     _semantic_search,
 )
@@ -714,10 +717,17 @@ async def memory_delete(params: MemoryDeleteInput) -> str:
         str: Confirmation or error message.
     """
     db = _get_db()
-    result = db.execute("DELETE FROM memories WHERE id = ?", (params.memory_id,))
-    db.commit()
-    if result.rowcount == 0:
+    row = db.execute(
+        "SELECT rowid FROM memories WHERE id = ?", (params.memory_id,)
+    ).fetchone()
+    if row is None:
         return f"Memory `{params.memory_id}` not found."
+    # Remove chunk vectors first — FTS and tags are cleaned by triggers, but
+    # vec_chunks/memories_vec are not, and SQLite reuses freed rowids (DI-01).
+    with contextlib.suppress(sqlite3.OperationalError):
+        _delete_chunks(db, row[0])
+    db.execute("DELETE FROM memories WHERE id = ?", (params.memory_id,))
+    db.commit()
     return f"✓ Memory `{params.memory_id}` deleted."
 
 
@@ -1090,6 +1100,14 @@ async def remind_me_reindex() -> str:
         )
 
     db = _get_db()
+    # Prune chunk vectors orphaned by old deletes — a reused rowid would
+    # otherwise keep the deleted memory's embedding and be skipped below (DI-01).
+    pruned = 0
+    try:
+        pruned = await asyncio.to_thread(_prune_orphan_chunks, db)
+    except sqlite3.OperationalError as e:
+        log.debug("Chunk tables not available for pruning: %s", e)
+
     # Find memories without chunk embeddings (a memory is "embedded" once it owns
     # at least one row in vec_chunks).
     all_rows = db.execute("SELECT id, rowid, content FROM memories").fetchall()
@@ -1118,7 +1136,8 @@ async def remind_me_reindex() -> str:
         f"**Total memories:** {len(all_rows)}\n"
         f"**Already embedded:** {len(embedded_rowids)}\n"
         f"**Newly embedded:** {created}\n"
-        f"**Failed:** {len(missing) - created}"
+        f"**Failed:** {len(missing) - created}\n"
+        f"**Orphaned chunks pruned:** {pruned}"
     )
 
 

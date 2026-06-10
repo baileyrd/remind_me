@@ -861,6 +861,33 @@ def _delete_chunks(db: sqlite3.Connection, memory_rowid: int) -> None:
     db.execute("DELETE FROM vec_chunks WHERE memory_rowid = ?", (memory_rowid,))
 
 
+def _prune_orphan_chunks(db: sqlite3.Connection) -> int:
+    """Remove chunk vectors whose parent memory no longer exists.
+
+    SQLite reuses freed rowids, so an orphaned ``vec_chunks`` row would make a
+    new memory inherit a deleted memory's embedding (and reindex would skip it
+    because the rowid already looks embedded). Called by reindex to heal
+    databases written before deletes cleaned up chunk vectors.
+
+    Args:
+        db: An open SQLite connection.
+
+    Returns:
+        The number of orphaned chunk rows removed.
+    """
+    orphans = db.execute(
+        """SELECT vec_rowid FROM vec_chunks
+           WHERE memory_rowid NOT IN (SELECT rowid FROM memories)"""
+    ).fetchall()
+    if not orphans:
+        return 0
+    for (vec_rowid,) in orphans:
+        db.execute("DELETE FROM memories_vec WHERE rowid = ?", (vec_rowid,))
+        db.execute("DELETE FROM vec_chunks WHERE vec_rowid = ?", (vec_rowid,))
+    db.commit()
+    return len(orphans)
+
+
 def _embed_and_store_rows(rows: list[tuple[int, str]]) -> int:
     """Embed and store sliding-window chunk vectors for several memories at once.
 
@@ -1090,8 +1117,10 @@ __all__ = [
     "_close_db",
     "_ensure_schema",
     "_migrate_schema",
+    "_delete_chunks",
     "_embed_and_store",
     "_embed_and_store_rows",
+    "_prune_orphan_chunks",
     "_fuse_query_embedding",
     "_semantic_search",
     "_now_iso",
