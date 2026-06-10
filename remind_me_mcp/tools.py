@@ -401,6 +401,7 @@ async def memory_search(params: MemorySearchInput) -> str:
             """SELECT m.* FROM memories m
                JOIN memories_fts fts ON m.rowid = fts.rowid
                WHERE memories_fts MATCH ?
+               AND m.superseded_by IS NULL
                ORDER BY rank
                LIMIT ?""",
             (match_query, params.limit),

@@ -1032,6 +1032,7 @@ def _semantic_search(
                JOIN memories m ON m.rowid = vc.memory_rowid
                WHERE mv.embedding MATCH ?
                AND mv.k = ?
+               AND m.superseded_by IS NULL
                GROUP BY m.rowid
                ORDER BY distance""",
             (query_bytes, knn_k),

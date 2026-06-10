@@ -2213,6 +2213,52 @@ async def test_structured_search_excludes_superseded(
     assert "Bailey prefers light mode" not in contents
 
 
+async def test_fts_search_excludes_superseded(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """The FTS keyword tier excludes superseded memories (DI-02)."""
+    canonical = memory_factory(content="Consolidated note about espresso machines")
+    memory_factory(
+        content="Duplicate note about espresso machines",
+        superseded_by=canonical["id"],
+    )
+
+    params = MemorySearchInput(
+        query="espresso machines", response_format=ResponseFormat.JSON
+    )
+    result = await memory_search(params)
+    data = json.loads(result)
+
+    contents = [m["content"] for m in data["memories"]]
+    assert "Consolidated note about espresso machines" in contents
+    assert "Duplicate note about espresso machines" not in contents
+
+
+async def test_semantic_search_excludes_superseded(
+    db_conn_with_vec: sqlite3.Connection, mock_embedder
+) -> None:
+    """The semantic vector tier excludes superseded memories (DI-02)."""
+    from remind_me_mcp.db import _semantic_search
+
+    await memory_add(MemoryAddInput(content="Canonical fact about hummingbird wings"))
+    await memory_add(MemoryAddInput(content="Old duplicate fact about hummingbird wings"))
+
+    canonical_id = db_conn_with_vec.execute(
+        "SELECT id FROM memories WHERE content LIKE 'Canonical%'"
+    ).fetchone()[0]
+    db_conn_with_vec.execute(
+        "UPDATE memories SET superseded_by = ? WHERE content LIKE 'Old duplicate%'",
+        (canonical_id,),
+    )
+    db_conn_with_vec.commit()
+
+    results = _semantic_search("Old duplicate fact about hummingbird wings", limit=10)
+
+    ids = [m["id"] for m in results]
+    assert canonical_id in ids
+    assert all(m.get("superseded_by") is None for m in results)
+
+
 # ---------------------------------------------------------------------------
 # Debug signals, tier breakdown, dormant_excluded (Phase 13 Plan 02)
 # ---------------------------------------------------------------------------
