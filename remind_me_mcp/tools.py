@@ -521,7 +521,7 @@ async def memory_search(params: MemorySearchInput) -> str:
     if not envelope["memories"]:
         return "_No memories found._"
 
-    parts: list[str] = []
+    parts: list[str] = []  # type: ignore[no-redef]  # also annotated in the structured-path branch above
     sem_available = len(sem_memories) > 0 or _get_embedder() is not None
     method_label = "hybrid (keyword + semantic)" if sem_available else "keyword only"
     parts.append(f"**{envelope['returned']} results** via {method_label} search")

@@ -138,14 +138,14 @@ def _extract_messages_from_json(data: Any, extract_mode: str) -> list[dict[str, 
                     messages.extend(_extract_messages_from_json(item, extract_mode))
                 elif "role" in item or "sender" in item:
                     role = item.get("role", item.get("sender", "unknown"))
-                    content = item.get("content", item.get("text", ""))
+                    content = item.get("content", item.get("text", ""))  # type: ignore[assignment]  # nested .get default may be None
                     if isinstance(content, list):
                         content = "\n".join(
                             b.get("text", "") if isinstance(b, dict) else str(b)
                             for b in content
                         )
                     if isinstance(content, str) and content.strip():
-                        messages.append({"role": role, "content": content.strip()})
+                        messages.append({"role": role, "content": content.strip()})  # type: ignore[dict-item]  # role from .get may be None
         return messages
 
     # Dict with 'messages' key

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+from typing import Any
 
 import numpy as np
 
@@ -57,8 +58,9 @@ class CrossEncoderReranker:
             model_name: HuggingFace repo name. Defaults to module-level RERANK_MODEL.
         """
         self.model_name = model_name or RERANK_MODEL
-        self._session = None
-        self._tokenizer = None
+        # Typed as Any: onnxruntime/tokenizers objects assigned lazily in _ensure_loaded().
+        self._session: Any = None
+        self._tokenizer: Any = None
         self._input_names: set[str] = set()
         self._ready = False
 

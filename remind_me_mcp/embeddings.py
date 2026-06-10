@@ -11,6 +11,7 @@ are not installed.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import numpy as np
 
@@ -111,8 +112,9 @@ class _Embedder:
         """
         self.model_name = model_name
         self.dim = dim
-        self._session = None
-        self._tokenizer = None
+        # Typed as Any: onnxruntime/tokenizers objects assigned lazily in _ensure_loaded().
+        self._session: Any = None
+        self._tokenizer: Any = None
         self._ready = False
 
     def _ensure_loaded(self) -> None:

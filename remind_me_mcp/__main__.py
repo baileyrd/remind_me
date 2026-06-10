@@ -190,12 +190,12 @@ def main() -> None:
 
     # -- Status check mode --
     if args.status:
-        status = get_server_status()
-        if status["ui_server"] == "running":
-            print(f"\u2713 Dashboard running at {status['ui_url']} (PID {status['ui_pid']})")
+        server_status = get_server_status()
+        if server_status["ui_server"] == "running":
+            print(f"\u2713 Dashboard running at {server_status['ui_url']} (PID {server_status['ui_pid']})")
         else:
             print("\u2717 Dashboard not running")
-        print(f"  Database: {status['db_path']} ({'exists' if status['db_exists'] else 'missing'})")
+        print(f"  Database: {server_status['db_path']} ({'exists' if server_status['db_exists'] else 'missing'})")
         sys.exit(0)
 
     # -- MCP HTTP + UI combined mode --
@@ -206,7 +206,7 @@ def main() -> None:
     # -- MCP HTTP standalone mode --
     if args.serve_mcp:
         log.info("Starting MCP HTTP transport on %s:%d", args.mcp_host, args.mcp_port)
-        mcp.run(
+        mcp.run(  # type: ignore[call-arg]  # FastMCP type stubs omit host/port kwargs
             transport="streamable-http",
             host=args.mcp_host,
             port=args.mcp_port,
