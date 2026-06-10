@@ -32,15 +32,15 @@ correctness), **SY** (sync hardening), **SE** (security & server lifecycle),
 
 | ID | P | Status | Item | Review ref |
 |----|---|--------|------|------------|
-| SY-01 | high | todo | Test coverage for `sync.py` and `peer_server.py` (push/pull via MockTransport, upsert conflict cases, peer auth) — written first, before behavior changes | §2 |
-| SY-02 | high | todo | Per-remote outbox send tracking; only mark records the remote actually accepted | §2 |
-| SY-03 | high | todo | Full-column `_upsert_records` with per-record try/rollback and key validation | §2 |
-| SY-04 | high | todo | Keyset pagination `(updated_at, id)` with drain loop for pulls | §2 |
-| SY-05 | med | todo | Echo suppression marks only the exact outbox rowids created by the upsert | §2 |
-| SY-06 | med | todo | Embed pulled records on ingest (semantic search visibility without manual reindex) | §2 |
-| SY-07 | med | todo | Prune sent outbox rows on a retention window; don't accumulate when sync disabled | §2 |
-| SY-08 | med | todo | One canonical UTC ISO timestamp format (triggers vs `_now_iso()` vs hub) | §2 |
-| SY-09 | med | todo | Peer server hardening: ThreadingHTTPServer, body/limit caps, JSON error handling, configurable bind, `hmac.compare_digest`, honor `STATIC_PEERS`/`TAILSCALE_SOCKET`, index on `memories(updated_at)` | §2 |
+| SY-01 | high | done | Test coverage for `sync.py` and `peer_server.py` (push/pull via MockTransport, upsert conflict cases, peer auth) — written first, before behavior changes | §2 |
+| SY-02 | high | done | Per-remote outbox send tracking; only mark records the remote actually accepted | §2 |
+| SY-03 | high | done | Full-column `_upsert_records` with per-record try/rollback and key validation | §2 |
+| SY-04 | high | done | Keyset pagination `(updated_at, id)` with drain loop for pulls | §2 |
+| SY-05 | med | done | Echo suppression marks only the exact outbox rowids created by the upsert | §2 |
+| SY-06 | med | done | Embed pulled records on ingest (semantic search visibility without manual reindex) | §2 |
+| SY-07 | med | done | Prune sent outbox rows on a retention window; don't accumulate when sync disabled | §2 |
+| SY-08 | med | done | One canonical UTC ISO timestamp format (triggers vs `_now_iso()` vs hub) | §2 |
+| SY-09 | med | done | Peer server hardening: ThreadingHTTPServer, body/limit caps, JSON error handling, configurable bind, `hmac.compare_digest`, honor `STATIC_PEERS`/`TAILSCALE_SOCKET`, index on `memories(updated_at)` | §2 |
 | SE-01 | high | done | Dashboard API: require/generate API key by default; reject non-JSON Content-Type on mutating routes (CSRF) | §3 |
 | SE-02 | high | done | Enforce `IMPORT_ROOTS` in MCP import tool inputs (parity with HTTP API) | §3 |
 | SE-03 | high | done | Fix combined-mode lifespan loss; fix `FastMCP.run()` host/port kwargs | §1.5 |
@@ -61,7 +61,7 @@ correctness), **SY** (sync hardening), **SE** (security & server lifecycle),
 | PF-06 | low | todo | `asyncio.to_thread` for DB work in API handlers | §4 |
 | HY-01 | med | todo | Remove root `remind_me_dashboard.jsx` duplicate, `remind_me_spec.docx`; untrack `.planning/` | §7 |
 | HY-02 | med | todo | Split `tools.py` into `tools/` package (search/crud/capture/lifecycle/admin); dedupe structured-path envelope logic | §7 |
-| HY-03 | med | todo | Generate outbox triggers from a single column list in `db.py` | §7 |
+| HY-03 | med | done | Generate outbox triggers from a single column list in `db.py` | §7 |
 | HY-04 | low | todo | Pin/vendor dashboard CDN assets (SRI at minimum) | §7 |
 | HY-05 | low | todo | Strip internal `_rrf_score`/`_keyword_rank` fields from JSON responses (or move under `debug_signals`) | §5 |
 | HY-06 | low | todo | Misc robustness: 400 on bad query params, guarded env parsing, no import-time `basicConfig`, longer memory IDs, empty-chunk guard in importer | §5, §7 |

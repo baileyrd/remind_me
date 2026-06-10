@@ -193,7 +193,6 @@ The dashboard is powered by a REST API you can also use directly:
 
 ### Standalone Artifact
 
-The project also includes `remind_me_dashboard.jsx` — a standalone React artifact with mock data that can be uploaded directly into Claude.ai for previewing the UI without running the server.
 
 ### Instance Detection
 
@@ -561,7 +560,6 @@ remind-me-mcp/
 │   └── dashboard/
 │       └── App.jsx             # React dashboard component
 ├── tests/                      # Test suite — 308 tests (pytest + pytest-asyncio)
-├── remind_me_dashboard.jsx     # Standalone React artifact for Claude.ai preview
 ├── pyproject.toml              # Package configuration and dependencies
 └── README.md                   # This file
 
