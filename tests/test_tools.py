@@ -2213,6 +2213,72 @@ async def test_structured_search_excludes_superseded(
     assert "Bailey prefers light mode" not in contents
 
 
+async def test_search_category_filter_applies_before_limit(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """Category filter is pushed into SQL, so matches past the fetch limit are found (DI-03)."""
+    # This memory matches the query more strongly (more term hits) but has the
+    # wrong category; with limit=1 it used to crowd out the real match before
+    # the Python-side filter dropped it.
+    memory_factory(content="zebra zebra zebra observation notes", category="noise")
+    memory_factory(content="single zebra sighting", category="wildlife")
+
+    params = MemorySearchInput(
+        query="zebra", category="wildlife", limit=1, response_format=ResponseFormat.JSON
+    )
+    result = await memory_search(params)
+    data = json.loads(result)
+
+    contents = [m["content"] for m in data["memories"]]
+    assert contents == ["single zebra sighting"]
+
+
+async def test_search_tag_filter_applies_before_limit(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """Tag filter is pushed into SQL, so matches past the fetch limit are found (DI-03)."""
+    memory_factory(content="kayak kayak kayak rental brochure", tags=["noise"])
+    memory_factory(content="one kayak trip", tags=["water", "sport"])
+
+    params = MemorySearchInput(
+        query="kayak",
+        tags=["water", "sport"],
+        limit=1,
+        response_format=ResponseFormat.JSON,
+    )
+    result = await memory_search(params)
+    data = json.loads(result)
+
+    contents = [m["content"] for m in data["memories"]]
+    assert contents == ["one kayak trip"]
+
+
+async def test_semantic_search_category_and_tag_filters_in_sql(
+    db_conn_with_vec: sqlite3.Connection, mock_embedder
+) -> None:
+    """_semantic_search filters category/tags in SQL before the limit (DI-03)."""
+    from remind_me_mcp.db import _semantic_search
+
+    await memory_add(
+        MemoryAddInput(content="perfectly matching decoy text", category="noise")
+    )
+    await memory_add(
+        MemoryAddInput(
+            content="loosely related target text",
+            category="target",
+            tags=["keep"],
+        )
+    )
+
+    # The decoy is the nearest neighbour; with limit=1 a post-hoc filter
+    # would return nothing.
+    results = _semantic_search("perfectly matching decoy text", limit=1, category="target")
+    assert [m["category"] for m in results] == ["target"]
+
+    results = _semantic_search("perfectly matching decoy text", limit=1, tags=["keep"])
+    assert [m["category"] for m in results] == ["target"]
+
+
 async def test_fts_search_excludes_superseded(
     db_conn: sqlite3.Connection, memory_factory
 ) -> None:

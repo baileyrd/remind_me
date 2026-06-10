@@ -208,24 +208,34 @@ def _build_api_app() -> Starlette:
             return _json_err("Missing 'q' parameter")
 
         limit = min(int(params.get("limit", 50)), 200)
+        # Category/tag predicates go into the SQL so they apply before LIMIT
+        # (DI-03; same pattern as api_list's DATA-02 fix).
+        conditions = ""
+        bindings: list[Any] = [query]
+        if cat := params.get("category"):
+            conditions += " AND m.category = ?"
+            bindings.append(cat)
+        if tag_param := params.get("tags"):
+            for i, tag in enumerate(tag_param.split(",")):
+                alias = f"mt{i}"
+                conditions += (
+                    f" AND EXISTS (SELECT 1 FROM memory_tags {alias}"
+                    f" WHERE {alias}.memory_id = m.id AND {alias}.tag = ?)"
+                )
+                bindings.append(tag)
+        bindings.append(limit)
         try:
             rows = db.execute(
-                """SELECT m.* FROM memories m
+                f"""SELECT m.* FROM memories m
                    JOIN memories_fts fts ON m.rowid = fts.rowid
-                   WHERE memories_fts MATCH ?
+                   WHERE memories_fts MATCH ?{conditions}
                    ORDER BY rank LIMIT ?""",
-                (query, limit),
+                bindings,
             ).fetchall()
         except _sqlite3.OperationalError as e:
             return _json_err(f"Search error: {e}")
 
         memories = [_row_to_dict(r) for r in rows]
-
-        if cat := params.get("category"):
-            memories = [m for m in memories if m["category"] == cat]
-        if tag_param := params.get("tags"):
-            tag_set = set(tag_param.split(","))
-            memories = [m for m in memories if tag_set.issubset(set(m.get("tags", [])))]
 
         return _json_ok({"count": len(memories), "memories": memories})
 

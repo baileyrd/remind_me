@@ -152,7 +152,7 @@ async def test_memory_search_passes_expansion(monkeypatch, db_conn, memory_facto
 
     seen: dict = {}
 
-    def fake_semantic(query, limit=20, extra_texts=None):
+    def fake_semantic(query, limit=20, extra_texts=None, category=None, tags=None):
         seen["extra_texts"] = extra_texts
         return []
 

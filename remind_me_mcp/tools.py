@@ -393,18 +393,38 @@ async def memory_search(params: MemorySearchInput) -> str:
                 )
             return "_No memories found._"
 
+    # Dormancy and min_vitality are filtered in Python after the SQL fetch, so
+    # over-fetch when they can prune candidates (DI-03); category/tag filters
+    # go straight into the SQL of both tiers below.
+    fetch_limit = params.limit
+    if params.min_vitality > 0 or not params.include_dormant:
+        fetch_limit = params.limit * 4
+
     # --- FTS5 keyword search ---
     fts_memories: list[dict] = []
 
     def _run_fts(match_query: str) -> list[dict]:
+        conditions = ""
+        bindings: list[Any] = [match_query]
+        if params.category:
+            conditions += " AND m.category = ?"
+            bindings.append(params.category)
+        for i, tag in enumerate(params.tags or []):
+            alias = f"mt{i}"
+            conditions += (
+                f" AND EXISTS (SELECT 1 FROM memory_tags {alias}"
+                f" WHERE {alias}.memory_id = m.id AND {alias}.tag = ?)"
+            )
+            bindings.append(tag)
+        bindings.append(fetch_limit)
         rows = db.execute(
-            """SELECT m.* FROM memories m
+            f"""SELECT m.* FROM memories m
                JOIN memories_fts fts ON m.rowid = fts.rowid
                WHERE memories_fts MATCH ?
-               AND m.superseded_by IS NULL
+               AND m.superseded_by IS NULL{conditions}
                ORDER BY rank
                LIMIT ?""",
-            (match_query, params.limit),
+            bindings,
         ).fetchall()
         return [_row_to_dict(r) for r in rows]
 
@@ -430,7 +450,12 @@ async def memory_search(params: MemorySearchInput) -> str:
     # --- Semantic vector search (optionally HyDE-expanded) ---
     extra_texts = await asyncio.to_thread(expand_query, params.query)
     sem_memories = await asyncio.to_thread(
-        _semantic_search, params.query, limit=params.limit, extra_texts=extra_texts
+        _semantic_search,
+        params.query,
+        limit=fetch_limit,
+        extra_texts=extra_texts,
+        category=params.category,
+        tags=params.tags,
     )
 
     # --- Tag search method on raw results before RRF ---
@@ -441,9 +466,9 @@ async def memory_search(params: MemorySearchInput) -> str:
     for m in sem_memories:
         m["_search_method"] = "semantic"
 
-    # --- Apply category/tag filters BEFORE RRF ranking ---
-    filtered_fts = _apply_filters(fts_memories, params.category, params.tags)
-    filtered_sem = _apply_filters(sem_memories, params.category, params.tags)
+    # Category/tag filters are already applied in the SQL of both tiers (DI-03).
+    filtered_fts = fts_memories
+    filtered_sem = sem_memories
 
     # --- Count dormant memories BEFORE exclusion (unique by ID) ---
     dormant_ids: set[str] = set()
