@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 import sys
 from pathlib import Path
 
@@ -70,7 +71,68 @@ MCP_HTTP_SECRET: str | None = os.environ.get("REMIND_ME_MCP_HTTP_SECRET") or Non
 # ---------------------------------------------------------------------------
 
 API_KEY: str | None = os.environ.get("REMIND_ME_API_KEY") or None
-"""Bearer token for /api/* routes. None when unset — auth disabled (backward-compatible)."""
+"""Bearer token for /api/* routes, from the REMIND_ME_API_KEY env var.
+
+When unset, a key is auto-generated on first run and persisted under
+MEMORY_DIR (see resolve_api_key). The special value ``disabled``
+(case-insensitive) turns dashboard auth off for users who explicitly
+want an open localhost API."""
+
+API_KEY_FILE = MEMORY_DIR / "api_key"
+"""Location of the auto-generated dashboard API key (created with 0600 perms)."""
+
+
+def resolve_api_key() -> str | None:
+    """Return the effective dashboard API key (SE-01).
+
+    Resolution order:
+      1. ``REMIND_ME_API_KEY`` env var — always wins when set. The special
+         value ``disabled`` (case-insensitive) turns dashboard auth off.
+      2. The key persisted at ``MEMORY_DIR/api_key``.
+      3. First run: generate a new key, persist it with 0600 permissions,
+         and log where it lives.
+
+    If the key file can be neither read nor written, an ephemeral key is
+    generated for this process (and logged) so the API never falls open.
+
+    Reads module attributes at call time so tests can monkeypatch
+    ``API_KEY`` / ``MEMORY_DIR``.
+    """
+    if API_KEY is not None:
+        if API_KEY.strip().lower() == "disabled":
+            log.warning(
+                "Dashboard API authentication is DISABLED (REMIND_ME_API_KEY=disabled)"
+            )
+            return None
+        return API_KEY
+    key_file = MEMORY_DIR / "api_key"
+    try:
+        if key_file.is_file():
+            existing = key_file.read_text(encoding="utf-8").strip()
+            if existing:
+                return existing
+        key = secrets.token_urlsafe(32)
+        key_file.touch(mode=0o600, exist_ok=True)
+        key_file.chmod(0o600)
+        key_file.write_text(key + "\n", encoding="utf-8")
+        log.info(
+            "Generated dashboard API key — stored at %s. Clients must send "
+            "'Authorization: Bearer <key>'. Set REMIND_ME_API_KEY=disabled to "
+            "opt out of dashboard auth.",
+            key_file,
+        )
+        return key
+    except OSError as exc:
+        key = secrets.token_urlsafe(32)
+        log.warning(
+            "Could not persist dashboard API key at %s (%s); using an "
+            "ephemeral key for this run: %s",
+            key_file,
+            exc,
+            key,
+        )
+        return key
+
 
 _import_roots_env: str | None = os.environ.get("REMIND_ME_IMPORT_ROOTS")
 IMPORT_ROOTS: list[Path] = (
@@ -79,6 +141,28 @@ IMPORT_ROOTS: list[Path] = (
     else [Path.home()]
 )
 """Allowed filesystem roots for import operations. Colon-separated paths. Default: user home directory."""
+
+
+def is_in_import_roots(path: Path) -> bool:
+    """Return True when the resolved ``path`` is contained in IMPORT_ROOTS (SEC-02).
+
+    Shared containment check used by both the HTTP /api/import route and the
+    MCP import tool input models (SE-02). Callers must pass an already
+    ``expanduser().resolve()``-ed path. Reads IMPORT_ROOTS at call time so
+    tests can monkeypatch it.
+    """
+    return any(path == root or root in path.parents for root in IMPORT_ROOTS)
+
+# ---------------------------------------------------------------------------
+# Updates
+# ---------------------------------------------------------------------------
+
+AUTO_UPDATE_CHECK: bool = os.environ.get(
+    "REMIND_ME_AUTO_UPDATE_CHECK", "true"
+).strip().lower() not in ("false", "0", "no", "off")
+"""Set REMIND_ME_AUTO_UPDATE_CHECK=false to skip the background `git fetch`
+update check at server startup (SE-06). The manual `remind_me_check_update`
+and `remind_me_self_update` tools keep working regardless."""
 
 # ---------------------------------------------------------------------------
 # Logging — stderr only (stdout reserved for MCP stdio transport)
@@ -112,7 +196,11 @@ __all__ = [
     "MCP_HTTP_HOST",
     "MCP_HTTP_SECRET",
     "API_KEY",
+    "API_KEY_FILE",
+    "resolve_api_key",
     "IMPORT_ROOTS",
+    "is_in_import_roots",
+    "AUTO_UPDATE_CHECK",
 ]
 
 # ---------------------------------------------------------------------------

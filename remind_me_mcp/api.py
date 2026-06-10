@@ -18,15 +18,124 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from remind_me_mcp.config import API_KEY, DB_PATH, IMPORT_ROOTS
+from remind_me_mcp.config import DB_PATH, is_in_import_roots, resolve_api_key
 from remind_me_mcp.db import _embed_and_store, _get_db, _make_id, _now_iso, _row_to_dict
 from remind_me_mcp.importer import import_chat_file, import_directory
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable, MutableMapping
+
     from starlette.applications import Starlette
     from starlette.requests import Request
 
+    _Scope = MutableMapping[str, Any]
+    _Receive = Callable[[], Awaitable[MutableMapping[str, Any]]]
+    _Send = Callable[[MutableMapping[str, Any]], Awaitable[None]]
+    _ASGIApp = Callable[[_Scope, _Receive, _Send], Awaitable[None]]
+
 log = logging.getLogger("remind_me_mcp.api")
+
+
+# ---------------------------------------------------------------------------
+# Shared ASGI middleware (no Starlette dependency — usable in stdio mode too)
+# ---------------------------------------------------------------------------
+
+
+async def _send_json(send: _Send, status: int, payload: dict[str, Any]) -> None:
+    """Send a minimal JSON HTTP response over a raw ASGI ``send`` callable."""
+    body = json.dumps(payload).encode("utf-8")
+    await send({
+        "type": "http.response.start",
+        "status": status,
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode("ascii")),
+        ],
+    })
+    await send({"type": "http.response.body", "body": body})
+
+
+def _header(scope: _Scope, name: bytes) -> str:
+    """Return the first value of an ASGI request header, or '' when absent."""
+    for key, value in scope.get("headers", []):
+        if key == name:
+            return str(value.decode("latin-1"))
+    return ""
+
+
+class BearerAuthMiddleware:
+    """Pure-ASGI bearer-token middleware (SE-05).
+
+    Shared by the dashboard API app (gating ``/api/*``) and the combined-mode
+    MCP HTTP wrapper in ``__main__`` (gating everything). The token comparison
+    uses ``hmac.compare_digest`` to avoid timing side channels.
+
+    Args:
+        app: The downstream ASGI application.
+        secret: The expected bearer token; ``None`` disables auth entirely.
+        protect_prefix: Only paths starting with this prefix are gated.
+        allow_paths: Exact paths that always pass (e.g. ``/health``).
+    """
+
+    def __init__(
+        self,
+        app: _ASGIApp,
+        secret: str | None,
+        protect_prefix: str = "/",
+        allow_paths: tuple[str, ...] = (),
+    ) -> None:
+        self.app = app
+        self.secret = secret
+        self.protect_prefix = protect_prefix
+        self.allow_paths = allow_paths
+
+    async def __call__(self, scope: _Scope, receive: _Receive, send: _Send) -> None:
+        """Enforce bearer auth on protected HTTP paths; pass everything else through."""
+        if scope["type"] != "http" or self.secret is None:
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path", "")
+        if path in self.allow_paths or not path.startswith(self.protect_prefix):
+            await self.app(scope, receive, send)
+            return
+        auth = _header(scope, b"authorization")
+        expected = f"Bearer {self.secret}"
+        if hmac.compare_digest(auth.encode("utf-8"), expected.encode("utf-8")):
+            await self.app(scope, receive, send)
+            return
+        await _send_json(send, 401, {"error": "Unauthorized"})
+
+
+class JSONContentTypeMiddleware:
+    """Reject mutating API requests whose Content-Type is not JSON (SE-01).
+
+    Browsers send cross-origin "simple" requests (no CORS preflight) only with
+    text/plain, multipart/form-data, or application/x-www-form-urlencoded
+    bodies. Requiring ``application/json`` on POST/PUT/PATCH forces a
+    preflight, which the localhost-only CORS policy denies for foreign
+    origins — closing the CSRF hole even when auth is explicitly disabled.
+    """
+
+    _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH"})
+
+    def __init__(self, app: _ASGIApp, protect_prefix: str = "/api/") -> None:
+        self.app = app
+        self.protect_prefix = protect_prefix
+
+    async def __call__(self, scope: _Scope, receive: _Receive, send: _Send) -> None:
+        """Return 415 for mutating /api/* requests without a JSON Content-Type."""
+        if (
+            scope["type"] == "http"
+            and scope.get("method", "").upper() in self._MUTATING_METHODS
+            and scope.get("path", "").startswith(self.protect_prefix)
+        ):
+            content_type = _header(scope, b"content-type").split(";")[0].strip().lower()
+            if content_type != "application/json":
+                await _send_json(
+                    send, 415, {"error": "Content-Type must be application/json"}
+                )
+                return
+        await self.app(scope, receive, send)
 
 # ---------------------------------------------------------------------------
 # Dashboard HTML builder
@@ -89,33 +198,9 @@ def _build_api_app() -> Starlette:
     """
     from starlette.applications import Starlette
     from starlette.middleware import Middleware
-    from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.middleware.cors import CORSMiddleware
     from starlette.responses import HTMLResponse, JSONResponse
     from starlette.routing import Route
-
-    class BearerAuthMiddleware(BaseHTTPMiddleware):
-        """Gate all /api/* routes behind Bearer token auth when REMIND_ME_API_KEY is set.
-
-        When api_key is None (env var unset), all requests pass through unchanged
-        preserving backward compatibility for existing deployments.
-        """
-
-        def __init__(self, app, api_key: str | None = None) -> None:
-            super().__init__(app)
-            self.api_key = api_key
-
-        async def dispatch(self, request, call_next):
-            """Pass requests through when auth is disabled; enforce bearer token otherwise."""
-            if self.api_key is None:
-                return await call_next(request)
-            if not request.url.path.startswith("/api/"):
-                return await call_next(request)
-            auth = request.headers.get("Authorization", "")
-            expected = f"Bearer {self.api_key}"
-            if hmac.compare_digest(auth, expected):
-                return await call_next(request)
-            return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
     # -- helpers --
     def _json_ok(data: Any, status: int = 200) -> JSONResponse:
@@ -125,6 +210,14 @@ def _build_api_app() -> Starlette:
         return JSONResponse({"error": msg}, status_code=status)
 
     # -- routes --
+
+    async def health(request: Request) -> JSONResponse:
+        """Unauthenticated liveness probe (SE-04) — reveals no data.
+
+        Used by the pid.py health check so `--status` and the already-running
+        guard keep working when API auth is enabled.
+        """
+        return JSONResponse({"status": "ok"})
 
     async def api_stats(request: Request) -> JSONResponse:
         """Return aggregate statistics about the memory store."""
@@ -340,8 +433,8 @@ def _build_api_app() -> Starlette:
 
         p = Path(file_path).expanduser().resolve()
 
-        # SEC-02: Reject paths outside configured import roots
-        if not any(p == root or root in p.parents for root in IMPORT_ROOTS):
+        # SEC-02: Reject paths outside configured import roots (shared helper, SE-02)
+        if not is_in_import_roots(p):
             return _json_err(f"Path not in allowed import roots: {p}")
 
         if not p.exists():
@@ -378,6 +471,7 @@ def _build_api_app() -> Starlette:
 
     routes = [
         Route("/", index),
+        Route("/health", health),
         Route("/api/stats", api_stats),
         Route("/api/memories", api_list, methods=["GET"]),
         Route("/api/memories", api_add, methods=["POST"]),
@@ -388,6 +482,10 @@ def _build_api_app() -> Starlette:
         Route("/api/import", api_import, methods=["POST"]),
     ]
 
+    # SE-01: auth is on by default — resolve_api_key() auto-generates and
+    # persists a key on first run; REMIND_ME_API_KEY=disabled opts out.
+    api_key = resolve_api_key()
+
     middleware = [
         Middleware(
             CORSMiddleware,
@@ -395,7 +493,8 @@ def _build_api_app() -> Starlette:
             allow_methods=["*"],
             allow_headers=["*"],
         ),
-        Middleware(BearerAuthMiddleware, api_key=API_KEY),
+        Middleware(BearerAuthMiddleware, secret=api_key, protect_prefix="/api/"),
+        Middleware(JSONContentTypeMiddleware),
     ]
 
     return Starlette(routes=routes, middleware=middleware)
@@ -406,6 +505,8 @@ def _build_api_app() -> Starlette:
 # ---------------------------------------------------------------------------
 
 __all__ = [
+    "BearerAuthMiddleware",
+    "JSONContentTypeMiddleware",
     "_build_api_app",
     "_build_dashboard_html",
 ]

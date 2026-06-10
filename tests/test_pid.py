@@ -141,7 +141,11 @@ class _FakeResponse:
 
 
 def test_check_ui_server_health_ok(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A 200 response from /api/stats means the server is healthy."""
+    """A 200 response from the unauthenticated /health route means the server is healthy.
+
+    SE-04: the probe must hit /health (not /api/stats) so it keeps working
+    when bearer auth is enabled on /api/* routes.
+    """
     import urllib.request
 
     seen_urls: list[str] = []
@@ -153,7 +157,7 @@ def test_check_ui_server_health_ok(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
     assert _check_ui_server_health("http://127.0.0.1:5199") is True
-    assert seen_urls == ["http://127.0.0.1:5199/api/stats"]
+    assert seen_urls == ["http://127.0.0.1:5199/health"]
 
 
 def test_check_ui_server_health_non_200(monkeypatch: pytest.MonkeyPatch) -> None:
