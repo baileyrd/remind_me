@@ -212,6 +212,14 @@ HUB_URL = os.environ.get("REMIND_ME_HUB_URL", "")
 SYNC_SECRET = os.environ.get("REMIND_ME_SYNC_SECRET", "")
 SYNC_INTERVAL = int(os.environ.get("REMIND_ME_SYNC_INTERVAL", "60"))
 PEER_PORT = int(os.environ.get("REMIND_ME_PEER_PORT", "8766"))
+PEER_BIND = os.environ.get("REMIND_ME_PEER_BIND", "0.0.0.0")  # noqa: S104
+"""Bind address for the peer sync server. Defaults to all interfaces so
+Tailscale peers can reach it (their addresses are not known in advance);
+set REMIND_ME_PEER_BIND to a specific address (e.g. this node's Tailscale
+IP, or 127.0.0.1 to disable remote access) to narrow exposure. Every
+request requires the SYNC_SECRET bearer token regardless of bind address."""
+OUTBOX_RETENTION_DAYS = int(os.environ.get("REMIND_ME_OUTBOX_RETENTION_DAYS", "30"))
+"""Sync outbox rows older than this many days are pruned each sync cycle."""
 SYNC_ENABLED = bool(NODE_ID and HUB_URL and SYNC_SECRET)
 STATIC_PEERS: list[dict] = json.loads(
     os.environ.get("REMIND_ME_STATIC_PEERS", "[]")
