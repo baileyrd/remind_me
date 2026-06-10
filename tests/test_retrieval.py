@@ -159,6 +159,34 @@ class TestRankRRF:
         result = rank_rrf([a], [a], k=60)
         assert len(result) == 1
 
+    def test_rrf_hybrid_hit_keeps_semantic_distance(self):
+        """A memory in both lists merges the semantic occurrence's keys (DI-05).
+
+        The keyword-tier dict has no semantic_distance; the semantic-tier dict
+        does. Dedup must not drop it.
+        """
+        from remind_me_mcp.retrieval import rank_rrf
+
+        kw = _mem("A", created_at=_ts(0), _search_method="keyword")
+        sem = _mem("A", created_at=_ts(0), semantic_distance=0.42, _search_method="semantic")
+
+        result = rank_rrf([kw], [sem], k=60)
+
+        assert len(result) == 1
+        assert result[0]["semantic_distance"] == 0.42
+
+    def test_rrf_merge_does_not_overwrite_first_occurrence(self):
+        """Merging the second occurrence never clobbers non-null keys from the first."""
+        from remind_me_mcp.retrieval import rank_rrf
+
+        kw = _mem("A", created_at=_ts(0), _search_method="keyword", extra="first")
+        sem = _mem("A", created_at=_ts(0), _search_method="semantic", extra="second")
+
+        result = rank_rrf([kw], [sem], k=60)
+
+        assert result[0]["_search_method"] == "keyword"
+        assert result[0]["extra"] == "first"
+
 
 # ---------------------------------------------------------------------------
 # RRF_K env var
