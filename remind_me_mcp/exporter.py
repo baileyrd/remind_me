@@ -13,6 +13,11 @@ but the importer re-chunks long content and assigns fresh ids, category, tags,
 and source — the original values are still present in the export file for
 manual restoration. Embedding vectors are intentionally excluded: they are
 derived data and can be rebuilt on the target machine with remind_me_reindex.
+
+FT-04 note: the structured subject/predicate/object columns on memories ARE
+exported (they are memory columns), but the entity graph itself (the
+``entities`` and ``memory_entities`` tables) is not yet included in exports —
+it does sync between peers. Adding the graph tables to exports is a follow-up.
 """
 
 from __future__ import annotations

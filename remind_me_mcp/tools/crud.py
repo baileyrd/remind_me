@@ -52,8 +52,10 @@ async def memory_add(params: MemoryAddInput) -> str:
     now = _now_iso()
     try:
         db.execute(
-            """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at, node_id, client)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO memories (id, content, category, tags, source, metadata,
+                                     created_at, updated_at, node_id, client,
+                                     subject, predicate, object)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 mem_id,
                 params.content,
@@ -65,8 +67,17 @@ async def memory_add(params: MemoryAddInput) -> str:
                 now,
                 NODE_ID,
                 CLIENT,
+                params.subject,
+                params.predicate,
+                params.object,
             ),
         )
+        # FT-04: upsert mentioned entities and record the mention links.
+        for ent in params.entities:
+            eid = _pkg._upsert_entity(
+                db, ent.name, ent.kind, ent.aliases, node_id=NODE_ID, now=now
+            )
+            _pkg._link_memory_entity(db, mem_id, eid, now)
         db.commit()
     except sqlite3.IntegrityError as e:
         log.error("Failed to add memory: %s", e)
@@ -237,6 +248,12 @@ async def memory_delete(params: MemoryDeleteInput) -> str:
     # vec_chunks/memories_vec are not, and SQLite reuses freed rowids (DI-01).
     with contextlib.suppress(sqlite3.OperationalError):
         _delete_chunks(db, row[0])
+    # FT-04: entity mention links have no FK (sync can deliver them out of
+    # order), so clean them up explicitly — mirroring the DI-01 chunk cleanup.
+    # Entities themselves stay; other memories may still mention them.
+    db.execute(
+        "DELETE FROM memory_entities WHERE memory_id = ?", (params.memory_id,)
+    )
     db.execute("DELETE FROM memories WHERE id = ?", (params.memory_id,))
     db.commit()
     return f"✓ Memory `{params.memory_id}` deleted."

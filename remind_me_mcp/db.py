@@ -20,6 +20,9 @@ Current schema versions:
           cursor (sync_log.last_pull_id), sync_flags gate so outbox triggers
           only fire when sync is enabled, canonical ISO-8601 UTC timestamps in
           the outbox triggers, and an index on memories(updated_at)
+  9 -> 10: FT-04 entity graph — entities + memory_entities tables with
+           deterministic entity ids (sha256 of the normalized canonical name)
+           and outbox triggers so the graph syncs between peers
 """
 
 from __future__ import annotations
@@ -219,7 +222,7 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 # Current target schema version.  Increment when adding a new migration step.
-_SCHEMA_VERSION = 9
+_SCHEMA_VERSION = 10
 
 
 
@@ -283,6 +286,11 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         _migrate_v8_to_v9(db)
         db.execute("PRAGMA user_version = 9")
         current_version = 9
+
+    if current_version < 10:
+        _migrate_v9_to_v10(db)
+        db.execute("PRAGMA user_version = 10")
+        current_version = 10
 
     db.commit()
 
@@ -882,6 +890,13 @@ _OUTBOX_PAYLOAD_COLUMNS = (
     "subject", "predicate", "object", "superseded_by",
 )
 
+# Entity columns mirrored into sync_outbox payloads (FT-04). Memory records
+# carry no record_type (older peers must keep accepting them unchanged);
+# entity and link payloads are tagged with record_type so receivers dispatch.
+_ENTITY_OUTBOX_COLUMNS = (
+    "id", "name", "kind", "aliases", "created_at", "updated_at", "node_id",
+)
+
 # Canonical UTC ISO-8601 timestamp in SQL, string-comparable with Python's
 # datetime.now(UTC).isoformat(). Replaces the previous datetime('now','utc'),
 # which is documented-incorrect SQLite usage ('now' is already UTC) and
@@ -889,10 +904,38 @@ _OUTBOX_PAYLOAD_COLUMNS = (
 _SQL_NOW_ISO = "strftime('%Y-%m-%dT%H:%M:%f000', 'now') || '+00:00'"
 
 
-def _outbox_payload_sql(prefix: str) -> str:
-    """Build the json_object(...) expression for an outbox payload."""
-    pairs = ", ".join(f"'{col}', {prefix}{col}" for col in _OUTBOX_PAYLOAD_COLUMNS)
+def _outbox_payload_sql(
+    prefix: str,
+    columns: tuple[str, ...] = _OUTBOX_PAYLOAD_COLUMNS,
+    record_type: str | None = None,
+) -> str:
+    """Build the json_object(...) expression for an outbox payload.
+
+    Args:
+        prefix: Column reference prefix, e.g. ``"NEW."`` inside a trigger or
+            ``""`` for a plain SELECT backfill.
+        columns: The columns to mirror into the payload (HY-03: a single
+            column list generates both the triggers and the backfill SQL).
+        record_type: Optional record-kind discriminator added to the payload
+            (``'entity'`` / ``'memory_entity'``). Memory payloads omit it so
+            the wire format pre-FT-04 peers expect is unchanged.
+    """
+    pairs = ", ".join(f"'{col}', {prefix}{col}" for col in columns)
+    if record_type is not None:
+        pairs = f"'record_type', '{record_type}', " + pairs
     return f"json_object({pairs})"
+
+
+# Link payload: the synthetic 'id' (memory_id|entity_id) lets the push
+# protocol's processed_ids matching mark link rows sent, like any record.
+_LINK_PAYLOAD_SQL = (
+    "json_object("
+    "'record_type', 'memory_entity', "
+    "'id', {p}memory_id || '|' || {p}entity_id, "
+    "'memory_id', {p}memory_id, "
+    "'entity_id', {p}entity_id, "
+    "'created_at', {p}created_at)"
+)
 
 
 def _migrate_v8_to_v9(db: sqlite3.Connection) -> None:
@@ -973,6 +1016,90 @@ def _migrate_v8_to_v9(db: sqlite3.Connection) -> None:
     """)
 
 
+def _migrate_v9_to_v10(db: sqlite3.Connection) -> None:
+    """v9 -> v10: FT-04 entity graph — entities + memory_entities tables.
+
+    ``entities`` is a fully-synced table of canonical named things (people,
+    projects, tools, ...). Entity ids are DETERMINISTIC — derived from the
+    normalized canonical name (see :func:`_entity_id`) — so the same entity
+    created independently on two machines converges to the same row instead
+    of conflicting. ``memory_entities`` links memories to the entities they
+    mention (immutable insert-or-ignore rows).
+
+    Outbox triggers mirror the SY-07/SY-08 memory triggers: gated on the
+    ``sync_enabled`` flag, canonical ISO-8601 UTC ``created_at``, payloads
+    generated from a single column list (HY-03). There are no delete
+    triggers — memory deletes do not sync either (no tombstones), so the
+    entity graph mirrors that behavior.
+
+    Args:
+        db: An open SQLite connection.
+    """
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS entities (
+            id          TEXT PRIMARY KEY,
+            name        TEXT NOT NULL,
+            kind        TEXT DEFAULT NULL,
+            aliases     TEXT NOT NULL DEFAULT '[]',  -- JSON array
+            created_at  TEXT NOT NULL,
+            updated_at  TEXT NOT NULL,
+            node_id     TEXT DEFAULT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name);
+        CREATE INDEX IF NOT EXISTS idx_entities_kind ON entities(kind);
+        CREATE INDEX IF NOT EXISTS idx_entities_updated_at ON entities(updated_at);
+
+        -- No FK on memory_id/entity_id: sync may deliver a link before its
+        -- memory or entity arrives. memory_delete cleans up links explicitly.
+        CREATE TABLE IF NOT EXISTS memory_entities (
+            memory_id   TEXT NOT NULL,
+            entity_id   TEXT NOT NULL,
+            created_at  TEXT NOT NULL,
+            PRIMARY KEY (memory_id, entity_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_memory_entities_entity
+            ON memory_entities(entity_id);
+        CREATE INDEX IF NOT EXISTS idx_memory_entities_created_at
+            ON memory_entities(created_at);
+    """)
+
+    entity_payload = _outbox_payload_sql(
+        "NEW.", _ENTITY_OUTBOX_COLUMNS, record_type="entity"
+    )
+    link_payload = _LINK_PAYLOAD_SQL.format(p="NEW.")
+    db.executescript(f"""
+        DROP TRIGGER IF EXISTS entities_outbox_ai;
+        DROP TRIGGER IF EXISTS entities_outbox_au;
+        DROP TRIGGER IF EXISTS memory_entities_outbox_ai;
+
+        CREATE TRIGGER IF NOT EXISTS entities_outbox_ai
+        AFTER INSERT ON entities
+        WHEN COALESCE((SELECT value FROM sync_flags WHERE key = 'sync_enabled'), '0') = '1'
+        BEGIN
+            INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+            VALUES (NEW.id, 'insert', {entity_payload}, {_SQL_NOW_ISO});
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS entities_outbox_au
+        AFTER UPDATE ON entities
+        WHEN COALESCE((SELECT value FROM sync_flags WHERE key = 'sync_enabled'), '0') = '1'
+        BEGIN
+            INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+            VALUES (NEW.id, 'update', {entity_payload}, {_SQL_NOW_ISO});
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS memory_entities_outbox_ai
+        AFTER INSERT ON memory_entities
+        WHEN COALESCE((SELECT value FROM sync_flags WHERE key = 'sync_enabled'), '0') = '1'
+        BEGIN
+            INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+            VALUES (NEW.memory_id, 'insert', {link_payload}, {_SQL_NOW_ISO});
+        END;
+    """)
+
+
 def _reconcile_sync_enabled_flag(db: sqlite3.Connection) -> None:
     """Align the sync_flags gate with config.SYNC_ENABLED at startup (SY-07).
 
@@ -1003,12 +1130,26 @@ def _reconcile_sync_enabled_flag(db: sqlite3.Connection) -> None:
     if desired == "1":
         if stored == "0":
             # Triggers were off while sync was disabled — backfill so every
-            # memory reaches the remotes.
+            # memory (and entity-graph row, FT-04) reaches the remotes.
             payload = _outbox_payload_sql("")
             db.execute(f"""
                 INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
                 SELECT id, 'insert', {payload}, {_SQL_NOW_ISO}
                 FROM memories
+            """)
+            entity_payload = _outbox_payload_sql(
+                "", _ENTITY_OUTBOX_COLUMNS, record_type="entity"
+            )
+            db.execute(f"""
+                INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+                SELECT id, 'insert', {entity_payload}, {_SQL_NOW_ISO}
+                FROM entities
+            """)
+            link_payload = _LINK_PAYLOAD_SQL.format(p="")
+            db.execute(f"""
+                INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+                SELECT memory_id, 'insert', {link_payload}, {_SQL_NOW_ISO}
+                FROM memory_entities
             """)
     else:
         db.execute("DELETE FROM sync_outbox")
@@ -1290,6 +1431,136 @@ def _make_id(content: str) -> str:
     return hashlib.sha256(f"{content}{ts}".encode()).hexdigest()[:12]
 
 
+# ---------------------------------------------------------------------------
+# Entity graph helpers (FT-04)
+# ---------------------------------------------------------------------------
+
+
+def _normalize_entity_name(name: str) -> str:
+    """Normalize an entity name for deterministic identity.
+
+    Lowercases and collapses all internal/surrounding whitespace, so
+    'Bailey  Robertson ' and 'bailey robertson' identify the same entity.
+    Shared by every write path (decompose, add, annotate, sync) — entity ids
+    are derived from this normalized form, so two machines independently
+    creating the same-named entity converge to the same row.
+
+    Args:
+        name: The raw entity name.
+
+    Returns:
+        The normalized name (lowercased, whitespace-collapsed).
+    """
+    return " ".join(name.split()).lower()
+
+
+def _entity_id(name: str) -> str:
+    """Derive the DETERMINISTIC id for an entity from its name.
+
+    Unlike :func:`_make_id`, this is a pure content hash (no timestamp):
+    sha256 of the normalized name, truncated to the same 12-hex-char length
+    as memory ids. Determinism is what makes fully-synced entities converge
+    across peers instead of conflicting.
+
+    Args:
+        name: The entity name (any casing/whitespace).
+
+    Returns:
+        A 12-character hex string.
+    """
+    return hashlib.sha256(_normalize_entity_name(name).encode()).hexdigest()[:12]
+
+
+def _upsert_entity(
+    db: sqlite3.Connection,
+    name: str,
+    kind: str | None = None,
+    aliases: list[str] | None = None,
+    *,
+    node_id: str | None = None,
+    now: str | None = None,
+) -> str:
+    """Insert or update an entity by its deterministic id (local write path).
+
+    A new name creates a new entity row (the display name keeps the caller's
+    casing, whitespace-collapsed). If the entity already exists, the provided
+    aliases are union-merged (dedup, order-preserving: existing first) and a
+    missing kind is filled in — the canonical name is never auto-merged with
+    a different mention name; alias merging is explicit via *aliases*.
+    ``updated_at`` is bumped only when something actually changed, so sync
+    propagates exactly the real edits. Does NOT commit.
+
+    Args:
+        db: An open SQLite connection.
+        name: The entity's canonical name as mentioned.
+        kind: Optional entity kind (e.g. 'person', 'project', 'tool').
+        aliases: Optional explicit alias names to merge in.
+        node_id: This node's id, stamped on newly created rows.
+        now: Timestamp override (defaults to now).
+
+    Returns:
+        The entity's deterministic id.
+    """
+    eid = _entity_id(name)
+    ts = now or _now_iso()
+    clean_aliases = list(dict.fromkeys(
+        a.strip() for a in (aliases or []) if isinstance(a, str) and a.strip()
+    ))
+
+    row = db.execute(
+        "SELECT kind, aliases FROM entities WHERE id = ?", (eid,)
+    ).fetchone()
+    if row is None:
+        db.execute(
+            """INSERT INTO entities (id, name, kind, aliases, created_at, updated_at, node_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (eid, " ".join(name.split()), kind, json.dumps(clean_aliases),
+             ts, ts, node_id),
+        )
+        return eid
+
+    try:
+        existing = json.loads(row["aliases"]) if isinstance(row["aliases"], str) else []
+    except json.JSONDecodeError:
+        existing = []
+    if not isinstance(existing, list):
+        existing = []
+    merged = list(dict.fromkeys([*existing, *clean_aliases]))
+    new_kind = row["kind"] or kind
+    if merged != existing or new_kind != row["kind"]:
+        db.execute(
+            "UPDATE entities SET kind = ?, aliases = ?, updated_at = ? WHERE id = ?",
+            (new_kind, json.dumps(merged), ts, eid),
+        )
+    return eid
+
+
+def _link_memory_entity(
+    db: sqlite3.Connection,
+    memory_id: str,
+    entity_id: str,
+    now: str | None = None,
+) -> bool:
+    """Record that a memory mentions an entity (immutable, insert-or-ignore).
+
+    Args:
+        db: An open SQLite connection.
+        memory_id: The mentioning memory's id.
+        entity_id: The mentioned entity's id.
+        now: Timestamp override (defaults to now).
+
+    Returns:
+        True if a new link row was created, False if it already existed.
+        Does NOT commit.
+    """
+    cur = db.execute(
+        """INSERT OR IGNORE INTO memory_entities (memory_id, entity_id, created_at)
+           VALUES (?, ?, ?)""",
+        (memory_id, entity_id, now or _now_iso()),
+    )
+    return cur.rowcount > 0
+
+
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     """Convert a sqlite3.Row to a plain dict, deserializing JSON fields.
 
@@ -1305,7 +1576,7 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         parsed into their corresponding Python types.
     """
     d = dict(row)
-    for key in ("tags", "metadata", "stats"):
+    for key in ("tags", "metadata", "stats", "aliases"):
         if key in d and isinstance(d[key], str):
             try:
                 d[key] = json.loads(d[key])
@@ -1331,5 +1602,9 @@ __all__ = [
     "_semantic_search",
     "_now_iso",
     "_make_id",
+    "_normalize_entity_name",
+    "_entity_id",
+    "_upsert_entity",
+    "_link_memory_entity",
     "_row_to_dict",
 ]

@@ -1131,6 +1131,404 @@ def test_start_sync_thread_runs_cycles(monkeypatch: pytest.MonkeyPatch) -> None:
     assert not thread.is_alive()
 
 
+# ---------------------------------------------------------------------------
+# Entity graph sync (FT-04)
+# ---------------------------------------------------------------------------
+
+
+def make_entity_record(name: str, **overrides: Any) -> dict:
+    """Build a wire-format entity record like an FT-04 peer would send."""
+    from remind_me_mcp.db import _entity_id
+
+    now = _now_iso()
+    rec = {
+        "record_type": "entity",
+        "id": _entity_id(name),
+        "name": name,
+        "kind": None,
+        "aliases": [],
+        "created_at": now,
+        "updated_at": now,
+        "node_id": "remote-node",
+    }
+    rec.update(overrides)
+    return rec
+
+
+def make_link_record(memory_id: str, entity_id: str, **overrides: Any) -> dict:
+    rec = {
+        "record_type": "memory_entity",
+        "id": f"{memory_id}|{entity_id}",
+        "memory_id": memory_id,
+        "entity_id": entity_id,
+        "created_at": _now_iso(),
+    }
+    rec.update(overrides)
+    return rec
+
+
+def insert_entity(
+    db: sqlite3.Connection,
+    name: str,
+    *,
+    kind: str | None = None,
+    aliases: list[str] | None = None,
+    updated_at: str | None = None,
+) -> str:
+    """Insert an entity through SQL so the outbox triggers fire."""
+    from remind_me_mcp.db import _entity_id
+
+    now = updated_at or _now_iso()
+    eid = _entity_id(name)
+    db.execute(
+        """INSERT INTO entities (id, name, kind, aliases, created_at, updated_at, node_id)
+           VALUES (?, ?, ?, ?, ?, ?, 'local-node')""",
+        (eid, name, kind, json.dumps(aliases or []), now, now),
+    )
+    db.commit()
+    return eid
+
+
+async def test_push_outbox_sends_entity_and_link_records(
+    sync_db: sqlite3.Connection,
+) -> None:
+    """Entity/link outbox rows ride the same push, tagged with record_type,
+    with aliases deserialized into a real list on the wire."""
+    eid = insert_entity(sync_db, "Bailey Robertson", kind="person", aliases=["Bailey"])
+    sync_db.execute(
+        "INSERT INTO memory_entities (memory_id, entity_id, created_at) VALUES (?, ?, ?)",
+        ("mem-1", eid, _now_iso()),
+    )
+    sync_db.commit()
+
+    recorder = RequestRecorder()
+    async with mock_client(recorder) as client:
+        await sync._push_outbox(client, "http://peer", "peer-x")
+
+    records = json.loads(recorder.requests[0].content)["records"]
+    by_type = {r.get("record_type", "memory"): r for r in records}
+    assert by_type["entity"]["id"] == eid
+    assert by_type["entity"]["aliases"] == ["Bailey"]
+    assert by_type["memory_entity"]["id"] == f"mem-1|{eid}"
+    assert by_type["memory_entity"]["entity_id"] == eid
+
+
+async def test_push_marks_link_records_via_composite_id(
+    sync_db: sqlite3.Connection,
+) -> None:
+    """processed_ids matching works for link records (synthetic memory|entity id)."""
+    eid = insert_entity(sync_db, "remind_me")
+    sync_db.execute(
+        "INSERT INTO memory_entities (memory_id, entity_id, created_at) VALUES (?, ?, ?)",
+        ("mem-1", eid, _now_iso()),
+    )
+    sync_db.commit()
+
+    recorder = RequestRecorder(
+        responses={"/sync/push": {
+            "accepted": 2,
+            "processed_ids": [eid, f"mem-1|{eid}"],
+        }}
+    )
+    async with mock_client(recorder) as client:
+        marked = await sync._push_outbox(client, "http://peer", "peer-x")
+    assert marked == 2
+
+    # Nothing left to retry.
+    recorder2 = RequestRecorder()
+    async with mock_client(recorder2) as client:
+        await sync._push_outbox(client, "http://peer", "peer-x")
+    assert recorder2.requests == []
+
+
+def test_upsert_entity_record_inserts(sync_db: sqlite3.Connection) -> None:
+    rec = make_entity_record("Tailscale", kind="tool", aliases=["ts"])
+    result = sync._upsert_records(sync_db, [rec])
+    assert result.applied == 1
+    assert result.processed_ids == [rec["id"]]
+    row = sync_db.execute("SELECT * FROM entities WHERE id = ?", (rec["id"],)).fetchone()
+    assert row["name"] == "Tailscale"
+    assert row["kind"] == "tool"
+    assert json.loads(row["aliases"]) == ["ts"]
+    assert row["node_id"] == "remote-node"
+
+
+def test_upsert_entity_lww_newer_wins_aliases_union(
+    sync_db: sqlite3.Connection,
+) -> None:
+    """LWW on updated_at for name/kind EXCEPT aliases, which union-merge."""
+    eid = insert_entity(
+        sync_db, "Bailey", aliases=["B"], updated_at="2026-01-01T00:00:00+00:00"
+    )
+    rec = make_entity_record(
+        "bailey",  # remote casing wins LWW (same deterministic id)
+        kind="person",
+        aliases=["Bails"],
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-02-01T00:00:00+00:00",
+    )
+    result = sync._upsert_records(sync_db, [rec])
+    assert result.applied == 1
+    row = sync_db.execute("SELECT * FROM entities WHERE id = ?", (eid,)).fetchone()
+    assert row["name"] == "bailey"
+    assert row["kind"] == "person"
+    assert row["updated_at"] == "2026-02-01T00:00:00+00:00"
+    # Union: local aliases survive the LWW loss of the row.
+    assert json.loads(row["aliases"]) == ["B", "Bails"]
+
+
+def test_upsert_entity_lww_loser_still_merges_aliases(
+    sync_db: sqlite3.Connection,
+) -> None:
+    """A stale record cannot rename the entity but its aliases still merge,
+    without bumping updated_at (no churn loops)."""
+    eid = insert_entity(
+        sync_db, "Bailey", kind="person", aliases=["B"],
+        updated_at="2026-03-01T00:00:00+00:00",
+    )
+    rec = make_entity_record(
+        "Bailey",
+        aliases=["Bails", "B"],
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+    )
+    rec["name"] = "STALE NAME"  # same id, stale rename attempt
+    result = sync._upsert_records(sync_db, [rec])
+    assert result.applied == 1  # aliases changed -> local state changed
+    row = sync_db.execute("SELECT * FROM entities WHERE id = ?", (eid,)).fetchone()
+    assert row["name"] == "Bailey"
+    assert row["kind"] == "person"
+    assert row["updated_at"] == "2026-03-01T00:00:00+00:00"
+    assert json.loads(row["aliases"]) == ["B", "Bails"]
+
+
+def test_upsert_entity_identical_record_is_noop(sync_db: sqlite3.Connection) -> None:
+    ts = "2026-01-01T00:00:00+00:00"
+    eid = insert_entity(sync_db, "Bailey", aliases=["B"], updated_at=ts)
+    rec = make_entity_record(
+        "Bailey", aliases=["B"], created_at=ts, updated_at=ts
+    )
+    result = sync._upsert_records(sync_db, [rec])
+    assert result.applied == 0
+    assert result.processed_ids == [eid]  # stale/no-op still counts processed
+
+
+def test_upsert_entity_suppresses_echo_outbox_rows(
+    sync_db: sqlite3.Connection,
+) -> None:
+    """SY-05 pattern: the outbox rows created by applying a remote entity
+    record are marked sent so they are never pushed back out."""
+    rec = make_entity_record("Echo Entity")
+    sync._upsert_records(sync_db, [rec])
+    rows = sync_db.execute(
+        "SELECT sent_at FROM sync_outbox WHERE memory_id = ?", (rec["id"],)
+    ).fetchall()
+    assert rows, "entity outbox trigger should have fired"
+    assert all(r["sent_at"] != "" for r in rows)
+
+
+def test_upsert_entity_malformed_is_isolated(sync_db: sqlite3.Connection) -> None:
+    bad = {"record_type": "entity", "id": "x", "updated_at": _now_iso()}  # no name
+    good = make_entity_record("Good Entity")
+    result = sync._upsert_records(sync_db, [bad, good])
+    assert result.applied == 1
+    assert result.failed == 1
+    assert result.processed_ids == [good["id"]]
+
+
+def test_upsert_unknown_record_type_is_defensive(
+    sync_db: sqlite3.Connection,
+) -> None:
+    """A record kind from a newer peer is skipped without poisoning the batch."""
+    future = {"record_type": "hologram", "id": "h1", "updated_at": _now_iso()}
+    good = make_record("mem-ok")
+    result = sync._upsert_records(sync_db, [future, good])
+    assert result.applied == 1
+    assert result.failed == 1
+    assert result.processed_ids == ["mem-ok"]
+
+
+def test_upsert_link_record_insert_or_ignore(sync_db: sqlite3.Connection) -> None:
+    rec = make_link_record("mem-1", "ent-1")
+    first = sync._upsert_records(sync_db, [rec])
+    assert first.applied == 1
+    assert first.processed_ids == ["mem-1|ent-1"]
+    again = sync._upsert_records(sync_db, [rec])
+    assert again.applied == 0
+    assert again.processed_ids == ["mem-1|ent-1"]
+    assert sync_db.execute("SELECT COUNT(*) FROM memory_entities").fetchone()[0] == 1
+
+
+def test_upsert_link_suppresses_echo_outbox_rows(sync_db: sqlite3.Connection) -> None:
+    rec = make_link_record("mem-9", "ent-9")
+    sync._upsert_records(sync_db, [rec])
+    rows = sync_db.execute(
+        "SELECT sent_at FROM sync_outbox WHERE memory_id = 'mem-9'"
+    ).fetchall()
+    assert rows
+    assert all(r["sent_at"] != "" for r in rows)
+
+
+async def test_pull_entities_upserts_and_advances_cursor(
+    sync_db: sqlite3.Connection,
+) -> None:
+    rec = make_entity_record("Pulled Entity", updated_at="2026-05-01T00:00:00+00:00")
+    recorder = RequestRecorder(
+        responses={"/sync/pull_entities": {"records": [rec], "count": 1}}
+    )
+    async with mock_client(recorder) as client:
+        count = await sync._pull_entities(client, "http://peer", "peer-x")
+    assert count == 1
+    assert sync_db.execute(
+        "SELECT COUNT(*) FROM entities WHERE id = ?", (rec["id"],)
+    ).fetchone()[0] == 1
+    # Cursor stored under its own remote key, separate from the memory cursor.
+    log_row = sync_db.execute(
+        "SELECT last_pull, last_pull_id FROM sync_log WHERE remote_id = 'peer-x#entities'"
+    ).fetchone()
+    assert log_row["last_pull"] == "2026-05-01T00:00:00+00:00"
+    assert log_row["last_pull_id"] == rec["id"]
+
+
+async def test_pull_links_upserts_records(sync_db: sqlite3.Connection) -> None:
+    rec = make_link_record("mem-a", "ent-a")
+    recorder = RequestRecorder(
+        responses={"/sync/pull_links": {"records": [rec], "count": 1}}
+    )
+    async with mock_client(recorder) as client:
+        count = await sync._pull_links(client, "http://peer", "peer-x")
+    assert count == 1
+    row = sync_db.execute("SELECT * FROM memory_entities").fetchone()
+    assert (row["memory_id"], row["entity_id"]) == ("mem-a", "ent-a")
+    log_row = sync_db.execute(
+        "SELECT last_pull_id FROM sync_log WHERE remote_id = 'peer-x#links'"
+    ).fetchone()
+    assert log_row["last_pull_id"] == "mem-a|ent-a"
+
+
+async def test_pull_entities_tolerates_pre_ft04_peer(
+    sync_db: sqlite3.Connection,
+) -> None:
+    """An old peer 404s the entity endpoints; the pull is a silent no-op."""
+    recorder = RequestRecorder()  # 404s everything but the legacy endpoints
+    async with mock_client(recorder) as client:
+        assert await sync._pull_entities(client, "http://old-peer", "old") == 0
+        assert await sync._pull_links(client, "http://old-peer", "old") == 0
+    assert sync_db.execute("SELECT COUNT(*) FROM sync_log").fetchone()[0] == 0
+
+
+async def test_two_db_entity_round_trip(
+    sync_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Entities and links converge between two databases: A pushes to B (via
+    B's _upsert_records), then B's rows are pulled back into A — including a
+    same-name entity created independently on both sides (deterministic ids
+    make them the same row; aliases union)."""
+    db_b = sqlite3.connect(":memory:", check_same_thread=False)
+    db_b.row_factory = sqlite3.Row
+    _ensure_schema(db_b)
+    db_b.execute(
+        "INSERT OR REPLACE INTO sync_flags (key, value) VALUES ('sync_enabled', '1')"
+    )
+    db_b.commit()
+
+    # Same entity created independently on both machines, different aliases.
+    eid = insert_entity(
+        sync_db, "Bailey Robertson", kind="person", aliases=["Bailey"],
+        updated_at="2026-01-01T00:00:00+00:00",
+    )
+    eid_b = insert_entity(
+        db_b, "Bailey Robertson", aliases=["BR"],
+        updated_at="2026-02-01T00:00:00+00:00",
+    )
+    assert eid == eid_b  # deterministic ids converge
+    insert_memory(sync_db, "mem-1", "Bailey fact")
+    sync_db.execute(
+        "INSERT INTO memory_entities (memory_id, entity_id, created_at) VALUES (?, ?, ?)",
+        ("mem-1", eid, _now_iso()),
+    )
+    sync_db.commit()
+
+    # --- A pushes its outbox; the "remote" applies records into db_b ---
+    def push_handler(request: httpx.Request) -> dict:
+        records = json.loads(request.content)["records"]
+        result = sync._upsert_records(db_b, records)
+        return {
+            "accepted": result.applied,
+            "processed_ids": result.processed_ids,
+            "failed": result.failed,
+        }
+
+    recorder = RequestRecorder(responses={"/sync/push": push_handler})
+    async with mock_client(recorder) as client:
+        await sync._push_outbox(client, "http://b", "node-b")
+
+    row_b = db_b.execute("SELECT * FROM entities WHERE id = ?", (eid,)).fetchone()
+    assert row_b is not None
+    # B's row was newer -> keeps B's updated_at; aliases union both sides.
+    assert row_b["updated_at"] == "2026-02-01T00:00:00+00:00"
+    assert set(json.loads(row_b["aliases"])) == {"Bailey", "BR"}
+    assert row_b["kind"] == "person"  # filled from A even though B's row won LWW
+    link_b = db_b.execute("SELECT * FROM memory_entities").fetchone()
+    assert (link_b["memory_id"], link_b["entity_id"]) == ("mem-1", eid)
+
+    # --- A pulls B's entities back; both sides converge on the alias set ---
+    def pull_entities_handler(request: httpx.Request) -> dict:
+        rows = db_b.execute("SELECT * FROM entities").fetchall()
+        records = []
+        for r in rows:
+            d = dict(r)
+            d["aliases"] = json.loads(d["aliases"])
+            d["record_type"] = "entity"
+            records.append(d)
+        return {"records": records, "count": len(records)}
+
+    recorder2 = RequestRecorder(
+        responses={"/sync/pull_entities": pull_entities_handler}
+    )
+    async with mock_client(recorder2) as client:
+        await sync._pull_entities(client, "http://b", "node-b")
+
+    row_a = sync_db.execute("SELECT * FROM entities WHERE id = ?", (eid,)).fetchone()
+    assert set(json.loads(row_a["aliases"])) == {"Bailey", "BR"}
+    assert row_a["updated_at"] == "2026-02-01T00:00:00+00:00"
+    db_b.close()
+
+
+def test_reconcile_enable_backfills_entity_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SY-07 + FT-04: enabling sync backfills entities and links too."""
+    import remind_me_mcp.config as config
+
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    monkeypatch.setattr(config, "SYNC_ENABLED", False)
+    _ensure_schema(db)
+    now = _now_iso()
+    db.execute(
+        """INSERT INTO entities (id, name, kind, aliases, created_at, updated_at)
+           VALUES ('e1', 'Quiet Entity', NULL, '[]', ?, ?)""",
+        (now, now),
+    )
+    db.execute(
+        "INSERT INTO memory_entities (memory_id, entity_id, created_at) VALUES ('m1', 'e1', ?)",
+        (now,),
+    )
+    db.commit()
+    assert db.execute("SELECT COUNT(*) FROM sync_outbox").fetchone()[0] == 0
+
+    monkeypatch.setattr(config, "SYNC_ENABLED", True)
+    _db_mod._reconcile_sync_enabled_flag(db)
+    payloads = [
+        json.loads(r["payload"])
+        for r in db.execute("SELECT payload FROM sync_outbox").fetchall()
+    ]
+    types = sorted(p.get("record_type", "memory") for p in payloads)
+    assert types == ["entity", "memory_entity"]
+    db.close()
+
+
 async def test_sync_once_syncs_healthy_peer(
     sync_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:

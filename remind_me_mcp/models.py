@@ -35,6 +35,40 @@ class ResponseFormat(StrEnum):
 # ---------------------------------------------------------------------------
 
 
+class EntityInput(BaseModel):
+    """An entity mentioned by a memory (FT-04 knowledge-graph layer).
+
+    A mention with a NEW name creates a new entity — different names are
+    never auto-merged into one entity. Alias merging is explicit: provide
+    ``aliases`` to union-merge alternate names onto this entity's record.
+    """
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    name: str = Field(
+        ...,
+        description=(
+            "Canonical entity name as mentioned (e.g. 'Bailey Robertson', "
+            "'remind_me', 'Tailscale'). Identity is case/whitespace-insensitive."
+        ),
+        min_length=1,
+        max_length=200,
+    )
+    kind: str | None = Field(
+        default=None,
+        description="Entity kind (e.g. 'person', 'project', 'tool', 'place', 'org')",
+        max_length=50,
+    )
+    aliases: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Explicit alternate names to merge onto this entity "
+            "(e.g. ['Bailey'] for canonical 'Bailey Robertson')"
+        ),
+        max_length=20,
+    )
+
+
 class MemoryAddInput(BaseModel):
     """Input for adding a new memory."""
 
@@ -70,6 +104,26 @@ class MemoryAddInput(BaseModel):
     metadata: dict[str, Any] = Field(
         default_factory=dict,
         description="Arbitrary metadata (e.g., {'conversation_id': '...', 'date': '...'})",
+    )
+    subject: str | None = Field(
+        default=None,
+        description="Structured triple: subject (e.g. 'Bailey') — FT-04",
+        max_length=200,
+    )
+    predicate: str | None = Field(
+        default=None,
+        description="Structured triple: predicate (e.g. 'prefers') — FT-04",
+        max_length=200,
+    )
+    object: str | None = Field(
+        default=None,
+        description="Structured triple: object (e.g. 'dark mode') — FT-04",
+        max_length=500,
+    )
+    entities: list[EntityInput] = Field(
+        default_factory=list,
+        description="Entities this memory mentions (FT-04 knowledge graph)",
+        max_length=20,
     )
 
 
@@ -495,6 +549,26 @@ class AtomicFact(BaseModel):
         default_factory=list,
         description="Additional tags to merge with the parent capture's tags",
     )
+    subject: str | None = Field(
+        default=None,
+        description="Structured triple: subject (e.g. 'Bailey') — FT-04",
+        max_length=200,
+    )
+    predicate: str | None = Field(
+        default=None,
+        description="Structured triple: predicate (e.g. 'prefers') — FT-04",
+        max_length=200,
+    )
+    object: str | None = Field(
+        default=None,
+        description="Structured triple: object (e.g. 'dark mode') — FT-04",
+        max_length=500,
+    )
+    entities: list[EntityInput] = Field(
+        default_factory=list,
+        description="Entities this fact mentions (FT-04 knowledge graph)",
+        max_length=20,
+    )
 
     @field_validator("memory_type")
     @classmethod
@@ -536,6 +610,60 @@ class DecomposeBatchInput(BaseModel):
         ge=1,
         le=100,
         description="Number of undecomposed captures to return",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Entity extraction / annotation models (FT-04)
+# ---------------------------------------------------------------------------
+
+
+class MemoryAnnotation(BaseModel):
+    """A structured annotation for one existing memory (FT-04).
+
+    Applies a subject/predicate/object triple and/or entity mentions to a
+    memory after the fact (backfill path). Omitted SPO fields are left
+    unchanged — annotations only add structure, never clear it.
+    """
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    memory_id: str = Field(
+        ..., description="The ID of the memory to annotate", min_length=1
+    )
+    subject: str | None = Field(default=None, max_length=200)
+    predicate: str | None = Field(default=None, max_length=200)
+    object: str | None = Field(default=None, max_length=500)
+    entities: list[EntityInput] = Field(
+        default_factory=list,
+        description="Entities this memory mentions",
+        max_length=20,
+    )
+
+
+class AnnotateInput(BaseModel):
+    """Input for the remind_me_annotate tool: apply annotations in batch."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    annotations: list[MemoryAnnotation] = Field(
+        ...,
+        description="List of {memory_id, subject?, predicate?, object?, entities?} annotations",
+        min_length=1,
+        max_length=100,
+    )
+
+
+class ExtractBatchInput(BaseModel):
+    """Input for the remind_me_extract_batch tool: fetch unannotated memories."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    batch_size: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="Number of unannotated memories to return",
     )
 
 
@@ -609,6 +737,10 @@ __all__ = [
     "AtomicFact",
     "DecomposeInput",
     "DecomposeBatchInput",
+    "EntityInput",
+    "MemoryAnnotation",
+    "AnnotateInput",
+    "ExtractBatchInput",
     "ConsolidateInput",
     "VitalityReportInput",
 ]

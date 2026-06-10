@@ -1,5 +1,5 @@
 """
-remind_me_mcp.tools — All 21 MCP tool handlers and 2 resource handlers.
+remind_me_mcp.tools — All 25 MCP tool handlers and 2 resource handlers.
 
 All handlers are registered on the `mcp` instance imported from server.py.
 This package imports mcp from server (not the other way around) to avoid
@@ -41,23 +41,30 @@ from remind_me_mcp.db import (
     _delete_chunks,
     _embed_and_store,
     _embed_and_store_rows,
+    _entity_id,
     _get_db,
+    _link_memory_entity,
     _make_id,
+    _normalize_entity_name,
     _now_iso,
     _prune_orphan_chunks,
     _row_to_dict,
     _semantic_search,
+    _upsert_entity,
 )
 from remind_me_mcp.formatting import _fmt_memories, _fmt_memory_md
 from remind_me_mcp.importer import import_chat_file, import_directory
 from remind_me_mcp.models import (
+    AnnotateInput,
     AutoCaptureInput,
     BulkImportDirInput,
     ChatImportInput,
     ConsolidateInput,
     DecomposeBatchInput,
     DecomposeInput,
+    EntityInput,
     ExportInput,
+    ExtractBatchInput,
     MemoryAddInput,
     MemoryDeleteInput,
     MemoryListInput,
@@ -107,9 +114,11 @@ from remind_me_mcp.tools.admin import (
     resource_stats,
 )
 from remind_me_mcp.tools.capture import (
+    remind_me_annotate,
     remind_me_auto_capture,
     remind_me_decompose,
     remind_me_decompose_batch,
+    remind_me_extract_batch,
     remind_me_get_capture,
 )
 from remind_me_mcp.tools.crud import (
@@ -173,6 +182,8 @@ __all__ = [
     "remind_me_vitality_report",
     "remind_me_decompose",
     "remind_me_decompose_batch",
+    "remind_me_extract_batch",
+    "remind_me_annotate",
     "remind_me_consolidate",
     "resource_stats",
     "resource_categories",

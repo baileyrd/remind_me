@@ -7,6 +7,11 @@ through the hub. Uses the same push/pull protocol as the hub, with two
 additive extensions: pull accepts a ``since_id`` keyset-cursor parameter,
 and push responses include ``processed_ids`` so the sender can mark
 exactly the records this node handled.
+
+FT-04 adds two endpoints for the entity graph: ``/sync/pull_entities`` and
+``/sync/pull_links``. Old peers never call them, and a new peer pulling
+from an old server treats the resulting 404 as "no entity support" —
+backward compatible in both directions.
 """
 from __future__ import annotations
 
@@ -113,7 +118,100 @@ class PeerHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"records": records, "count": len(records)})
             return
 
+        if parsed.path == "/sync/pull_entities":
+            self._pull_entities(parse_qs(parsed.query))
+            return
+
+        if parsed.path == "/sync/pull_links":
+            self._pull_links(parse_qs(parsed.query))
+            return
+
         self._send_json(404, {"error": "not found"})
+
+    @staticmethod
+    def _pull_params(params: dict) -> tuple[str, str, str | None, int] | None:
+        """Parse the shared since/since_id/exclude_node/limit pull params."""
+        since = params.get("since", ["1970-01-01T00:00:00+00:00"])[0]
+        since_id = params.get("since_id", [""])[0]
+        exclude_node = params.get("exclude_node", [None])[0]
+        try:
+            limit = int(params.get("limit", [str(MAX_PULL_LIMIT)])[0])
+        except ValueError:
+            return None
+        return since, since_id, exclude_node, max(1, min(limit, MAX_PULL_LIMIT))
+
+    def _pull_entities(self, params: dict) -> None:
+        """Serve entity records newer than the keyset cursor (FT-04).
+
+        Only FT-04-aware clients call this endpoint, so the keyset cursor
+        ``(updated_at, id)`` is always used. Records carry
+        ``record_type='entity'`` so the puller dispatches them correctly.
+        """
+        parsed = self._pull_params(params)
+        if parsed is None:
+            self._send_json(400, {"error": "invalid limit"})
+            return
+        since, since_id, exclude_node, limit = parsed
+
+        where = "(e.updated_at > ? OR (e.updated_at = ? AND e.id > ?))"
+        bindings: list = [since, since, since_id]
+        if exclude_node:
+            where += " AND (e.node_id IS NULL OR e.node_id != ?)"
+            bindings.append(exclude_node)
+        bindings.append(limit)
+
+        db = _get_db()
+        rows = db.execute(f"""
+            SELECT e.* FROM entities e
+            WHERE {where}
+            ORDER BY e.updated_at ASC, e.id ASC
+            LIMIT ?
+        """, bindings).fetchall()
+
+        records = []
+        for row in rows:
+            d = dict(row)
+            if isinstance(d.get("aliases"), str):
+                with contextlib.suppress(json.JSONDecodeError):
+                    d["aliases"] = json.loads(d["aliases"])
+            d["record_type"] = "entity"
+            records.append(d)
+        self._send_json(200, {"records": records, "count": len(records)})
+
+    def _pull_links(self, params: dict) -> None:
+        """Serve memory_entities link records newer than the cursor (FT-04).
+
+        Links are immutable, so the keyset pages on ``created_at`` with the
+        synthetic key ``memory_id || '|' || entity_id`` (the ORDER BY uses
+        the same concatenated expression so server ordering and the client's
+        cursor comparison agree exactly).
+        """
+        parsed = self._pull_params(params)
+        if parsed is None:
+            self._send_json(400, {"error": "invalid limit"})
+            return
+        since, since_id, _exclude_node, limit = parsed
+
+        key = "(l.memory_id || '|' || l.entity_id)"
+        db = _get_db()
+        rows = db.execute(f"""
+            SELECT l.memory_id, l.entity_id, l.created_at FROM memory_entities l
+            WHERE (l.created_at > ? OR (l.created_at = ? AND {key} > ?))
+            ORDER BY l.created_at ASC, {key} ASC
+            LIMIT ?
+        """, (since, since, since_id, limit)).fetchall()
+
+        records = [
+            {
+                "record_type": "memory_entity",
+                "id": f"{row['memory_id']}|{row['entity_id']}",
+                "memory_id": row["memory_id"],
+                "entity_id": row["entity_id"],
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+        self._send_json(200, {"records": records, "count": len(records)})
 
     def do_POST(self):
         if not self._auth():
