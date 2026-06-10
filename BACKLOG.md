@@ -19,14 +19,14 @@ correctness), **SY** (sync hardening), **SE** (security & server lifecycle),
 | CI-05 | med | done | Add dev dependency group (`pytest`, `pytest-cov`, `pytest-asyncio`, `ruff`, `mypy`) to pyproject; CI installs from it | §6 |
 | CI-06 | med | done | Move coverage threshold/config into pyproject; add `.coverage` to `.gitignore` | §6 |
 | CI-07 | med | done | Deflake tests: stable digest seed for FakeEmbedder (`conftest.py:128`), replace `sleep(0.1)` waits with deterministic task awaiting | §6 |
-| DI-01 | high | todo | `memory_delete` must delete chunk vectors (`_delete_chunks`); reindex must prune orphaned `vec_chunks` rows | §1.2 |
-| DI-02 | high | todo | Filter `superseded_by IS NULL` in both FTS and semantic search tiers | §1.3 |
-| DI-03 | high | todo | Push category/tag/dormant filters into SQL before LIMIT (both `memory_search` and `api_search`) | §1.4 |
-| DI-04 | high | todo | Wire real elapsed-days vitality decay at query/report time; fix vitality report buckets (open-ended top bucket) | §1.1 |
-| DI-05 | med | todo | RRF dedup: merge dicts so hybrid hits keep `semantic_distance` | §5 |
-| DI-06 | med | todo | Consolidation: infer embedding dim from blob length instead of hardcoded 384 | §5 |
-| DI-07 | med | todo | Rerank a 3–5× candidate pool before truncating to `limit` | §5 |
-| DI-08 | med | todo | Gate HyDE expansion on embedder availability; cache by query | §5 |
+| DI-01 | high | done | `memory_delete` must delete chunk vectors (`_delete_chunks`); reindex must prune orphaned `vec_chunks` rows | §1.2 |
+| DI-02 | high | done | Filter `superseded_by IS NULL` in both FTS and semantic search tiers | §1.3 |
+| DI-03 | high | done | Push category/tag/dormant filters into SQL before LIMIT (both `memory_search` and `api_search`) | §1.4 |
+| DI-04 | high | done | Wire real elapsed-days vitality decay at query/report time; fix vitality report buckets (open-ended top bucket) | §1.1 |
+| DI-05 | med | done | RRF dedup: merge dicts so hybrid hits keep `semantic_distance` | §5 |
+| DI-06 | med | done | Consolidation: infer embedding dim from blob length instead of hardcoded 384 | §5 |
+| DI-07 | med | done | Rerank a 3–5× candidate pool before truncating to `limit` | §5 |
+| DI-08 | med | done | Gate HyDE expansion on embedder availability; cache by query | §5 |
 
 ## Wave 2 — sync hardening + security
 
