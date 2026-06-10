@@ -4,6 +4,8 @@ remind_me_mcp.__main__ — CLI argument parsing and mode dispatch.
 Supports multiple execution modes:
   - MCP stdio mode (default): runs the FastMCP server over stdin/stdout
   - UI server mode (--serve-ui): starts the Starlette dashboard HTTP server
+  - Remote connector mode (--serve-remote): MCP over Streamable HTTP behind a
+    secret URL path, for claude.ai custom connectors via a tunnel (FT-05)
   - Status mode (--status): checks if the dashboard is running and exits
   - Version mode (--version): prints the installed version and exits
   - Check-update mode (--check-update): checks for updates and exits
@@ -11,6 +13,7 @@ Supports multiple execution modes:
 
 Usage:
   python -m remind_me_mcp [--serve-ui] [--ui-port PORT] [--ui-host HOST]
+                           [--serve-remote] [--remote-port PORT] [--remote-host HOST]
                            [--status] [--version] [--check-update] [--update]
 """
 
@@ -24,7 +27,16 @@ import sys
 
 import remind_me_mcp.tools  # noqa: F401 — ensure tools are registered before mcp.run()
 from remind_me_mcp.api import _build_api_app
-from remind_me_mcp.config import MCP_HTTP_HOST, MCP_HTTP_PORT, SERVE_MCP, SERVE_UI, UI_PORT
+from remind_me_mcp.config import (
+    MCP_HTTP_HOST,
+    MCP_HTTP_PORT,
+    REMOTE_MCP,
+    REMOTE_MCP_HOST,
+    REMOTE_MCP_PORT,
+    SERVE_MCP,
+    SERVE_UI,
+    UI_PORT,
+)
 from remind_me_mcp.pid import (
     _check_ui_server_health,
     _read_pid_file,
@@ -109,6 +121,42 @@ def _run_combined(args) -> None:
     uvicorn.run(combined, host=args.ui_host, port=args.ui_port)
 
 
+def _run_remote(args) -> None:
+    """Run the remote MCP connector (FT-05) on a dedicated Uvicorn instance.
+
+    Serves the MCP server over Streamable HTTP at /mcp/<connector token>
+    (URL-as-credential, so claude.ai custom connectors can attach without
+    header support) and at /mcp with 'Authorization: Bearer <token>' for
+    clients that can send headers. The token is generated and persisted on
+    first use (config.resolve_connector_token); the startup log shows it
+    redacted — the full URL path is logged once at generation time and
+    stored in the token file.
+    """
+    import uvicorn
+
+    from remind_me_mcp import config as cfg
+    from remind_me_mcp.remote import build_remote_app, redact_token
+
+    token = cfg.resolve_connector_token()
+    app = build_remote_app(token)
+
+    log.info(
+        "Remote MCP connector starting — endpoint: http://%s:%d/mcp/%s "
+        "(token redacted; full token at %s). Header-capable clients may "
+        "instead use http://%s:%d/mcp with 'Authorization: Bearer <token>'. "
+        "Expose via an HTTPS tunnel (e.g. `tailscale funnel %d`) and add the "
+        "public /mcp/<token> URL as a claude.ai custom connector.",
+        args.remote_host,
+        args.remote_port,
+        redact_token(token),
+        cfg.MEMORY_DIR / "connector_token",
+        args.remote_host,
+        args.remote_port,
+        args.remote_port,
+    )
+    uvicorn.run(app, host=args.remote_host, port=args.remote_port)
+
+
 def main() -> None:
     """Parse CLI arguments and dispatch to the appropriate execution mode."""
     # Root logging setup belongs in the entrypoint, not at package import time
@@ -145,6 +193,21 @@ def main() -> None:
     )
     parser.add_argument("--mcp-port", type=int, default=MCP_HTTP_PORT, help="MCP HTTP port")
     parser.add_argument("--mcp-host", default=MCP_HTTP_HOST, help="MCP HTTP host")
+    parser.add_argument(
+        "--serve-remote",
+        action="store_true",
+        default=REMOTE_MCP,
+        help=(
+            "Run the remote MCP connector (FT-05): Streamable HTTP behind a "
+            "secret URL path for claude.ai custom connectors (port 8768 by default)"
+        ),
+    )
+    parser.add_argument(
+        "--remote-port", type=int, default=REMOTE_MCP_PORT, help="Remote MCP connector port"
+    )
+    parser.add_argument(
+        "--remote-host", default=REMOTE_MCP_HOST, help="Remote MCP connector host"
+    )
     parser.add_argument(
         "--status",
         action="store_true",
@@ -229,6 +292,19 @@ def main() -> None:
             print("\u2717 Dashboard not running")
         print(f"  Database: {server_status['db_path']} ({'exists' if server_status['db_exists'] else 'missing'})")
         sys.exit(0)
+
+    # -- Remote MCP connector mode (FT-05) --
+    # Standalone by design: the remote app owns the global FastMCP session
+    # manager (created once per process), so it cannot share a process with
+    # the local MCP HTTP / combined modes.
+    if args.serve_remote:
+        if args.serve_ui or args.serve_mcp:
+            log.warning(
+                "--serve-remote is standalone; ignoring --serve-ui/--serve-mcp "
+                "(run those in a separate process)."
+            )
+        _run_remote(args)
+        return
 
     # -- MCP HTTP + UI combined mode --
     if args.serve_mcp and args.serve_ui:

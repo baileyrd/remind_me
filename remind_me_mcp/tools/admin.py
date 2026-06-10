@@ -392,6 +392,28 @@ async def remind_me_server_status() -> str:
             "auto-ingest a notes/docs folder)"
         )
 
+    # Remote MCP connector (FT-05)
+    from remind_me_mcp.remote import get_remote_status
+
+    remote = get_remote_status()
+    if remote["enabled"]:
+        lines.append(
+            f"\n**Remote MCP connector:** ✓ Enabled — serves "
+            f"http://{remote['host']}:{remote['port']}/mcp/<token> "
+            f"(token at `{remote['token_file']}`; run with --serve-remote)"
+        )
+    elif remote["token_configured"]:
+        lines.append(
+            f"\n**Remote MCP connector:** ✗ Disabled (token exists at "
+            f"`{remote['token_file']}`; set REMIND_ME_REMOTE_MCP=1 or run "
+            f"with --serve-remote to enable)"
+        )
+    else:
+        lines.append(
+            "\n**Remote MCP connector:** ✗ Disabled (set REMIND_ME_REMOTE_MCP=1 "
+            "and run with --serve-remote to expose a claude.ai custom connector)"
+        )
+
     return "\n".join(lines)
 
 
