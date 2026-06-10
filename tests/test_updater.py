@@ -386,6 +386,39 @@ def test_start_background_check_no_notice_when_up_to_date() -> None:
     assert pop_update_notice() is None
 
 
+def test_start_background_check_opt_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SE-06: REMIND_ME_AUTO_UPDATE_CHECK=false skips the startup update check entirely.
+
+    With config.AUTO_UPDATE_CHECK False, start_background_check must spawn no
+    thread and never call check_for_update (i.e. no `git fetch` at startup).
+    """
+    import remind_me_mcp.config as cfg
+    import remind_me_mcp.updater as mod
+
+    monkeypatch.setattr(cfg, "AUTO_UPDATE_CHECK", False)
+
+    with patch(
+        "remind_me_mcp.updater.check_for_update",
+        side_effect=AssertionError("check_for_update must not run when opted out"),
+    ):
+        start_background_check()
+
+        update_threads = [t for t in threading.enumerate() if t.name == "update-check"]
+        assert update_threads == [], "no update-check thread may be spawned when opted out"
+
+    assert pop_update_notice() is None
+    # The module-level notice must be untouched
+    with mod._notice_lock:
+        assert mod._update_notice is None
+
+
+def test_auto_update_check_default_enabled() -> None:
+    """SE-06: with the env var unset, the startup check stays enabled (default true)."""
+    import remind_me_mcp.config as cfg
+
+    assert cfg.AUTO_UPDATE_CHECK is True
+
+
 # ---------------------------------------------------------------------------
 # MCP tool wrappers (integration-style)
 # ---------------------------------------------------------------------------
