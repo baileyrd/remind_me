@@ -1,8 +1,21 @@
 """
-remind_me_mcp.importer — Chat export import engine.
+remind_me_mcp.importer — Chat export and document import engine.
 
-Handles parsing JSON, JSONL, and Markdown chat export formats, chunking text
-into memory-sized pieces, and storing results into the database.
+Handles parsing JSON, JSONL, and Markdown chat export formats — plus generic
+documents (plain Markdown notes and text files, FT-02) — chunking text into
+memory-sized pieces, and storing results into the database.
+
+Two import kinds share one pipeline (hash dedup, _import_lock, batched
+embedding):
+
+* ``chat`` — role-structured exports, chunked per-message (the original path).
+* ``document`` — notes/docs files, chunked per-section (Markdown headings,
+  with heading context kept on each chunk) or per-paragraph (plain text).
+
+``kind="auto"`` (the default) routes .json/.jsonl to the chat parser and
+sniffs .md/.markdown/.txt content: files with chat role markers
+(``**User:**`` / ``## Assistant`` …) import as chat, everything else as a
+document.
 """
 
 from __future__ import annotations
@@ -22,6 +35,16 @@ from remind_me_mcp.db import _embed_and_store_rows, _get_db, _make_id, _now_iso
 log = logging.getLogger("remind_me_mcp.importer")
 
 IMPORT_CONCURRENCY = 8
+
+IMPORT_KINDS = ("auto", "chat", "document")
+"""Valid values for the ``kind`` import parameter (FT-02)."""
+
+DOCUMENT_SOURCE = "document_import"
+"""``memories.source`` value for document imports (chat imports use 'chat_import')."""
+
+DOCUMENT_CATEGORY = "document"
+"""Default ``memories.category`` for document imports when the caller passed
+the generic chat default ('chat_import') or an empty category."""
 
 # Serializes the dedup-check + INSERT transaction when import_chat_file runs
 # concurrently in multiple asyncio.to_thread workers. SQLite connections are
@@ -202,6 +225,46 @@ def _filter_messages(messages: list[dict[str, str]], mode: str) -> list[str]:
     return [m["content"] for m in messages]
 
 
+# Common chat role markers in markdown exports: "## Human", "## Assistant",
+# "**User:**", etc. Shared by the chat parser and the auto-detection sniffer.
+_CHAT_MD_PATTERN = re.compile(
+    r"(?:^|\n)(?:#{1,3}\s*|(?:\*\*))?(Human|User|Assistant|Claude|Bot|System)(?:\*\*)?[:\s]*\n?",
+    re.IGNORECASE,
+)
+
+
+def _split_chat_markdown(text: str) -> list[dict[str, str]]:
+    """Split markdown text on chat role markers into {role, content} messages.
+
+    Args:
+        text: Raw markdown/plain text.
+
+    Returns:
+        List of {role, content} dicts; empty when no role-structured content
+        is found (the basis for chat-vs-document auto-detection, FT-02).
+    """
+    parts = _CHAT_MD_PATTERN.split(text)
+    messages: list[dict[str, str]] = []
+    i = 1
+    while i < len(parts) - 1:
+        role = parts[i].strip().lower()
+        content = parts[i + 1].strip()
+        if content:
+            messages.append({"role": role, "content": content})
+        i += 2
+    return messages
+
+
+def _looks_like_chat_markdown(text: str) -> bool:
+    """Return True when the text contains chat-export role structure (FT-02).
+
+    Used by ``kind="auto"`` to route .md/.markdown/.txt files: exactly the
+    files the chat parser would find messages in import as chat, so existing
+    chat-export behavior is unchanged.
+    """
+    return bool(_split_chat_markdown(text))
+
+
 def _parse_markdown_chat(text: str, extract_mode: str) -> list[str]:
     """Parse markdown-formatted chat exports into content strings.
 
@@ -216,26 +279,100 @@ def _parse_markdown_chat(text: str, extract_mode: str) -> list[str]:
     Returns:
         List of content strings extracted according to extract_mode.
     """
-    # Common patterns: "## Human", "## Assistant", "**User:**", etc.
-    pattern = re.compile(
-        r"(?:^|\n)(?:#{1,3}\s*|(?:\*\*))?(Human|User|Assistant|Claude|Bot|System)(?:\*\*)?[:\s]*\n?",
-        re.IGNORECASE,
-    )
-    parts = pattern.split(text)
-    messages: list[dict[str, str]] = []
-    i = 1
-    while i < len(parts) - 1:
-        role = parts[i].strip().lower()
-        content = parts[i + 1].strip()
-        if content:
-            messages.append({"role": role, "content": content})
-        i += 2
+    messages = _split_chat_markdown(text)
 
     if not messages:
         # No structure detected — treat entire file as one memory
         return [text.strip()] if text.strip() else []
 
     return _filter_messages(messages, extract_mode)
+
+
+# ---------------------------------------------------------------------------
+# Document parsing (FT-02)
+# ---------------------------------------------------------------------------
+
+_MD_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
+_MD_FENCE_RE = re.compile(r"^(`{3,}|~{3,})")
+
+
+def _split_markdown_sections(text: str) -> list[tuple[str | None, str]]:
+    """Split Markdown into (heading_path, body) sections on ATX headings.
+
+    The heading path is a breadcrumb of the section's ancestor headings joined
+    with ``" > "`` (e.g. ``"Projects > Remind Me"``), so nested context travels
+    with each section. Content before the first heading becomes a section with
+    heading ``None``. Lines inside fenced code blocks are never treated as
+    headings. Sections whose body is empty (heading-only) are dropped.
+
+    Args:
+        text: Raw markdown text.
+
+    Returns:
+        List of (heading_path | None, stripped_body) tuples in document order.
+    """
+    sections: list[tuple[str | None, str]] = []
+    heading_stack: list[tuple[int, str]] = []
+    current_heading: str | None = None
+    current_lines: list[str] = []
+    in_fence = False
+
+    def _flush() -> None:
+        body = "\n".join(current_lines).strip()
+        if body:
+            sections.append((current_heading, body))
+
+    for line in text.splitlines():
+        if _MD_FENCE_RE.match(line.lstrip()):
+            in_fence = not in_fence
+            current_lines.append(line)
+            continue
+        match = None if in_fence else _MD_HEADING_RE.match(line)
+        if match:
+            _flush()
+            current_lines = []
+            level = len(match.group(1))
+            title = match.group(2).strip()
+            while heading_stack and heading_stack[-1][0] >= level:
+                heading_stack.pop()
+            heading_stack.append((level, title))
+            current_heading = " > ".join(t for _, t in heading_stack)
+        else:
+            current_lines.append(line)
+    _flush()
+    return sections
+
+
+def _parse_document(text: str, suffix: str, max_length: int) -> list[tuple[str, str | None]]:
+    """Chunk a notes/document file into (content, section_heading) pairs (FT-02).
+
+    Markdown files are split per-section on headings; each chunk keeps its
+    heading breadcrumb both prepended to the content (for search context) and
+    as the second tuple element (stored in memory metadata). Long sections
+    fall back to paragraph/size-based chunking via :func:`_chunk_text`. Plain
+    text files are paragraph/size-chunked with no heading metadata.
+
+    Args:
+        text: Raw file text.
+        suffix: Lowercased file extension ('.md', '.markdown', or '.txt').
+        max_length: Maximum characters per chunk (including heading prefix).
+
+    Returns:
+        List of (chunk_content, heading_path | None) tuples.
+    """
+    pairs: list[tuple[str, str | None]] = []
+    if suffix in (".md", ".markdown"):
+        for heading, body in _split_markdown_sections(text):
+            prefix = f"{heading}\n\n" if heading else ""
+            # Keep the heading context inside the chunk budget; floor the
+            # body budget so a pathological heading can't zero it out.
+            budget = max(max_length - len(prefix), 100)
+            for chunk in _chunk_text(body, budget):
+                pairs.append((prefix + chunk, heading))
+    else:
+        for chunk in _chunk_text(text, max_length):
+            pairs.append((chunk, None))
+    return pairs
 
 
 # ---------------------------------------------------------------------------
@@ -249,33 +386,58 @@ def import_chat_file(
     tags: list[str],
     extract_mode: str,
     max_length: int,
+    kind: str = "auto",
 ) -> dict[str, Any]:
-    """Import a single chat export file into the memory store.
+    """Import a single chat export or document file into the memory store.
 
-    Parses the file based on its extension (.json, .jsonl, .md/.markdown/.txt),
-    extracts messages according to extract_mode, chunks them, and stores each
-    chunk as a separate memory. Deduplicates by file hash — if the same file
-    content has already been imported, returns a 'skipped' result immediately.
+    Parses the file based on its extension (.json, .jsonl, .md/.markdown/.txt)
+    and the resolved import ``kind``. Chat exports extract messages according
+    to extract_mode and chunk per-message; documents (FT-02) chunk per-section
+    (Markdown headings) or per-paragraph (plain text), recording the section
+    heading in each memory's metadata. Deduplicates by file hash — if the same
+    file content has already been imported, returns a 'skipped' result
+    immediately.
 
     Args:
-        file_path: Path to the chat export file.
-        category: Category to assign to all imported memories.
+        file_path: Path to the file to import.
+        category: Category to assign to all imported memories. For document
+            imports, the generic chat default ('chat_import') or an empty
+            string is replaced with 'document'.
         tags: Tags to apply to all imported memories.
-        extract_mode: Message extraction strategy (e.g., 'assistant_messages').
+        extract_mode: Message extraction strategy (e.g., 'assistant_messages');
+            chat imports only.
         max_length: Maximum characters per memory chunk.
+        kind: 'chat', 'document', or 'auto' (default). Auto routes
+            .json/.jsonl to the chat parser and sniffs .md/.markdown/.txt
+            content: chat role markers import as chat, everything else as a
+            document.
 
     Returns:
         A status dict. On success: {'status': 'ok', 'import_id': str,
-        'memories_created': int, 'raw_entries': int, 'file': str}.
+        'kind': str, 'memories_created': int, 'raw_entries': int, 'file': str}.
         On skip: {'status': 'skipped', 'reason': str, 'file': str,
-        'import_id': str}. On unsupported format: {'status': 'error',
+        'import_id': str}. On unsupported format/kind: {'status': 'error',
         'reason': str, 'file': str}.
     """
     path = Path(file_path)
     suffix = path.suffix.lower()
 
+    if kind not in IMPORT_KINDS:
+        return {
+            "status": "error",
+            "reason": f"invalid kind: {kind!r} (use 'auto', 'chat', or 'document')",
+            "file": path.name,
+        }
+
     if suffix not in (".json", ".jsonl", ".md", ".markdown", ".txt"):
         return {"status": "error", "reason": f"unsupported format: {suffix}", "file": path.name}
+
+    if kind == "document" and suffix in (".json", ".jsonl"):
+        return {
+            "status": "error",
+            "reason": f"document import does not support {suffix}: use .md, .markdown, or .txt",
+            "file": path.name,
+        }
 
     # --- Phase 1: hash dedup BEFORE any parsing/chunking (PF-03) so
     # re-importing an already-imported file short-circuits immediately. ---
@@ -295,9 +457,24 @@ def import_chat_file(
 
     # --- Phase 2: file I/O and parsing (no lock needed; pure CPU/disk work) ---
     raw = path.read_text(encoding="utf-8", errors="replace")
+
+    # Resolve the effective kind (FT-02). JSON/JSONL are always chat exports;
+    # markdown/text files are content-sniffed in auto mode so chat-style
+    # markdown keeps importing as chat (existing behavior preserved).
+    if suffix in (".json", ".jsonl"):
+        effective_kind = "chat"
+    elif kind == "auto":
+        effective_kind = "chat" if _looks_like_chat_markdown(raw) else "document"
+    else:
+        effective_kind = kind
+
+    # (content, section_heading) pairs — section is always None for chat.
+    parsed: list[tuple[str, str | None]] = []
     contents: list[str] = []
 
-    if suffix in (".json",):
+    if effective_kind == "document":
+        parsed = _parse_document(raw, suffix, max_length)
+    elif suffix in (".json",):
         data = json.loads(raw)
         # Could be a list of conversations or a single conversation
         if isinstance(data, list) and data and isinstance(data[0], dict) and ("chat_messages" in data[0] or "messages" in data[0]):
@@ -323,15 +500,28 @@ def import_chat_file(
     elif suffix in (".md", ".markdown", ".txt"):
         contents = _parse_markdown_chat(raw, extract_mode)
 
-    # Pre-compute chunk/embed pairs before acquiring the lock
+    if effective_kind == "document":
+        # Documents are already chunked per-section/paragraph by _parse_document.
+        raw_entries = len(parsed)
+        source = DOCUMENT_SOURCE
+        if category in ("", "chat_import"):
+            category = DOCUMENT_CATEGORY
+    else:
+        # Chat: chunk each extracted message/content string.
+        for content in contents:
+            if not content.strip():
+                continue
+            for chunk in _chunk_text(content, max_length):
+                parsed.append((chunk, None))
+        raw_entries = len(contents)
+        source = "chat_import"
+
+    # Pre-compute chunk/embed entries before acquiring the lock
     now = _now_iso()
     import_id = _make_id(file_path)
-    embed_pairs: list[tuple[str, str]] = []
-    for content in contents:
-        if not content.strip():
-            continue
-        for chunk in _chunk_text(content, max_length):
-            embed_pairs.append((_make_id(chunk), chunk))
+    embed_entries: list[tuple[str, str, str | None]] = [
+        (_make_id(chunk), chunk, section) for chunk, section in parsed
+    ]
 
     # --- Phase 3: dedup re-check + INSERTs in one short locked transaction.
     # The lock covers only the DB writes; parsing (above) and embedding
@@ -348,7 +538,10 @@ def import_chat_file(
         # Chunk and store — collect (mem_id, chunk) pairs so the same IDs are used
         # for both INSERT and embedding (BUGF-01 fix: prevents ID mismatch)
         stored = 0
-        for mem_id, chunk in embed_pairs:
+        for mem_id, chunk, section in embed_entries:
+            metadata: dict[str, Any] = {"import_id": import_id, "filename": path.name}
+            if section is not None:
+                metadata["section"] = section
             db.execute(
                 """INSERT OR IGNORE INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -357,15 +550,20 @@ def import_chat_file(
                     chunk,
                     category,
                     json.dumps(tags),
-                    "chat_import",
-                    json.dumps({"import_id": import_id, "filename": path.name}),
+                    source,
+                    json.dumps(metadata),
                     now,
                     now,
                 ),
             )
             stored += 1
 
-        stats = {"memories_created": stored, "raw_entries": len(contents), "file": path.name}
+        stats = {
+            "kind": effective_kind,
+            "memories_created": stored,
+            "raw_entries": raw_entries,
+            "file": path.name,
+        }
         db.execute(
             "INSERT INTO chat_imports (import_id, filename, hash, imported_at, stats) VALUES (?, ?, ?, ?, ?)",
             (import_id, path.name, fhash, now, json.dumps(stats)),
@@ -375,8 +573,8 @@ def import_chat_file(
     # --- Phase 4: embed OUTSIDE the lock, in batches (PF-03). The rows use
     # the SAME mem_ids that were INSERTed (BUGF-01); any failure here is
     # healed later by remind_me_reindex. ---
-    if embed_pairs:
-        chunk_by_id = dict(embed_pairs)
+    if embed_entries:
+        chunk_by_id = {mem_id: chunk for mem_id, chunk, _section in embed_entries}
         ids = list(chunk_by_id)
         rows_to_embed: list[tuple[int, str]] = []
         # The quick rowid lookups reuse the lock only because tests may share
@@ -408,8 +606,9 @@ async def import_directory(
     extract_mode: str = "assistant_messages",
     max_length: int = 10000,
     recursive: bool = True,
+    kind: str = "auto",
 ) -> dict[str, Any]:
-    """Import all chat export files from a directory concurrently.
+    """Import all chat export and document files from a directory concurrently.
 
     Scans for .json, .jsonl, .md, .markdown, and .txt files. Skips
     already-imported files (hash-based deduplication). Files are processed
@@ -417,12 +616,15 @@ async def import_directory(
     IMPORT_CONCURRENCY (default 8) to prevent resource exhaustion.
 
     Args:
-        directory: Path to the directory containing chat export files.
-        category: Category to assign to all imported memories.
+        directory: Path to the directory containing files to import.
+        category: Category to assign to all imported memories (the chat
+            default 'chat_import' becomes 'document' for document files).
         tags: Optional tags to apply to all imported memories.
-        extract_mode: Message extraction strategy.
+        extract_mode: Message extraction strategy (chat files only).
         max_length: Max characters per memory chunk.
         recursive: Whether to search subdirectories.
+        kind: 'chat', 'document', or 'auto' (default) — per-file routing,
+            see :func:`import_chat_file` (FT-02).
 
     Returns:
         Summary dict with keys: files_processed, imported, skipped,
@@ -449,6 +651,7 @@ async def import_directory(
                     tags=tags,
                     extract_mode=extract_mode,
                     max_length=max_length,
+                    kind=kind,
                 )
             except (json.JSONDecodeError, UnicodeDecodeError, FileNotFoundError, OSError) as e:
                 log.warning("Failed to import %s: %s", f.name, e)
@@ -475,11 +678,18 @@ async def import_directory(
 # ---------------------------------------------------------------------------
 
 __all__ = [
+    "IMPORT_KINDS",
+    "DOCUMENT_SOURCE",
+    "DOCUMENT_CATEGORY",
     "import_chat_file",
     "import_directory",
     "_chunk_text",
     "_extract_messages_from_json",
     "_filter_messages",
     "_parse_markdown_chat",
+    "_split_chat_markdown",
+    "_looks_like_chat_markdown",
+    "_split_markdown_sections",
+    "_parse_document",
     "_file_hash",
 ]

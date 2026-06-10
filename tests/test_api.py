@@ -415,6 +415,55 @@ def test_api_import_directory(client: TestClient, db_conn, tmp_path: Path) -> No
     assert data["total_memories_created"] >= 1
 
 
+def test_api_import_document_markdown(client: TestClient, db_conn, tmp_path: Path) -> None:
+    """POST /api/import auto-detects a notes markdown file as a document (FT-02).
+
+    Each heading section becomes its own memory with the heading recorded in
+    metadata and source set to 'document_import' — parity with the MCP tool.
+    """
+    import json
+
+    notes = tmp_path / "notes.md"
+    notes.write_text("# Garden\n\n## Tomatoes\nNeed full sun and weekly feeding.\n")
+
+    response = client.post("/api/import", json={"file_path": str(notes)})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    assert data["kind"] == "document"
+    assert data["memories_created"] == 1
+
+    row = db_conn.execute("SELECT source, metadata FROM memories").fetchone()
+    assert row["source"] == "document_import"
+    assert json.loads(row["metadata"])["section"] == "Garden > Tomatoes"
+
+
+def test_api_import_explicit_kind_forwarded(client: TestClient, db_conn, tmp_path: Path) -> None:
+    """POST /api/import forwards an explicit kind to the importer (FT-02)."""
+    chatish = tmp_path / "chatish.md"
+    chatish.write_text("## Assistant\nThis looks like a chat export.\n")
+
+    response = client.post(
+        "/api/import", json={"file_path": str(chatish), "kind": "document"}
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    assert data["kind"] == "document"
+
+
+def test_api_import_invalid_kind(client: TestClient, tmp_path: Path) -> None:
+    """POST /api/import with an unknown kind returns 400 (FT-02)."""
+    notes = tmp_path / "notes.md"
+    notes.write_text("Some notes.")
+
+    response = client.post(
+        "/api/import", json={"file_path": str(notes), "kind": "banana"}
+    )
+    assert response.status_code == 400
+    assert "invalid kind" in response.json()["error"].lower()
+
+
 # ---------------------------------------------------------------------------
 # GET /api/export (FT-01)
 # ---------------------------------------------------------------------------

@@ -157,18 +157,37 @@ class MemoryDeleteInput(BaseModel):
     )
 
 
+class ImportKind(StrEnum):
+    """How to parse an imported file (FT-02).
+
+    AUTO routes by extension and content sniffing: .json/.jsonl always import
+    as chat; .md/.markdown/.txt import as chat when they contain chat role
+    markers (e.g. '**User:**', '## Assistant'), otherwise as a document.
+    """
+
+    AUTO = "auto"
+    CHAT = "chat"
+    DOCUMENT = "document"
+
+
 class ChatImportInput(BaseModel):
-    """Input for importing chat exports into memory."""
+    """Input for importing chat exports or documents into memory."""
 
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
     file_path: str = Field(
         ...,
-        description="Path to the chat export file (JSON, JSONL, or Markdown)",
+        description=(
+            "Path to the file to import: a chat export (JSON, JSONL, or "
+            "Markdown) or a notes/document file (Markdown or plain text)"
+        ),
     )
     category: str = Field(
         default="chat_import",
-        description="Category to assign to imported memories",
+        description=(
+            "Category to assign to imported memories. The default "
+            "'chat_import' becomes 'document' for document imports."
+        ),
     )
     tags: list[str] = Field(
         default_factory=list,
@@ -190,6 +209,17 @@ class ChatImportInput(BaseModel):
         description="Max characters per memory entry; longer content is chunked",
         ge=100,
         le=50000,
+    )
+    kind: ImportKind = Field(
+        default=ImportKind.AUTO,
+        description=(
+            "How to parse the file (FT-02): "
+            "'auto' — detect by extension/content (chat-style markdown imports "
+            "as chat, notes markdown/text as a document), "
+            "'chat' — force the chat-export parser, "
+            "'document' — force per-section/paragraph document chunking "
+            "(.md/.markdown/.txt only)"
+        ),
     )
 
     @field_validator("file_path")
@@ -276,18 +306,26 @@ class ExportInput(BaseModel):
 
 
 class BulkImportDirInput(BaseModel):
-    """Input for bulk-importing a directory of chat exports."""
+    """Input for bulk-importing a directory of chat exports and/or documents."""
 
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
     directory: str = Field(
-        ..., description="Path to directory containing chat export files"
+        ...,
+        description="Path to directory containing chat export and/or document files",
     )
     category: str = Field(default="chat_import")
     tags: list[str] = Field(default_factory=list)
     extract_mode: str = Field(default="assistant_messages")
     max_length: int = Field(default=10000, ge=100, le=50000)
     recursive: bool = Field(default=True, description="Search subdirectories")
+    kind: ImportKind = Field(
+        default=ImportKind.AUTO,
+        description=(
+            "Per-file parsing mode (FT-02): 'auto' (detect chat vs document "
+            "per file), 'chat', or 'document'"
+        ),
+    )
 
     @field_validator("directory")
     @classmethod
@@ -557,6 +595,7 @@ __all__ = [
     "MemoryListInput",
     "MemoryUpdateInput",
     "MemoryDeleteInput",
+    "ImportKind",
     "ChatImportInput",
     "MemoryStatsInput",
     "ExportFormat",

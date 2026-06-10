@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any
 from remind_me_mcp.config import DB_PATH, is_in_export_roots, is_in_import_roots, resolve_api_key
 from remind_me_mcp.db import _embed_and_store, _get_db, _make_id, _now_iso, _row_to_dict
 from remind_me_mcp.exporter import EXPORT_FORMATS, collect_export_records, export_memories, render_export
-from remind_me_mcp.importer import import_chat_file, import_directory
+from remind_me_mcp.importer import IMPORT_KINDS, import_chat_file, import_directory
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, MutableMapping
@@ -485,7 +485,12 @@ def _build_api_app() -> Starlette:
         return await asyncio.to_thread(_work)
 
     async def api_import(request: Request) -> JSONResponse:
-        """Import a chat export file or directory into the memory store."""
+        """Import a chat export or document file (or directory) into the memory store.
+
+        The optional ``kind`` body field ('auto' default, 'chat', or
+        'document') controls routing (FT-02) — parity with the MCP import
+        tools: chat-style files chunk per-message, documents per-section.
+        """
         try:
             body = await request.json()
         except (json.JSONDecodeError, TypeError, ValueError) as e:
@@ -508,6 +513,9 @@ def _build_api_app() -> Starlette:
         tags = body.get("tags", [])
         extract_mode = body.get("extract_mode", "assistant_messages")
         max_length = body.get("max_length", 10000)
+        kind = str(body.get("kind", "auto")).strip().lower()
+        if kind not in IMPORT_KINDS:
+            return _json_err(f"Invalid kind {kind!r}: use 'auto', 'chat', or 'document'")
 
         try:
             if p.is_dir():
@@ -519,12 +527,13 @@ def _build_api_app() -> Starlette:
                     extract_mode=extract_mode,
                     max_length=max_length,
                     recursive=True,
+                    kind=kind,
                 )
                 return _json_ok(summary)
             else:
                 # Single file import — blocking parse/DB/embed work off-loop (PF-06)
                 result = await asyncio.to_thread(
-                    import_chat_file, str(p), category, tags, extract_mode, max_length
+                    import_chat_file, str(p), category, tags, extract_mode, max_length, kind
                 )
                 return _json_ok(result)
         except (FileNotFoundError, OSError, json.JSONDecodeError, UnicodeDecodeError) as e:

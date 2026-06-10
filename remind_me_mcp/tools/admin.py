@@ -31,7 +31,7 @@ from remind_me_mcp.tools._shared import _maybe_update_notice, log
 @mcp.tool(
     name="remind_me_import_chat",
     annotations={
-        "title": "Import Chat Export",
+        "title": "Import Chat Export or Document",
         "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": True,
@@ -39,13 +39,16 @@ from remind_me_mcp.tools._shared import _maybe_update_notice, log
     },
 )
 async def memory_import_chat(params: ChatImportInput) -> str:
-    """Import a chat export file (JSON, JSONL, or Markdown) into memory.
+    """Import a chat export (JSON, JSONL, or Markdown) or a document/notes file into memory.
 
-    Supports Claude's export format, OpenAI's export format, and generic {role, content} message arrays.
+    Supports Claude's export format, OpenAI's export format, and generic {role, content} message
+    arrays — plus generic documents (FT-02): Markdown notes are chunked per-section (heading
+    context kept with each chunk and stored as metadata), plain text per-paragraph. With the
+    default kind='auto', chat-style markdown imports as chat and notes files as documents.
     Deduplicates by file hash — re-importing the same file is a no-op.
 
     Args:
-        params (ChatImportInput): File path, extraction mode, and tagging options.
+        params (ChatImportInput): File path, import kind, extraction mode, and tagging options.
 
     Returns:
         str: Import statistics.
@@ -57,6 +60,7 @@ async def memory_import_chat(params: ChatImportInput) -> str:
             tags=params.tags,
             extract_mode=params.extract_mode,
             max_length=params.max_length,
+            kind=params.kind.value,
         )
     except FileNotFoundError:
         return json.dumps({"status": "error", "error": f"File not found: {params.file_path}"})
@@ -69,7 +73,7 @@ async def memory_import_chat(params: ChatImportInput) -> str:
 @mcp.tool(
     name="remind_me_import_directory",
     annotations={
-        "title": "Bulk Import Chat Directory",
+        "title": "Bulk Import Directory",
         "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": True,
@@ -77,9 +81,11 @@ async def memory_import_chat(params: ChatImportInput) -> str:
     },
 )
 async def memory_import_directory(params: BulkImportDirInput) -> str:
-    """Bulk import all chat export files from a directory.
+    """Bulk import all chat export and document files from a directory.
 
-    Scans for .json, .jsonl, .md, .markdown, and .txt files. Skips
+    Scans for .json, .jsonl, .md, .markdown, and .txt files. With the default
+    kind='auto' each file is routed individually: chat exports are chunked
+    per-message, documents per-section/paragraph (FT-02). Skips
     already-imported files (hash-based deduplication). Delegates to the
     shared import_directory() function in importer.py (DRY).
 
@@ -97,6 +103,7 @@ async def memory_import_directory(params: BulkImportDirInput) -> str:
         extract_mode=params.extract_mode,
         max_length=params.max_length,
         recursive=params.recursive,
+        kind=params.kind.value,
     )
     return json.dumps(summary, indent=2)
 
