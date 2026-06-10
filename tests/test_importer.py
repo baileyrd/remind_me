@@ -195,6 +195,29 @@ def test_extract_bare_message_dict() -> None:
     assert result == [{"role": "assistant", "content": "Exported memory content"}]
 
 
+def test_extract_skips_record_type_dict() -> None:
+    """A record_type-tagged record (FT-06 graph record) is never a message —
+    even a hypothetical one carrying role-like keys."""
+    entity = {"record_type": "entity", "id": "abc", "name": "Bailey", "kind": "person"}
+    assert _extract_messages_from_json(entity, "all_messages") == []
+    link = {"record_type": "memory_entity", "memory_id": "m1", "entity_id": "abc"}
+    assert _extract_messages_from_json(link, "all_messages") == []
+    # Defensive: record_type wins even when role/content keys are present.
+    weird = {"record_type": "entity", "role": "assistant", "content": "not a memory"}
+    assert _extract_messages_from_json(weird, "all_messages") == []
+
+
+def test_extract_skips_record_type_items_in_list() -> None:
+    """Graph records mixed into an export array are skipped, messages kept."""
+    data = [
+        {"role": "assistant", "content": "Real memory"},
+        {"record_type": "entity", "id": "abc", "name": "Bailey"},
+        {"record_type": "memory_entity", "memory_id": "m1", "entity_id": "abc"},
+    ]
+    result = _extract_messages_from_json(data, "all_messages")
+    assert result == [{"role": "assistant", "content": "Real memory"}]
+
+
 # ---------------------------------------------------------------------------
 # _filter_messages
 # ---------------------------------------------------------------------------

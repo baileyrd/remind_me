@@ -580,6 +580,67 @@ def test_api_export_import_round_trip(client: TestClient, memory_factory, tmp_pa
     assert data["memories_created"] == 1
 
 
+def _seed_api_graph(db_conn, memory_factory) -> dict:
+    """One memory linked to one entity (FT-06 API tests)."""
+    from remind_me_mcp.db import _link_memory_entity, _upsert_entity
+
+    mem = memory_factory(content="Graph endpoint memory")
+    eid = _upsert_entity(db_conn, "Bailey Robertson", kind="person", aliases=["Bailey"])
+    _link_memory_entity(db_conn, mem["id"], eid)
+    db_conn.commit()
+    return mem
+
+
+def test_api_export_includes_graph_by_default(client: TestClient, db_conn, memory_factory) -> None:
+    """FT-06: GET /api/export appends entity/memory_entity records by default."""
+    mem = _seed_api_graph(db_conn, memory_factory)
+    records = client.get("/api/export").json()
+    entities = [r for r in records if r.get("record_type") == "entity"]
+    links = [r for r in records if r.get("record_type") == "memory_entity"]
+    assert len(entities) == 1
+    assert entities[0]["name"] == "Bailey Robertson"
+    assert entities[0]["aliases"] == ["Bailey"]
+    assert len(links) == 1
+    assert links[0]["memory_id"] == mem["id"]
+    # Memory records are unchanged: first record, no record_type, role marker.
+    assert "record_type" not in records[0]
+    assert records[0]["role"] == "assistant"
+
+
+def test_api_export_include_graph_false(client: TestClient, db_conn, memory_factory) -> None:
+    """FT-06: include_graph=false produces a memories-only export."""
+    _seed_api_graph(db_conn, memory_factory)
+    records = client.get("/api/export?include_graph=false").json()
+    assert len(records) == 1
+    assert all("record_type" not in r for r in records)
+
+
+def test_api_export_import_graph_round_trip(
+    client: TestClient, db_conn, memory_factory, tmp_path: Path
+) -> None:
+    """End-to-end FT-06: export -> wipe graph -> POST /api/import restores it
+    (links re-attach because the memories kept their original ids)."""
+    mem = _seed_api_graph(db_conn, memory_factory)
+    backup = tmp_path / "http_graph_round_trip.json"
+    backup.write_text(client.get("/api/export").text)
+
+    db_conn.execute("DELETE FROM memory_entities")
+    db_conn.execute("DELETE FROM entities")
+    db_conn.commit()
+
+    response = client.post("/api/import", json={"file_path": str(backup)})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    assert data["entities_restored"] == 1
+    assert data["links_restored"] == 1
+    assert data["links_skipped_dangling"] == 0
+    row = db_conn.execute(
+        "SELECT entity_id FROM memory_entities WHERE memory_id = ?", (mem["id"],)
+    ).fetchone()
+    assert row is not None
+
+
 # ---------------------------------------------------------------------------
 # Full REST CRUD cycle
 # ---------------------------------------------------------------------------

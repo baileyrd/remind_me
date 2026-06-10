@@ -5,6 +5,10 @@ Covers record collection (all columns, category/tag filters), JSON vs JSONL
 rendering, file writes, the inline-size guard, export-root path validation in
 ExportInput, and the round-trip guarantee: an exported file re-imports into a
 fresh database with every memory's content preserved.
+
+FT-06: also covers the entity-graph export (record_type-tagged entity /
+memory_entity records, the include_graph opt-out, filter scoping) and the
+import-side restore (alias union-merge, dangling-link skipping and counts).
 """
 
 from __future__ import annotations
@@ -16,9 +20,15 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from remind_me_mcp.db import _ensure_schema
+from remind_me_mcp.db import (
+    _ensure_schema,
+    _entity_id,
+    _link_memory_entity,
+    _upsert_entity,
+)
 from remind_me_mcp.exporter import (
     collect_export_records,
+    collect_graph_records,
     export_memories,
     render_export,
 )
@@ -234,6 +244,261 @@ def test_round_trip_jsonl(db_conn: sqlite3.Connection, fresh_db: sqlite3.Connect
     memory_factory(content="JSONL round trip alpha")
     memory_factory(content="JSONL round trip beta")
     _round_trip(db_conn, fresh_db, tmp_path, "jsonl")
+
+
+# ---------------------------------------------------------------------------
+# Entity-graph export and restore (FT-06)
+# ---------------------------------------------------------------------------
+
+
+def _seed_graph(db: sqlite3.Connection, memory_factory) -> tuple[dict, dict]:
+    """Two memories linked to two entities, plus one unlinked entity.
+
+    Returns the two memory dicts (the first in category 'keep').
+    """
+    mem_a = memory_factory(content="Bailey ships remind_me", category="keep")
+    mem_b = memory_factory(content="Unrelated note", category="drop")
+    eid_person = _upsert_entity(db, "Bailey Robertson", kind="person", aliases=["Bailey"])
+    eid_project = _upsert_entity(db, "remind_me", kind="project")
+    _upsert_entity(db, "Lonely Entity", kind="tool")  # no links
+    _link_memory_entity(db, mem_a["id"], eid_person)
+    _link_memory_entity(db, mem_a["id"], eid_project)
+    _link_memory_entity(db, mem_b["id"], eid_project)
+    db.commit()
+    return mem_a, mem_b
+
+
+def test_graph_records_follow_memories_in_json(db_conn: sqlite3.Connection, memory_factory) -> None:
+    """Default export appends record_type-tagged graph records after memories."""
+    mem_a, mem_b = _seed_graph(db_conn, memory_factory)
+    records = collect_export_records()
+
+    memories = [r for r in records if "record_type" not in r]
+    entities = [r for r in records if r.get("record_type") == "entity"]
+    links = [r for r in records if r.get("record_type") == "memory_entity"]
+    assert len(memories) == 2
+    assert len(entities) == 3  # unlinked entities are part of a full backup
+    assert len(links) == 3
+
+    # Memory records come first and are unchanged (importer-compatible).
+    assert all("record_type" not in r for r in records[:2])
+    assert records[0]["role"] == "assistant"
+
+    person = next(e for e in entities if e["name"] == "Bailey Robertson")
+    assert person["id"] == _entity_id("Bailey Robertson")
+    assert person["kind"] == "person"
+    assert person["aliases"] == ["Bailey"]  # deserialized, like tags/metadata
+    assert "created_at" in person and "updated_at" in person
+
+    assert {(li["memory_id"], li["entity_id"]) for li in links} == {
+        (mem_a["id"], _entity_id("Bailey Robertson")),
+        (mem_a["id"], _entity_id("remind_me")),
+        (mem_b["id"], _entity_id("remind_me")),
+    }
+    assert all(li["created_at"] for li in links)
+
+
+def test_graph_records_in_jsonl_file_export(db_conn: sqlite3.Connection, memory_factory, tmp_path: Path) -> None:
+    """JSONL file exports carry the graph records, one per line."""
+    _seed_graph(db_conn, memory_factory)
+    dest = tmp_path / "graph_backup.jsonl"
+    result = export_memories(format="jsonl", file_path=str(dest))
+    assert result["status"] == "ok"
+    assert result["exported"] == 2  # memory count only
+    assert result["entities"] == 3
+    assert result["links"] == 3
+
+    lines = [json.loads(line) for line in dest.read_text().splitlines() if line.strip()]
+    assert len(lines) == 8
+    assert sum(1 for rec in lines if rec.get("record_type") == "entity") == 3
+    assert sum(1 for rec in lines if rec.get("record_type") == "memory_entity") == 3
+
+
+def test_include_graph_false_excludes_graph(db_conn: sqlite3.Connection, memory_factory) -> None:
+    """The opt-out produces a memories-only export with no graph keys."""
+    _seed_graph(db_conn, memory_factory)
+    records = collect_export_records(include_graph=False)
+    assert len(records) == 2
+    assert all("record_type" not in r for r in records)
+
+    result = export_memories(format="json", include_graph=False)
+    assert result["exported"] == 2
+    assert "entities" not in result
+    assert "links" not in result
+    assert all("record_type" not in r for r in json.loads(result["content"]))
+
+
+def test_filtered_export_scopes_graph_to_exported_memories(db_conn: sqlite3.Connection, memory_factory) -> None:
+    """Category/tag filters keep only links of exported memories and the
+    entities those links reference (unlinked entities are dropped too)."""
+    mem_a, _mem_b = _seed_graph(db_conn, memory_factory)
+    records = collect_export_records(category="keep")
+
+    memories = [r for r in records if "record_type" not in r]
+    entities = [r for r in records if r.get("record_type") == "entity"]
+    links = [r for r in records if r.get("record_type") == "memory_entity"]
+    assert [m["content"] for m in memories] == ["Bailey ships remind_me"]
+    assert {e["name"] for e in entities} == {"Bailey Robertson", "remind_me"}
+    assert all(li["memory_id"] == mem_a["id"] for li in links)
+    assert len(links) == 2
+
+
+def test_collect_graph_records_orders_entities_before_links(db_conn: sqlite3.Connection, memory_factory) -> None:
+    """Entities precede links so a sequential restore sees link endpoints."""
+    _seed_graph(db_conn, memory_factory)
+    kinds = [r["record_type"] for r in collect_graph_records()]
+    assert kinds == ["entity"] * 3 + ["memory_entity"] * 3
+
+
+def test_inline_limit_counts_graph_records(db_conn: sqlite3.Connection, memory_factory) -> None:
+    """The inline cap is about payload size: graph records count against it."""
+    _seed_graph(db_conn, memory_factory)
+    # 2 memories alone fit, but 2 + 6 graph records exceed the cap of 5.
+    result = export_memories(format="json", inline_max=5)
+    assert result["status"] == "error"
+    assert "file_path" in result["error"]
+    # The opt-out brings the export back under the cap.
+    assert export_memories(format="json", inline_max=5, include_graph=False)["status"] == "ok"
+
+
+@pytest.mark.parametrize("fmt", ["json", "jsonl"])
+def test_restore_graph_into_db_with_original_memories(
+    db_conn: sqlite3.Connection, memory_factory, tmp_path: Path, fmt: str
+) -> None:
+    """export -> wipe graph -> re-import restores entities AND links, because
+    the referenced memories still exist under their original ids."""
+    _seed_graph(db_conn, memory_factory)
+    original_links = {
+        (r["memory_id"], r["entity_id"])
+        for r in db_conn.execute("SELECT memory_id, entity_id FROM memory_entities").fetchall()
+    }
+    dest = tmp_path / f"graph_restore.{fmt}"
+    assert export_memories(format=fmt, file_path=str(dest))["status"] == "ok"
+
+    db_conn.execute("DELETE FROM memory_entities")
+    db_conn.execute("DELETE FROM entities")
+    db_conn.commit()
+
+    result = import_chat_file(
+        file_path=str(dest),
+        category="restored",
+        tags=[],
+        extract_mode="assistant_messages",
+        max_length=10000,
+    )
+    assert result["status"] == "ok"
+    assert result["entities_restored"] == 3
+    assert result["links_restored"] == 3
+    assert result["links_skipped_dangling"] == 0
+
+    restored_links = {
+        (r["memory_id"], r["entity_id"])
+        for r in db_conn.execute("SELECT memory_id, entity_id FROM memory_entities").fetchall()
+    }
+    assert restored_links == original_links
+    person = db_conn.execute(
+        "SELECT * FROM entities WHERE id = ?", (_entity_id("Bailey Robertson"),)
+    ).fetchone()
+    assert person is not None
+    assert person["kind"] == "person"
+    assert json.loads(person["aliases"]) == ["Bailey"]
+
+
+def test_fresh_db_import_skips_dangling_links(
+    db_conn: sqlite3.Connection, fresh_db: sqlite3.Connection, memory_factory, tmp_path: Path
+) -> None:
+    """A fresh-DB re-import assigns NEW memory ids, so every link is dangling:
+    entities restore, links are skipped and counted, nothing is stored as junk."""
+    _seed_graph(db_conn, memory_factory)
+    dest = tmp_path / "fresh_restore.json"
+    assert export_memories(format="json", file_path=str(dest))["status"] == "ok"
+
+    result = import_chat_file(
+        file_path=str(dest),
+        category="restored",
+        tags=[],
+        extract_mode="assistant_messages",
+        max_length=10000,
+    )
+    assert result["status"] == "ok"
+    assert result["memories_created"] == 2  # graph records never become memories
+    assert result["entities_restored"] == 3
+    assert result["links_restored"] == 0
+    assert result["links_skipped_dangling"] == 3
+
+    assert fresh_db.execute("SELECT COUNT(*) FROM memory_entities").fetchone()[0] == 0
+    assert fresh_db.execute("SELECT COUNT(*) FROM entities").fetchone()[0] == 3
+    # No memory was created from an entity record's fields.
+    contents = {r["content"] for r in fresh_db.execute("SELECT content FROM memories").fetchall()}
+    assert contents == {"Bailey ships remind_me", "Unrelated note"}
+
+
+def test_restore_union_merges_aliases_into_existing_entity(
+    db_conn: sqlite3.Connection, fresh_db: sqlite3.Connection, memory_factory, tmp_path: Path
+) -> None:
+    """Restoring over an existing entity union-merges aliases (existing first,
+    like sync) and fills in a missing kind instead of clobbering."""
+    memory_factory(content="Alias merge memory")
+    _upsert_entity(db_conn, "Bailey Robertson", kind="person", aliases=["Bailey", "B-Rob"])
+    db_conn.commit()
+    dest = tmp_path / "alias_merge.json"
+    assert export_memories(format="json", file_path=str(dest))["status"] == "ok"
+
+    _upsert_entity(fresh_db, "Bailey Robertson", aliases=["bdog"])
+    fresh_db.commit()
+
+    result = import_chat_file(
+        file_path=str(dest),
+        category="restored",
+        tags=[],
+        extract_mode="assistant_messages",
+        max_length=10000,
+    )
+    assert result["status"] == "ok"
+    assert result["entities_restored"] == 1
+
+    row = fresh_db.execute(
+        "SELECT * FROM entities WHERE id = ?", (_entity_id("Bailey Robertson"),)
+    ).fetchone()
+    assert json.loads(row["aliases"]) == ["bdog", "Bailey", "B-Rob"]
+    assert row["kind"] == "person"  # filled in, since it was locally missing
+
+
+def test_import_without_graph_records_reports_no_graph_keys(
+    db_conn: sqlite3.Connection, fresh_db: sqlite3.Connection, memory_factory, tmp_path: Path
+) -> None:
+    """A memories-only export imports exactly as before FT-06 — the result
+    carries no graph-restore keys (backward-compatible output)."""
+    memory_factory(content="Plain export memory")
+    dest = tmp_path / "plain.json"
+    assert export_memories(format="json", file_path=str(dest), include_graph=False)["status"] == "ok"
+
+    result = import_chat_file(
+        file_path=str(dest),
+        category="restored",
+        tags=[],
+        extract_mode="assistant_messages",
+        max_length=10000,
+    )
+    assert result["status"] == "ok"
+    assert result["memories_created"] == 1
+    assert "entities_restored" not in result
+    assert "links_restored" not in result
+
+
+async def test_tool_export_include_graph_flag(db_conn: sqlite3.Connection, memory_factory) -> None:
+    """The MCP tool exposes include_graph: default on, opt-out honored."""
+    _seed_graph(db_conn, memory_factory)
+
+    result = json.loads(await memory_export(ExportInput()))
+    assert result["entities"] == 3
+    assert result["links"] == 3
+    records = json.loads(result["content"])
+    assert sum(1 for r in records if "record_type" in r) == 6
+
+    result = json.loads(await memory_export(ExportInput(include_graph=False)))
+    assert "entities" not in result
+    assert all("record_type" not in r for r in json.loads(result["content"]))
 
 
 # ---------------------------------------------------------------------------

@@ -16,6 +16,15 @@ embedding):
 sniffs .md/.markdown/.txt content: files with chat role markers
 (``**User:**`` / ``## Assistant`` …) import as chat, everything else as a
 document.
+
+FT-06: exports may carry entity-graph records tagged with a ``record_type``
+discriminator ('entity' / 'memory_entity'; absent = memory, mirroring the
+FT-04 sync wire format). Message extraction skips them, and JSON/JSONL chat
+imports restore them: entities upsert through the FT-04 helpers (alias
+union-merge), links insert-or-ignore. Caveat: links reference original memory
+ids while a chat re-import assigns NEW ids, so links only fully restore when
+the referenced memories already exist in the target database — dangling links
+are skipped and counted in the result.
 """
 
 from __future__ import annotations
@@ -27,10 +36,20 @@ import logging
 import re
 import threading
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import sqlite3
 
 from remind_me_mcp.config import EMBED_BATCH_SIZE
-from remind_me_mcp.db import _embed_and_store_rows, _get_db, _make_id, _now_iso
+from remind_me_mcp.db import (
+    _embed_and_store_rows,
+    _get_db,
+    _link_memory_entity,
+    _make_id,
+    _now_iso,
+    _upsert_entity,
+)
 
 log = logging.getLogger("remind_me_mcp.importer")
 
@@ -143,6 +162,12 @@ def _extract_messages_from_json(data: Any, extract_mode: str) -> list[dict[str, 
     """
     messages: list[dict[str, str]] = []
 
+    # Entity-graph records (FT-06) carry a record_type discriminator and no
+    # role/content — they are restored by _restore_graph_records, never
+    # parsed as chat messages.
+    if isinstance(data, dict) and "record_type" in data:
+        return messages
+
     # If it's a single conversation object with chat_messages (Claude export format)
     if isinstance(data, dict) and "chat_messages" in data:
         for msg in data["chat_messages"]:
@@ -175,6 +200,9 @@ def _extract_messages_from_json(data: Any, extract_mode: str) -> list[dict[str, 
     if isinstance(data, list):
         for item in data:
             if isinstance(item, dict):
+                # Graph records mixed into an export array are not messages.
+                if "record_type" in item:
+                    continue
                 # Check if it's a conversation wrapper
                 if "messages" in item or "chat_messages" in item:
                     messages.extend(_extract_messages_from_json(item, extract_mode))
@@ -376,6 +404,88 @@ def _parse_document(text: str, suffix: str, max_length: int) -> list[tuple[str, 
 
 
 # ---------------------------------------------------------------------------
+# Entity-graph restore (FT-06)
+# ---------------------------------------------------------------------------
+
+
+def _restore_graph_records(
+    db: sqlite3.Connection, records: list[dict[str, Any]]
+) -> dict[str, int]:
+    """Restore exported entity-graph records into the database (FT-06).
+
+    Entities are applied first, through :func:`_upsert_entity` — the same
+    union-merge semantics as sync: aliases dedup-merge into any existing row,
+    a missing kind is filled in, and the deterministic id is re-derived from
+    the name. Links then insert-or-ignore, but only when BOTH endpoints exist:
+    links reference original memory ids, and a fresh-DB chat re-import assigns
+    NEW memory ids, so a link is restorable only when the referenced memory
+    was kept with its original id (same DB, or a synced one). Dangling links
+    are skipped and counted — restore is honest, not magic.
+
+    Timestamps are assigned fresh, matching the lossy chat re-import semantics
+    for memories (the originals remain in the export file). Malformed records
+    and unknown record_type values are logged and skipped (defensive, like
+    sync's dispatch). Does NOT commit.
+
+    Args:
+        db: An open SQLite connection.
+        records: Export records carrying a ``record_type`` discriminator.
+
+    Returns:
+        Counts: {'entities_restored': int, 'links_restored': int,
+        'links_skipped_dangling': int}. 'links_restored' counts newly
+        inserted rows only (already-present links are no-ops).
+    """
+    counts = {"entities_restored": 0, "links_restored": 0, "links_skipped_dangling": 0}
+
+    # Entities first so link endpoint checks see freshly restored rows.
+    for rec in records:
+        if rec.get("record_type") != "entity":
+            continue
+        name = rec.get("name")
+        if not isinstance(name, str) or not name.strip():
+            log.warning("Skipping entity record without a name: %r", rec)
+            continue
+        aliases = rec.get("aliases")
+        if isinstance(aliases, str):
+            try:
+                aliases = json.loads(aliases)
+            except json.JSONDecodeError:
+                aliases = []
+        if not isinstance(aliases, list):
+            aliases = []
+        kind = rec.get("kind")
+        _upsert_entity(
+            db,
+            name,
+            kind=kind if isinstance(kind, str) and kind else None,
+            aliases=[a for a in aliases if isinstance(a, str)],
+        )
+        counts["entities_restored"] += 1
+
+    for rec in records:
+        if rec.get("record_type") != "memory_entity":
+            continue
+        memory_id, entity_id = rec.get("memory_id"), rec.get("entity_id")
+        if not memory_id or not entity_id:
+            log.warning("Skipping link record without memory_id/entity_id: %r", rec)
+            continue
+        memory_row = db.execute(
+            "SELECT 1 FROM memories WHERE id = ?", (str(memory_id),)
+        ).fetchone()
+        entity_row = db.execute(
+            "SELECT 1 FROM entities WHERE id = ?", (str(entity_id),)
+        ).fetchone()
+        if memory_row is None or entity_row is None:
+            counts["links_skipped_dangling"] += 1
+            continue
+        if _link_memory_entity(db, str(memory_id), str(entity_id)):
+            counts["links_restored"] += 1
+
+    return counts
+
+
+# ---------------------------------------------------------------------------
 # Public import function
 # ---------------------------------------------------------------------------
 
@@ -414,7 +524,9 @@ def import_chat_file(
 
     Returns:
         A status dict. On success: {'status': 'ok', 'import_id': str,
-        'kind': str, 'memories_created': int, 'raw_entries': int, 'file': str}.
+        'kind': str, 'memories_created': int, 'raw_entries': int, 'file': str};
+        when the file carried entity-graph records (FT-06 exports), also
+        'entities_restored', 'links_restored', and 'links_skipped_dangling'.
         On skip: {'status': 'skipped', 'reason': str, 'file': str,
         'import_id': str}. On unsupported format/kind: {'status': 'error',
         'reason': str, 'file': str}.
@@ -471,11 +583,19 @@ def import_chat_file(
     # (content, section_heading) pairs — section is always None for chat.
     parsed: list[tuple[str, str | None]] = []
     contents: list[str] = []
+    # Entity-graph records found in JSON/JSONL exports (FT-06) — restored in
+    # phase 3, never parsed as chat messages.
+    graph_records: list[dict[str, Any]] = []
 
     if effective_kind == "document":
         parsed = _parse_document(raw, suffix, max_length)
     elif suffix in (".json",):
         data = json.loads(raw)
+        if isinstance(data, list):
+            graph_records = [
+                item for item in data
+                if isinstance(item, dict) and "record_type" in item
+            ]
         # Could be a list of conversations or a single conversation
         if isinstance(data, list) and data and isinstance(data[0], dict) and ("chat_messages" in data[0] or "messages" in data[0]):
             # Multiple conversations
@@ -492,11 +612,14 @@ def import_chat_file(
                 continue
             try:
                 obj = json.loads(line)
-                msgs = _extract_messages_from_json(obj, extract_mode)
-                contents.extend(_filter_messages(msgs, extract_mode))
             except json.JSONDecodeError:
                 log.debug("Skipping malformed JSONL line")
                 continue
+            if isinstance(obj, dict) and "record_type" in obj:
+                graph_records.append(obj)
+                continue
+            msgs = _extract_messages_from_json(obj, extract_mode)
+            contents.extend(_filter_messages(msgs, extract_mode))
     elif suffix in (".md", ".markdown", ".txt"):
         contents = _parse_markdown_chat(raw, extract_mode)
 
@@ -558,12 +681,18 @@ def import_chat_file(
             )
             stored += 1
 
-        stats = {
+        stats: dict[str, Any] = {
             "kind": effective_kind,
             "memories_created": stored,
             "raw_entries": raw_entries,
             "file": path.name,
         }
+        if graph_records:
+            # Restore the entity graph from an FT-06 export: entities upsert
+            # (alias union-merge), links insert-or-ignore when both endpoints
+            # exist — dangling links (the referenced memory id is gone, e.g.
+            # a fresh-DB re-import assigned new ids) are skipped and counted.
+            stats.update(_restore_graph_records(db, graph_records))
         db.execute(
             "INSERT INTO chat_imports (import_id, filename, hash, imported_at, stats) VALUES (?, ?, ?, ?, ?)",
             (import_id, path.name, fhash, now, json.dumps(stats)),
@@ -692,4 +821,5 @@ __all__ = [
     "_split_markdown_sections",
     "_parse_document",
     "_file_hash",
+    "_restore_graph_records",
 ]

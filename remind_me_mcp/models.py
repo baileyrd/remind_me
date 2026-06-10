@@ -368,6 +368,15 @@ class ExportInput(BaseModel):
             "are returned inline. Must be inside the allowed export roots."
         ),
     )
+    include_graph: bool = Field(
+        default=True,
+        description=(
+            "Include the entity graph (entities and memory-entity links) as "
+            "record_type-tagged records after the memories, so the backup "
+            "captures the full knowledge graph (FT-06). Set false for a "
+            "memories-only export."
+        ),
+    )
 
     @field_validator("file_path")
     @classmethod

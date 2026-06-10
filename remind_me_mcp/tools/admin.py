@@ -123,24 +123,31 @@ async def memory_export(params: ExportInput) -> str:
 
     Every column of the memories table is included (id, content, category, tags,
     source, metadata, timestamps, and lifecycle fields like vitality and
-    superseded_by), so an export is a complete logical backup. Embedding vectors
-    are NOT exported — they are derived data; run remind_me_reindex after
-    importing on the target machine to rebuild them.
+    superseded_by), so an export is a complete logical backup. By default the
+    entity graph is included too (FT-06): entities and memory-entity links
+    follow the memories as record_type-tagged records ('entity' /
+    'memory_entity'); set include_graph=false for a memories-only export.
+    Embedding vectors are NOT exported — they are derived data; run
+    remind_me_reindex after importing on the target machine to rebuild them.
 
-    Each record also carries a 'role' key, making the file directly consumable
-    by remind_me_import_chat / remind_me_import_directory (the generic
-    {role, content} message format) for round-trip migration. Re-importing
-    preserves memory content verbatim, but is lossy for everything else: the
-    importer re-chunks long content and assigns fresh ids, category, tags, and
-    source (the originals remain in the export file for manual restoration).
+    Each memory record also carries a 'role' key, making the file directly
+    consumable by remind_me_import_chat / remind_me_import_directory (the
+    generic {role, content} message format) for round-trip migration.
+    Re-importing preserves memory content verbatim, but is lossy for
+    everything else: the importer re-chunks long content and assigns fresh
+    ids, category, tags, and source (the originals remain in the export file
+    for manual restoration). Graph records restore on import — entities
+    upsert (alias union-merge), links insert when the referenced memory still
+    exists under its original id; dangling links are skipped and counted.
 
     Small exports are returned inline; pass file_path (inside the allowed
     export roots) to write larger exports to a file. Optional category/tags
-    filters narrow the export.
+    filters narrow the export (and scope the graph to the exported memories).
 
     Args:
         params (ExportInput): Format (json|jsonl), optional category/tag
-            filters, and optional destination file path.
+            filters, optional destination file path, and the include_graph
+            flag.
 
     Returns:
         str: JSON result — inline export content, or a file-write summary.
@@ -155,6 +162,7 @@ async def memory_export(params: ExportInput) -> str:
             tags=params.tags,
             file_path=params.file_path,
             inline_max=EXPORT_INLINE_MAX,
+            include_graph=params.include_graph,
         )
     except OSError as e:
         log.error("Export failed for %s: %s", params.file_path, e)

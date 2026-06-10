@@ -633,12 +633,16 @@ def _build_api_app() -> Starlette:
         """Export memories as JSON or JSONL (FT-01).
 
         Query parameters: ``format`` (json|jsonl, default json), ``category``,
-        ``tags`` (comma-separated, memory must have ALL), and ``file_path``.
-        Without ``file_path`` the export payload is returned as the response
-        body (``curl .../api/export > backup.json``); with it, the export is
+        ``tags`` (comma-separated, memory must have ALL), ``file_path``, and
+        ``include_graph`` (default true — entities and memory-entity links
+        follow the memories as record_type-tagged records, FT-06; pass
+        false/0/no for a memories-only export). Without ``file_path`` the
+        export payload is returned as the response body
+        (``curl .../api/export > backup.json``); with it, the export is
         written server-side to a path inside EXPORT_ROOTS and a JSON summary
         is returned. Embedding vectors are excluded (rebuildable via reindex);
-        the records round-trip through POST /api/import.
+        the records round-trip through POST /api/import (which also restores
+        the graph records).
         """
         params = request.query_params
         fmt = (params.get("format") or "json").strip().lower()
@@ -648,6 +652,10 @@ def _build_api_app() -> Starlette:
         tag_param = params.get("tags")
         tags = tag_param.split(",") if tag_param else None
         file_path = (params.get("file_path") or "").strip()
+        include_graph = (
+            (params.get("include_graph") or "true").strip().lower()
+            not in ("0", "false", "no")
+        )
 
         if file_path:
             p = Path(file_path).expanduser().resolve()
@@ -664,7 +672,11 @@ def _build_api_app() -> Starlette:
                 try:
                     return _json_ok(
                         export_memories(
-                            format=fmt, category=category, tags=tags, file_path=str(p)
+                            format=fmt,
+                            category=category,
+                            tags=tags,
+                            file_path=str(p),
+                            include_graph=include_graph,
                         )
                     )
                 except OSError as e:
@@ -674,7 +686,9 @@ def _build_api_app() -> Starlette:
             return await asyncio.to_thread(_work_file)
 
         def _work() -> Response:
-            records = collect_export_records(category=category, tags=tags)
+            records = collect_export_records(
+                category=category, tags=tags, include_graph=include_graph
+            )
             payload = render_export(records, fmt)
             media = "application/json" if fmt == "json" else "application/x-ndjson"
             return Response(payload, media_type=media)
