@@ -31,10 +31,18 @@ from remind_me_mcp.db import _ensure_schema, _now_iso
 
 @pytest.fixture()
 def sync_db(monkeypatch: pytest.MonkeyPatch) -> sqlite3.Connection:
-    """In-memory DB with full schema, wired into db + sync modules."""
+    """In-memory DB with full schema, wired into db + sync modules.
+
+    The sync_flags gate is switched on (as it would be on a sync-enabled
+    node) so the outbox triggers fire.
+    """
     db = sqlite3.connect(":memory:", check_same_thread=False)
     db.row_factory = sqlite3.Row
     _ensure_schema(db)
+    db.execute(
+        "INSERT OR REPLACE INTO sync_flags (key, value) VALUES ('sync_enabled', '1')"
+    )
+    db.commit()
 
     monkeypatch.setattr(_db_mod, "_get_db", lambda: db)
     monkeypatch.setattr(sync, "_get_db", lambda: db)

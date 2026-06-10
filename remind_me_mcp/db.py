@@ -16,6 +16,10 @@ Current schema versions:
   5 -> 6: Add source_capture_id column for atomic decomposition
   6 -> 7: Add subject, predicate, object, superseded_by columns for structured memory
   7 -> 8: Add vec_chunks map for multi-vector (sliding-window) embeddings
+  8 -> 9: Sync hardening — per-remote send tracking (sync_sends), keyset pull
+          cursor (sync_log.last_pull_id), sync_flags gate so outbox triggers
+          only fire when sync is enabled, canonical ISO-8601 UTC timestamps in
+          the outbox triggers, and an index on memories(updated_at)
 """
 
 from __future__ import annotations
@@ -202,7 +206,7 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 # Current target schema version.  Increment when adding a new migration step.
-_SCHEMA_VERSION = 8
+_SCHEMA_VERSION = 9
 
 
 
@@ -262,7 +266,16 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         db.execute("PRAGMA user_version = 8")
         current_version = 8
 
+    if current_version < 9:
+        _migrate_v8_to_v9(db)
+        db.execute("PRAGMA user_version = 9")
+        current_version = 9
+
     db.commit()
+
+    # Align the sync_flags gate (and outbox contents) with the current
+    # SYNC_ENABLED configuration on every startup.
+    _reconcile_sync_enabled_flag(db)
 
 
 def _migrate_v0_to_v1(db: sqlite3.Connection) -> None:
@@ -844,6 +857,156 @@ def _migrate_v7_to_v8(db: sqlite3.Connection) -> None:
             """INSERT OR IGNORE INTO vec_chunks(vec_rowid, memory_rowid, chunk_ix)
                SELECT rowid, rowid, 0 FROM memories_vec"""
         )
+
+
+# All memory columns mirrored into sync_outbox payloads. Single source of
+# truth for the v9 triggers and the enable-time backfill.
+_OUTBOX_PAYLOAD_COLUMNS = (
+    "id", "content", "category", "tags", "source", "metadata",
+    "created_at", "updated_at", "capture_id", "node_id", "client",
+    "accessed_at", "access_count", "decay_rate", "vitality", "base_weight",
+    "status", "memory_type", "source_capture_id",
+    "subject", "predicate", "object", "superseded_by",
+)
+
+# Canonical UTC ISO-8601 timestamp in SQL, string-comparable with Python's
+# datetime.now(UTC).isoformat(). Replaces the previous datetime('now','utc'),
+# which is documented-incorrect SQLite usage ('now' is already UTC) and
+# produced a different, non-ISO format ('YYYY-MM-DD HH:MM:SS').
+_SQL_NOW_ISO = "strftime('%Y-%m-%dT%H:%M:%f000', 'now') || '+00:00'"
+
+
+def _outbox_payload_sql(prefix: str) -> str:
+    """Build the json_object(...) expression for an outbox payload."""
+    pairs = ", ".join(f"'{col}', {prefix}{col}" for col in _OUTBOX_PAYLOAD_COLUMNS)
+    return f"json_object({pairs})"
+
+
+def _migrate_v8_to_v9(db: sqlite3.Connection) -> None:
+    """v8 -> v9: Sync hardening support tables, triggers, and indexes.
+
+    - ``sync_sends(remote_id, outbox_id, sent_at)``: per-remote outbox send
+      tracking, so every configured hub/peer receives every row (SY-02).
+    - ``sync_log.last_pull_id``: id half of the keyset pull cursor
+      ``(updated_at, id)`` so page-boundary timestamp ties are never lost (SY-04).
+    - ``sync_flags``: small key/value table; the outbox triggers are gated on
+      ``sync_enabled = '1'`` so the outbox does not accumulate when sync is
+      disabled (SY-07). The flag is reconciled with config at every startup by
+      :func:`_reconcile_sync_enabled_flag`.
+    - Outbox triggers recreated with a canonical ISO-8601 UTC ``created_at``
+      instead of the incorrect ``datetime('now','utc')`` (SY-08); legacy
+      outbox timestamps are normalized in place.
+    - ``idx_memories_updated_at`` so peer pull pagination does not scan the
+      whole table (SY-09), plus an index on ``sync_outbox(created_at)`` for
+      retention pruning (SY-07).
+
+    Args:
+        db: An open SQLite connection.
+    """
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS sync_sends (
+            remote_id  TEXT NOT NULL,
+            outbox_id  INTEGER NOT NULL,
+            sent_at    TEXT NOT NULL,
+            PRIMARY KEY (remote_id, outbox_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS sync_flags (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_memories_updated_at
+            ON memories(updated_at);
+
+        CREATE INDEX IF NOT EXISTS idx_outbox_created_at
+            ON sync_outbox(created_at);
+    """)
+
+    with contextlib.suppress(sqlite3.OperationalError):
+        db.execute(
+            "ALTER TABLE sync_log ADD COLUMN last_pull_id TEXT NOT NULL DEFAULT ''"
+        )
+
+    # Normalize legacy outbox timestamps ('YYYY-MM-DD HH:MM:SS' from the old
+    # triggers) into the canonical ISO format so string comparisons (pruning,
+    # ordering) stay coherent.
+    db.execute("""
+        UPDATE sync_outbox
+           SET created_at = replace(created_at, ' ', 'T') || '+00:00'
+         WHERE created_at LIKE '____-__-__ __:__:__'
+    """)
+
+    payload = _outbox_payload_sql("NEW.")
+    db.executescript(f"""
+        DROP TRIGGER IF EXISTS memories_outbox_ai;
+        DROP TRIGGER IF EXISTS memories_outbox_au;
+
+        CREATE TRIGGER IF NOT EXISTS memories_outbox_ai
+        AFTER INSERT ON memories
+        WHEN COALESCE((SELECT value FROM sync_flags WHERE key = 'sync_enabled'), '0') = '1'
+        BEGIN
+            INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+            VALUES (NEW.id, 'insert', {payload}, {_SQL_NOW_ISO});
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS memories_outbox_au
+        AFTER UPDATE ON memories
+        WHEN COALESCE((SELECT value FROM sync_flags WHERE key = 'sync_enabled'), '0') = '1'
+        BEGIN
+            INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+            VALUES (NEW.id, 'update', {payload}, {_SQL_NOW_ISO});
+        END;
+    """)
+
+
+def _reconcile_sync_enabled_flag(db: sqlite3.Connection) -> None:
+    """Align the sync_flags gate with config.SYNC_ENABLED at startup (SY-07).
+
+    The outbox triggers only fire while ``sync_flags['sync_enabled'] = '1'``.
+    On every startup this function compares the stored flag with the current
+    configuration:
+
+    - enabled -> disabled: the outbox (and per-remote send log) is truncated —
+      nothing will consume it.
+    - disabled -> enabled: the outbox is backfilled from all current memories
+      so changes made while sync was off still reach the remotes.
+    - unset (pre-v9 database or fresh schema): no backfill is needed — pre-v9
+      triggers were unconditional, so the outbox is already complete.
+
+    Args:
+        db: An open SQLite connection.
+    """
+    from remind_me_mcp import config as _config
+
+    desired = "1" if _config.SYNC_ENABLED else "0"
+    row = db.execute(
+        "SELECT value FROM sync_flags WHERE key = 'sync_enabled'"
+    ).fetchone()
+    stored = row[0] if row is not None else None
+    if stored == desired:
+        return
+
+    if desired == "1":
+        if stored == "0":
+            # Triggers were off while sync was disabled — backfill so every
+            # memory reaches the remotes.
+            payload = _outbox_payload_sql("")
+            db.execute(f"""
+                INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+                SELECT id, 'insert', {payload}, {_SQL_NOW_ISO}
+                FROM memories
+            """)
+    else:
+        db.execute("DELETE FROM sync_outbox")
+        db.execute("DELETE FROM sync_sends")
+
+    db.execute(
+        """INSERT INTO sync_flags (key, value) VALUES ('sync_enabled', ?)
+           ON CONFLICT (key) DO UPDATE SET value = excluded.value""",
+        (desired,),
+    )
+    db.commit()
 
 
 # ---------------------------------------------------------------------------

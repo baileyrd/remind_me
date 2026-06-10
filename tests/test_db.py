@@ -505,9 +505,9 @@ def test_v4_to_v5_indexes_exist(db_conn: sqlite3.Connection) -> None:
 def test_schema_version_is_current(db_conn: sqlite3.Connection) -> None:
     """After migration, _SCHEMA_VERSION and PRAGMA user_version match the latest."""
     from remind_me_mcp.db import _SCHEMA_VERSION
-    assert _SCHEMA_VERSION == 8
+    assert _SCHEMA_VERSION == 9
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 8, f"Expected user_version 8, got {version}"
+    assert version == 9, f"Expected user_version 9, got {version}"
 
 
 def test_v6_to_v7_new_columns_exist(db_conn: sqlite3.Connection) -> None:
@@ -604,6 +604,10 @@ def test_v6_to_v7_update_superseded_by(db_conn: sqlite3.Connection) -> None:
 
 def test_v6_to_v7_outbox_triggers_include_new_columns(db_conn: sqlite3.Connection) -> None:
     """Outbox triggers include subject, predicate, object, superseded_by in JSON payload."""
+    # Since v9 the outbox triggers only fire while sync is enabled (SY-07).
+    db_conn.execute(
+        "INSERT OR REPLACE INTO sync_flags (key, value) VALUES ('sync_enabled', '1')"
+    )
     now = _now_iso()
     mem_id = _make_id("v7-outbox-test")
     db_conn.execute(
