@@ -1147,3 +1147,37 @@ def test_api_update_metadata_only(client: TestClient, memory_factory) -> None:
     assert response.status_code == 200
     data = response.json()
     assert data["metadata"].get("project") == "remind_me"
+
+
+# ---------------------------------------------------------------------------
+# HY-06: garbage query parameters answer 400, not 500
+# ---------------------------------------------------------------------------
+
+
+def test_api_list_invalid_limit_returns_400(client: TestClient) -> None:
+    """GET /api/memories?limit=garbage should be a client error, not a crash."""
+    response = client.get("/api/memories", params={"limit": "garbage"})
+    assert response.status_code == 400
+    assert "limit" in response.json()["error"]
+
+
+def test_api_list_invalid_offset_returns_400(client: TestClient) -> None:
+    """GET /api/memories?offset=NaN should be a client error, not a crash."""
+    response = client.get("/api/memories", params={"offset": "NaN"})
+    assert response.status_code == 400
+    assert "offset" in response.json()["error"]
+
+
+def test_api_search_invalid_limit_returns_400(client: TestClient) -> None:
+    """GET /api/memories/search?q=x&limit=zzz should be a client error."""
+    response = client.get("/api/memories/search", params={"q": "x", "limit": "zzz"})
+    assert response.status_code == 400
+    assert "limit" in response.json()["error"]
+
+
+def test_api_list_blank_limit_uses_default(client: TestClient, memory_factory) -> None:
+    """A blank limit parameter falls back to the default instead of erroring."""
+    memory_factory(content="Blank limit default test")
+    response = client.get("/api/memories", params={"limit": ""})
+    assert response.status_code == 200
+    assert response.json()["total"] == 1

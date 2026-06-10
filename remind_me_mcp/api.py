@@ -209,7 +209,29 @@ def _build_api_app() -> Starlette:
     def _json_err(msg: str, status: int = 400) -> JSONResponse:
         return JSONResponse({"error": msg}, status_code=status)
 
+    def _int_param(params: Any, name: str, default: int) -> int:
+        """Parse an integer query parameter (HY-06).
+
+        Raises ValueError with a client-friendly message for garbage input so
+        handlers can answer 400 instead of crashing with a 500.
+        """
+        raw = params.get(name)
+        if raw is None or raw == "":
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            raise ValueError(
+                f"Invalid integer for query parameter {name!r}: {raw!r}"
+            ) from None
+
     # -- routes --
+    #
+    # PF-06: every handler runs its (blocking) SQLite work in a worker thread
+    # via asyncio.to_thread instead of on the event loop. Each closure calls
+    # _get_db() *inside* the thread — connections are threading.local-based,
+    # so the to_thread pool thread gets (or creates) its own connection
+    # rather than borrowing the event loop thread's.
 
     async def health(request: Request) -> JSONResponse:
         """Unauthenticated liveness probe (SE-04) — reveals no data.
@@ -221,35 +243,38 @@ def _build_api_app() -> Starlette:
 
     async def api_stats(request: Request) -> JSONResponse:
         """Return aggregate statistics about the memory store."""
-        db = _get_db()
-        total = db.execute("SELECT COUNT(*) as cnt FROM memories").fetchone()["cnt"]
-        categories = db.execute(
-            "SELECT category, COUNT(*) as cnt FROM memories GROUP BY category ORDER BY cnt DESC"
-        ).fetchall()
-        sources = db.execute(
-            "SELECT source, COUNT(*) as cnt FROM memories GROUP BY source ORDER BY cnt DESC"
-        ).fetchall()
-        imports = db.execute("SELECT COUNT(*) as cnt FROM chat_imports").fetchone()["cnt"]
-        all_tags: dict[str, int] = {}
-        for row in db.execute("SELECT tags FROM memories").fetchall():
-            try:
-                for t in json.loads(row["tags"]):
-                    all_tags[t] = all_tags.get(t, 0) + 1
-            except (json.JSONDecodeError, TypeError) as e:
-                log.debug("Malformed tags field skipped during stats aggregation: %s", e)
-        return _json_ok({
-            "total": total,
-            "imports": imports,
-            "categories": {r["category"]: r["cnt"] for r in categories},
-            "sources": {r["source"]: r["cnt"] for r in sources},
-            "tags": dict(sorted(all_tags.items(), key=lambda x: -x[1])),
-            "db_path": str(DB_PATH),
-            "db_size_mb": round(DB_PATH.stat().st_size / 1_048_576, 2) if DB_PATH.exists() else 0,
-        })
+
+        def _work() -> JSONResponse:
+            db = _get_db()
+            total = db.execute("SELECT COUNT(*) as cnt FROM memories").fetchone()["cnt"]
+            categories = db.execute(
+                "SELECT category, COUNT(*) as cnt FROM memories GROUP BY category ORDER BY cnt DESC"
+            ).fetchall()
+            sources = db.execute(
+                "SELECT source, COUNT(*) as cnt FROM memories GROUP BY source ORDER BY cnt DESC"
+            ).fetchall()
+            imports = db.execute("SELECT COUNT(*) as cnt FROM chat_imports").fetchone()["cnt"]
+            all_tags: dict[str, int] = {}
+            for row in db.execute("SELECT tags FROM memories").fetchall():
+                try:
+                    for t in json.loads(row["tags"]):
+                        all_tags[t] = all_tags.get(t, 0) + 1
+                except (json.JSONDecodeError, TypeError) as e:
+                    log.debug("Malformed tags field skipped during stats aggregation: %s", e)
+            return _json_ok({
+                "total": total,
+                "imports": imports,
+                "categories": {r["category"]: r["cnt"] for r in categories},
+                "sources": {r["source"]: r["cnt"] for r in sources},
+                "tags": dict(sorted(all_tags.items(), key=lambda x: -x[1])),
+                "db_path": str(DB_PATH),
+                "db_size_mb": round(DB_PATH.stat().st_size / 1_048_576, 2) if DB_PATH.exists() else 0,
+            })
+
+        return await asyncio.to_thread(_work)
 
     async def api_list(request: Request) -> JSONResponse:
         """List memories with optional category, source, and tag filters."""
-        db = _get_db()
         params = request.query_params
         conditions: list[str] = []
         bindings: list[Any] = []
@@ -272,35 +297,44 @@ def _build_api_app() -> Starlette:
                 bindings.append(tag)
 
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        limit = min(int(params.get("limit", 50)), 200)
-        offset = max(int(params.get("offset", 0)), 0)
+        try:
+            limit = min(_int_param(params, "limit", 50), 200)
+            offset = max(_int_param(params, "offset", 0), 0)
+        except ValueError as e:
+            return _json_err(str(e))
 
-        total = db.execute(f"SELECT COUNT(*) as cnt FROM memories m {where}", bindings).fetchone()["cnt"]
-        rows = db.execute(
-            f"SELECT m.* FROM memories m {where} ORDER BY m.created_at DESC LIMIT ? OFFSET ?",
-            bindings + [limit, offset],
-        ).fetchall()
-        memories = [_row_to_dict(r) for r in rows]
+        def _work() -> JSONResponse:
+            db = _get_db()
+            total = db.execute(f"SELECT COUNT(*) as cnt FROM memories m {where}", bindings).fetchone()["cnt"]
+            rows = db.execute(
+                f"SELECT m.* FROM memories m {where} ORDER BY m.created_at DESC LIMIT ? OFFSET ?",
+                bindings + [limit, offset],
+            ).fetchall()
+            memories = [_row_to_dict(r) for r in rows]
 
-        return _json_ok({
-            "total": total,
-            "count": len(memories),
-            "offset": offset,
-            "has_more": total > offset + limit,
-            "memories": memories,
-        })
+            return _json_ok({
+                "total": total,
+                "count": len(memories),
+                "offset": offset,
+                "has_more": total > offset + limit,
+                "memories": memories,
+            })
+
+        return await asyncio.to_thread(_work)
 
     async def api_search(request: Request) -> JSONResponse:
         """Full-text search memories using FTS5 with optional category/tag filters."""
         import sqlite3 as _sqlite3
 
-        db = _get_db()
         params = request.query_params
         query = params.get("q", "").strip()
         if not query:
             return _json_err("Missing 'q' parameter")
 
-        limit = min(int(params.get("limit", 50)), 200)
+        try:
+            limit = min(_int_param(params, "limit", 50), 200)
+        except ValueError as e:
+            return _json_err(str(e))
         # Category/tag predicates go into the SQL so they apply before LIMIT
         # (DI-03; same pattern as api_list's DATA-02 fix).
         conditions = ""
@@ -317,29 +351,37 @@ def _build_api_app() -> Starlette:
                 )
                 bindings.append(tag)
         bindings.append(limit)
-        try:
-            rows = db.execute(
-                f"""SELECT m.* FROM memories m
-                   JOIN memories_fts fts ON m.rowid = fts.rowid
-                   WHERE memories_fts MATCH ?{conditions}
-                   ORDER BY rank LIMIT ?""",
-                bindings,
-            ).fetchall()
-        except _sqlite3.OperationalError as e:
-            return _json_err(f"Search error: {e}")
 
-        memories = [_row_to_dict(r) for r in rows]
+        def _work() -> JSONResponse:
+            db = _get_db()
+            try:
+                rows = db.execute(
+                    f"""SELECT m.* FROM memories m
+                       JOIN memories_fts fts ON m.rowid = fts.rowid
+                       WHERE memories_fts MATCH ?{conditions}
+                       ORDER BY rank LIMIT ?""",
+                    bindings,
+                ).fetchall()
+            except _sqlite3.OperationalError as e:
+                return _json_err(f"Search error: {e}")
 
-        return _json_ok({"count": len(memories), "memories": memories})
+            memories = [_row_to_dict(r) for r in rows]
+            return _json_ok({"count": len(memories), "memories": memories})
+
+        return await asyncio.to_thread(_work)
 
     async def api_get(request: Request) -> JSONResponse:
         """Retrieve a single memory by its ID."""
-        db = _get_db()
         memory_id = request.path_params["memory_id"]
-        row = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
-        if not row:
-            return _json_err("Not found", 404)
-        return _json_ok(_row_to_dict(row))
+
+        def _work() -> JSONResponse:
+            db = _get_db()
+            row = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+            if not row:
+                return _json_err("Not found", 404)
+            return _json_ok(_row_to_dict(row))
+
+        return await asyncio.to_thread(_work)
 
     async def api_add(request: Request) -> JSONResponse:
         """Create a new memory from a JSON request body."""
@@ -352,23 +394,26 @@ def _build_api_app() -> Starlette:
         if not content:
             return _json_err("'content' is required")
 
-        db = _get_db()
-        mem_id = _make_id(content)
-        now = _now_iso()
         category = body.get("category", "general")
         tags = body.get("tags", [])
         source = body.get("source", "manual")
         metadata = body.get("metadata", {})
 
-        db.execute(
-            """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (mem_id, content, category, json.dumps(tags), source, json.dumps(metadata), now, now),
-        )
-        db.commit()
-        await asyncio.to_thread(_embed_and_store, mem_id, content)
-        row = db.execute("SELECT * FROM memories WHERE id = ?", (mem_id,)).fetchone()
-        return _json_ok(_row_to_dict(row), status=201)
+        def _work() -> JSONResponse:
+            db = _get_db()
+            mem_id = _make_id(content)
+            now = _now_iso()
+            db.execute(
+                """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (mem_id, content, category, json.dumps(tags), source, json.dumps(metadata), now, now),
+            )
+            db.commit()
+            _embed_and_store(mem_id, content)
+            row = db.execute("SELECT * FROM memories WHERE id = ?", (mem_id,)).fetchone()
+            return _json_ok(_row_to_dict(row), status=201)
+
+        return await asyncio.to_thread(_work)
 
     async def api_update(request: Request) -> JSONResponse:
         """Update fields on an existing memory by its ID."""
@@ -377,11 +422,6 @@ def _build_api_app() -> Starlette:
             body = await request.json()
         except (json.JSONDecodeError, TypeError, ValueError) as e:
             return _json_err(f"Invalid JSON body: {e}")
-
-        db = _get_db()
-        row = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
-        if not row:
-            return _json_err("Not found", 404)
 
         sets: list[str] = []
         bindings: list[Any] = []
@@ -403,22 +443,34 @@ def _build_api_app() -> Starlette:
         bindings.append(_now_iso())
         bindings.append(memory_id)
 
-        db.execute(f"UPDATE memories SET {', '.join(sets)} WHERE id = ?", bindings)
-        db.commit()
-        if "content" in body and body["content"] is not None:
-            await asyncio.to_thread(_embed_and_store, memory_id, body["content"])
-        updated = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
-        return _json_ok(_row_to_dict(updated))
+        def _work() -> JSONResponse:
+            db = _get_db()
+            row = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+            if not row:
+                return _json_err("Not found", 404)
+
+            db.execute(f"UPDATE memories SET {', '.join(sets)} WHERE id = ?", bindings)
+            db.commit()
+            if "content" in body and body["content"] is not None:
+                _embed_and_store(memory_id, body["content"])
+            updated = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+            return _json_ok(_row_to_dict(updated))
+
+        return await asyncio.to_thread(_work)
 
     async def api_delete(request: Request) -> JSONResponse:
         """Permanently delete a memory by its ID."""
         memory_id = request.path_params["memory_id"]
-        db = _get_db()
-        result = db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
-        db.commit()
-        if result.rowcount == 0:
-            return _json_err("Not found", 404)
-        return _json_ok({"deleted": memory_id})
+
+        def _work() -> JSONResponse:
+            db = _get_db()
+            result = db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+            db.commit()
+            if result.rowcount == 0:
+                return _json_err("Not found", 404)
+            return _json_ok({"deleted": memory_id})
+
+        return await asyncio.to_thread(_work)
 
     async def api_import(request: Request) -> JSONResponse:
         """Import a chat export file or directory into the memory store."""
@@ -458,8 +510,10 @@ def _build_api_app() -> Starlette:
                 )
                 return _json_ok(summary)
             else:
-                # Single file import
-                result = import_chat_file(str(p), category, tags, extract_mode, max_length)
+                # Single file import — blocking parse/DB/embed work off-loop (PF-06)
+                result = await asyncio.to_thread(
+                    import_chat_file, str(p), category, tags, extract_mode, max_length
+                )
                 return _json_ok(result)
         except (FileNotFoundError, OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
             log.error("Import failed for %s: %s", file_path, e)

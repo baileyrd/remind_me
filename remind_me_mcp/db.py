@@ -1094,8 +1094,8 @@ def _embed_and_store_rows(rows: list[tuple[int, str]]) -> int:
         flat_chunks.extend(chunks)
     if not flat_chunks:
         return 0
+    db = _get_db()
     try:
-        db = _get_db()
         vecs = embedder.embed(flat_chunks)
         stored = 0
         for memory_rowid, offset, count in plan:
@@ -1115,9 +1115,16 @@ def _embed_and_store_rows(rows: list[tuple[int, str]]) -> int:
         return stored
     except sqlite3.DatabaseError as e:
         log.warning("Database error storing chunk embeddings: %s", e)
+        # PF-05: undo any uncommitted chunk DELETEs/INSERTs, otherwise they
+        # would silently ride along with the next unrelated commit on this
+        # connection — deleting a memory's existing embeddings.
+        with contextlib.suppress(sqlite3.Error):
+            db.rollback()
         return 0
     except (ValueError, TypeError) as e:
         log.warning("Embedding computation failed: %s", e)
+        with contextlib.suppress(sqlite3.Error):
+            db.rollback()  # PF-05: see above
         return 0
 
 
