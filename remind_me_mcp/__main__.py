@@ -111,6 +111,13 @@ def _run_combined(args) -> None:
 
 def main() -> None:
     """Parse CLI arguments and dispatch to the appropriate execution mode."""
+    # Root logging setup belongs in the entrypoint, not at package import time
+    # (HY-06): importing remind_me_mcp must never reconfigure a host
+    # application's logging. stderr only — stdout is the MCP stdio transport.
+    logging.basicConfig(
+        stream=sys.stderr, level=logging.INFO, format="%(levelname)s | %(message)s"
+    )
+
     parser = argparse.ArgumentParser(description="Remind Me MCP Server")
     parser.add_argument(
         "--serve-ui",

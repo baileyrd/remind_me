@@ -16,15 +16,24 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from remind_me_mcp.db import _embed_and_store, _get_db, _make_id, _now_iso
+from remind_me_mcp.config import EMBED_BATCH_SIZE
+from remind_me_mcp.db import _embed_and_store_rows, _get_db, _make_id, _now_iso
 
 log = logging.getLogger("remind_me_mcp.importer")
 
 IMPORT_CONCURRENCY = 8
 
-# Serializes SQLite write operations when import_chat_file runs concurrently
-# in multiple asyncio.to_thread workers sharing the same DB connection.
+# Serializes the dedup-check + INSERT transaction when import_chat_file runs
+# concurrently in multiple asyncio.to_thread workers. SQLite connections are
+# per-thread (db._get_db), so this is not about sharing a connection — it
+# prevents two workers importing the same file content from both passing the
+# chat_imports hash check before either records its row (PF-03). Embedding
+# happens outside the lock so workers actually run concurrently.
 _import_lock = threading.Lock()
+
+# Max ids per IN (...) clause when mapping memory ids to rowids (SQLite's
+# default bound-parameter limit is 999).
+_ROWID_LOOKUP_BATCH = 500
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -66,7 +75,7 @@ def _chunk_text(text: str, max_len: int) -> list[str]:
         List of non-empty stripped text chunks, each at most max_len chars.
     """
     if len(text) <= max_len:
-        return [text]
+        return [text] if text.strip() else []
     chunks = []
     while text:
         if len(text) <= max_len:
@@ -82,7 +91,11 @@ def _chunk_text(text: str, max_len: int) -> list[str]:
             idx = max_len
         else:
             idx += 1
-        chunks.append(text[:idx].strip())
+        # Guard against empty chunks: a window of pure whitespace (e.g. a long
+        # run of leading spaces) strips to "" and must not be stored (HY-06).
+        chunk = text[:idx].strip()
+        if chunk:
+            chunks.append(chunk)
         text = text[idx:].strip()
     return chunks
 
@@ -253,14 +266,28 @@ def import_chat_file(
         'reason': str, 'file': str}.
     """
     path = Path(file_path)
-
-    # --- Phase 1: File I/O and parsing (no lock needed; pure CPU/disk work) ---
-    fhash = _file_hash(file_path)
     suffix = path.suffix.lower()
 
     if suffix not in (".json", ".jsonl", ".md", ".markdown", ".txt"):
         return {"status": "error", "reason": f"unsupported format: {suffix}", "file": path.name}
 
+    # --- Phase 1: hash dedup BEFORE any parsing/chunking (PF-03) so
+    # re-importing an already-imported file short-circuits immediately. ---
+    fhash = _file_hash(file_path)
+    db = _get_db()
+    with _import_lock:
+        existing = db.execute(
+            "SELECT import_id FROM chat_imports WHERE hash = ?", (fhash,)
+        ).fetchone()
+    if existing:
+        return {
+            "status": "skipped",
+            "reason": "already_imported",
+            "file": path.name,
+            "import_id": existing["import_id"],
+        }
+
+    # --- Phase 2: file I/O and parsing (no lock needed; pure CPU/disk work) ---
     raw = path.read_text(encoding="utf-8", errors="replace")
     contents: list[str] = []
 
@@ -300,12 +327,15 @@ def import_chat_file(
         for chunk in _chunk_text(content, max_length):
             embed_pairs.append((_make_id(chunk), chunk))
 
-    # --- Phase 2: DB writes (serialized via lock for thread safety) ---
+    # --- Phase 3: dedup re-check + INSERTs in one short locked transaction.
+    # The lock covers only the DB writes; parsing (above) and embedding
+    # (below) run unlocked so concurrent import workers make progress (PF-03).
     with _import_lock:
-        db = _get_db()
-
-        # Check for duplicate import
-        existing = db.execute("SELECT import_id FROM chat_imports WHERE hash = ?", (fhash,)).fetchone()
+        # Re-check under the lock: another worker importing the same content
+        # may have won the race since the early check in phase 1.
+        existing = db.execute(
+            "SELECT import_id FROM chat_imports WHERE hash = ?", (fhash,)
+        ).fetchone()
         if existing:
             return {"status": "skipped", "reason": "already_imported", "file": path.name, "import_id": existing["import_id"]}
 
@@ -329,18 +359,34 @@ def import_chat_file(
             )
             stored += 1
 
-        db.commit()
-
-        # Embed using the SAME mem_id that was used for INSERT (no recomputation)
-        for mem_id, chunk in embed_pairs:
-            _embed_and_store(mem_id, chunk)
-
         stats = {"memories_created": stored, "raw_entries": len(contents), "file": path.name}
         db.execute(
             "INSERT INTO chat_imports (import_id, filename, hash, imported_at, stats) VALUES (?, ?, ?, ?, ?)",
             (import_id, path.name, fhash, now, json.dumps(stats)),
         )
         db.commit()
+
+    # --- Phase 4: embed OUTSIDE the lock, in batches (PF-03). The rows use
+    # the SAME mem_ids that were INSERTed (BUGF-01); any failure here is
+    # healed later by remind_me_reindex. ---
+    if embed_pairs:
+        chunk_by_id = dict(embed_pairs)
+        ids = list(chunk_by_id)
+        rows_to_embed: list[tuple[int, str]] = []
+        # The quick rowid lookups reuse the lock only because tests may share
+        # one connection across workers; the slow embed calls stay unlocked.
+        with _import_lock:
+            for i in range(0, len(ids), _ROWID_LOOKUP_BATCH):
+                batch_ids = ids[i : i + _ROWID_LOOKUP_BATCH]
+                placeholders = ",".join("?" for _ in batch_ids)
+                for row in db.execute(
+                    f"SELECT id, rowid FROM memories WHERE id IN ({placeholders})",
+                    batch_ids,
+                ).fetchall():
+                    rows_to_embed.append((row["rowid"], chunk_by_id[row["id"]]))
+        for i in range(0, len(rows_to_embed), EMBED_BATCH_SIZE):
+            _embed_and_store_rows(rows_to_embed[i : i + EMBED_BATCH_SIZE])
+
     return {"status": "ok", "import_id": import_id, **stats}
 
 

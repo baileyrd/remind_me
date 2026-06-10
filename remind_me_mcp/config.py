@@ -11,8 +11,40 @@ import json
 import logging
 import os
 import secrets
-import sys
 from pathlib import Path
+
+# Module logger only — root logging setup (logging.basicConfig) lives in the
+# __main__ entrypoint so importing this package never hijacks the host
+# application's logging configuration (HY-06).
+log = logging.getLogger("remind_me_mcp.config")
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read an integer environment variable, falling back to *default* (HY-06).
+
+    A malformed value (e.g. ``REMIND_ME_UI_PORT=abc``) logs a warning and
+    returns the default instead of raising ValueError at import time.
+
+    Args:
+        name: The environment variable name.
+        default: Value returned when the variable is unset, blank, or invalid.
+
+    Returns:
+        The parsed integer or the default.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning(
+            "Invalid integer for environment variable %s=%r; using default %d",
+            name,
+            raw,
+            default,
+        )
+        return default
 
 # ---------------------------------------------------------------------------
 # Directory / file paths
@@ -33,7 +65,7 @@ MEMORY_DIR.mkdir(parents=True, exist_ok=True)
 EMBEDDING_MODEL = os.environ.get(
     "REMIND_ME_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
 )
-EMBEDDING_DIM = int(os.environ.get("REMIND_ME_EMBEDDING_DIM", "384"))
+EMBEDDING_DIM = _env_int("REMIND_ME_EMBEDDING_DIM", 384)
 """Embedding vector dimension. MUST match the chosen model (all-MiniLM-L6-v2=384,
 nomic-embed-text=768, bge-m3/mxbai-embed-large=1024). Changing this on an existing
 database requires recreating the memories_vec table and running remind_me_reindex."""
@@ -49,20 +81,24 @@ OLLAMA_EMBED_MODEL = os.environ.get("REMIND_ME_OLLAMA_EMBED_MODEL", "nomic-embed
 # character windows, each embedded as its own vector linked to the parent memory,
 # so the whole text is searchable instead of only the first ~256 tokens. Short
 # content (<= CHUNK_CHARS) yields a single chunk — identical to the old behavior.
-EMBED_CHUNK_CHARS = int(os.environ.get("REMIND_ME_EMBED_CHUNK_CHARS", "1600"))
-EMBED_CHUNK_OVERLAP = int(os.environ.get("REMIND_ME_EMBED_CHUNK_OVERLAP", "200"))
-EMBED_MAX_CHUNKS = int(os.environ.get("REMIND_ME_EMBED_MAX_CHUNKS", "16"))
+EMBED_CHUNK_CHARS = _env_int("REMIND_ME_EMBED_CHUNK_CHARS", 1600)
+EMBED_CHUNK_OVERLAP = _env_int("REMIND_ME_EMBED_CHUNK_OVERLAP", 200)
+EMBED_MAX_CHUNKS = _env_int("REMIND_ME_EMBED_MAX_CHUNKS", 16)
+
+EMBED_BATCH_SIZE = _env_int("REMIND_ME_EMBED_BATCH_SIZE", 32)
+"""Memories embedded per batched _embed_and_store_rows call (reindex and chat
+import). Larger batches amortise model overhead; smaller ones bound memory."""
 
 # ---------------------------------------------------------------------------
 # UI / dashboard
 # ---------------------------------------------------------------------------
 
 SERVE_UI = os.environ.get("REMIND_ME_MCP_SERVE_UI", "").lower() in ("true", "1", "yes")
-UI_PORT = int(os.environ.get("REMIND_ME_MCP_UI_PORT", "5199"))
+UI_PORT = _env_int("REMIND_ME_MCP_UI_PORT", 5199)
 
 # MCP HTTP transport
 SERVE_MCP: bool = os.environ.get("REMIND_ME_MCP_SERVE_HTTP", "").lower() in ("true", "1", "yes")
-MCP_HTTP_PORT: int = int(os.environ.get("REMIND_ME_MCP_HTTP_PORT", "8767"))
+MCP_HTTP_PORT: int = _env_int("REMIND_ME_MCP_HTTP_PORT", 8767)
 MCP_HTTP_HOST: str = os.environ.get("REMIND_ME_MCP_HTTP_HOST", "127.0.0.1")
 MCP_HTTP_SECRET: str | None = os.environ.get("REMIND_ME_MCP_HTTP_SECRET") or None
 
@@ -165,13 +201,6 @@ update check at server startup (SE-06). The manual `remind_me_check_update`
 and `remind_me_self_update` tools keep working regardless."""
 
 # ---------------------------------------------------------------------------
-# Logging — stderr only (stdout reserved for MCP stdio transport)
-# ---------------------------------------------------------------------------
-
-logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(levelname)s | %(message)s")
-log = logging.getLogger("remind_me_mcp.config")
-
-# ---------------------------------------------------------------------------
 # Exports
 # ---------------------------------------------------------------------------
 
@@ -185,6 +214,7 @@ __all__ = [
     "EMBEDDING_BACKEND",
     "OLLAMA_URL",
     "OLLAMA_EMBED_MODEL",
+    "EMBED_BATCH_SIZE",
     "EMBED_CHUNK_CHARS",
     "EMBED_CHUNK_OVERLAP",
     "EMBED_MAX_CHUNKS",
@@ -210,15 +240,15 @@ NODE_ID = os.environ.get("REMIND_ME_NODE_ID", "")
 CLIENT: str = os.getenv("REMIND_ME_CLIENT", "unknown")
 HUB_URL = os.environ.get("REMIND_ME_HUB_URL", "")
 SYNC_SECRET = os.environ.get("REMIND_ME_SYNC_SECRET", "")
-SYNC_INTERVAL = int(os.environ.get("REMIND_ME_SYNC_INTERVAL", "60"))
-PEER_PORT = int(os.environ.get("REMIND_ME_PEER_PORT", "8766"))
+SYNC_INTERVAL = _env_int("REMIND_ME_SYNC_INTERVAL", 60)
+PEER_PORT = _env_int("REMIND_ME_PEER_PORT", 8766)
 PEER_BIND = os.environ.get("REMIND_ME_PEER_BIND", "0.0.0.0")  # noqa: S104
 """Bind address for the peer sync server. Defaults to all interfaces so
 Tailscale peers can reach it (their addresses are not known in advance);
 set REMIND_ME_PEER_BIND to a specific address (e.g. this node's Tailscale
 IP, or 127.0.0.1 to disable remote access) to narrow exposure. Every
 request requires the SYNC_SECRET bearer token regardless of bind address."""
-OUTBOX_RETENTION_DAYS = int(os.environ.get("REMIND_ME_OUTBOX_RETENTION_DAYS", "30"))
+OUTBOX_RETENTION_DAYS = _env_int("REMIND_ME_OUTBOX_RETENTION_DAYS", 30)
 """Sync outbox rows older than this many days are pruned each sync cycle."""
 SYNC_ENABLED = bool(NODE_ID and HUB_URL and SYNC_SECRET)
 STATIC_PEERS: list[dict] = json.loads(
