@@ -152,6 +152,11 @@ def _build_dashboard_html() -> str:
     jsx_path = Path(__file__).parent / "dashboard" / "App.jsx"
     jsx_content = jsx_path.read_text(encoding="utf-8")
 
+    # HY-04: CDN assets are pinned to exact versions with Subresource Integrity
+    # (sha384 computed from the corresponding npm tarballs, which are the exact
+    # bytes unpkg serves), so a compromised or substituted CDN response cannot
+    # execute. NOTE: the dashboard still requires network access to unpkg.com
+    # on first load (assets are not vendored), so it does not work offline.
     return """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -170,9 +175,15 @@ def _build_dashboard_html() -> str:
 </head>
 <body>
 <div id="root"></div>
-<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"
+        integrity="sha384-DGyLxAyjq0f9SPpVevD6IgztCFlnMF6oW/XQGmfe+IsZ8TqEiDrcHkMLKI6fiB/Z"
+        crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"
+        integrity="sha384-gTGxhz21lVGYNMcdJOyq01Edg0jhn/c22nsx0kyqP0TxaV5WVdsSH1fSDUf5YJj1"
+        crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.7/babel.min.js"
+        integrity="sha384-ezQ6HS3FLspd9te19o2McUV6FAK091+GG7KO54f/R8DKgCDi7fULhapNrd5LY+vG"
+        crossorigin="anonymous"></script>
 <script type="text/babel">
 """ + jsx_content + """
 </script>
