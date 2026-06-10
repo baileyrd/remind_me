@@ -14,6 +14,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from remind_me_mcp.config import is_in_import_roots
+
 log = logging.getLogger("remind_me_mcp.models")
 
 # ---------------------------------------------------------------------------
@@ -193,8 +195,15 @@ class ChatImportInput(BaseModel):
     @field_validator("file_path")
     @classmethod
     def validate_path(cls, v: str) -> str:
-        """Validate the file path exists and has a supported extension."""
+        """Validate import-root containment, existence, and a supported extension.
+
+        SE-02: the containment check (shared with the HTTP /api/import route)
+        runs first so paths outside IMPORT_ROOTS are rejected without leaking
+        whether they exist.
+        """
         p = Path(v).expanduser().resolve()
+        if not is_in_import_roots(p):
+            raise ValueError(f"Path not in allowed import roots: {p}")
         if not p.exists():
             raise ValueError(f"File not found: {p}")
         if p.suffix.lower() not in (".json", ".jsonl", ".md", ".markdown", ".txt"):
@@ -228,8 +237,10 @@ class BulkImportDirInput(BaseModel):
     @field_validator("directory")
     @classmethod
     def validate_dir(cls, v: str) -> str:
-        """Validate the directory path exists."""
+        """Validate import-root containment (SE-02) and that the directory exists."""
         p = Path(v).expanduser().resolve()
+        if not is_in_import_roots(p):
+            raise ValueError(f"Path not in allowed import roots: {p}")
         if not p.is_dir():
             raise ValueError(f"Directory not found: {p}")
         return str(p)

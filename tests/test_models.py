@@ -205,11 +205,54 @@ def test_chat_import_valid(tmp_path: Path) -> None:
     assert Path(m.file_path).exists()
 
 
-def test_chat_import_nonexistent_path() -> None:
-    """Path to a missing file raises ValidationError with 'File not found'."""
+def test_chat_import_nonexistent_path(tmp_path: Path) -> None:
+    """Path to a missing file (inside allowed roots) raises 'File not found'.
+
+    SE-02: the containment check fires before the existence check, so the
+    missing file must live inside IMPORT_ROOTS to exercise this branch.
+    """
     with pytest.raises(ValidationError) as exc_info:
-        ChatImportInput(file_path="/nonexistent/path/file.json")
+        ChatImportInput(file_path=str(tmp_path / "missing_file.json"))
     assert "File not found" in str(exc_info.value)
+
+
+def test_chat_import_rejects_path_outside_import_roots() -> None:
+    """SE-02: a file outside IMPORT_ROOTS is rejected before any existence check.
+
+    /etc/passwd exists, but it is outside the allowed roots ($HOME and the
+    temp dir in tests) — the MCP import model must reject it just like the
+    HTTP /api/import route does.
+    """
+    with pytest.raises(ValidationError) as exc_info:
+        ChatImportInput(file_path="/etc/passwd")
+    assert "not in allowed import roots" in str(exc_info.value)
+
+
+def test_chat_import_rejects_traversal_outside_roots() -> None:
+    """SE-02: traversal sequences are resolved before the containment check."""
+    traversal = str(Path.home() / ".." / ".." / "etc" / "passwd")
+    with pytest.raises(ValidationError) as exc_info:
+        ChatImportInput(file_path=traversal)
+    assert "not in allowed import roots" in str(exc_info.value)
+
+
+def test_chat_import_respects_custom_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """SE-02: restricting IMPORT_ROOTS rejects files outside the configured root."""
+    import remind_me_mcp.config as _cfg
+
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    inside = allowed / "ok.json"
+    inside.write_text("{}")
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}")
+
+    monkeypatch.setattr(_cfg, "IMPORT_ROOTS", [allowed.resolve()])
+
+    assert ChatImportInput(file_path=str(inside)).file_path == str(inside.resolve())
+    with pytest.raises(ValidationError) as exc_info:
+        ChatImportInput(file_path=str(outside))
+    assert "not in allowed import roots" in str(exc_info.value)
 
 
 def test_chat_import_unsupported_extension(tmp_path: Path) -> None:
@@ -249,11 +292,39 @@ def test_bulk_import_valid(tmp_path: Path) -> None:
     assert Path(m.directory).is_dir()
 
 
-def test_bulk_import_nonexistent_dir() -> None:
-    """Missing directory raises ValidationError with 'Directory not found'."""
+def test_bulk_import_nonexistent_dir(tmp_path: Path) -> None:
+    """Missing directory (inside allowed roots) raises 'Directory not found'.
+
+    SE-02: the containment check fires first, so the missing directory must
+    live inside IMPORT_ROOTS to exercise the existence branch.
+    """
     with pytest.raises(ValidationError) as exc_info:
-        BulkImportDirInput(directory="/nonexistent/directory/path")
+        BulkImportDirInput(directory=str(tmp_path / "missing_subdir"))
     assert "Directory not found" in str(exc_info.value)
+
+
+def test_bulk_import_rejects_dir_outside_import_roots() -> None:
+    """SE-02: a directory outside IMPORT_ROOTS is rejected (parity with /api/import)."""
+    with pytest.raises(ValidationError) as exc_info:
+        BulkImportDirInput(directory="/etc")
+    assert "not in allowed import roots" in str(exc_info.value)
+
+
+def test_bulk_import_respects_custom_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """SE-02: restricting IMPORT_ROOTS rejects directories outside the configured root."""
+    import remind_me_mcp.config as _cfg
+
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    monkeypatch.setattr(_cfg, "IMPORT_ROOTS", [allowed.resolve()])
+
+    assert BulkImportDirInput(directory=str(allowed)).directory == str(allowed.resolve())
+    with pytest.raises(ValidationError) as exc_info:
+        BulkImportDirInput(directory=str(outside))
+    assert "not in allowed import roots" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
