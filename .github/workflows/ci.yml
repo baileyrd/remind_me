@@ -1,18 +1,26 @@
-# Coverage gate: 80% (CICD-02 requirement satisfied — Phase 9 gap closure).
+# Coverage gate: 80%, enforced via [tool.coverage.report] fail_under in pyproject.toml.
 name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   ci:
-    name: Python ${{ matrix.python-version }}
+    name: Python ${{ matrix.python-version }} (${{ matrix.extras }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
+        # "semantic" = full install with sqlite-vec/onnxruntime extras;
+        # "base" = plain install — the README's default path; vec/onnx tests importorskip.
+        extras: [semantic, base]
 
     steps:
       - uses: actions/checkout@v4
@@ -20,12 +28,29 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: ${{ matrix.python-version }}
+          enable-cache: true
 
-      - name: Install dependencies
-        run: uv pip install -e ".[semantic]" pytest-cov "ruff>=0.15,<0.16" pytest-asyncio
+      - name: Install dependencies from uv.lock (dev group included by default)
+        run: |
+          if [ "${{ matrix.extras }}" = "semantic" ]; then
+            uv sync --locked --extra semantic
+          else
+            uv sync --locked
+          fi
 
       - name: Lint
-        run: ruff check --output-format=github .
+        run: uv run ruff check --output-format=github .
 
+      - name: Type check
+        run: uv run mypy remind_me_mcp
+
+      # The 80% gate (pyproject [tool.coverage.report] fail_under) applies to the
+      # full install only — the base leg skips sqlite-vec/onnx tests via importorskip,
+      # so its coverage is structurally lower; it still must pass the whole suite.
       - name: Test with coverage
-        run: pytest --cov=remind_me_mcp --cov-report=term-missing --cov-fail-under=80
+        run: |
+          if [ "${{ matrix.extras }}" = "semantic" ]; then
+            uv run pytest --cov=remind_me_mcp --cov-report=term-missing
+          else
+            uv run pytest --cov=remind_me_mcp --cov-report=term-missing --cov-fail-under=0
+          fi
