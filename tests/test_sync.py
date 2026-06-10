@@ -1,20 +1,17 @@
 """
 Tests for remind_me_mcp.sync — outbox push, pull, upsert conflict resolution,
-peer discovery, and the sync cycle.
+peer discovery, outbox pruning, and the sync cycle.
 
 Network traffic is mocked with httpx.MockTransport; the database is a real
 in-memory SQLite connection with the full schema (so the outbox triggers fire
 exactly as in production). No test touches ~/.remind-me.
-
-NOTE: several tests below intentionally pin CURRENT buggy behavior (marked
-with the backlog item that will change them) so the fixes are visible as
-test diffs.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -126,7 +123,32 @@ def mock_client(handler: RequestRecorder) -> httpx.AsyncClient:
 
 
 # ---------------------------------------------------------------------------
-# Outbox push
+# Timestamp canonicalization (SY-08)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("2026-06-01T12:00:00+00:00", "2026-06-01T12:00:00+00:00"),
+        ("2026-06-01T12:00:00Z", "2026-06-01T12:00:00+00:00"),
+        ("2026-06-01 12:00:00", "2026-06-01T12:00:00+00:00"),
+        ("2026-06-01T14:00:00+02:00", "2026-06-01T12:00:00+00:00"),
+        ("2026-06-01T12:00:00.123456+00:00", "2026-06-01T12:00:00.123456+00:00"),
+    ],
+)
+def test_canon_ts(raw: str, expected: str) -> None:
+    assert sync._canon_ts(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "not a time", None, 42, []])
+def test_canon_ts_rejects_garbage(raw: Any) -> None:
+    with pytest.raises(ValueError):
+        sync._canon_ts(raw)
+
+
+# ---------------------------------------------------------------------------
+# Outbox push (per-remote tracking — SY-02)
 # ---------------------------------------------------------------------------
 
 
@@ -136,7 +158,7 @@ async def test_push_outbox_sends_unsent_rows(sync_db: sqlite3.Connection) -> Non
 
     recorder = RequestRecorder()
     async with mock_client(recorder) as client:
-        await sync._push_outbox(client, "http://hub")
+        await sync._push_outbox(client, "http://hub", "hub")
 
     assert len(recorder.requests) == 1
     body = json.loads(recorder.requests[0].content)
@@ -151,7 +173,7 @@ async def test_push_outbox_sends_unsent_rows(sync_db: sqlite3.Connection) -> Non
 async def test_push_outbox_nothing_to_send(sync_db: sqlite3.Connection) -> None:
     recorder = RequestRecorder()
     async with mock_client(recorder) as client:
-        result = await sync._push_outbox(client, "http://hub")
+        result = await sync._push_outbox(client, "http://hub", "hub")
     assert result == 0
     assert recorder.requests == []
 
@@ -165,7 +187,7 @@ async def test_push_outbox_batches(
 
     recorder = RequestRecorder()
     async with mock_client(recorder) as client:
-        await sync._push_outbox(client, "http://hub")
+        await sync._push_outbox(client, "http://hub", "hub")
 
     # 5 rows with batch size 2 -> 3 requests (2 + 2 + 1)
     assert len(recorder.requests) == 3
@@ -183,46 +205,80 @@ async def test_push_outbox_http_error_leaves_rows_unsent(
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(httpx.HTTPStatusError):
-            await sync._push_outbox(client, "http://hub")
+            await sync._push_outbox(client, "http://hub", "hub")
 
-    rows = sync_db.execute("SELECT sent_at FROM sync_outbox").fetchall()
-    assert all(r["sent_at"] == "" for r in rows)
+    assert sync_db.execute("SELECT COUNT(*) FROM sync_sends").fetchone()[0] == 0
 
 
-async def test_push_outbox_sent_marking_is_global(sync_db: sqlite3.Connection) -> None:
-    """CURRENT BEHAVIOR (bug, SY-02): the first successful push marks rows
-    sent for everyone — a second remote never receives them."""
+async def test_push_outbox_tracks_sends_per_remote(sync_db: sqlite3.Connection) -> None:
+    """SY-02: each remote receives every outbox row, tracked independently."""
     insert_memory(sync_db, "mem-1", "alpha")
 
     recorder_a = RequestRecorder()
     async with mock_client(recorder_a) as client:
-        await sync._push_outbox(client, "http://hub")
+        await sync._push_outbox(client, "http://hub", "hub")
     assert len(recorder_a.requests) == 1
 
+    # A second remote must still receive the same rows.
     recorder_b = RequestRecorder()
     async with mock_client(recorder_b) as client:
-        await sync._push_outbox(client, "http://peer")
-    assert recorder_b.requests == []  # SY-02 will flip this
+        await sync._push_outbox(client, "http://peer", "peer-b")
+    assert len(recorder_b.requests) == 1
+    ids = [r["id"] for r in json.loads(recorder_b.requests[0].content)["records"]]
+    assert ids == ["mem-1"]
+
+    # And re-pushing to the first remote sends nothing new.
+    recorder_a2 = RequestRecorder()
+    async with mock_client(recorder_a2) as client:
+        await sync._push_outbox(client, "http://hub", "hub")
+    assert recorder_a2.requests == []
 
 
-async def test_push_outbox_partial_accept_marks_whole_batch(
+async def test_push_outbox_marks_only_processed_records(
     sync_db: sqlite3.Connection,
 ) -> None:
-    """CURRENT BEHAVIOR (bug, SY-02): even when the remote accepts fewer
-    records than sent, the whole batch is marked sent."""
+    """SY-02: when the remote reports which records it processed, only those
+    are marked sent; the rest are retried on the next push."""
+    insert_memory(sync_db, "mem-1", "alpha")
+    insert_memory(sync_db, "mem-2", "beta")
+
+    recorder = RequestRecorder(
+        responses={"/sync/push": {"accepted": 1, "processed_ids": ["mem-1"]}}
+    )
+    async with mock_client(recorder) as client:
+        marked = await sync._push_outbox(client, "http://peer", "peer-x")
+    assert marked == 1
+
+    # mem-2 was not processed, so the next push retries it.
+    recorder2 = RequestRecorder()
+    async with mock_client(recorder2) as client:
+        await sync._push_outbox(client, "http://peer", "peer-x")
+    assert len(recorder2.requests) == 1
+    ids = [r["id"] for r in json.loads(recorder2.requests[0].content)["records"]]
+    assert ids == ["mem-2"]
+
+
+async def test_push_outbox_count_only_remote_marks_batch(
+    sync_db: sqlite3.Connection,
+) -> None:
+    """A legacy remote that only returns a count still marks the whole batch
+    (LWW-stale records would never be re-accepted, so retrying is useless)."""
     insert_memory(sync_db, "mem-1")
     insert_memory(sync_db, "mem-2")
 
     recorder = RequestRecorder(responses={"/sync/push": {"accepted": 1}})
     async with mock_client(recorder) as client:
-        await sync._push_outbox(client, "http://hub")
+        marked = await sync._push_outbox(client, "http://hub", "hub")
+    assert marked == 2
 
-    rows = sync_db.execute("SELECT sent_at FROM sync_outbox").fetchall()
-    assert all(r["sent_at"] != "" for r in rows)
+    recorder2 = RequestRecorder()
+    async with mock_client(recorder2) as client:
+        await sync._push_outbox(client, "http://hub", "hub")
+    assert recorder2.requests == []
 
 
 # ---------------------------------------------------------------------------
-# Pull
+# Pull (keyset cursor + drain loop — SY-04)
 # ---------------------------------------------------------------------------
 
 
@@ -241,17 +297,19 @@ async def test_pull_remote_upserts_records(sync_db: sqlite3.Connection) -> None:
     assert row is not None
     assert row["content"] == "pulled content"
 
-    # Cursor advanced to the newest record we received
+    # Keyset cursor advanced to the newest record we received
     log_row = sync_db.execute(
-        "SELECT last_pull FROM sync_log WHERE remote_id = 'hub'"
+        "SELECT last_pull, last_pull_id FROM sync_log WHERE remote_id = 'hub'"
     ).fetchone()
     assert log_row is not None
     assert log_row["last_pull"] == rec["updated_at"]
+    assert log_row["last_pull_id"] == "remote-1"
 
 
 async def test_pull_remote_sends_since_cursor(sync_db: sqlite3.Connection) -> None:
     sync_db.execute(
-        "INSERT INTO sync_log (remote_id, last_pull) VALUES ('hub', '2026-01-01T00:00:00+00:00')"
+        """INSERT INTO sync_log (remote_id, last_pull, last_pull_id)
+           VALUES ('hub', '2026-01-01T00:00:00+00:00', 'mem-z')"""
     )
     sync_db.commit()
 
@@ -262,6 +320,7 @@ async def test_pull_remote_sends_since_cursor(sync_db: sqlite3.Connection) -> No
     assert len(recorder.requests) == 1
     params = dict(recorder.requests[0].url.params)
     assert params["since"] == "2026-01-01T00:00:00+00:00"
+    assert params["since_id"] == "mem-z"
     assert params["exclude_node"] == sync.NODE_ID
 
 
@@ -274,34 +333,97 @@ async def test_pull_remote_empty(sync_db: sqlite3.Connection) -> None:
     assert sync_db.execute("SELECT COUNT(*) FROM sync_log").fetchone()[0] == 0
 
 
-async def test_pull_remote_single_page_per_cycle(
-    sync_db: sqlite3.Connection,
-) -> None:
-    """CURRENT BEHAVIOR (bug, SY-04): only one page is pulled per cycle and
-    the resume cursor uses strict '>' on updated_at, losing boundary ties."""
-    ts = "2026-06-01T00:00:00+00:00"
-    page = [make_record(f"tie-{i}", f"tie {i}", created_at=ts, updated_at=ts) for i in range(3)]
-    recorder = RequestRecorder(responses={"/sync/pull": {"records": page}})
+def _paging_pull_handler(all_records: list[dict], page_size: int):
+    """Simulate a keyset-paginated server over a fixed record set."""
 
+    def handler(request: httpx.Request) -> dict:
+        params = dict(request.url.params)
+        since = params.get("since", "")
+        since_id = params.get("since_id", "")
+        matching = sorted(
+            (r for r in all_records if (r["updated_at"], r["id"]) > (since, since_id)),
+            key=lambda r: (r["updated_at"], r["id"]),
+        )
+        page = matching[:page_size]
+        return {"records": page, "count": len(page)}
+
+    return handler
+
+
+async def test_pull_remote_drains_multiple_pages(
+    sync_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SY-04: one sync cycle keeps pulling until a short page arrives."""
+    monkeypatch.setattr(sync, "PULL_PAGE_SIZE", 2)
+    ts1 = "2026-06-01T00:00:00+00:00"
+    ts2 = "2026-06-02T00:00:00+00:00"
+    all_records = [
+        make_record("rec-a", "a", created_at=ts1, updated_at=ts1),
+        make_record("rec-b", "b", created_at=ts1, updated_at=ts1),
+        make_record("rec-c", "c", created_at=ts2, updated_at=ts2),
+    ]
+    recorder = RequestRecorder(
+        responses={"/sync/pull": _paging_pull_handler(all_records, 2)}
+    )
     async with mock_client(recorder) as client:
         count = await sync._pull_remote(client, "http://hub", "hub")
 
     assert count == 3
-    assert len(recorder.requests) == 1  # no drain loop yet (SY-04)
+    assert len(recorder.requests) == 2  # full page, then short page
+    got = sync_db.execute("SELECT id FROM memories ORDER BY id").fetchall()
+    assert [r["id"] for r in got] == ["rec-a", "rec-b", "rec-c"]
+
     log_row = sync_db.execute(
-        "SELECT last_pull FROM sync_log WHERE remote_id = 'hub'"
+        "SELECT last_pull, last_pull_id FROM sync_log WHERE remote_id = 'hub'"
     ).fetchone()
-    assert log_row["last_pull"] == ts  # next pull uses strict '>' and skips ties
+    assert log_row["last_pull"] == ts2
+    assert log_row["last_pull_id"] == "rec-c"
+
+
+async def test_pull_remote_boundary_ties_not_lost(
+    sync_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SY-04: records sharing the page-boundary timestamp must all arrive."""
+    monkeypatch.setattr(sync, "PULL_PAGE_SIZE", 2)
+    ts = "2026-06-01T00:00:00+00:00"
+    all_records = [
+        make_record(f"tie-{i}", f"tie {i}", created_at=ts, updated_at=ts)
+        for i in range(5)
+    ]
+    recorder = RequestRecorder(
+        responses={"/sync/pull": _paging_pull_handler(all_records, 2)}
+    )
+    async with mock_client(recorder) as client:
+        count = await sync._pull_remote(client, "http://hub", "hub")
+
+    assert count == 5
+    assert sync_db.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 5
+
+
+async def test_pull_remote_stuck_cursor_stops(
+    sync_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A server that keeps replaying the same full page cannot trap the cycle."""
+    monkeypatch.setattr(sync, "PULL_PAGE_SIZE", 1)
+    rec = make_record("loop-1", "same page forever")
+    recorder = RequestRecorder(responses={"/sync/pull": {"records": [rec]}})
+    async with mock_client(recorder) as client:
+        await sync._pull_remote(client, "http://hub", "hub")
+
+    # First page consumed, second page identical -> cursor no progress -> stop.
+    assert len(recorder.requests) <= 3
 
 
 # ---------------------------------------------------------------------------
-# _upsert_records — conflict resolution
+# _upsert_records — conflict resolution (SY-03)
 # ---------------------------------------------------------------------------
 
 
 def test_upsert_inserts_new_record(sync_db: sqlite3.Connection) -> None:
-    upserted = sync._upsert_records(sync_db, [make_record("new-1", "hello")])
-    assert upserted == 1
+    result = sync._upsert_records(sync_db, [make_record("new-1", "hello")])
+    assert result.applied == 1
+    assert result.failed == 0
+    assert result.processed_ids == ["new-1"]
     row = sync_db.execute("SELECT * FROM memories WHERE id = 'new-1'").fetchone()
     assert row["content"] == "hello"
     assert row["node_id"] == "remote-node"
@@ -314,8 +436,8 @@ def test_upsert_newer_wins(sync_db: sqlite3.Connection) -> None:
         created_at="2026-01-01T00:00:00+00:00",
         updated_at="2026-02-01T00:00:00+00:00",
     )
-    upserted = sync._upsert_records(sync_db, [rec])
-    assert upserted == 1
+    result = sync._upsert_records(sync_db, [rec])
+    assert result.applied == 1
     row = sync_db.execute("SELECT content FROM memories WHERE id = 'm1'").fetchone()
     assert row["content"] == "newer remote"
 
@@ -327,8 +449,10 @@ def test_upsert_older_loses(sync_db: sqlite3.Connection) -> None:
         created_at="2026-01-01T00:00:00+00:00",
         updated_at="2026-01-01T00:00:00+00:00",
     )
-    upserted = sync._upsert_records(sync_db, [rec])
-    assert upserted == 0
+    result = sync._upsert_records(sync_db, [rec])
+    assert result.applied == 0
+    # Stale records still count as successfully processed (no retry needed)
+    assert result.processed_ids == ["m1"]
     row = sync_db.execute("SELECT content FROM memories WHERE id = 'm1'").fetchone()
     assert row["content"] == "newer local"
 
@@ -337,16 +461,14 @@ def test_upsert_equal_timestamp_is_noop(sync_db: sqlite3.Connection) -> None:
     ts = "2026-03-01T00:00:00+00:00"
     insert_memory(sync_db, "m1", "local", updated_at=ts)
     rec = make_record("m1", "remote echo", created_at=ts, updated_at=ts)
-    upserted = sync._upsert_records(sync_db, [rec])
-    assert upserted == 0
+    result = sync._upsert_records(sync_db, [rec])
+    assert result.applied == 0
     row = sync_db.execute("SELECT content FROM memories WHERE id = 'm1'").fetchone()
     assert row["content"] == "local"
 
 
 def test_upsert_parses_string_tags_and_metadata(sync_db: sqlite3.Connection) -> None:
-    rec = make_record(
-        "m1", tags='["x", "y"]', metadata='{"k": "v"}'
-    )
+    rec = make_record("m1", tags='["x", "y"]', metadata='{"k": "v"}')
     sync._upsert_records(sync_db, [rec])
     row = sync_db.execute("SELECT tags, metadata FROM memories WHERE id = 'm1'").fetchone()
     assert json.loads(row["tags"]) == ["x", "y"]
@@ -361,31 +483,81 @@ def test_upsert_malformed_tags_become_empty(sync_db: sqlite3.Connection) -> None
     assert json.loads(row["metadata"]) == {}
 
 
-def test_upsert_drops_extended_columns(sync_db: sqlite3.Connection) -> None:
-    """CURRENT BEHAVIOR (bug, SY-03): vitality/classification/structured
-    fields present in the payload are silently discarded on receive."""
+def test_upsert_preserves_extended_columns(sync_db: sqlite3.Connection) -> None:
+    """SY-03: vitality/classification/structured fields survive the wire."""
     rec = make_record(
         "rich-1",
         "rich record",
-        memory_type="decision",
+        client="claude-code",
+        accessed_at="2026-05-01T00:00:00+00:00",
         access_count=7,
+        decay_rate=0.05,
         vitality=0.83,
+        base_weight=1.5,
+        status="active",
+        memory_type="decision",
+        source_capture_id="cap-9",
         subject="Bailey",
         predicate="prefers",
         object="dark mode",
+        superseded_by=None,
     )
-    upserted = sync._upsert_records(sync_db, [rec])
-    assert upserted == 1
+    result = sync._upsert_records(sync_db, [rec])
+    assert result.applied == 1
     row = sync_db.execute("SELECT * FROM memories WHERE id = 'rich-1'").fetchone()
-    # All of these arrive in the payload but are dropped today:
-    assert row["memory_type"] == "unclassified"  # SY-03 will preserve "decision"
-    assert row["access_count"] == 0
-    assert row["vitality"] == 1.0
-    assert row["subject"] is None
+    assert row["memory_type"] == "decision"
+    assert row["access_count"] == 7
+    assert row["vitality"] == pytest.approx(0.83)
+    assert row["base_weight"] == pytest.approx(1.5)
+    assert row["decay_rate"] == pytest.approx(0.05)
+    assert row["accessed_at"] == "2026-05-01T00:00:00+00:00"
+    assert row["subject"] == "Bailey"
+    assert row["predicate"] == "prefers"
+    assert row["object"] == "dark mode"
+    assert row["client"] == "claude-code"
+    assert row["source_capture_id"] == "cap-9"
+
+
+def test_upsert_extended_columns_updated_on_conflict(
+    sync_db: sqlite3.Connection,
+) -> None:
+    """SY-03: an LWW-winning update also refreshes the extended columns."""
+    insert_memory(sync_db, "m1", "v1", updated_at="2026-01-01T00:00:00+00:00")
+    rec = make_record(
+        "m1", "v2",
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-02-01T00:00:00+00:00",
+        memory_type="preference",
+        vitality=0.42,
+        superseded_by="m2",
+    )
+    sync._upsert_records(sync_db, [rec])
+    row = sync_db.execute("SELECT * FROM memories WHERE id = 'm1'").fetchone()
+    assert row["memory_type"] == "preference"
+    assert row["vitality"] == pytest.approx(0.42)
+    assert row["superseded_by"] == "m2"
+
+
+def test_upsert_supersession_tombstone_propagates(sync_db: sqlite3.Connection) -> None:
+    """A remote update that marks a record superseded must apply locally."""
+    insert_memory(sync_db, "old-fact", "obsolete", updated_at="2026-01-01T00:00:00+00:00")
+    rec = make_record(
+        "old-fact",
+        "obsolete",
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-02-01T00:00:00+00:00",
+        superseded_by="new-fact",
+    )
+    result = sync._upsert_records(sync_db, [rec])
+    assert result.applied == 1
+    row = sync_db.execute(
+        "SELECT superseded_by FROM memories WHERE id = 'old-fact'"
+    ).fetchone()
+    assert row["superseded_by"] == "new-fact"
 
 
 def test_upsert_tolerates_records_from_older_nodes(sync_db: sqlite3.Connection) -> None:
-    """Records missing newer schema fields get schema defaults."""
+    """SY-03: records missing newer schema fields get schema defaults."""
     now = _now_iso()
     rec = {
         "id": "v2-era",
@@ -397,46 +569,75 @@ def test_upsert_tolerates_records_from_older_nodes(sync_db: sqlite3.Connection) 
         "created_at": now,
         "updated_at": now,
     }
-    upserted = sync._upsert_records(sync_db, [rec])
-    assert upserted == 1
+    result = sync._upsert_records(sync_db, [rec])
+    assert result.applied == 1
     row = sync_db.execute("SELECT * FROM memories WHERE id = 'v2-era'").fetchone()
     assert row["status"] == "active"
     assert row["memory_type"] == "unclassified"
     assert row["access_count"] == 0
+    assert row["client"] == "unknown"
+    assert row["accessed_at"] == row["created_at"]
 
 
-def test_upsert_malformed_record_poisons_batch(sync_db: sqlite3.Connection) -> None:
-    """CURRENT BEHAVIOR (bug, SY-03): a record missing a required key raises
-    out of the loop, losing the rest of the batch."""
+def test_upsert_skips_malformed_records(sync_db: sqlite3.Connection) -> None:
+    """SY-03: a bad record must not poison the rest of the batch."""
     good_before = make_record("good-1", "first")
     missing_content = {"id": "bad-1", "updated_at": _now_iso(), "created_at": _now_iso()}
+    not_a_dict = "totally wrong"
+    missing_id = make_record("x")
+    del missing_id["id"]
     good_after = make_record("good-2", "last")
 
-    with pytest.raises(KeyError):
-        sync._upsert_records(sync_db, [good_before, missing_content, good_after])
-
+    result = sync._upsert_records(
+        sync_db, [good_before, missing_content, not_a_dict, missing_id, good_after]
+    )
+    assert result.applied == 2
+    assert result.failed == 3
+    assert result.processed_ids == ["good-1", "good-2"]
     ids = {r["id"] for r in sync_db.execute("SELECT id FROM memories").fetchall()}
-    assert "good-2" not in ids  # SY-03 will make the batch survive
+    assert ids == {"good-1", "good-2"}
+    # No transaction left open
+    assert not sync_db.in_transaction
 
 
-def test_upsert_stores_timestamps_verbatim(sync_db: sqlite3.Connection) -> None:
-    """CURRENT BEHAVIOR (bug, SY-08): heterogeneous remote timestamp formats
-    are stored as-is, breaking string-based LWW ordering."""
+def test_upsert_normalizes_timestamps(sync_db: sqlite3.Connection) -> None:
+    """SY-08: heterogeneous remote timestamps are canonicalized on ingest."""
     rec = make_record(
         "z-ts",
         created_at="2026-06-01 10:00:00",  # SQLite trigger style
         updated_at="2026-06-01T12:00:00Z",  # hub style
     )
-    sync._upsert_records(sync_db, [rec])
+    result = sync._upsert_records(sync_db, [rec])
+    assert result.applied == 1
     row = sync_db.execute(
         "SELECT created_at, updated_at FROM memories WHERE id = 'z-ts'"
     ).fetchone()
-    assert row["created_at"] == "2026-06-01 10:00:00"  # SY-08 will canonicalize
-    assert row["updated_at"] == "2026-06-01T12:00:00Z"
+    assert row["created_at"] == "2026-06-01T10:00:00+00:00"
+    assert row["updated_at"] == "2026-06-01T12:00:00+00:00"
+
+
+def test_upsert_z_timestamp_beats_local_format(sync_db: sqlite3.Connection) -> None:
+    """SY-08: a Z-suffixed remote timestamp must still win LWW correctly."""
+    insert_memory(sync_db, "m1", "local", updated_at="2026-01-01T00:00:00+00:00")
+    rec = make_record(
+        "m1", "remote", created_at="2026-01-01T00:00:00Z", updated_at="2026-02-01T00:00:00Z"
+    )
+    result = sync._upsert_records(sync_db, [rec])
+    assert result.applied == 1
+    row = sync_db.execute("SELECT content FROM memories WHERE id = 'm1'").fetchone()
+    assert row["content"] == "remote"
+
+
+def test_upsert_unparseable_timestamp_fails_record(sync_db: sqlite3.Connection) -> None:
+    rec = make_record("m1", updated_at="not a time")
+    result = sync._upsert_records(sync_db, [rec])
+    assert result.applied == 0
+    assert result.failed == 1
+    assert result.processed_ids == []
 
 
 # ---------------------------------------------------------------------------
-# Echo suppression
+# Echo suppression (SY-05)
 # ---------------------------------------------------------------------------
 
 
@@ -453,11 +654,9 @@ def test_upsert_suppresses_echo_outbox_rows(sync_db: sqlite3.Connection) -> None
     assert all(r["sent_at"] != "" for r in rows)
 
 
-def test_upsert_echo_suppression_swallows_local_edits(
-    sync_db: sqlite3.Connection,
-) -> None:
-    """CURRENT BEHAVIOR (bug, SY-05): suppression marks ALL pending outbox
-    rows for the memory — including a concurrent local edit's row."""
+def test_upsert_echo_suppression_spares_local_edits(sync_db: sqlite3.Connection) -> None:
+    """SY-05: only the outbox rows created BY the upsert are suppressed —
+    a pending local edit's row must survive."""
     insert_memory(sync_db, "m1", "local edit", updated_at="2026-01-01T00:00:00+00:00")
     local_rows = sync_db.execute(
         "SELECT id FROM sync_outbox WHERE memory_id = 'm1'"
@@ -475,19 +674,303 @@ def test_upsert_echo_suppression_swallows_local_edits(
     local_row = sync_db.execute(
         "SELECT sent_at FROM sync_outbox WHERE id = ?", (local_outbox_id,)
     ).fetchone()
-    # The local edit is lost from sync today. SY-05 will keep it pending.
-    assert local_row["sent_at"] != ""
+    assert local_row["sent_at"] == "", "local edit's outbox row must stay pending"
+
+    echo_rows = sync_db.execute(
+        "SELECT sent_at FROM sync_outbox WHERE memory_id = 'm1' AND id != ?",
+        (local_outbox_id,),
+    ).fetchall()
+    assert echo_rows
+    assert all(r["sent_at"] != "" for r in echo_rows)
 
 
 # ---------------------------------------------------------------------------
-# Peer discovery
+# Embedding on ingest (SY-06)
 # ---------------------------------------------------------------------------
 
 
-async def test_discover_peers_without_tailscale() -> None:
+def test_upsert_embeds_applied_records(
+    sync_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    embedded: list[tuple[int, str]] = []
+
+    def fake_embed(rows: list[tuple[int, str]]) -> int:
+        embedded.extend(rows)
+        return len(rows)
+
+    monkeypatch.setattr(sync, "_embed_and_store_rows", fake_embed)
+
+    insert_memory(sync_db, "stale", "newer local", updated_at="2026-03-01T00:00:00+00:00")
+    recs = [
+        make_record("fresh", "embed me"),
+        make_record(
+            "stale", "loses lww",
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:00:00+00:00",
+        ),
+    ]
+    sync._upsert_records(sync_db, recs)
+
+    contents = [c for _, c in embedded]
+    assert contents == ["embed me"], "only applied records are embedded"
+
+
+def test_upsert_embedding_failure_is_nonfatal(
+    sync_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(rows: list[tuple[int, str]]) -> int:
+        raise RuntimeError("embedder exploded")
+
+    monkeypatch.setattr(sync, "_embed_and_store_rows", boom)
+    result = sync._upsert_records(sync_db, [make_record("m1", "content")])
+    assert result.applied == 1
+    assert sync_db.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 1
+
+
+# ---------------------------------------------------------------------------
+# Outbox pruning (SY-07)
+# ---------------------------------------------------------------------------
+
+
+def test_prune_outbox_removes_old_and_suppressed_rows(
+    sync_db: sqlite3.Connection,
+) -> None:
+    old_ts = (datetime.now(UTC) - timedelta(days=45)).isoformat()
+    fresh_ts = _now_iso()
+    sync_db.executemany(
+        """INSERT INTO sync_outbox (memory_id, operation, payload, created_at, sent_at)
+           VALUES (?, 'insert', '{}', ?, ?)""",
+        [
+            ("old-row", old_ts, ""),       # past retention -> pruned
+            ("echo-row", fresh_ts, fresh_ts),  # suppressed echo -> pruned
+            ("fresh-row", fresh_ts, ""),   # pending -> kept
+        ],
+    )
+    sync_db.execute(
+        "INSERT INTO sync_sends (remote_id, outbox_id, sent_at) "
+        "SELECT 'hub', id, ? FROM sync_outbox", (fresh_ts,)
+    )
+    sync_db.commit()
+
+    removed = sync._prune_outbox(sync_db)
+    assert removed == 2
+
+    remaining = sync_db.execute("SELECT memory_id FROM sync_outbox").fetchall()
+    assert [r["memory_id"] for r in remaining] == ["fresh-row"]
+    # Orphaned per-remote send markers were cleaned up too
+    assert sync_db.execute("SELECT COUNT(*) FROM sync_sends").fetchone()[0] == 1
+
+
+def test_outbox_triggers_gated_on_sync_enabled(sync_db: sqlite3.Connection) -> None:
+    """SY-07: with the sync_enabled flag off, the outbox does not accumulate."""
+    sync_db.execute("UPDATE sync_flags SET value = '0' WHERE key = 'sync_enabled'")
+    sync_db.commit()
+
+    insert_memory(sync_db, "silent", "no outbox row")
+    assert sync_db.execute("SELECT COUNT(*) FROM sync_outbox").fetchone()[0] == 0
+
+    # Re-enabling the flag turns the triggers back on.
+    sync_db.execute("UPDATE sync_flags SET value = '1' WHERE key = 'sync_enabled'")
+    sync_db.commit()
+    insert_memory(sync_db, "loud", "outbox row")
+    rows = sync_db.execute("SELECT memory_id FROM sync_outbox").fetchall()
+    assert [r["memory_id"] for r in rows] == ["loud"]
+
+
+def test_outbox_trigger_timestamp_is_canonical(sync_db: sqlite3.Connection) -> None:
+    """SY-08: trigger-written created_at uses canonical ISO-8601 UTC."""
+    insert_memory(sync_db, "ts-check", "content")
+    row = sync_db.execute(
+        "SELECT created_at FROM sync_outbox WHERE memory_id = 'ts-check'"
+    ).fetchone()
+    created = row["created_at"]
+    assert "T" in created
+    assert created.endswith("+00:00")
+    # Round-trips through the canonicalizer unchanged
+    assert sync._canon_ts(created) == created
+
+
+# ---------------------------------------------------------------------------
+# v9 schema migration / sync_enabled reconciliation
+# ---------------------------------------------------------------------------
+
+
+def test_v9_schema_objects_exist(sync_db: sqlite3.Connection) -> None:
+    """SY-02/SY-04/SY-09: v9 adds sync_sends, sync_flags, last_pull_id, and
+    the memories(updated_at) index."""
+    tables = {
+        r[0]
+        for r in sync_db.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    assert {"sync_sends", "sync_flags"} <= tables
+
+    indexes = {
+        r[0]
+        for r in sync_db.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index'"
+        ).fetchall()
+    }
+    assert "idx_memories_updated_at" in indexes
+    assert "idx_outbox_created_at" in indexes
+
+    cols = {r[1] for r in sync_db.execute("PRAGMA table_info(sync_log)").fetchall()}
+    assert "last_pull_id" in cols
+
+
+def test_reconcile_disabled_truncates_outbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SY-07: with sync disabled, startup truncates whatever accumulated."""
+    import remind_me_mcp.config as config
+
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    monkeypatch.setattr(config, "SYNC_ENABLED", True)
+    _ensure_schema(db)
+    db.execute(
+        """INSERT INTO memories (id, content, created_at, updated_at)
+           VALUES ('m1', 'hello', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')"""
+    )
+    db.commit()
+    assert db.execute("SELECT COUNT(*) FROM sync_outbox").fetchone()[0] == 1
+
+    # Restart with sync disabled -> outbox is truncated, flag flips to '0'.
+    monkeypatch.setattr(config, "SYNC_ENABLED", False)
+    _db_mod._reconcile_sync_enabled_flag(db)
+    assert db.execute("SELECT COUNT(*) FROM sync_outbox").fetchone()[0] == 0
+    flag = db.execute(
+        "SELECT value FROM sync_flags WHERE key = 'sync_enabled'"
+    ).fetchone()
+    assert flag["value"] == "0"
+    db.close()
+
+
+def test_reconcile_enable_backfills_outbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SY-07: enabling sync backfills memories created while it was off."""
+    import remind_me_mcp.config as config
+
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    monkeypatch.setattr(config, "SYNC_ENABLED", False)
+    _ensure_schema(db)
+    db.execute(
+        """INSERT INTO memories (id, content, created_at, updated_at)
+           VALUES ('quiet', 'made while sync off', '2026-01-01T00:00:00+00:00',
+                   '2026-01-01T00:00:00+00:00')"""
+    )
+    db.commit()
+    assert db.execute("SELECT COUNT(*) FROM sync_outbox").fetchone()[0] == 0
+
+    # Restart with sync enabled -> the memory is backfilled into the outbox.
+    monkeypatch.setattr(config, "SYNC_ENABLED", True)
+    _db_mod._reconcile_sync_enabled_flag(db)
+    rows = db.execute("SELECT memory_id, payload FROM sync_outbox").fetchall()
+    assert [r["memory_id"] for r in rows] == ["quiet"]
+    payload = json.loads(rows[0]["payload"])
+    assert payload["content"] == "made while sync off"
+    assert payload["status"] == "active"  # full-column payload
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# Peer discovery (SY-09: STATIC_PEERS / TAILSCALE_SOCKET)
+# ---------------------------------------------------------------------------
+
+
+async def test_discover_peers_without_tailscale(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
     """With no Tailscale daemon socket, discovery degrades to no peers."""
+    import remind_me_mcp.config as config
+
+    monkeypatch.setattr(config, "TAILSCALE_SOCKET", str(tmp_path / "missing.sock"))
+    monkeypatch.setattr(config, "STATIC_PEERS", [])
     peers = await sync._discover_peers()
     assert peers == []
+
+
+async def test_discover_peers_returns_static_peers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    """SY-09: STATIC_PEERS from config are honored."""
+    import remind_me_mcp.config as config
+
+    monkeypatch.setattr(config, "TAILSCALE_SOCKET", str(tmp_path / "missing.sock"))
+    monkeypatch.setattr(
+        config,
+        "STATIC_PEERS",
+        [{"node_id": "laptop", "url": "http://100.64.0.9:8766"}],
+    )
+    peers = await sync._discover_peers()
+    assert peers == [{"node_id": "laptop", "url": "http://100.64.0.9:8766"}]
+
+
+async def test_discover_peers_ignores_malformed_static_entries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    import remind_me_mcp.config as config
+
+    monkeypatch.setattr(config, "TAILSCALE_SOCKET", str(tmp_path / "missing.sock"))
+    monkeypatch.setattr(
+        config,
+        "STATIC_PEERS",
+        ["not-a-dict", {"node_id": "x"}, {"url": "http://ok:1"}, 42],
+    )
+    peers = await sync._discover_peers()
+    assert peers == []
+
+
+def test_tailscale_socket_config_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SY-09: TAILSCALE_SOCKET config overrides the platform default."""
+    import remind_me_mcp.config as config
+
+    monkeypatch.setattr(config, "TAILSCALE_SOCKET", "/custom/tailscaled.sock")
+    assert sync._tailscale_socket() == "/custom/tailscaled.sock"
+
+    monkeypatch.setattr(config, "TAILSCALE_SOCKET", "")
+    monkeypatch.setattr(sync.sys, "platform", "darwin")
+    assert sync._tailscale_socket() == "/var/run/tailscaled.socket"
+    monkeypatch.setattr(sync.sys, "platform", "linux")
+    assert sync._tailscale_socket() == "/var/run/tailscale/tailscaled.sock"
+
+
+async def test_discover_peers_parses_tailscale_status(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    """Tailscale peers come from the local API: online peers with IPs only,
+    deduplicated against STATIC_PEERS by URL."""
+    import remind_me_mcp.config as config
+
+    status = {
+        "Peer": {
+            "p1": {"Online": True, "TailscaleIPs": ["100.64.0.1"], "HostName": "alpha"},
+            "p2": {"Online": False, "TailscaleIPs": ["100.64.0.2"], "HostName": "off"},
+            "p3": {"Online": True, "TailscaleIPs": [], "HostName": "no-ip"},
+            "p4": {"Online": True, "TailscaleIPs": ["100.64.0.4"], "HostName": "static-dup"},
+        }
+    }
+    recorder = RequestRecorder(responses={"/localapi/v0/status": status})
+    real_async_client = httpx.AsyncClient
+    monkeypatch.setattr(config, "TAILSCALE_SOCKET", str(tmp_path / "fake.sock"))
+    monkeypatch.setattr(
+        config,
+        "STATIC_PEERS",
+        [{"node_id": "static-dup", "url": f"http://100.64.0.4:{sync.PEER_PORT}"}],
+    )
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kw: real_async_client(
+            **{**kw, "transport": httpx.MockTransport(recorder)}
+        ),
+    )
+
+    peers = await sync._discover_peers()
+    by_node = {p["node_id"]: p["url"] for p in peers}
+    assert by_node == {
+        "static-dup": f"http://100.64.0.4:{sync.PEER_PORT}",
+        "alpha": f"http://100.64.0.1:{sync.PEER_PORT}",
+    }
 
 
 async def test_probe_peer_healthy() -> None:
@@ -546,6 +1029,34 @@ async def test_sync_once_hub_push_and_pull(
     )
 
 
+async def test_sync_once_prunes_outbox(
+    sync_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SY-07: each cycle prunes echo-suppressed/expired outbox rows."""
+    old_ts = (datetime.now(UTC) - timedelta(days=45)).isoformat()
+    sync_db.execute(
+        """INSERT INTO sync_outbox (memory_id, operation, payload, created_at, sent_at)
+           VALUES ('ancient', 'insert', '{}', ?, '')""",
+        (old_ts,),
+    )
+    sync_db.commit()
+
+    recorder = RequestRecorder()
+    real_async_client = httpx.AsyncClient
+    monkeypatch.setattr(sync, "HUB_URL", "")
+    monkeypatch.setattr(sync, "_discover_peers", _no_peers)
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kw: real_async_client(
+            **{**kw, "transport": httpx.MockTransport(recorder)}
+        ),
+    )
+
+    await sync._sync_once()
+    assert sync_db.execute("SELECT COUNT(*) FROM sync_outbox").fetchone()[0] == 0
+
+
 async def test_sync_once_hub_error_does_not_raise(
     sync_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -573,9 +1084,9 @@ async def test_sync_once_skips_self_peer(
     real_async_client = httpx.AsyncClient
 
     async def fake_peers() -> list[dict[str, str]]:
-        return [{"node_id": sync.NODE_ID or "this-node", "url": "http://self"}]
+        return [{"node_id": sync.NODE_ID, "url": "http://self"}]
 
-    monkeypatch.setattr(sync, "NODE_ID", sync.NODE_ID or "this-node")
+    monkeypatch.setattr(sync, "NODE_ID", "this-node")
     monkeypatch.setattr(sync, "HUB_URL", "")
     monkeypatch.setattr(sync, "_discover_peers", fake_peers)
     monkeypatch.setattr(
@@ -588,6 +1099,36 @@ async def test_sync_once_skips_self_peer(
 
     await sync._sync_once()
     assert recorder.requests == []
+
+
+async def test_sync_loop_returns_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sync, "SYNC_ENABLED", False)
+    await sync.sync_loop()  # returns immediately, no network or DB access
+
+
+# The deliberate SystemExit that stops the daemon thread trips pytest's
+# unhandled-thread-exception detector; that is the expected mechanism here.
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_start_sync_thread_runs_cycles(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The daemon thread drives _sync_once on its own event loop."""
+    import threading
+
+    ran = threading.Event()
+
+    async def fake_sync_once() -> None:
+        ran.set()
+        # SystemExit is not caught by the thread's except Exception — it
+        # terminates the loop so no orphan thread outlives the test.
+        raise SystemExit
+
+    monkeypatch.setattr(sync, "_sync_once", fake_sync_once)
+    thread = sync.start_sync_thread()
+    assert thread.daemon
+    assert ran.wait(timeout=5), "_sync_once never ran in the sync thread"
+    thread.join(timeout=5)
+    assert not thread.is_alive()
 
 
 async def test_sync_once_syncs_healthy_peer(

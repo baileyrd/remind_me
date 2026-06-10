@@ -6,18 +6,28 @@ outbox/pull protocol — the only difference is the endpoint URL.
 
 Hub sync:   push local outbox → hub, pull hub changes → local
 Peer sync:  push local outbox → peer, pull peer changes → local
-            (peers discovered via Tailscale local API or mDNS)
+            (peers discovered via Tailscale local API, plus STATIC_PEERS)
 
 Conflict resolution: last-write-wins on updated_at (applied in the
-upsert query). This is safe because memories are append-dominant —
-true concurrent updates to the same record are rare.
+upsert query). All timestamps are normalized to canonical UTC ISO-8601
+on ingest so string comparison is a correct ordering. This is safe
+because memories are append-dominant — true concurrent updates to the
+same record are rare.
+
+Outbox sends are tracked per remote in the ``sync_sends`` table, so every
+configured hub/peer receives every outbox row. Pulls use a keyset cursor
+``(updated_at, id)`` persisted in ``sync_log`` and drain the remote with
+repeated pages until a short page arrives.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import sys
 import threading
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -25,6 +35,7 @@ if TYPE_CHECKING:
 
 import httpx
 
+from remind_me_mcp import config
 from remind_me_mcp.config import (
     HUB_URL,
     NODE_ID,
@@ -33,45 +44,94 @@ from remind_me_mcp.config import (
     SYNC_INTERVAL,
     SYNC_SECRET,
 )
-from remind_me_mcp.db import _get_db, _now_iso
+from remind_me_mcp.db import _embed_and_store_rows, _get_db, _now_iso
 
 log = logging.getLogger("remind_me_mcp.sync")
 
 HEADERS = {"Authorization": f"Bearer {SYNC_SECRET}"}
 BATCH_SIZE = 200
+PULL_PAGE_SIZE = 500
+# Safety valve so a misbehaving remote cannot trap one cycle forever.
+MAX_PULL_PAGES = 100
+
+_EPOCH = "1970-01-01T00:00:00+00:00"
 
 
 # ---------------------------------------------------------------------------
-# Outbox push
+# Timestamp canonicalization (SY-08)
 # ---------------------------------------------------------------------------
 
-async def _push_outbox(client: httpx.AsyncClient, url: str) -> int:
+
+def _canon_ts(value: Any) -> str:
+    """Normalize a timestamp to canonical UTC ISO-8601 ('...+00:00').
+
+    Accepts the formats seen on the sync wire: Python isoformat with offset,
+    'Z'-suffixed hub timestamps, and SQLite's 'YYYY-MM-DD HH:MM:SS'. Naive
+    timestamps are assumed UTC. The canonical form is string-comparable, so
+    last-write-wins ordering is correct across heterogeneous nodes.
+
+    Args:
+        value: The raw timestamp value from a sync record.
+
+    Returns:
+        The canonical ISO-8601 UTC string.
+
+    Raises:
+        ValueError: If the value is not a parseable timestamp string.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"not a timestamp: {value!r}")
+    dt = datetime.fromisoformat(value.strip())
+    dt = dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+    return dt.isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Outbox push (per-remote send tracking — SY-02)
+# ---------------------------------------------------------------------------
+
+def _decode_payload(raw: str) -> dict[str, Any]:
+    """Decode an outbox payload, deserializing JSON-string tag/metadata fields."""
+    payload: dict[str, Any] = json.loads(raw)
+    for fld in ("tags", "metadata"):
+        if isinstance(payload.get(fld), str):
+            try:
+                payload[fld] = json.loads(payload[fld])
+            except (json.JSONDecodeError, TypeError):
+                payload[fld] = [] if fld == "tags" else {}
+    return payload
+
+
+async def _push_outbox(client: httpx.AsyncClient, url: str, remote_id: str) -> int:
+    """Push outbox rows not yet sent to *remote_id*; mark what it processed.
+
+    Sends are tracked per remote in ``sync_sends`` so every hub/peer receives
+    every row. When the remote reports ``processed_ids`` (our peer server
+    does), only those rows are marked sent and the rest are retried next
+    cycle; a count-only remote (legacy hub) marks the whole batch, with a
+    warning when the accepted count falls short.
+
+    Returns:
+        The number of outbox rows marked sent to this remote.
+    """
     db = _get_db()
+    total_marked = 0
+    cursor = 0
 
     while True:
         rows = db.execute("""
             SELECT id, payload FROM sync_outbox
-            WHERE sent_at = ''
+            WHERE id > ? AND sent_at = ''
+              AND id NOT IN (SELECT outbox_id FROM sync_sends WHERE remote_id = ?)
             ORDER BY id ASC
             LIMIT ?
-        """, (BATCH_SIZE,)).fetchall()
+        """, (cursor, remote_id, BATCH_SIZE)).fetchall()
 
         if not rows:
-            return 0
+            break
+        cursor = rows[-1]["id"]
 
-        records = []
-        for r in rows:
-            payload = json.loads(r["payload"])
-            # Deserialize JSON string fields into proper types
-            for field in ("tags", "metadata"):
-                if isinstance(payload.get(field), str):
-                    try:
-                        payload[field] = json.loads(payload[field])
-                    except (json.JSONDecodeError, TypeError):
-                        payload[field] = [] if field == "tags" else {}
-            records.append(payload)
-
-        row_ids = [r["id"] for r in rows]
+        records = [_decode_payload(r["payload"]) for r in rows]
 
         resp = await client.post(
             f"{url}/sync/push",
@@ -80,155 +140,380 @@ async def _push_outbox(client: httpx.AsyncClient, url: str) -> int:
             timeout=15,
         )
         resp.raise_for_status()
-        accepted = resp.json().get("accepted", 0)
+        data = resp.json()
+        accepted = data.get("accepted", 0)
+        processed_ids = data.get("processed_ids")
+
+        if processed_ids is None:
+            # Count-only remote: we cannot tell which records failed. Mark the
+            # whole batch — LWW-stale records would never be re-accepted anyway.
+            to_mark = [r["id"] for r in rows]
+            if accepted < len(records):
+                log.warning(
+                    "Remote %s accepted %d of %d records but did not report "
+                    "which; marking the whole batch sent",
+                    remote_id, accepted, len(records),
+                )
+        else:
+            ok = {str(i) for i in processed_ids}
+            to_mark = [
+                row["id"]
+                for row, rec in zip(rows, records, strict=True)
+                if str(rec.get("id")) in ok
+            ]
 
         now = _now_iso()
-        db.execute(
-            f"UPDATE sync_outbox SET sent_at = ? "
-            f"WHERE id IN ({','.join('?' * len(row_ids))})",
-            [now, *row_ids],
+        db.executemany(
+            "INSERT OR REPLACE INTO sync_sends (remote_id, outbox_id, sent_at) "
+            "VALUES (?, ?, ?)",
+            [(remote_id, outbox_id, now) for outbox_id in to_mark],
         )
         db.commit()
-        log.debug("Pushed %d records to %s (%d accepted)", len(records), url, accepted)
+        total_marked += len(to_mark)
+        log.debug(
+            "Pushed %d records to %s (%d accepted, %d marked sent)",
+            len(records), url, accepted, len(to_mark),
+        )
 
         if len(rows) < BATCH_SIZE:
             break
 
-    return accepted
+    return total_marked
 
 
 # ---------------------------------------------------------------------------
-# Pull
+# Pull (keyset cursor + drain loop — SY-04)
 # ---------------------------------------------------------------------------
 
 async def _pull_remote(client: httpx.AsyncClient, url: str, remote_id: str) -> int:
-    """Pull new memories from a remote since our last pull timestamp.
+    """Pull new memories from a remote since our last keyset cursor.
 
-    Returns the number of records upserted locally.
+    Pages with a ``(updated_at, id)`` keyset cursor (the ``since_id`` param is
+    additive — older servers simply ignore it) and keeps pulling until a short
+    page arrives, so one cycle drains the remote and page-boundary timestamp
+    ties are never lost.
+
+    Returns:
+        The number of records upserted locally.
     """
     db = _get_db()
 
-    last_pull = db.execute(
-        "SELECT last_pull FROM sync_log WHERE remote_id = ?", (remote_id,)
+    row = db.execute(
+        "SELECT last_pull, last_pull_id FROM sync_log WHERE remote_id = ?",
+        (remote_id,),
     ).fetchone()
-    since = last_pull["last_pull"] if last_pull else "1970-01-01T00:00:00+00:00"
+    since = row["last_pull"] if row else _EPOCH
+    since_id = row["last_pull_id"] if row else ""
 
-    resp = await client.get(
-        f"{url}/sync/pull",
-        params={"since": since, "exclude_node": NODE_ID, "limit": 500},
-        headers=HEADERS,
-        timeout=15,
-    )
-    resp.raise_for_status()
+    total = 0
+    for _ in range(MAX_PULL_PAGES):
+        resp = await client.get(
+            f"{url}/sync/pull",
+            params={
+                "since": since,
+                "since_id": since_id,
+                "exclude_node": NODE_ID,
+                "limit": PULL_PAGE_SIZE,
+            },
+            headers=HEADERS,
+            timeout=15,
+        )
+        resp.raise_for_status()
 
-    data = resp.json()
-    records = data.get("records", [])
-    if not records:
-        return 0
+        records = resp.json().get("records", [])
+        if not records:
+            break
 
-    upserted = _upsert_records(db, records)
+        result = _upsert_records(db, records)
+        total += result.applied
 
-    # Update sync_log with the latest updated_at we received
-    latest = max(r["updated_at"] for r in records)
-    db.execute("""
-        INSERT INTO sync_log (remote_id, last_pull)
-        VALUES (?, ?)
-        ON CONFLICT (remote_id) DO UPDATE SET last_pull = excluded.last_pull
-    """, (remote_id, latest))
-    db.commit()
+        # Advance the keyset cursor to the greatest (updated_at, id) received.
+        page_max: tuple[str, str] | None = None
+        for rec in records:
+            try:
+                pair = (_canon_ts(rec["updated_at"]), str(rec["id"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if page_max is None or pair > page_max:
+                page_max = pair
+        if page_max is None or page_max <= (since, since_id):
+            # No usable cursor progress — stop rather than spin on this page.
+            break
+        since, since_id = page_max
 
-    log.debug("Pulled %d records from %s, upserted %d", len(records), url, upserted)
-    return upserted
+        db.execute("""
+            INSERT INTO sync_log (remote_id, last_pull, last_pull_id)
+            VALUES (?, ?, ?)
+            ON CONFLICT (remote_id) DO UPDATE SET
+                last_pull = excluded.last_pull,
+                last_pull_id = excluded.last_pull_id
+        """, (remote_id, since, since_id))
+        db.commit()
+
+        log.debug(
+            "Pulled %d records from %s, upserted %d (failed %d)",
+            len(records), url, result.applied, result.failed,
+        )
+
+        if len(records) < PULL_PAGE_SIZE:
+            break
+
+    return total
 
 
 # ---------------------------------------------------------------------------
-# Upsert
+# Upsert (full-column, per-record isolation — SY-03)
 # ---------------------------------------------------------------------------
 
-def _upsert_records(db: sqlite3.Connection, records: list[dict[str, Any]]) -> int:
-    """Upsert a list of memory records with last-write-wins conflict resolution.
+_REQUIRED_KEYS = ("id", "content", "created_at", "updated_at")
 
-    Skips inserting to the outbox — these are incoming remote records,
-    not local writes. We temporarily disable the outbox triggers by checking
-    a flag... actually we use a cleaner approach: direct insert bypassing
-    triggers is not possible in SQLite, so instead we mark these as
-    already-sent in the outbox immediately after insert.
+
+@dataclass
+class UpsertResult:
+    """Outcome of applying a batch of remote records.
+
+    Attributes:
+        applied: Records actually written (new or LWW winners).
+        failed: Malformed records that were skipped.
+        processed_ids: Ids handled successfully — applied OR skipped as
+            LWW-stale. These are safe for the sender to mark as sent.
     """
-    upserted = 0
+
+    applied: int = 0
+    failed: int = 0
+    processed_ids: list[str] = field(default_factory=list)
+
+
+def _coerce_json_field(value: Any, default: Any) -> str:
+    """Return a JSON string for a tags/metadata field of unknown shape."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            value = default
+    if value is None:
+        value = default
+    return json.dumps(value)
+
+
+def _upsert_one(db: sqlite3.Connection, rec: dict[str, Any]) -> int | None:
+    """Validate and upsert a single remote record (LWW on updated_at).
+
+    Writes every schema column, defaulting fields absent from records sent by
+    older nodes. Returns the memory rowid when the record was applied, or
+    None when it lost last-write-wins. Raises on malformed input (caller
+    isolates the failure).
+    """
+    if not isinstance(rec, dict):
+        raise ValueError(f"record is not an object: {type(rec).__name__}")
+    missing = [k for k in _REQUIRED_KEYS if not rec.get(k)]
+    if missing:
+        raise ValueError(f"record missing required keys: {missing}")
+
+    created_at = _canon_ts(rec["created_at"])
+    updated_at = _canon_ts(rec["updated_at"])
+    try:
+        accessed_at = _canon_ts(rec.get("accessed_at"))
+    except ValueError:
+        accessed_at = created_at
+
+    # Snapshot the outbox high-water mark so we can suppress exactly the echo
+    # rows created by this upsert's triggers (SY-05).
+    outbox_max = db.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM sync_outbox"
+    ).fetchone()[0]
+
+    result = db.execute("""
+        INSERT INTO memories
+            (id, content, category, tags, source, metadata,
+             created_at, updated_at, capture_id, node_id, client,
+             accessed_at, access_count, decay_rate, vitality, base_weight,
+             status, memory_type, source_capture_id,
+             subject, predicate, object, superseded_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            content           = excluded.content,
+            category          = excluded.category,
+            tags              = excluded.tags,
+            source            = excluded.source,
+            metadata          = excluded.metadata,
+            updated_at        = excluded.updated_at,
+            capture_id        = excluded.capture_id,
+            node_id           = excluded.node_id,
+            client            = excluded.client,
+            accessed_at       = excluded.accessed_at,
+            access_count      = excluded.access_count,
+            decay_rate        = excluded.decay_rate,
+            vitality          = excluded.vitality,
+            base_weight       = excluded.base_weight,
+            status            = excluded.status,
+            memory_type       = excluded.memory_type,
+            source_capture_id = excluded.source_capture_id,
+            subject           = excluded.subject,
+            predicate         = excluded.predicate,
+            object            = excluded.object,
+            superseded_by     = excluded.superseded_by
+        WHERE excluded.updated_at > memories.updated_at
+        RETURNING rowid
+    """, (
+        str(rec["id"]),
+        str(rec["content"]),
+        rec.get("category") or "general",
+        _coerce_json_field(rec.get("tags"), []),
+        rec.get("source") or "manual",
+        _coerce_json_field(rec.get("metadata"), {}),
+        created_at,
+        updated_at,
+        rec.get("capture_id"),
+        rec.get("node_id"),
+        rec.get("client") or "unknown",
+        accessed_at,
+        int(rec.get("access_count") or 0),
+        float(rec.get("decay_rate") or 0.1),
+        float(rec.get("vitality") or 1.0),
+        float(rec.get("base_weight") or 1.0),
+        rec.get("status") or "active",
+        rec.get("memory_type") or "unclassified",
+        rec.get("source_capture_id"),
+        rec.get("subject"),
+        rec.get("predicate"),
+        rec.get("object"),
+        rec.get("superseded_by"),
+    ))
+
+    applied = result.fetchone()
+    if applied is None:
+        return None
+
+    # Suppress only the echo rows this upsert's triggers just created —
+    # pending rows from concurrent local edits keep their place in the
+    # outbox (SY-05).
+    db.execute("""
+        UPDATE sync_outbox SET sent_at = ?
+        WHERE memory_id = ? AND id > ? AND sent_at = ''
+    """, (_now_iso(), str(rec["id"]), outbox_max))
+    return int(applied[0])
+
+
+def _upsert_records(db: sqlite3.Connection, records: list[dict[str, Any]]) -> UpsertResult:
+    """Upsert remote records with last-write-wins conflict resolution.
+
+    Each record is applied independently: a malformed record is rolled back,
+    logged, and counted as failed without poisoning the rest of the batch.
+    Applied records are embedded for semantic search after commit (SY-06) —
+    best-effort, silently skipped when no embedder is available.
+
+    Args:
+        db: An open SQLite connection.
+        records: Wire-format memory records from a hub or peer.
+
+    Returns:
+        An :class:`UpsertResult` with applied/failed counts and the ids that
+        were processed successfully.
+    """
+    result = UpsertResult()
+    embed_rows: list[tuple[int, str]] = []
+
     for rec in records:
-        # Tags come in as a JSON string from SQLite peers or a list from Postgres hub
-        tags = rec.get("tags", [])
-        if isinstance(tags, str):
-            try:
-                tags = json.loads(tags)
-            except json.JSONDecodeError:
-                tags = []
+        try:
+            rowid = _upsert_one(db, rec)
+            # Commit per record: a later malformed record's rollback must not
+            # discard work already applied for earlier records.
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            result.failed += 1
+            log.warning("Skipping malformed sync record: %s", e)
+            continue
+        result.processed_ids.append(str(rec["id"]))
+        if rowid is not None:
+            result.applied += 1
+            embed_rows.append((rowid, str(rec.get("content") or "")))
 
-        metadata = rec.get("metadata", {})
-        if isinstance(metadata, str):
-            try:
-                metadata = json.loads(metadata)
-            except json.JSONDecodeError:
-                metadata = {}
+    if embed_rows:
+        try:
+            _embed_and_store_rows(embed_rows)
+        except Exception as e:
+            log.debug("Embedding pulled records failed (non-fatal): %s", e)
 
-        result = db.execute("""
-            INSERT INTO memories
-                (id, content, category, tags, source, metadata,
-                 created_at, updated_at, capture_id, node_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                content    = excluded.content,
-                category   = excluded.category,
-                tags       = excluded.tags,
-                metadata   = excluded.metadata,
-                updated_at = excluded.updated_at,
-                capture_id = excluded.capture_id,
-                node_id    = excluded.node_id
-            WHERE excluded.updated_at > memories.updated_at
-            RETURNING id
-        """, (
-            rec["id"],
-            rec["content"],
-            rec.get("category", "general"),
-            json.dumps(tags),
-            rec.get("source", "manual"),
-            json.dumps(metadata),
-            rec["created_at"],
-            rec["updated_at"],
-            rec.get("capture_id"),
-            rec.get("node_id"),
-        ))
+    return result
 
-        if result.fetchone():
-            upserted += 1
-            # Mark the outbox entry for this record as already sent
-            # so we don't echo it back to the remote we just got it from
-            db.execute("""
-                UPDATE sync_outbox SET sent_at = ?
-                WHERE memory_id = ? AND sent_at = ''
-            """, (_now_iso(), rec["id"]))
 
+# ---------------------------------------------------------------------------
+# Outbox pruning (SY-07)
+# ---------------------------------------------------------------------------
+
+
+def _prune_outbox(db: sqlite3.Connection) -> int:
+    """Prune echo-suppressed rows and rows past the retention window.
+
+    Echo-suppressed rows (``sent_at != ''``) are never pushed, so they are
+    removed immediately. Remaining rows are kept for OUTBOX_RETENTION_DAYS so
+    intermittently-reachable remotes can still catch up, then dropped along
+    with their per-remote send markers.
+
+    Returns:
+        The number of outbox rows removed.
+    """
+    cutoff = (
+        datetime.now(UTC) - timedelta(days=config.OUTBOX_RETENTION_DAYS)
+    ).isoformat()
+    removed = db.execute(
+        "DELETE FROM sync_outbox WHERE sent_at != '' OR created_at < ?", (cutoff,)
+    ).rowcount
+    db.execute(
+        "DELETE FROM sync_sends WHERE outbox_id NOT IN (SELECT id FROM sync_outbox)"
+    )
     db.commit()
-    return upserted
+    if removed:
+        log.debug("Pruned %d outbox rows", removed)
+    return removed
 
 
 # ---------------------------------------------------------------------------
 # Peer discovery
 # ---------------------------------------------------------------------------
 
+
+def _tailscale_socket() -> str:
+    """Resolve the tailscaled local API socket path (config override first)."""
+    if config.TAILSCALE_SOCKET:
+        return config.TAILSCALE_SOCKET
+    if sys.platform == "darwin":
+        return "/var/run/tailscaled.socket"
+    return "/var/run/tailscale/tailscaled.sock"
+
+
 async def _discover_peers() -> list[dict[str, str]]:
-    """Discover other remind_me peers via Tailscale local API.
+    """Discover other remind_me peers.
 
-    Queries the Tailscale local API for all online peers, then probes
-    each one on PEER_PORT to see if they're running remind_me.
+    Static peers from config.STATIC_PEERS are always included (entries must
+    be objects with string 'node_id' and 'url' keys). The Tailscale local API
+    is then queried for online peers, each assumed reachable on PEER_PORT.
 
-    Returns a list of dicts with 'node_id' and 'url' keys.
+    Returns:
+        A list of dicts with 'node_id' and 'url' keys, deduplicated by URL.
     """
-    peers = []
+    peers: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+
+    for entry in config.STATIC_PEERS:
+        if (
+            isinstance(entry, dict)
+            and isinstance(entry.get("node_id"), str)
+            and isinstance(entry.get("url"), str)
+        ):
+            url = entry["url"].rstrip("/")
+            if url not in seen_urls:
+                seen_urls.add(url)
+                peers.append({"node_id": entry["node_id"], "url": url})
+        else:
+            log.warning("Ignoring malformed STATIC_PEERS entry: %r", entry)
+
     try:
         # Tailscale local API — available on all Tailscale nodes
         async with httpx.AsyncClient(
-            transport=httpx.AsyncHTTPTransport(uds="/var/run/tailscale/tailscaled.sock")
+            transport=httpx.AsyncHTTPTransport(uds=_tailscale_socket())
         ) as ts_client:
             resp = await ts_client.get("http://local-tailscaled.sock/localapi/v0/status")
             status = resp.json()
@@ -241,7 +526,9 @@ async def _discover_peers() -> list[dict[str, str]]:
                 continue
             ip = addrs[0]
             url = f"http://{ip}:{PEER_PORT}"
-            peers.append({"node_id": peer.get("HostName", name), "url": url})
+            if url not in seen_urls:
+                seen_urls.add(url)
+                peers.append({"node_id": peer.get("HostName", name), "url": url})
 
     except Exception as e:
         log.debug("Tailscale peer discovery failed: %s", e)
@@ -267,13 +554,13 @@ async def _probe_peer(client: httpx.AsyncClient, peer: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 async def _sync_once() -> None:
-    """Run one full sync cycle: hub push/pull, then peer push/pull."""
+    """Run one full sync cycle: hub push/pull, peer push/pull, outbox prune."""
     async with httpx.AsyncClient() as client:
 
         # --- Hub sync ---
         if HUB_URL:
             try:
-                await _push_outbox(client, HUB_URL)
+                await _push_outbox(client, HUB_URL, "hub")
                 await _pull_remote(client, HUB_URL, "hub")
                 log.info("Hub sync complete")
             except httpx.ConnectError:
@@ -291,13 +578,18 @@ async def _sync_once() -> None:
             if not await _probe_peer(client, peer):
                 continue
             try:
-                await _push_outbox(client, peer["url"])
+                await _push_outbox(client, peer["url"], peer["node_id"])
                 await _pull_remote(client, peer["url"], peer["node_id"])
                 log.info("Peer sync complete: %s", peer["node_id"])
             except httpx.ConnectError:
                 log.debug("Peer %s unreachable", peer["node_id"])
             except Exception as e:
                 log.warning("Peer sync error (%s): %s", peer["node_id"], e)
+
+    try:
+        _prune_outbox(_get_db())
+    except Exception as e:
+        log.warning("Outbox prune failed: %s", e)
 
 
 async def sync_loop() -> None:
@@ -336,7 +628,6 @@ def start_sync_thread() -> threading.Thread:
         log.info("Sync thread starting")
         while True:
             try:
-                import asyncio
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 try:
