@@ -66,7 +66,7 @@ check_untyped_defs = true
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = "remind_me_mcp.tools"
+module = ["remind_me_mcp.tools", "remind_me_mcp.tools.*"]
 # FastMCP's @mcp.tool(annotations=...) accepts plain dicts at runtime but the
 # stubs declare ToolAnnotations | None — every tool registration (22 sites)
 # would need an inline ignore otherwise.
