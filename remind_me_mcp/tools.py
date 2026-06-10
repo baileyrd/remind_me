@@ -460,7 +460,11 @@ async def memory_search(params: MemorySearchInput) -> str:
             log.warning("FTS5 query syntax error for query %r: %s", params.query, raw_err)
 
     # --- Semantic vector search (optionally HyDE-expanded) ---
-    extra_texts = await asyncio.to_thread(expand_query, params.query)
+    # HyDE output is only consumed by the semantic tier — skip the (slow)
+    # generation entirely when no embedder is available (DI-08).
+    extra_texts: list[str] = []
+    if _get_embedder() is not None:
+        extra_texts = await asyncio.to_thread(expand_query, params.query)
     sem_memories = await asyncio.to_thread(
         _semantic_search,
         params.query,

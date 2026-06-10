@@ -12,9 +12,17 @@ from __future__ import annotations
 import json
 
 import numpy as np
+import pytest
 
 import remind_me_mcp.query_expansion as qe
 from remind_me_mcp.db import _embed_and_store, _fuse_query_embedding, _semantic_search
+
+
+@pytest.fixture(autouse=True)
+def _isolated_expansion_cache(monkeypatch):
+    """Give every test a fresh expansion cache (module-level state, DI-08)."""
+    monkeypatch.setattr(qe, "_EXPANSION_CACHE", {})
+
 
 # ---------------------------------------------------------------------------
 # expand_query / hyde_passage
@@ -69,6 +77,60 @@ def test_expand_query_failure_falls_back_to_plain(monkeypatch):
     monkeypatch.setattr(qe, "EXPANSION_MODE", "hyde")
     monkeypatch.setattr(qe, "hyde_passage", lambda q: None)
     assert qe.expand_query("anything") == []
+
+
+# ---------------------------------------------------------------------------
+# expansion cache (DI-08)
+# ---------------------------------------------------------------------------
+
+
+def test_expand_query_caches_identical_queries(monkeypatch):
+    """A repeated query reuses the cached passage instead of regenerating."""
+    monkeypatch.setattr(qe, "EXPANSION_MODE", "hyde")
+    monkeypatch.setattr(qe, "_EXPANSION_CACHE", {})
+    calls: list[str] = []
+
+    def fake_passage(q: str) -> str:
+        calls.append(q)
+        return "a generated passage"
+
+    monkeypatch.setattr(qe, "hyde_passage", fake_passage)
+
+    assert qe.expand_query("same question?") == ["a generated passage"]
+    assert qe.expand_query("same question?") == ["a generated passage"]
+    assert len(calls) == 1
+
+
+def test_expand_query_does_not_cache_failures(monkeypatch):
+    """A failed generation is retried next time (the daemon may come back)."""
+    monkeypatch.setattr(qe, "EXPANSION_MODE", "hyde")
+    monkeypatch.setattr(qe, "_EXPANSION_CACHE", {})
+    calls: list[str] = []
+
+    def failing_passage(q: str) -> None:
+        calls.append(q)
+        return None
+
+    monkeypatch.setattr(qe, "hyde_passage", failing_passage)
+
+    assert qe.expand_query("flaky") == []
+    assert qe.expand_query("flaky") == []
+    assert len(calls) == 2
+
+
+def test_expand_query_cache_is_bounded(monkeypatch):
+    """The cache evicts its oldest entry once the size cap is reached."""
+    monkeypatch.setattr(qe, "EXPANSION_MODE", "hyde")
+    monkeypatch.setattr(qe, "_EXPANSION_CACHE", {})
+    monkeypatch.setattr(qe, "_EXPANSION_CACHE_MAX", 2)
+    monkeypatch.setattr(qe, "hyde_passage", lambda q: f"passage for {q}")
+
+    qe.expand_query("q1")
+    qe.expand_query("q2")
+    qe.expand_query("q3")
+
+    assert len(qe._EXPANSION_CACHE) == 2
+    assert "q1" not in qe._EXPANSION_CACHE
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +207,7 @@ def test_semantic_search_without_extras_unchanged(db_conn_with_vec, mock_embedde
 
 async def test_memory_search_passes_expansion(monkeypatch, db_conn, memory_factory):
     """memory_search feeds expand_query output into the semantic tier."""
+    import remind_me_mcp.embeddings as emb_mod
     import remind_me_mcp.tools as tools_mod
     from remind_me_mcp.models import MemorySearchInput, ResponseFormat
 
@@ -156,6 +219,8 @@ async def test_memory_search_passes_expansion(monkeypatch, db_conn, memory_facto
         seen["extra_texts"] = extra_texts
         return []
 
+    # Expansion only runs when an embedder is available (DI-08).
+    monkeypatch.setattr(emb_mod, "_get_embedder", lambda: object())
     monkeypatch.setattr(tools_mod, "expand_query", lambda q: ["hypothetical passage"])
     monkeypatch.setattr(tools_mod, "_semantic_search", fake_semantic)
     monkeypatch.setattr(tools_mod, "record_access", lambda *_a, **_k: None)
@@ -165,3 +230,34 @@ async def test_memory_search_passes_expansion(monkeypatch, db_conn, memory_facto
     )
     json.loads(raw)  # response stays well-formed
     assert seen["extra_texts"] == ["hypothetical passage"]
+
+
+async def test_memory_search_skips_expansion_without_embedder(
+    monkeypatch, db_conn, memory_factory
+):
+    """expand_query (a slow LLM generation) never runs when the semantic tier
+    can't consume its output (DI-08)."""
+    import remind_me_mcp.db as db_mod
+    import remind_me_mcp.embeddings as emb_mod
+    import remind_me_mcp.tools as tools_mod
+    from remind_me_mcp.models import MemorySearchInput, ResponseFormat
+
+    memory_factory(content="expansion gate test memory")
+
+    monkeypatch.setattr(emb_mod, "_get_embedder", lambda: None)
+    monkeypatch.setattr(db_mod, "_get_embedder", lambda: None)
+
+    calls: list[str] = []
+
+    def spy_expand(q: str) -> list[str]:
+        calls.append(q)
+        return []
+
+    monkeypatch.setattr(tools_mod, "expand_query", spy_expand)
+    monkeypatch.setattr(tools_mod, "record_access", lambda *_a, **_k: None)
+
+    raw = await tools_mod.memory_search(
+        MemorySearchInput(query="expansion gate test", response_format=ResponseFormat.JSON)
+    )
+    json.loads(raw)
+    assert calls == []
