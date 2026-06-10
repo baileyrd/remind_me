@@ -152,6 +152,21 @@ Then open **http://localhost:5199** in your browser.
 
 > The `--serve-ui` mode runs the HTTP dashboard server. Without it, the server runs in stdio mode for Claude Code / Claude Desktop. They are separate modes — run one instance for MCP and optionally another for the UI.
 
+### Authentication
+
+The `/api/*` routes require a bearer token by default. On first run a key is
+auto-generated and stored at `~/.remind-me/api_key` (mode 0600); the dashboard
+page prompts for it once and remembers it in the browser. For direct API use:
+
+```bash
+curl -H "Authorization: Bearer $(cat ~/.remind-me/api_key)" http://localhost:5199/api/stats
+```
+
+Set `REMIND_ME_API_KEY` to use your own token, or `REMIND_ME_API_KEY=disabled`
+to run an open localhost API (not recommended). Mutating requests must send
+`Content-Type: application/json` (cross-origin form posts are rejected with 415).
+`GET /health` is an unauthenticated liveness probe.
+
 ### What It Does
 
 - **Browse & search** — full-text search with `⌘K` shortcut, category sidebar with counts, clickable tag filters
@@ -497,8 +512,9 @@ The search tool uses SQLite FTS5. Examples:
 | `REMIND_ME_EMBEDDING_DIM` | `384` | Embedding dimension — must match the model (nomic-embed-text=768, bge-m3=1024). Changing it requires recreating the vector table + `remind_me_reindex` |
 | `REMIND_ME_OLLAMA_URL` | `http://localhost:11434` | Ollama daemon URL (when backend is `ollama`) |
 | `REMIND_ME_OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Ollama embedding model name |
-| `REMIND_ME_API_KEY` | *(unset)* | Bearer token for `/api/*` routes (auth disabled when unset) |
-| `REMIND_ME_IMPORT_ROOTS` | `$HOME` | Colon-separated allowed filesystem roots for import operations |
+| `REMIND_ME_API_KEY` | *(auto-generated)* | Bearer token for `/api/*` routes. When unset, a key is generated on first run and stored at `~/.remind-me/api_key` (0600) — check the server log or that file for the value. Set to `disabled` to explicitly turn dashboard auth off |
+| `REMIND_ME_IMPORT_ROOTS` | `$HOME` | Colon-separated allowed filesystem roots for import operations (enforced by both the HTTP API and the MCP import tools) |
+| `REMIND_ME_AUTO_UPDATE_CHECK` | `true` | Set to `false` to skip the background `git fetch` update check at server startup (the manual check/update tools keep working) |
 | `REMIND_ME_RRF_K` | `60` | Smoothing constant for Reciprocal Rank Fusion scoring |
 | `REMIND_ME_RRF_W_KEYWORD` | `1.0` | RRF weight for the keyword (FTS5) signal |
 | `REMIND_ME_RRF_W_SEMANTIC` | `1.0` | RRF weight for the semantic (vector) signal |
