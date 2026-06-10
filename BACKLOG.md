@@ -60,8 +60,8 @@ correctness), **SY** (sync hardening), **SE** (security & server lifecycle),
 | PF-05 | med | done | `db.rollback()` on failure paths in `_embed_and_store_rows` | §4 |
 | PF-06 | low | done | `asyncio.to_thread` for DB work in API handlers | §4 |
 | HY-01 | med | done | Remove root `remind_me_dashboard.jsx` duplicate, `remind_me_spec.docx`; untrack `.planning/` | §7 |
-| HY-02 | med | todo | Split `tools.py` into `tools/` package (search/crud/capture/lifecycle/admin); dedupe structured-path envelope logic | §7 |
+| HY-02 | med | done | Split `tools.py` into `tools/` package (search/crud/capture/lifecycle/admin); dedupe structured-path envelope logic | §7 |
 | HY-03 | med | done | Generate outbox triggers from a single column list in `db.py` | §7 |
-| HY-04 | low | todo | Pin/vendor dashboard CDN assets (SRI at minimum) | §7 |
+| HY-04 | low | done | Pin/vendor dashboard CDN assets (SRI at minimum) | §7 |
 | HY-05 | low | done | Strip internal `_rrf_score`/`_keyword_rank` fields from JSON responses (or move under `debug_signals`) | §5 |
 | HY-06 | low | done | Misc robustness: 400 on bad query params, guarded env parsing, no import-time `basicConfig`, longer memory IDs, empty-chunk guard in importer | §5, §7 |
