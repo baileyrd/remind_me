@@ -366,7 +366,54 @@ async def remind_me_server_status() -> str:
     else:
         lines.append("\n**Semantic search:** ✗ Unavailable (install onnxruntime, tokenizers, huggingface-hub, numpy, sqlite-vec)")
 
+    # Folder watcher (FT-03)
+    from remind_me_mcp.watcher import get_watch_status
+
+    watch = get_watch_status()
+    if watch["enabled"]:
+        state = "✓ Running" if watch["running"] else "✗ Not running"
+        lines.append(
+            f"\n**Folder watcher:** {state} — {len(watch['watch_dirs'])} dir(s), "
+            f"every {watch['interval_seconds']}s, "
+            f"{watch['files_ingested']} ingested / {watch['files_skipped']} skipped"
+        )
+        lines.append("_Details: `remind_me_watch_status`_")
+    else:
+        lines.append(
+            "\n**Folder watcher:** ✗ Disabled (set REMIND_ME_WATCH_DIRS to "
+            "auto-ingest a notes/docs folder)"
+        )
+
     return "\n".join(lines)
+
+
+@mcp.tool(
+    name="remind_me_watch_status",
+    annotations={
+        "title": "Folder Watcher Status",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def remind_me_watch_status() -> str:
+    """Report the folder watcher's state (FT-03): watched dirs, scan counters, recent errors.
+
+    The watcher polls the directories in REMIND_ME_WATCH_DIRS every
+    REMIND_ME_WATCH_INTERVAL seconds and auto-ingests new or changed
+    notes/docs files through the import pipeline (hash dedup applies; a
+    changed file imports fresh and its previous import's memories are
+    marked superseded).
+
+    Returns:
+        str: JSON status — enabled/running flags, watched dirs, scan
+        interval, last scan time, ingest/skip/supersede counters, and
+        recent errors. When disabled, includes a configuration hint.
+    """
+    from remind_me_mcp.watcher import get_watch_status
+
+    return json.dumps(get_watch_status(), indent=2)
 
 
 # ---------------------------------------------------------------------------

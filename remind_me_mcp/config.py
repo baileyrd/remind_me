@@ -210,6 +210,29 @@ def is_in_export_roots(path: Path) -> bool:
     return any(path == root or root in path.parents for root in EXPORT_ROOTS)
 
 # ---------------------------------------------------------------------------
+# Folder watcher (FT-03)
+# ---------------------------------------------------------------------------
+
+_watch_dirs_env: str | None = os.environ.get("REMIND_ME_WATCH_DIRS")
+WATCH_DIRS: list[Path] = (
+    [Path(r.strip()).expanduser().resolve() for r in _watch_dirs_env.split(":") if r.strip()]
+    if _watch_dirs_env
+    else []
+)
+"""Directories polled by the folder watcher (FT-03). Colon-separated paths.
+Default: empty — the watcher is disabled. Every directory must lie inside
+IMPORT_ROOTS (the SE-02 containment rule shared with the import tools);
+non-contained entries are rejected at startup."""
+
+WATCH_INTERVAL = _env_int("REMIND_ME_WATCH_INTERVAL", 60)
+"""Seconds between folder watcher scan passes."""
+
+WATCH_GRACE = _env_int("REMIND_ME_WATCH_GRACE", 5)
+"""Debounce grace period in seconds. A file whose mtime is younger than this
+is deferred until a later scan observes the same (mtime, size) signature, so
+partially-written files are never ingested mid-write."""
+
+# ---------------------------------------------------------------------------
 # Updates
 # ---------------------------------------------------------------------------
 
@@ -252,6 +275,9 @@ __all__ = [
     "is_in_import_roots",
     "EXPORT_ROOTS",
     "is_in_export_roots",
+    "WATCH_DIRS",
+    "WATCH_INTERVAL",
+    "WATCH_GRACE",
     "AUTO_UPDATE_CHECK",
 ]
 

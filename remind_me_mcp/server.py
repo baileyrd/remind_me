@@ -55,9 +55,17 @@ async def app_lifespan(app: FastMCP):
         start_sync_thread()
         log.info("Sync started")
 
+    # FT-03: folder watcher — start_watcher() is a no-op unless
+    # REMIND_ME_WATCH_DIRS is configured with at least one valid directory.
+    from remind_me_mcp.watcher import start_watcher, stop_watcher
+    start_watcher()
+
     try:
         yield {"db": db}
     finally:
+        # FT-03/SE-07: stop the watcher thread *before* closing the database
+        # connections so an in-flight scan never writes to a closed handle.
+        stop_watcher()
         # SE-07: always close every tracked connection, even when the body
         # raised — otherwise file descriptors leak and the WAL is never
         # checkpointed. NOTE: sync/peer threads are daemon threads with no
