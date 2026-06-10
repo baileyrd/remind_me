@@ -415,6 +415,232 @@ def test_api_import_directory(client: TestClient, db_conn, tmp_path: Path) -> No
     assert data["total_memories_created"] >= 1
 
 
+def test_api_import_document_markdown(client: TestClient, db_conn, tmp_path: Path) -> None:
+    """POST /api/import auto-detects a notes markdown file as a document (FT-02).
+
+    Each heading section becomes its own memory with the heading recorded in
+    metadata and source set to 'document_import' — parity with the MCP tool.
+    """
+    import json
+
+    notes = tmp_path / "notes.md"
+    notes.write_text("# Garden\n\n## Tomatoes\nNeed full sun and weekly feeding.\n")
+
+    response = client.post("/api/import", json={"file_path": str(notes)})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    assert data["kind"] == "document"
+    assert data["memories_created"] == 1
+
+    row = db_conn.execute("SELECT source, metadata FROM memories").fetchone()
+    assert row["source"] == "document_import"
+    assert json.loads(row["metadata"])["section"] == "Garden > Tomatoes"
+
+
+def test_api_import_explicit_kind_forwarded(client: TestClient, db_conn, tmp_path: Path) -> None:
+    """POST /api/import forwards an explicit kind to the importer (FT-02)."""
+    chatish = tmp_path / "chatish.md"
+    chatish.write_text("## Assistant\nThis looks like a chat export.\n")
+
+    response = client.post(
+        "/api/import", json={"file_path": str(chatish), "kind": "document"}
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    assert data["kind"] == "document"
+
+
+def test_api_import_invalid_kind(client: TestClient, tmp_path: Path) -> None:
+    """POST /api/import with an unknown kind returns 400 (FT-02)."""
+    notes = tmp_path / "notes.md"
+    notes.write_text("Some notes.")
+
+    response = client.post(
+        "/api/import", json={"file_path": str(notes), "kind": "banana"}
+    )
+    assert response.status_code == 400
+    assert "invalid kind" in response.json()["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# GET /api/export (FT-01)
+# ---------------------------------------------------------------------------
+
+
+def test_api_export_empty(client: TestClient) -> None:
+    """GET /api/export on an empty store returns an empty JSON array."""
+    response = client.get("/api/export")
+    assert response.status_code == 200
+    assert "application/json" in response.headers["content-type"]
+    assert response.json() == []
+
+
+def test_api_export_json_inline(client: TestClient, memory_factory) -> None:
+    """GET /api/export returns full records including lifecycle columns."""
+    memory_factory(content="Export endpoint memory", category="work", tags=["x"])
+    response = client.get("/api/export")
+    assert response.status_code == 200
+    records = response.json()
+    assert len(records) == 1
+    rec = records[0]
+    assert rec["content"] == "Export endpoint memory"
+    assert rec["category"] == "work"
+    assert rec["tags"] == ["x"]
+    assert rec["role"] == "assistant"
+    assert "id" in rec
+    assert "created_at" in rec
+    assert "superseded_by" in rec
+
+
+def test_api_export_jsonl(client: TestClient, memory_factory) -> None:
+    """GET /api/export?format=jsonl streams one record per line as NDJSON."""
+    import json as _json
+
+    memory_factory(content="JSONL export one")
+    memory_factory(content="JSONL export two")
+    response = client.get("/api/export?format=jsonl")
+    assert response.status_code == 200
+    assert "application/x-ndjson" in response.headers["content-type"]
+    lines = [line for line in response.text.splitlines() if line.strip()]
+    assert len(lines) == 2
+    assert {_json.loads(line)["content"] for line in lines} == {
+        "JSONL export one",
+        "JSONL export two",
+    }
+
+
+def test_api_export_invalid_format(client: TestClient) -> None:
+    """GET /api/export?format=xml is rejected with 400."""
+    response = client.get("/api/export?format=xml")
+    assert response.status_code == 400
+    assert "format" in response.json()["error"].lower()
+
+
+def test_api_export_category_and_tag_filters(client: TestClient, memory_factory) -> None:
+    """Category and tag filters narrow the export."""
+    memory_factory(content="Keep me", category="keep", tags=["a", "b"])
+    memory_factory(content="Wrong category", category="drop", tags=["a", "b"])
+    memory_factory(content="Missing tag", category="keep", tags=["a"])
+
+    response = client.get("/api/export?category=keep&tags=a,b")
+    assert response.status_code == 200
+    records = response.json()
+    assert [r["content"] for r in records] == ["Keep me"]
+
+
+def test_api_export_to_file(client: TestClient, memory_factory, tmp_path: Path) -> None:
+    """GET /api/export?file_path=... writes the file and returns a summary."""
+    memory_factory(content="File endpoint export memory")
+    dest = tmp_path / "api_backup.json"
+    response = client.get(f"/api/export?file_path={dest}")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    assert data["exported"] == 1
+    assert dest.exists()
+
+
+def test_api_export_rejects_path_outside_roots(client: TestClient) -> None:
+    """FT-01 mirrors SE-02: export destinations outside EXPORT_ROOTS are 400."""
+    response = client.get("/api/export?file_path=/etc/exfiltrated.json")
+    assert response.status_code == 400
+    assert "not in allowed export roots" in response.json()["error"].lower()
+
+
+def test_api_export_rejects_missing_parent(client: TestClient, tmp_path: Path) -> None:
+    """A destination in a nonexistent directory is rejected with 400."""
+    dest = tmp_path / "missing" / "backup.json"
+    response = client.get(f"/api/export?file_path={dest}")
+    assert response.status_code == 400
+    assert "parent directory" in response.json()["error"].lower()
+
+
+def test_api_export_requires_auth(client_with_auth: TestClient) -> None:
+    """SEC-03: /api/export is gated by bearer auth like every /api/* route."""
+    assert client_with_auth.get("/api/export").status_code == 401
+    r = client_with_auth.get(
+        "/api/export", headers={"Authorization": "Bearer test-secret-key"}
+    )
+    assert r.status_code == 200
+
+
+def test_api_export_import_round_trip(client: TestClient, memory_factory, tmp_path: Path) -> None:
+    """End-to-end: GET /api/export -> save -> POST /api/import re-creates content."""
+    memory_factory(content="HTTP round trip memory")
+    export_text = client.get("/api/export").text
+    backup = tmp_path / "http_round_trip.json"
+    backup.write_text(export_text)
+
+    response = client.post("/api/import", json={"file_path": str(backup)})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    assert data["memories_created"] == 1
+
+
+def _seed_api_graph(db_conn, memory_factory) -> dict:
+    """One memory linked to one entity (FT-06 API tests)."""
+    from remind_me_mcp.db import _link_memory_entity, _upsert_entity
+
+    mem = memory_factory(content="Graph endpoint memory")
+    eid = _upsert_entity(db_conn, "Bailey Robertson", kind="person", aliases=["Bailey"])
+    _link_memory_entity(db_conn, mem["id"], eid)
+    db_conn.commit()
+    return mem
+
+
+def test_api_export_includes_graph_by_default(client: TestClient, db_conn, memory_factory) -> None:
+    """FT-06: GET /api/export appends entity/memory_entity records by default."""
+    mem = _seed_api_graph(db_conn, memory_factory)
+    records = client.get("/api/export").json()
+    entities = [r for r in records if r.get("record_type") == "entity"]
+    links = [r for r in records if r.get("record_type") == "memory_entity"]
+    assert len(entities) == 1
+    assert entities[0]["name"] == "Bailey Robertson"
+    assert entities[0]["aliases"] == ["Bailey"]
+    assert len(links) == 1
+    assert links[0]["memory_id"] == mem["id"]
+    # Memory records are unchanged: first record, no record_type, role marker.
+    assert "record_type" not in records[0]
+    assert records[0]["role"] == "assistant"
+
+
+def test_api_export_include_graph_false(client: TestClient, db_conn, memory_factory) -> None:
+    """FT-06: include_graph=false produces a memories-only export."""
+    _seed_api_graph(db_conn, memory_factory)
+    records = client.get("/api/export?include_graph=false").json()
+    assert len(records) == 1
+    assert all("record_type" not in r for r in records)
+
+
+def test_api_export_import_graph_round_trip(
+    client: TestClient, db_conn, memory_factory, tmp_path: Path
+) -> None:
+    """End-to-end FT-06: export -> wipe graph -> POST /api/import restores it
+    (links re-attach because the memories kept their original ids)."""
+    mem = _seed_api_graph(db_conn, memory_factory)
+    backup = tmp_path / "http_graph_round_trip.json"
+    backup.write_text(client.get("/api/export").text)
+
+    db_conn.execute("DELETE FROM memory_entities")
+    db_conn.execute("DELETE FROM entities")
+    db_conn.commit()
+
+    response = client.post("/api/import", json={"file_path": str(backup)})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    assert data["entities_restored"] == 1
+    assert data["links_restored"] == 1
+    assert data["links_skipped_dangling"] == 0
+    row = db_conn.execute(
+        "SELECT entity_id FROM memory_entities WHERE memory_id = ?", (mem["id"],)
+    ).fetchone()
+    assert row is not None
+
+
 # ---------------------------------------------------------------------------
 # Full REST CRUD cycle
 # ---------------------------------------------------------------------------
@@ -1181,3 +1407,111 @@ def test_api_list_blank_limit_uses_default(client: TestClient, memory_factory) -
     response = client.get("/api/memories", params={"limit": ""})
     assert response.status_code == 200
     assert response.json()["total"] == 1
+
+
+# ---------------------------------------------------------------------------
+# FT-04 part 2: GET /api/entity and entity: search syntax parity
+# ---------------------------------------------------------------------------
+
+
+def _api_mention(db_conn, memory_id: str, name: str, kind=None, aliases=None) -> str:
+    """Upsert an entity, link it to *memory_id*, commit, return the entity id."""
+    from remind_me_mcp.db import _link_memory_entity, _upsert_entity
+
+    eid = _upsert_entity(db_conn, name, kind, aliases)
+    _link_memory_entity(db_conn, memory_id, eid)
+    db_conn.commit()
+    return eid
+
+
+def test_api_entity_lookup(client: TestClient, db_conn, memory_factory) -> None:
+    """GET /api/entity?name= returns the entity, its facts, and linked memories."""
+    mem = memory_factory(content="Tailscale config notes")
+    _api_mention(db_conn, mem["id"], "Tailscale", kind="tool", aliases=["ts"])
+    memory_factory(
+        content="remind_me syncs over Tailscale",
+        subject="remind_me", predicate="syncs over", object="Tailscale",
+    )
+
+    response = client.get("/api/entity", params={"name": "Tailscale"})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["entity"]["name"] == "Tailscale"
+    assert data["entity"]["kind"] == "tool"
+    assert data["entity"]["aliases"] == ["ts"]
+    assert [m["id"] for m in data["memories"]] == [mem["id"]]
+    assert data["total_linked_memories"] == 1
+    assert [f["content"] for f in data["facts"]] == ["remind_me syncs over Tailscale"]
+
+
+def test_api_entity_lookup_by_alias(client: TestClient, db_conn, memory_factory) -> None:
+    mem = memory_factory(content="Bailey's notes")
+    _api_mention(db_conn, mem["id"], "Bailey Robertson", aliases=["BR"])
+
+    response = client.get("/api/entity", params={"name": "br"})
+    assert response.status_code == 200
+    assert response.json()["entity"]["name"] == "Bailey Robertson"
+
+
+def test_api_entity_not_found(client: TestClient, db_conn) -> None:
+    response = client.get("/api/entity", params={"name": "Ghost"})
+    assert response.status_code == 404
+    assert "No entity found" in response.json()["error"]
+
+
+def test_api_entity_missing_name(client: TestClient, db_conn) -> None:
+    response = client.get("/api/entity")
+    assert response.status_code == 400
+    assert "name" in response.json()["error"]
+
+
+def test_api_entity_requires_auth(client_with_auth: TestClient) -> None:
+    """GET /api/entity sits under /api/ so bearer auth gates it (SE-05)."""
+    response = client_with_auth.get("/api/entity", params={"name": "x"})
+    assert response.status_code == 401
+
+
+def test_api_search_entity_only_lists_linked_memories(
+    client: TestClient, db_conn, memory_factory
+) -> None:
+    """q='entity:NAME' with no free text lists the entity's memories."""
+    linked = memory_factory(content="Tailscale handles the mesh")
+    memory_factory(content="unrelated memory")
+    stale = memory_factory(content="stale mention", superseded_by="newer")
+    eid = _api_mention(db_conn, linked["id"], "Tailscale")
+    _api_mention(db_conn, stale["id"], "Tailscale")
+    assert eid
+
+    response = client.get("/api/memories/search", params={"q": "entity:Tailscale"})
+    assert response.status_code == 200
+    data = response.json()
+    assert [m["id"] for m in data["memories"]] == [linked["id"]]
+
+
+def test_api_search_entity_with_free_text(
+    client: TestClient, db_conn, memory_factory
+) -> None:
+    """entity: filter composes with the FTS remainder."""
+    match = memory_factory(content="Tailscale mesh networking guide")
+    other = memory_factory(content="mesh networking with something else")
+    _api_mention(db_conn, match["id"], "Tailscale")
+
+    response = client.get(
+        "/api/memories/search", params={"q": 'entity:"Tailscale" mesh'}
+    )
+    assert response.status_code == 200
+    ids = [m["id"] for m in response.json()["memories"]]
+    assert ids == [match["id"]]
+    assert other["id"] not in ids
+
+
+def test_api_search_entity_unresolved_returns_empty_with_message(
+    client: TestClient, db_conn, memory_factory
+) -> None:
+    memory_factory(content="Ghost stories are fun")
+    response = client.get("/api/memories/search", params={"q": "entity:Ghost"})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 0
+    assert data["memories"] == []
+    assert "No entity found" in data["message"]

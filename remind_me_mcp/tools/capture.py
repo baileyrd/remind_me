@@ -1,5 +1,6 @@
 """
-remind_me_mcp.tools.capture — auto_capture / get_capture / decompose tool handlers.
+remind_me_mcp.tools.capture — auto_capture / get_capture / decompose /
+extract_batch / annotate tool handlers.
 
 Patchable shared state and cross-module helpers are looked up through the
 ``remind_me_mcp.tools`` package namespace (``_pkg.<name>``) at call time so
@@ -17,13 +18,40 @@ from remind_me_mcp.config import CLIENT, NODE_ID
 from remind_me_mcp.db import _make_id, _now_iso, _row_to_dict
 from remind_me_mcp.formatting import _fmt_memory_md
 from remind_me_mcp.models import (  # noqa: TC001  # FastMCP resolves these annotations at runtime for tool schemas
+    AnnotateInput,
     AutoCaptureInput,
     DecomposeBatchInput,
     DecomposeInput,
+    EntityInput,
+    ExtractBatchInput,
 )
 from remind_me_mcp.server import mcp
 from remind_me_mcp.tools._shared import log
 from remind_me_mcp.vitality import DECAY_RATES
+
+
+def _apply_entity_mentions(
+    db, memory_id: str, entities: list[EntityInput], now: str
+) -> int:
+    """Upsert entities and link them to *memory_id* (FT-04). Does not commit.
+
+    Args:
+        db: An open SQLite connection.
+        memory_id: The memory the entities are mentioned by.
+        entities: Validated entity inputs ({name, kind?, aliases?}).
+        now: Timestamp for created/updated rows.
+
+    Returns:
+        The number of NEW mention links created (existing links are ignored).
+    """
+    linked = 0
+    for ent in entities:
+        eid = _pkg._upsert_entity(
+            db, ent.name, ent.kind, ent.aliases, node_id=NODE_ID, now=now
+        )
+        if _pkg._link_memory_entity(db, memory_id, eid, now):
+            linked += 1
+    return linked
 
 
 @mcp.tool(
@@ -267,6 +295,7 @@ async def remind_me_decompose(params: DecomposeInput) -> str:
         parent_tags = raw_tags if raw_tags else []
 
     fact_ids: list[str] = []
+    entities_linked = 0
 
     for fact in params.facts:
         fact_id = _make_id(fact.content)
@@ -284,8 +313,9 @@ async def remind_me_decompose(params: DecomposeInput) -> str:
                 capture_id, source_capture_id,
                 created_at, updated_at, node_id, client,
                 memory_type, decay_rate, vitality, base_weight,
-                status, accessed_at, access_count
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                status, accessed_at, access_count,
+                subject, predicate, object
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 fact_id,
                 fact.content,
@@ -306,10 +336,16 @@ async def remind_me_decompose(params: DecomposeInput) -> str:
                 "active",
                 now,  # accessed_at
                 0,  # access_count
+                fact.subject,
+                fact.predicate,
+                fact.object,
             ),
         )
 
         fact_ids.append(fact_id)
+
+        # FT-04: upsert mentioned entities and link them to this fact.
+        entities_linked += _apply_entity_mentions(db, fact_id, fact.entities, now)
 
         # Fire-and-forget embed (reference held in _background_tasks, PF-04)
         _pkg._spawn_task(asyncio.to_thread(_pkg._embed_and_store, fact_id, fact.content))
@@ -321,6 +357,7 @@ async def remind_me_decompose(params: DecomposeInput) -> str:
         "fact_ids": fact_ids,
         "capture_id": params.capture_id,
         "parent_tags_inherited": parent_tags,
+        "entities_linked": entities_linked,
     }
     return json.dumps(result)
 
@@ -395,3 +432,153 @@ async def remind_me_decompose_batch(params: DecomposeBatchInput) -> str:
         "total_undecomposed": total_undecomposed,
     }
     return json.dumps(result, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Entity & relation extraction tools (FT-04)
+# ---------------------------------------------------------------------------
+
+# Memories eligible for entity/SPO annotation: not superseded, not raw
+# verbatim dialogs (annotate the summary/facts instead), and not yet
+# annotated — no SPO triple AND no entity mentions. A category='fact' row
+# that already has SPO is excluded by the subject/predicate/object check.
+_UNANNOTATED_WHERE = """
+    m.superseded_by IS NULL
+    AND m.category != 'dialog'
+    AND m.subject IS NULL AND m.predicate IS NULL AND m.object IS NULL
+    AND NOT EXISTS (
+        SELECT 1 FROM memory_entities me WHERE me.memory_id = m.id
+    )
+"""
+
+
+@mcp.tool(
+    name="remind_me_extract_batch",
+    annotations={
+        "title": "Get Memories Needing Entity Extraction",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def remind_me_extract_batch(params: ExtractBatchInput) -> str:
+    """Fetch a batch of memories that have no structured triple and no entity mentions yet.
+
+    Returns memories (facts, documents, summaries — anything except raw
+    dialogs and superseded rows) whose subject/predicate/object columns are
+    empty and that mention no entities. Claude can review each and call
+    remind_me_annotate with extracted {subject, predicate, object} triples
+    and {name, kind, aliases} entities to build the knowledge-graph layer.
+
+    Args:
+        params: Batch size (default 20, max 100).
+
+    Returns:
+        JSON string with a memories array and total_unannotated count.
+    """
+    db = _pkg._get_db()
+
+    total_row = db.execute(
+        f"SELECT COUNT(*) as cnt FROM memories m WHERE {_UNANNOTATED_WHERE}"
+    ).fetchone()
+
+    rows = db.execute(
+        f"""SELECT id, substr(content, 1, 500) as content_snippet,
+                   category, memory_type, tags
+            FROM memories m
+            WHERE {_UNANNOTATED_WHERE}
+            ORDER BY m.created_at DESC
+            LIMIT ?""",
+        (params.batch_size,),
+    ).fetchall()
+
+    memories = []
+    for row in rows:
+        tags = row["tags"]
+        if isinstance(tags, str):
+            try:
+                tags = json.loads(tags)
+            except (json.JSONDecodeError, TypeError):
+                tags = []
+        memories.append({
+            "id": row["id"],
+            "content_snippet": row["content_snippet"],
+            "category": row["category"],
+            "memory_type": row["memory_type"],
+            "tags": tags,
+        })
+
+    result = {
+        "memories": memories,
+        "total_unannotated": total_row["cnt"],
+    }
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool(
+    name="remind_me_annotate",
+    annotations={
+        "title": "Annotate Memories with Triples & Entities",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def remind_me_annotate(params: AnnotateInput) -> str:
+    """Apply structured annotations (subject/predicate/object triples and entity mentions) to existing memories.
+
+    For each annotation, the provided SPO fields are written onto the memory
+    (omitted fields are left unchanged), mentioned entities are upserted into
+    the entity table (deterministic ids — the same name always maps to the
+    same entity, aliases union-merge), and mention links are recorded.
+    updated_at is bumped so the changes sync to peers.
+
+    Args:
+        params: A batch of {memory_id, subject?, predicate?, object?, entities?}.
+
+    Returns:
+        JSON string with per-memory results and any errors.
+    """
+    db = _pkg._get_db()
+    now = _now_iso()
+
+    results: list[dict] = []
+    errors: list[dict] = []
+
+    for ann in params.annotations:
+        row = db.execute(
+            "SELECT id FROM memories WHERE id = ?", (ann.memory_id,)
+        ).fetchone()
+        if row is None:
+            errors.append({"memory_id": ann.memory_id, "error": "memory not found"})
+            continue
+
+        sets: list[str] = []
+        bindings: list = []
+        for col, val in (
+            ("subject", ann.subject),
+            ("predicate", ann.predicate),
+            ("object", ann.object),
+        ):
+            if val is not None:
+                sets.append(f"{col} = ?")
+                bindings.append(val)
+        sets.append("updated_at = ?")
+        bindings.append(now)
+        db.execute(
+            f"UPDATE memories SET {', '.join(sets)} WHERE id = ?",
+            (*bindings, ann.memory_id),
+        )
+
+        linked = _apply_entity_mentions(db, ann.memory_id, ann.entities, now)
+        results.append({"memory_id": ann.memory_id, "entities_linked": linked})
+
+    db.commit()
+
+    return json.dumps({
+        "annotated": len(results),
+        "results": results,
+        "errors": errors,
+    })

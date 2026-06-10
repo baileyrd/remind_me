@@ -1,6 +1,6 @@
 """
-remind_me_mcp.tools.admin — stats / reindex / status / update / import handlers
-and the two MCP resource handlers.
+remind_me_mcp.tools.admin — stats / reindex / status / update / import / export
+handlers and the two MCP resource handlers.
 
 Patchable shared state and cross-module helpers are looked up through the
 ``remind_me_mcp.tools`` package namespace (``_pkg.<name>``) at call time so
@@ -15,10 +15,12 @@ import sqlite3
 
 from remind_me_mcp import tools as _pkg
 from remind_me_mcp.config import EMBED_BATCH_SIZE
+from remind_me_mcp.exporter import EXPORT_INLINE_MAX, export_memories
 from remind_me_mcp.importer import import_chat_file, import_directory
 from remind_me_mcp.models import (
     BulkImportDirInput,
     ChatImportInput,
+    ExportInput,
     MemoryStatsInput,
     ResponseFormat,
 )
@@ -29,7 +31,7 @@ from remind_me_mcp.tools._shared import _maybe_update_notice, log
 @mcp.tool(
     name="remind_me_import_chat",
     annotations={
-        "title": "Import Chat Export",
+        "title": "Import Chat Export or Document",
         "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": True,
@@ -37,13 +39,16 @@ from remind_me_mcp.tools._shared import _maybe_update_notice, log
     },
 )
 async def memory_import_chat(params: ChatImportInput) -> str:
-    """Import a chat export file (JSON, JSONL, or Markdown) into memory.
+    """Import a chat export (JSON, JSONL, or Markdown) or a document/notes file into memory.
 
-    Supports Claude's export format, OpenAI's export format, and generic {role, content} message arrays.
+    Supports Claude's export format, OpenAI's export format, and generic {role, content} message
+    arrays — plus generic documents (FT-02): Markdown notes are chunked per-section (heading
+    context kept with each chunk and stored as metadata), plain text per-paragraph. With the
+    default kind='auto', chat-style markdown imports as chat and notes files as documents.
     Deduplicates by file hash — re-importing the same file is a no-op.
 
     Args:
-        params (ChatImportInput): File path, extraction mode, and tagging options.
+        params (ChatImportInput): File path, import kind, extraction mode, and tagging options.
 
     Returns:
         str: Import statistics.
@@ -55,6 +60,7 @@ async def memory_import_chat(params: ChatImportInput) -> str:
             tags=params.tags,
             extract_mode=params.extract_mode,
             max_length=params.max_length,
+            kind=params.kind.value,
         )
     except FileNotFoundError:
         return json.dumps({"status": "error", "error": f"File not found: {params.file_path}"})
@@ -67,7 +73,7 @@ async def memory_import_chat(params: ChatImportInput) -> str:
 @mcp.tool(
     name="remind_me_import_directory",
     annotations={
-        "title": "Bulk Import Chat Directory",
+        "title": "Bulk Import Directory",
         "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": True,
@@ -75,9 +81,11 @@ async def memory_import_chat(params: ChatImportInput) -> str:
     },
 )
 async def memory_import_directory(params: BulkImportDirInput) -> str:
-    """Bulk import all chat export files from a directory.
+    """Bulk import all chat export and document files from a directory.
 
-    Scans for .json, .jsonl, .md, .markdown, and .txt files. Skips
+    Scans for .json, .jsonl, .md, .markdown, and .txt files. With the default
+    kind='auto' each file is routed individually: chat exports are chunked
+    per-message, documents per-section/paragraph (FT-02). Skips
     already-imported files (hash-based deduplication). Delegates to the
     shared import_directory() function in importer.py (DRY).
 
@@ -95,8 +103,71 @@ async def memory_import_directory(params: BulkImportDirInput) -> str:
         extract_mode=params.extract_mode,
         max_length=params.max_length,
         recursive=params.recursive,
+        kind=params.kind.value,
     )
     return json.dumps(summary, indent=2)
+
+
+@mcp.tool(
+    name="remind_me_export_memories",
+    annotations={
+        "title": "Export Memories",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def memory_export(params: ExportInput) -> str:
+    """Export memories to JSON or JSONL for backup or migration to another machine.
+
+    Every column of the memories table is included (id, content, category, tags,
+    source, metadata, timestamps, and lifecycle fields like vitality and
+    superseded_by), so an export is a complete logical backup. By default the
+    entity graph is included too (FT-06): entities and memory-entity links
+    follow the memories as record_type-tagged records ('entity' /
+    'memory_entity'); set include_graph=false for a memories-only export.
+    Embedding vectors are NOT exported — they are derived data; run
+    remind_me_reindex after importing on the target machine to rebuild them.
+
+    Each memory record also carries a 'role' key, making the file directly
+    consumable by remind_me_import_chat / remind_me_import_directory (the
+    generic {role, content} message format) for round-trip migration.
+    Re-importing preserves memory content verbatim, but is lossy for
+    everything else: the importer re-chunks long content and assigns fresh
+    ids, category, tags, and source (the originals remain in the export file
+    for manual restoration). Graph records restore on import — entities
+    upsert (alias union-merge), links insert when the referenced memory still
+    exists under its original id; dangling links are skipped and counted.
+
+    Small exports are returned inline; pass file_path (inside the allowed
+    export roots) to write larger exports to a file. Optional category/tags
+    filters narrow the export (and scope the graph to the exported memories).
+
+    Args:
+        params (ExportInput): Format (json|jsonl), optional category/tag
+            filters, optional destination file path, and the include_graph
+            flag.
+
+    Returns:
+        str: JSON result — inline export content, or a file-write summary.
+    """
+    try:
+        # File I/O and the full-table scan are blocking — keep them off the
+        # event loop (PF-01/PF-06 conventions).
+        result = await asyncio.to_thread(
+            export_memories,
+            format=params.format.value,
+            category=params.category,
+            tags=params.tags,
+            file_path=params.file_path,
+            inline_max=EXPORT_INLINE_MAX,
+            include_graph=params.include_graph,
+        )
+    except OSError as e:
+        log.error("Export failed for %s: %s", params.file_path, e)
+        return json.dumps({"status": "error", "error": f"Failed to write export: {e}"})
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool(
@@ -303,7 +374,135 @@ async def remind_me_server_status() -> str:
     else:
         lines.append("\n**Semantic search:** ✗ Unavailable (install onnxruntime, tokenizers, huggingface-hub, numpy, sqlite-vec)")
 
+    # Folder watcher (FT-03)
+    from remind_me_mcp.watcher import get_watch_status
+
+    watch = get_watch_status()
+    if watch["enabled"]:
+        state = "✓ Running" if watch["running"] else "✗ Not running"
+        lines.append(
+            f"\n**Folder watcher:** {state} — {len(watch['watch_dirs'])} dir(s), "
+            f"every {watch['interval_seconds']}s, "
+            f"{watch['files_ingested']} ingested / {watch['files_skipped']} skipped"
+        )
+        lines.append("_Details: `remind_me_watch_status`_")
+    else:
+        lines.append(
+            "\n**Folder watcher:** ✗ Disabled (set REMIND_ME_WATCH_DIRS to "
+            "auto-ingest a notes/docs folder)"
+        )
+
+    # Remote MCP connector (FT-05) + OAuth (FT-07)
+    from remind_me_mcp.remote import get_remote_status
+
+    remote = get_remote_status()
+    if remote["enabled"]:
+        lines.append(
+            f"\n**Remote MCP connector:** ✓ Enabled — serves "
+            f"http://{remote['host']}:{remote['port']}/mcp/<token> "
+            f"(token at `{remote['token_file']}`; run with --serve-remote)"
+        )
+        if remote["oauth_enabled"]:
+            lines.append(
+                f"**Connector OAuth:** ✓ Enabled — issuer {remote['issuer']}, "
+                f"{remote['oauth_clients']} registered client(s) "
+                f"(list/revoke with `remind_me_revoke_clients`)"
+            )
+        else:
+            lines.append(
+                "**Connector OAuth:** ✗ Disabled (set REMIND_ME_REMOTE_ISSUER "
+                "to the public HTTPS origin to enable per-client auth)"
+            )
+    elif remote["token_configured"]:
+        lines.append(
+            f"\n**Remote MCP connector:** ✗ Disabled (token exists at "
+            f"`{remote['token_file']}`; set REMIND_ME_REMOTE_MCP=1 or run "
+            f"with --serve-remote to enable)"
+        )
+    else:
+        lines.append(
+            "\n**Remote MCP connector:** ✗ Disabled (set REMIND_ME_REMOTE_MCP=1 "
+            "and run with --serve-remote to expose a claude.ai custom connector)"
+        )
+
     return "\n".join(lines)
+
+
+@mcp.tool(
+    name="remind_me_watch_status",
+    annotations={
+        "title": "Folder Watcher Status",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def remind_me_watch_status() -> str:
+    """Report the folder watcher's state (FT-03): watched dirs, scan counters, recent errors.
+
+    The watcher polls the directories in REMIND_ME_WATCH_DIRS every
+    REMIND_ME_WATCH_INTERVAL seconds and auto-ingests new or changed
+    notes/docs files through the import pipeline (hash dedup applies; a
+    changed file imports fresh and its previous import's memories are
+    marked superseded).
+
+    Returns:
+        str: JSON status — enabled/running flags, watched dirs, scan
+        interval, last scan time, ingest/skip/supersede counters, and
+        recent errors. When disabled, includes a configuration hint.
+    """
+    from remind_me_mcp.watcher import get_watch_status
+
+    return json.dumps(get_watch_status(), indent=2)
+
+
+@mcp.tool(
+    name="remind_me_revoke_clients",
+    annotations={
+        "title": "List / Revoke OAuth Connector Clients",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def remind_me_revoke_clients(client_id: str = "") -> str:
+    """List OAuth clients registered with the remote connector, or revoke one (FT-07).
+
+    Without a client_id, lists every client that registered against the
+    remote connector's OAuth authorization server (claude.ai registers one
+    per connector) with its live access/refresh token counts. With a
+    client_id, deletes that client's registration and every token it holds —
+    the client is locked out immediately (the running remote server re-reads
+    the state file on each token check) and must re-register and re-obtain
+    the owner's consent to reconnect.
+
+    Args:
+        client_id: The client to revoke. Empty (default) lists clients.
+
+    Returns:
+        str: JSON — the client list, a revocation summary, or an error.
+    """
+    from remind_me_mcp import config as cfg
+    from remind_me_mcp.oauth import OAuthStateStore
+
+    store = OAuthStateStore(cfg.MEMORY_DIR / "oauth.json")
+    if not client_id:
+        # File I/O off the event loop (PF-06 conventions).
+        clients = await asyncio.to_thread(store.list_clients)
+        return json.dumps(
+            {
+                "clients": clients,
+                "state_file": str(store.path),
+                "hint": "Pass client_id to revoke a client and all of its tokens.",
+            },
+            indent=2,
+        )
+    result = await asyncio.to_thread(store.revoke_client, client_id)
+    if result is None:
+        return json.dumps({"status": "error", "error": f"Unknown client_id: {client_id}"})
+    return json.dumps({"status": "revoked", **result}, indent=2)
 
 
 # ---------------------------------------------------------------------------

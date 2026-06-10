@@ -18,6 +18,15 @@ Outbox sends are tracked per remote in the ``sync_sends`` table, so every
 configured hub/peer receives every outbox row. Pulls use a keyset cursor
 ``(updated_at, id)`` persisted in ``sync_log`` and drain the remote with
 repeated pages until a short page arrives.
+
+FT-04: the entity graph syncs too. Outbox records carry a ``record_type``
+discriminator ('entity' / 'memory_entity'; absent = memory, so the wire
+format old peers expect is unchanged). Entities resolve conflicts LWW on
+updated_at except aliases, which union-merge (a commutative, idempotent
+merge, so peers converge). memory_entities links are immutable
+insert-or-ignore rows. Dedicated pull endpoints (/sync/pull_entities,
+/sync/pull_links) keep separate keyset cursors; a 404 from a pre-FT-04
+peer is tolerated.
 """
 from __future__ import annotations
 
@@ -91,14 +100,14 @@ def _canon_ts(value: Any) -> str:
 # ---------------------------------------------------------------------------
 
 def _decode_payload(raw: str) -> dict[str, Any]:
-    """Decode an outbox payload, deserializing JSON-string tag/metadata fields."""
+    """Decode an outbox payload, deserializing JSON-string list/object fields."""
     payload: dict[str, Any] = json.loads(raw)
-    for fld in ("tags", "metadata"):
+    for fld in ("tags", "metadata", "aliases"):
         if isinstance(payload.get(fld), str):
             try:
                 payload[fld] = json.loads(payload[fld])
             except (json.JSONDecodeError, TypeError):
-                payload[fld] = [] if fld == "tags" else {}
+                payload[fld] = {} if fld == "metadata" else []
     return payload
 
 
@@ -261,6 +270,113 @@ async def _pull_remote(client: httpx.AsyncClient, url: str, remote_id: str) -> i
     return total
 
 
+async def _pull_graph_table(
+    client: httpx.AsyncClient,
+    url: str,
+    remote_id: str,
+    *,
+    path: str,
+    cursor_suffix: str,
+    ts_field: str,
+) -> int:
+    """Pull entity-graph records (FT-04) with a keyset cursor; 404-tolerant.
+
+    Same drain-loop/keyset shape as :func:`_pull_remote`, parameterized for
+    the ``/sync/pull_entities`` and ``/sync/pull_links`` endpoints. The
+    cursor is stored in ``sync_log`` under ``{remote_id}#{cursor_suffix}``
+    so it never collides with the memory cursor. A 404 from the remote means
+    a pre-FT-04 peer — skipped silently for backward compatibility.
+
+    Returns:
+        The number of records applied locally.
+    """
+    db = _get_db()
+    cursor_id = f"{remote_id}#{cursor_suffix}"
+
+    row = db.execute(
+        "SELECT last_pull, last_pull_id FROM sync_log WHERE remote_id = ?",
+        (cursor_id,),
+    ).fetchone()
+    since = row["last_pull"] if row else _EPOCH
+    since_id = row["last_pull_id"] if row else ""
+
+    total = 0
+    for _ in range(MAX_PULL_PAGES):
+        resp = await client.get(
+            f"{url}{path}",
+            params={
+                "since": since,
+                "since_id": since_id,
+                "exclude_node": NODE_ID,
+                "limit": PULL_PAGE_SIZE,
+            },
+            headers=HEADERS,
+            timeout=15,
+        )
+        if resp.status_code == 404:
+            log.debug(
+                "Remote %s does not serve %s (pre-FT-04 peer) — skipping",
+                remote_id, path,
+            )
+            return total
+        resp.raise_for_status()
+
+        records = resp.json().get("records", [])
+        if not records:
+            break
+
+        result = _upsert_records(db, records)
+        total += result.applied
+
+        # Advance the keyset cursor to the greatest (timestamp, id) received.
+        page_max: tuple[str, str] | None = None
+        for rec in records:
+            try:
+                pair = (_canon_ts(rec[ts_field]), _record_wire_id(rec))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if page_max is None or pair > page_max:
+                page_max = pair
+        if page_max is None or page_max <= (since, since_id):
+            break
+        since, since_id = page_max
+
+        db.execute("""
+            INSERT INTO sync_log (remote_id, last_pull, last_pull_id)
+            VALUES (?, ?, ?)
+            ON CONFLICT (remote_id) DO UPDATE SET
+                last_pull = excluded.last_pull,
+                last_pull_id = excluded.last_pull_id
+        """, (cursor_id, since, since_id))
+        db.commit()
+
+        log.debug(
+            "Pulled %d %s records from %s, applied %d (failed %d)",
+            len(records), cursor_suffix, url, result.applied, result.failed,
+        )
+
+        if len(records) < PULL_PAGE_SIZE:
+            break
+
+    return total
+
+
+async def _pull_entities(client: httpx.AsyncClient, url: str, remote_id: str) -> int:
+    """Pull entity records from a remote (FT-04); no-op against old peers."""
+    return await _pull_graph_table(
+        client, url, remote_id,
+        path="/sync/pull_entities", cursor_suffix="entities", ts_field="updated_at",
+    )
+
+
+async def _pull_links(client: httpx.AsyncClient, url: str, remote_id: str) -> int:
+    """Pull memory_entities link records from a remote (FT-04)."""
+    return await _pull_graph_table(
+        client, url, remote_id,
+        path="/sync/pull_links", cursor_suffix="links", ts_field="created_at",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Upsert (full-column, per-record isolation — SY-03)
 # ---------------------------------------------------------------------------
@@ -395,17 +511,148 @@ def _upsert_one(db: sqlite3.Connection, rec: dict[str, Any]) -> int | None:
     return int(applied[0])
 
 
+def _upsert_entity_one(db: sqlite3.Connection, rec: dict[str, Any]) -> bool:
+    """Validate and upsert a single remote entity record (FT-04).
+
+    Conflict semantics: last-write-wins on ``updated_at`` for name/kind/
+    node_id (same as memories) EXCEPT aliases, which are always union-merged
+    (dedup, order-preserving: local first) regardless of which side wins —
+    union is commutative and idempotent, so peers converge on the same alias
+    set. A losing record's kind still fills in a locally-missing kind (a
+    deterministic-id collision across peers should enrich, not erase).
+    The merge does NOT bump updated_at: the contributing peer's own outbox
+    row propagates the aliases, so bumping would only cause churn.
+
+    Returns:
+        True when local state changed, False when the record was a no-op.
+        Raises on malformed input (caller isolates the failure).
+    """
+    missing = [k for k in ("id", "name", "created_at", "updated_at") if not rec.get(k)]
+    if missing:
+        raise ValueError(f"entity record missing required keys: {missing}")
+
+    created_at = _canon_ts(rec["created_at"])
+    updated_at = _canon_ts(rec["updated_at"])
+    eid = str(rec["id"])
+    incoming_aliases = rec.get("aliases")
+    if isinstance(incoming_aliases, str):
+        try:
+            incoming_aliases = json.loads(incoming_aliases)
+        except json.JSONDecodeError:
+            incoming_aliases = []
+    if not isinstance(incoming_aliases, list):
+        incoming_aliases = []
+    incoming_aliases = [a for a in incoming_aliases if isinstance(a, str) and a]
+
+    # Snapshot the outbox high-water mark to suppress exactly the echo rows
+    # this upsert's triggers create (SY-05).
+    outbox_max = db.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM sync_outbox"
+    ).fetchone()[0]
+
+    row = db.execute(
+        "SELECT name, kind, aliases, updated_at FROM entities WHERE id = ?", (eid,)
+    ).fetchone()
+
+    applied = False
+    if row is None:
+        db.execute(
+            """INSERT INTO entities (id, name, kind, aliases, created_at, updated_at, node_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (eid, str(rec["name"]), rec.get("kind"),
+             json.dumps(list(dict.fromkeys(incoming_aliases))),
+             created_at, updated_at, rec.get("node_id")),
+        )
+        applied = True
+    else:
+        try:
+            local_aliases = json.loads(row["aliases"]) if isinstance(row["aliases"], str) else []
+        except json.JSONDecodeError:
+            local_aliases = []
+        if not isinstance(local_aliases, list):
+            local_aliases = []
+        merged = list(dict.fromkeys([*local_aliases, *incoming_aliases]))
+        if updated_at > row["updated_at"]:
+            db.execute(
+                """UPDATE entities SET name = ?, kind = ?, aliases = ?,
+                          updated_at = ?, node_id = ? WHERE id = ?""",
+                (str(rec["name"]), rec.get("kind") or row["kind"],
+                 json.dumps(merged), updated_at, rec.get("node_id"), eid),
+            )
+            applied = True
+        else:
+            fill_kind = row["kind"] or rec.get("kind")
+            if merged != local_aliases or fill_kind != row["kind"]:
+                db.execute(
+                    "UPDATE entities SET aliases = ?, kind = ? WHERE id = ?",
+                    (json.dumps(merged), fill_kind, eid),
+                )
+                applied = True
+
+    if applied:
+        db.execute("""
+            UPDATE sync_outbox SET sent_at = ?
+            WHERE memory_id = ? AND id > ? AND sent_at = ''
+        """, (_now_iso(), eid, outbox_max))
+    return applied
+
+
+def _upsert_link_one(db: sqlite3.Connection, rec: dict[str, Any]) -> bool:
+    """Validate and apply a single remote memory_entities link record (FT-04).
+
+    Mention links are immutable — insert-or-ignore semantics, no conflict
+    resolution needed. No FK enforcement: a link may arrive before its memory
+    or entity does; the row simply waits for them.
+
+    Returns:
+        True when a new link row was inserted, False when it already existed.
+        Raises on malformed input (caller isolates the failure).
+    """
+    missing = [k for k in ("memory_id", "entity_id", "created_at") if not rec.get(k)]
+    if missing:
+        raise ValueError(f"link record missing required keys: {missing}")
+    created_at = _canon_ts(rec["created_at"])
+
+    outbox_max = db.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM sync_outbox"
+    ).fetchone()[0]
+    cur = db.execute(
+        """INSERT OR IGNORE INTO memory_entities (memory_id, entity_id, created_at)
+           VALUES (?, ?, ?)""",
+        (str(rec["memory_id"]), str(rec["entity_id"]), created_at),
+    )
+    applied = cur.rowcount > 0
+    if applied:
+        # The link trigger writes NEW.memory_id into sync_outbox.memory_id.
+        db.execute("""
+            UPDATE sync_outbox SET sent_at = ?
+            WHERE memory_id = ? AND id > ? AND sent_at = ''
+        """, (_now_iso(), str(rec["memory_id"]), outbox_max))
+    return applied
+
+
+def _record_wire_id(rec: dict[str, Any]) -> str:
+    """The id the sender matches in processed_ids (links use memory_id|entity_id)."""
+    rid = rec.get("id")
+    if rid is None and rec.get("memory_id") and rec.get("entity_id"):
+        rid = f"{rec['memory_id']}|{rec['entity_id']}"
+    return str(rid)
+
+
 def _upsert_records(db: sqlite3.Connection, records: list[dict[str, Any]]) -> UpsertResult:
     """Upsert remote records with last-write-wins conflict resolution.
 
-    Each record is applied independently: a malformed record is rolled back,
-    logged, and counted as failed without poisoning the rest of the batch.
-    Applied records are embedded for semantic search after commit (SY-06) —
+    Records are dispatched on their ``record_type`` ('entity' /
+    'memory_entity' / absent = memory, FT-04). Each record is applied
+    independently: a malformed or unknown-kind record is rolled back, logged,
+    and counted as failed without poisoning the rest of the batch (defensive
+    against newer peers sending kinds this node does not know). Applied
+    memory records are embedded for semantic search after commit (SY-06) —
     best-effort, silently skipped when no embedder is available.
 
     Args:
         db: An open SQLite connection.
-        records: Wire-format memory records from a hub or peer.
+        records: Wire-format records from a hub or peer.
 
     Returns:
         An :class:`UpsertResult` with applied/failed counts and the ids that
@@ -416,7 +663,19 @@ def _upsert_records(db: sqlite3.Connection, records: list[dict[str, Any]]) -> Up
 
     for rec in records:
         try:
-            rowid = _upsert_one(db, rec)
+            if not isinstance(rec, dict):
+                raise ValueError(f"record is not an object: {type(rec).__name__}")
+            record_type = rec.get("record_type") or "memory"
+            rowid: int | None = None
+            if record_type == "memory":
+                rowid = _upsert_one(db, rec)
+                applied = rowid is not None
+            elif record_type == "entity":
+                applied = _upsert_entity_one(db, rec)
+            elif record_type == "memory_entity":
+                applied = _upsert_link_one(db, rec)
+            else:
+                raise ValueError(f"unknown record_type: {record_type!r}")
             # Commit per record: a later malformed record's rollback must not
             # discard work already applied for earlier records.
             db.commit()
@@ -425,9 +684,10 @@ def _upsert_records(db: sqlite3.Connection, records: list[dict[str, Any]]) -> Up
             result.failed += 1
             log.warning("Skipping malformed sync record: %s", e)
             continue
-        result.processed_ids.append(str(rec["id"]))
-        if rowid is not None:
+        result.processed_ids.append(_record_wire_id(rec))
+        if applied:
             result.applied += 1
+        if rowid is not None:
             embed_rows.append((rowid, str(rec.get("content") or "")))
 
     if embed_rows:
@@ -562,6 +822,9 @@ async def _sync_once() -> None:
             try:
                 await _push_outbox(client, HUB_URL, "hub")
                 await _pull_remote(client, HUB_URL, "hub")
+                # Entity graph (FT-04) — no-ops against pre-FT-04 remotes.
+                await _pull_entities(client, HUB_URL, "hub")
+                await _pull_links(client, HUB_URL, "hub")
                 log.info("Hub sync complete")
             except httpx.ConnectError:
                 log.debug("Hub unreachable, skipping")
@@ -580,6 +843,9 @@ async def _sync_once() -> None:
             try:
                 await _push_outbox(client, peer["url"], peer["node_id"])
                 await _pull_remote(client, peer["url"], peer["node_id"])
+                # Entity graph (FT-04) — no-ops against pre-FT-04 peers.
+                await _pull_entities(client, peer["url"], peer["node_id"])
+                await _pull_links(client, peer["url"], peer["node_id"])
                 log.info("Peer sync complete: %s", peer["node_id"])
             except httpx.ConnectError:
                 log.debug("Peer %s unreachable", peer["node_id"])

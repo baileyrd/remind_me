@@ -10,6 +10,7 @@ touches ~/.remind-me.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from typing import TYPE_CHECKING
 
@@ -20,7 +21,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 import remind_me_mcp.peer_server as peer_server
-from remind_me_mcp.db import _ensure_schema, _now_iso
+from remind_me_mcp.db import _ensure_schema, _entity_id, _now_iso
 
 SECRET = "test-secret"
 AUTH = {"Authorization": f"Bearer {SECRET}"}
@@ -406,3 +407,163 @@ def test_start_peer_server_port_in_use(monkeypatch: pytest.MonkeyPatch) -> None:
         assert peer_server.start_peer_server() is None
     finally:
         sock.close()
+
+
+# ---------------------------------------------------------------------------
+# Entity graph endpoints (FT-04)
+# ---------------------------------------------------------------------------
+
+
+def insert_entity(
+    db: sqlite3.Connection,
+    name: str,
+    *,
+    kind: str | None = None,
+    aliases: list[str] | None = None,
+    updated_at: str | None = None,
+    node_id: str | None = None,
+) -> str:
+    now = updated_at or _now_iso()
+    eid = _entity_id(name)
+    db.execute(
+        """INSERT INTO entities (id, name, kind, aliases, created_at, updated_at, node_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (eid, name, kind, json.dumps(aliases or []), now, now, node_id),
+    )
+    db.commit()
+    return eid
+
+
+def test_pull_entities_returns_tagged_records(
+    peer_url: str, peer_db: sqlite3.Connection
+) -> None:
+    eid = insert_entity(
+        peer_db, "Bailey Robertson", kind="person", aliases=["Bailey"]
+    )
+    resp = httpx.get(f"{peer_url}/sync/pull_entities", headers=AUTH)
+    assert resp.status_code == 200
+    records = resp.json()["records"]
+    assert len(records) == 1
+    rec = records[0]
+    assert rec["record_type"] == "entity"
+    assert rec["id"] == eid
+    assert rec["name"] == "Bailey Robertson"
+    assert rec["aliases"] == ["Bailey"]  # deserialized list on the wire
+
+
+def test_pull_entities_keyset_cursor(
+    peer_url: str, peer_db: sqlite3.Connection
+) -> None:
+    ts1 = "2026-01-01T00:00:00+00:00"
+    ts2 = "2026-02-01T00:00:00+00:00"
+    insert_entity(peer_db, "Old Entity", updated_at=ts1)
+    eid_new = insert_entity(peer_db, "New Entity", updated_at=ts2)
+    resp = httpx.get(
+        f"{peer_url}/sync/pull_entities",
+        params={"since": ts1, "since_id": _entity_id("Old Entity")},
+        headers=AUTH,
+    )
+    ids = [r["id"] for r in resp.json()["records"]]
+    assert ids == [eid_new]
+
+
+def test_pull_entities_excludes_node(
+    peer_url: str, peer_db: sqlite3.Connection
+) -> None:
+    insert_entity(peer_db, "Mine", node_id="puller-node")
+    theirs = insert_entity(peer_db, "Theirs", node_id="other-node")
+    resp = httpx.get(
+        f"{peer_url}/sync/pull_entities",
+        params={"exclude_node": "puller-node"},
+        headers=AUTH,
+    )
+    ids = [r["id"] for r in resp.json()["records"]]
+    assert ids == [theirs]
+
+
+def test_pull_links_returns_tagged_records(
+    peer_url: str, peer_db: sqlite3.Connection
+) -> None:
+    now = _now_iso()
+    peer_db.execute(
+        "INSERT INTO memory_entities (memory_id, entity_id, created_at) VALUES (?, ?, ?)",
+        ("mem-1", "ent-1", now),
+    )
+    peer_db.commit()
+    resp = httpx.get(f"{peer_url}/sync/pull_links", headers=AUTH)
+    assert resp.status_code == 200
+    records = resp.json()["records"]
+    assert records == [{
+        "record_type": "memory_entity",
+        "id": "mem-1|ent-1",
+        "memory_id": "mem-1",
+        "entity_id": "ent-1",
+        "created_at": now,
+    }]
+
+
+def test_pull_links_keyset_cursor(
+    peer_url: str, peer_db: sqlite3.Connection
+) -> None:
+    ts = "2026-01-01T00:00:00+00:00"
+    peer_db.executemany(
+        "INSERT INTO memory_entities (memory_id, entity_id, created_at) VALUES (?, ?, ?)",
+        [("m1", "e1", ts), ("m1", "e2", ts), ("m2", "e1", ts)],
+    )
+    peer_db.commit()
+    # Cursor sits at (ts, 'm1|e2') -> only 'm2|e1' remains.
+    resp = httpx.get(
+        f"{peer_url}/sync/pull_links",
+        params={"since": ts, "since_id": "m1|e2"},
+        headers=AUTH,
+    )
+    ids = [r["id"] for r in resp.json()["records"]]
+    assert ids == ["m2|e1"]
+
+
+def test_pull_entity_endpoints_require_auth(peer_url: str) -> None:
+    assert httpx.get(f"{peer_url}/sync/pull_entities").status_code == 401
+    assert httpx.get(f"{peer_url}/sync/pull_links").status_code == 401
+
+
+def test_push_entity_and_link_records(
+    peer_url: str, peer_db: sqlite3.Connection
+) -> None:
+    """The push endpoint applies mixed memory/entity/link batches and
+    reports composite link ids in processed_ids."""
+    now = _now_iso()
+    eid = _entity_id("Pushed Entity")
+    records = [
+        make_record("mem-x", "memory body"),
+        {
+            "record_type": "entity",
+            "id": eid,
+            "name": "Pushed Entity",
+            "kind": "tool",
+            "aliases": ["pe"],
+            "created_at": now,
+            "updated_at": now,
+            "node_id": "other-node",
+        },
+        {
+            "record_type": "memory_entity",
+            "id": f"mem-x|{eid}",
+            "memory_id": "mem-x",
+            "entity_id": eid,
+            "created_at": now,
+        },
+    ]
+    resp = httpx.post(
+        f"{peer_url}/sync/push",
+        json={"node_id": "other-node", "records": records},
+        headers=AUTH,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["accepted"] == 3
+    assert set(body["processed_ids"]) == {"mem-x", eid, f"mem-x|{eid}"}
+
+    ent = peer_db.execute("SELECT * FROM entities WHERE id = ?", (eid,)).fetchone()
+    assert ent["kind"] == "tool"
+    link = peer_db.execute("SELECT * FROM memory_entities").fetchone()
+    assert (link["memory_id"], link["entity_id"]) == ("mem-x", eid)

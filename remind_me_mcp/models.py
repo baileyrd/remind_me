@@ -14,7 +14,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from remind_me_mcp.config import is_in_import_roots
+from remind_me_mcp.config import is_in_export_roots, is_in_import_roots
 
 log = logging.getLogger("remind_me_mcp.models")
 
@@ -33,6 +33,40 @@ class ResponseFormat(StrEnum):
 # ---------------------------------------------------------------------------
 # Pydantic input models
 # ---------------------------------------------------------------------------
+
+
+class EntityInput(BaseModel):
+    """An entity mentioned by a memory (FT-04 knowledge-graph layer).
+
+    A mention with a NEW name creates a new entity — different names are
+    never auto-merged into one entity. Alias merging is explicit: provide
+    ``aliases`` to union-merge alternate names onto this entity's record.
+    """
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    name: str = Field(
+        ...,
+        description=(
+            "Canonical entity name as mentioned (e.g. 'Bailey Robertson', "
+            "'remind_me', 'Tailscale'). Identity is case/whitespace-insensitive."
+        ),
+        min_length=1,
+        max_length=200,
+    )
+    kind: str | None = Field(
+        default=None,
+        description="Entity kind (e.g. 'person', 'project', 'tool', 'place', 'org')",
+        max_length=50,
+    )
+    aliases: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Explicit alternate names to merge onto this entity "
+            "(e.g. ['Bailey'] for canonical 'Bailey Robertson')"
+        ),
+        max_length=20,
+    )
 
 
 class MemoryAddInput(BaseModel):
@@ -70,6 +104,26 @@ class MemoryAddInput(BaseModel):
     metadata: dict[str, Any] = Field(
         default_factory=dict,
         description="Arbitrary metadata (e.g., {'conversation_id': '...', 'date': '...'})",
+    )
+    subject: str | None = Field(
+        default=None,
+        description="Structured triple: subject (e.g. 'Bailey') — FT-04",
+        max_length=200,
+    )
+    predicate: str | None = Field(
+        default=None,
+        description="Structured triple: predicate (e.g. 'prefers') — FT-04",
+        max_length=200,
+    )
+    object: str | None = Field(
+        default=None,
+        description="Structured triple: object (e.g. 'dark mode') — FT-04",
+        max_length=500,
+    )
+    entities: list[EntityInput] = Field(
+        default_factory=list,
+        description="Entities this memory mentions (FT-04 knowledge graph)",
+        max_length=20,
     )
 
 
@@ -111,6 +165,37 @@ class MemorySearchInput(BaseModel):
     verbose: bool = Field(
         default=False,
         description="Include debug ranking signals (semantic_rank, keyword_rank, recency_rank, vitality_rank, days_old) per result",
+    )
+    expand_entities: bool = Field(
+        default=False,
+        description=(
+            "Opt-in 1-hop knowledge-graph expansion (FT-04): after ranking, append "
+            "up to 5 additional non-superseded memories that share a mentioned "
+            "entity with the returned results, in a separate related_via_entities "
+            "section. Does not affect the main ranking."
+        ),
+    )
+
+
+class EntityLookupInput(BaseModel):
+    """Input for the remind_me_entity tool: look up an entity by name or alias."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    name: str = Field(
+        ...,
+        description=(
+            "Entity name or alias to look up (case/whitespace-insensitive, "
+            "e.g. 'Bailey Robertson' or 'Bailey')"
+        ),
+        min_length=1,
+        max_length=200,
+    )
+    limit: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="Max facts and max linked memories to return",
     )
 
 
@@ -157,18 +242,37 @@ class MemoryDeleteInput(BaseModel):
     )
 
 
+class ImportKind(StrEnum):
+    """How to parse an imported file (FT-02).
+
+    AUTO routes by extension and content sniffing: .json/.jsonl always import
+    as chat; .md/.markdown/.txt import as chat when they contain chat role
+    markers (e.g. '**User:**', '## Assistant'), otherwise as a document.
+    """
+
+    AUTO = "auto"
+    CHAT = "chat"
+    DOCUMENT = "document"
+
+
 class ChatImportInput(BaseModel):
-    """Input for importing chat exports into memory."""
+    """Input for importing chat exports or documents into memory."""
 
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
     file_path: str = Field(
         ...,
-        description="Path to the chat export file (JSON, JSONL, or Markdown)",
+        description=(
+            "Path to the file to import: a chat export (JSON, JSONL, or "
+            "Markdown) or a notes/document file (Markdown or plain text)"
+        ),
     )
     category: str = Field(
         default="chat_import",
-        description="Category to assign to imported memories",
+        description=(
+            "Category to assign to imported memories. The default "
+            "'chat_import' becomes 'document' for document imports."
+        ),
     )
     tags: list[str] = Field(
         default_factory=list,
@@ -190,6 +294,17 @@ class ChatImportInput(BaseModel):
         description="Max characters per memory entry; longer content is chunked",
         ge=100,
         le=50000,
+    )
+    kind: ImportKind = Field(
+        default=ImportKind.AUTO,
+        description=(
+            "How to parse the file (FT-02): "
+            "'auto' — detect by extension/content (chat-style markdown imports "
+            "as chat, notes markdown/text as a document), "
+            "'chat' — force the chat-export parser, "
+            "'document' — force per-section/paragraph document chunking "
+            "(.md/.markdown/.txt only)"
+        ),
     )
 
     @field_validator("file_path")
@@ -220,19 +335,91 @@ class MemoryStatsInput(BaseModel):
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
 
 
+class ExportFormat(StrEnum):
+    """Serialization format for memory exports (FT-01)."""
+
+    JSON = "json"
+    JSONL = "jsonl"
+
+
+class ExportInput(BaseModel):
+    """Input for exporting memories to JSON/JSONL (FT-01)."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    format: ExportFormat = Field(
+        default=ExportFormat.JSON,
+        description=(
+            "'json' — single indented JSON array, "
+            "'jsonl' — one JSON record per line"
+        ),
+    )
+    category: str | None = Field(
+        default=None,
+        description="Filter: only export memories with this category",
+    )
+    tags: list[str] | None = Field(
+        default=None, description="Filter: memory must have ALL of these tags"
+    )
+    file_path: str | None = Field(
+        default=None,
+        description=(
+            "Destination file path for the export. When omitted, small exports "
+            "are returned inline. Must be inside the allowed export roots."
+        ),
+    )
+    include_graph: bool = Field(
+        default=True,
+        description=(
+            "Include the entity graph (entities and memory-entity links) as "
+            "record_type-tagged records after the memories, so the backup "
+            "captures the full knowledge graph (FT-06). Set false for a "
+            "memories-only export."
+        ),
+    )
+
+    @field_validator("file_path")
+    @classmethod
+    def validate_export_path(cls, v: str | None) -> str | None:
+        """Validate export-root containment and a writable destination (FT-01).
+
+        Mirrors the SE-02 import-root check (shared with the HTTP /api/export
+        route): containment runs first so paths outside EXPORT_ROOTS are
+        rejected without leaking whether they exist.
+        """
+        if v is None or not v.strip():
+            return None
+        p = Path(v).expanduser().resolve()
+        if not is_in_export_roots(p):
+            raise ValueError(f"Path not in allowed export roots: {p}")
+        if p.is_dir():
+            raise ValueError(f"Destination is a directory, not a file: {p}")
+        if not p.parent.is_dir():
+            raise ValueError(f"Parent directory not found: {p.parent}")
+        return str(p)
+
+
 class BulkImportDirInput(BaseModel):
-    """Input for bulk-importing a directory of chat exports."""
+    """Input for bulk-importing a directory of chat exports and/or documents."""
 
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
     directory: str = Field(
-        ..., description="Path to directory containing chat export files"
+        ...,
+        description="Path to directory containing chat export and/or document files",
     )
     category: str = Field(default="chat_import")
     tags: list[str] = Field(default_factory=list)
     extract_mode: str = Field(default="assistant_messages")
     max_length: int = Field(default=10000, ge=100, le=50000)
     recursive: bool = Field(default=True, description="Search subdirectories")
+    kind: ImportKind = Field(
+        default=ImportKind.AUTO,
+        description=(
+            "Per-file parsing mode (FT-02): 'auto' (detect chat vs document "
+            "per file), 'chat', or 'document'"
+        ),
+    )
 
     @field_validator("directory")
     @classmethod
@@ -402,6 +589,26 @@ class AtomicFact(BaseModel):
         default_factory=list,
         description="Additional tags to merge with the parent capture's tags",
     )
+    subject: str | None = Field(
+        default=None,
+        description="Structured triple: subject (e.g. 'Bailey') — FT-04",
+        max_length=200,
+    )
+    predicate: str | None = Field(
+        default=None,
+        description="Structured triple: predicate (e.g. 'prefers') — FT-04",
+        max_length=200,
+    )
+    object: str | None = Field(
+        default=None,
+        description="Structured triple: object (e.g. 'dark mode') — FT-04",
+        max_length=500,
+    )
+    entities: list[EntityInput] = Field(
+        default_factory=list,
+        description="Entities this fact mentions (FT-04 knowledge graph)",
+        max_length=20,
+    )
 
     @field_validator("memory_type")
     @classmethod
@@ -443,6 +650,60 @@ class DecomposeBatchInput(BaseModel):
         ge=1,
         le=100,
         description="Number of undecomposed captures to return",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Entity extraction / annotation models (FT-04)
+# ---------------------------------------------------------------------------
+
+
+class MemoryAnnotation(BaseModel):
+    """A structured annotation for one existing memory (FT-04).
+
+    Applies a subject/predicate/object triple and/or entity mentions to a
+    memory after the fact (backfill path). Omitted SPO fields are left
+    unchanged — annotations only add structure, never clear it.
+    """
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    memory_id: str = Field(
+        ..., description="The ID of the memory to annotate", min_length=1
+    )
+    subject: str | None = Field(default=None, max_length=200)
+    predicate: str | None = Field(default=None, max_length=200)
+    object: str | None = Field(default=None, max_length=500)
+    entities: list[EntityInput] = Field(
+        default_factory=list,
+        description="Entities this memory mentions",
+        max_length=20,
+    )
+
+
+class AnnotateInput(BaseModel):
+    """Input for the remind_me_annotate tool: apply annotations in batch."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    annotations: list[MemoryAnnotation] = Field(
+        ...,
+        description="List of {memory_id, subject?, predicate?, object?, entities?} annotations",
+        min_length=1,
+        max_length=100,
+    )
+
+
+class ExtractBatchInput(BaseModel):
+    """Input for the remind_me_extract_batch tool: fetch unannotated memories."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    batch_size: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="Number of unannotated memories to return",
     )
 
 
@@ -502,8 +763,11 @@ __all__ = [
     "MemoryListInput",
     "MemoryUpdateInput",
     "MemoryDeleteInput",
+    "ImportKind",
     "ChatImportInput",
     "MemoryStatsInput",
+    "ExportFormat",
+    "ExportInput",
     "BulkImportDirInput",
     "AutoCaptureInput",
     "MemoryClassification",
@@ -513,6 +777,11 @@ __all__ = [
     "AtomicFact",
     "DecomposeInput",
     "DecomposeBatchInput",
+    "EntityInput",
+    "EntityLookupInput",
+    "MemoryAnnotation",
+    "AnnotateInput",
+    "ExtractBatchInput",
     "ConsolidateInput",
     "VitalityReportInput",
 ]

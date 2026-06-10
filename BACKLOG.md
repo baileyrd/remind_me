@@ -6,7 +6,8 @@ messages. Status: `todo` / `in-progress` / `done` / `wontfix`.
 
 Workstreams: **CI** (pipeline/tooling), **DI** (data integrity & retrieval
 correctness), **SY** (sync hardening), **SE** (security & server lifecycle),
-**PF** (performance), **HY** (hygiene & refactoring).
+**PF** (performance), **HY** (hygiene & refactoring), **FT** (new features,
+not from the review).
 
 ## Wave 1 — CI honesty + data integrity
 
@@ -65,3 +66,15 @@ correctness), **SY** (sync hardening), **SE** (security & server lifecycle),
 | HY-04 | low | done | Pin/vendor dashboard CDN assets (SRI at minimum) | §7 |
 | HY-05 | low | done | Strip internal `_rrf_score`/`_keyword_rank` fields from JSON responses (or move under `debug_signals`) | §5 |
 | HY-06 | low | done | Misc robustness: 400 on bad query params, guarded env parsing, no import-time `basicConfig`, longer memory IDs, empty-chunk guard in importer | §5, §7 |
+
+## Features
+
+| ID | P | Status | Item | Review ref |
+|----|---|--------|------|------------|
+| FT-01 | med | done | Govern — data export: `export_memories` MCP tool (plus HTTP API endpoint) that dumps all memories to JSON/JSONL in an importer-compatible format, enabling backup and round-trip migration between machines | — |
+| FT-02 | med | done | Collect — generic document ingestion: extend the importer beyond chat exports to plain Markdown, text, and notes files (per-file/per-section chunking instead of per-message) | — |
+| FT-03 | med | done | Collect — source connectors: watch a configured notes/docs folder and auto-ingest new or changed files (reuse import dedup-by-hash), as a path toward email/app connectors | — |
+| FT-04 | med | done | Organize — entity & link extraction: during decomposition, extract entities and relations and store them as structured metadata/links between memories (lightweight knowledge-graph layer over SQLite) | — |
+| FT-05 | med | done | Use — claude.ai web MCP support: expose the MCP server as a remote connector (Streamable HTTP transport, OAuth/bearer auth, public reachability e.g. Tailscale Funnel or tunnel) so claude.ai custom connectors can attach remind_me from the website | — |
+| FT-06 | med | done | Govern — export the entity graph: include `entities` and `memory_entities` in `export_memories` / `GET /api/export` (with import-side restore for round-trip), so backups capture the full knowledge graph, not just memories | — |
+| FT-07 | med | done | Use — OAuth for the remote connector: minimal single-user OAuth 2.1 authorization server (AS metadata, dynamic client registration, PKCE authorization-code flow, token issue/refresh/revoke) on the remote MCP mode, so claude.ai connects with real, revocable per-client auth instead of the secret-path URL | — |

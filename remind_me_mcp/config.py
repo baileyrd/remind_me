@@ -170,6 +170,94 @@ def resolve_api_key() -> str | None:
         return key
 
 
+# ---------------------------------------------------------------------------
+# Remote MCP connector (FT-05)
+# ---------------------------------------------------------------------------
+
+REMOTE_MCP: bool = os.environ.get("REMIND_ME_REMOTE_MCP", "").lower() in ("true", "1", "yes")
+"""Set REMIND_ME_REMOTE_MCP=1 (or pass --serve-remote) to expose the MCP
+server as a remote connector: Streamable HTTP under a secret URL path,
+suitable for tunnelling (e.g. Tailscale Funnel) and attaching from claude.ai
+as a custom connector. Default OFF."""
+
+REMOTE_MCP_HOST: str = os.environ.get("REMIND_ME_REMOTE_HOST", "127.0.0.1")
+REMOTE_MCP_PORT: int = _env_int("REMIND_ME_REMOTE_PORT", 8768)
+
+REMOTE_MCP_TOKEN: str | None = os.environ.get("REMIND_ME_REMOTE_TOKEN") or None
+"""Connector token for the remote MCP endpoint. When unset, a token is
+auto-generated on first use and persisted under MEMORY_DIR (see
+resolve_connector_token). Unlike REMIND_ME_API_KEY there is no 'disabled'
+opt-out — the token doubles as the secret URL path and the endpoint must
+never be open."""
+
+CONNECTOR_TOKEN_FILE = MEMORY_DIR / "connector_token"
+"""Location of the auto-generated remote-MCP connector token (0600 perms).
+Delete the file to rotate: a fresh token is generated on next startup."""
+
+REMOTE_MCP_ISSUER: str | None = os.environ.get("REMIND_ME_REMOTE_ISSUER") or None
+"""Public base URL of the remote connector (FT-07) — the HTTPS tunnel origin,
+e.g. ``https://machine.tailnet.ts.net``. Setting it activates the single-user
+OAuth 2.1 authorization server on the remote MCP mode (claude.ai discovers it
+via the well-known metadata and connects with per-client, revocable tokens).
+When unset, the connector falls back to the FT-05 secret-path/bearer mode and
+logs a warning. The value must be an origin only (https, no path/query) — it
+is deliberately NOT derived from the request Host header, which is
+attacker-influenced while DNS-rebinding protection is disabled."""
+
+OAUTH_STATE_FILE = MEMORY_DIR / "oauth.json"
+"""Persisted OAuth state (FT-07): registered clients plus SHA-256 hashes of
+issued access/refresh tokens (0600 perms). Delete the file to revoke every
+client at once; per-client revocation via the remind_me_revoke_clients tool."""
+
+
+def resolve_connector_token() -> str:
+    """Return the effective remote-MCP connector token (FT-05).
+
+    Resolution order mirrors :func:`resolve_api_key` (SE-01):
+      1. ``REMIND_ME_REMOTE_TOKEN`` env var — always wins when set.
+      2. The token persisted at ``MEMORY_DIR/connector_token``.
+      3. First use: generate a new token, persist it with 0600 permissions,
+         and log the connector URL path once (the only time the full token
+         is logged — later startups log it redacted).
+
+    If the token file can be neither read nor written, an ephemeral token is
+    generated for this process (and logged) so the endpoint never falls open.
+
+    Reads module attributes at call time so tests can monkeypatch
+    ``REMOTE_MCP_TOKEN`` / ``MEMORY_DIR``.
+    """
+    if REMOTE_MCP_TOKEN is not None:
+        return REMOTE_MCP_TOKEN.strip()
+    token_file = MEMORY_DIR / "connector_token"
+    try:
+        if token_file.is_file():
+            existing = token_file.read_text(encoding="utf-8").strip()
+            if existing:
+                return existing
+        token = secrets.token_urlsafe(32)
+        token_file.touch(mode=0o600, exist_ok=True)
+        token_file.chmod(0o600)
+        token_file.write_text(token + "\n", encoding="utf-8")
+        log.info(
+            "Generated remote MCP connector token — stored at %s. Connector "
+            "URL path: /mcp/%s (treat the URL like a password; rotate by "
+            "deleting the file).",
+            token_file,
+            token,
+        )
+        return token
+    except OSError as exc:
+        token = secrets.token_urlsafe(32)
+        log.warning(
+            "Could not persist connector token at %s (%s); using an "
+            "ephemeral token for this run: %s",
+            token_file,
+            exc,
+            token,
+        )
+        return token
+
+
 _import_roots_env: str | None = os.environ.get("REMIND_ME_IMPORT_ROOTS")
 IMPORT_ROOTS: list[Path] = (
     [Path(r.strip()).expanduser().resolve() for r in _import_roots_env.split(":") if r.strip()]
@@ -188,6 +276,49 @@ def is_in_import_roots(path: Path) -> bool:
     tests can monkeypatch it.
     """
     return any(path == root or root in path.parents for root in IMPORT_ROOTS)
+
+
+_export_roots_env: str | None = os.environ.get("REMIND_ME_EXPORT_ROOTS")
+EXPORT_ROOTS: list[Path] = (
+    [Path(r.strip()).expanduser().resolve() for r in _export_roots_env.split(":") if r.strip()]
+    if _export_roots_env
+    else [Path.home()]
+)
+"""Allowed filesystem roots for export destinations. Colon-separated paths. Default: user home directory."""
+
+
+def is_in_export_roots(path: Path) -> bool:
+    """Return True when the resolved ``path`` is contained in EXPORT_ROOTS (FT-01).
+
+    Mirrors :func:`is_in_import_roots` (SE-02) for export destinations: shared
+    by the HTTP /api/export route and the ExportInput MCP input model. Callers
+    must pass an already ``expanduser().resolve()``-ed path. Reads EXPORT_ROOTS
+    at call time so tests can monkeypatch it.
+    """
+    return any(path == root or root in path.parents for root in EXPORT_ROOTS)
+
+# ---------------------------------------------------------------------------
+# Folder watcher (FT-03)
+# ---------------------------------------------------------------------------
+
+_watch_dirs_env: str | None = os.environ.get("REMIND_ME_WATCH_DIRS")
+WATCH_DIRS: list[Path] = (
+    [Path(r.strip()).expanduser().resolve() for r in _watch_dirs_env.split(":") if r.strip()]
+    if _watch_dirs_env
+    else []
+)
+"""Directories polled by the folder watcher (FT-03). Colon-separated paths.
+Default: empty — the watcher is disabled. Every directory must lie inside
+IMPORT_ROOTS (the SE-02 containment rule shared with the import tools);
+non-contained entries are rejected at startup."""
+
+WATCH_INTERVAL = _env_int("REMIND_ME_WATCH_INTERVAL", 60)
+"""Seconds between folder watcher scan passes."""
+
+WATCH_GRACE = _env_int("REMIND_ME_WATCH_GRACE", 5)
+"""Debounce grace period in seconds. A file whose mtime is younger than this
+is deferred until a later scan observes the same (mtime, size) signature, so
+partially-written files are never ingested mid-write."""
 
 # ---------------------------------------------------------------------------
 # Updates
@@ -228,8 +359,21 @@ __all__ = [
     "API_KEY",
     "API_KEY_FILE",
     "resolve_api_key",
+    "REMOTE_MCP",
+    "REMOTE_MCP_HOST",
+    "REMOTE_MCP_PORT",
+    "REMOTE_MCP_TOKEN",
+    "CONNECTOR_TOKEN_FILE",
+    "REMOTE_MCP_ISSUER",
+    "OAUTH_STATE_FILE",
+    "resolve_connector_token",
     "IMPORT_ROOTS",
     "is_in_import_roots",
+    "EXPORT_ROOTS",
+    "is_in_export_roots",
+    "WATCH_DIRS",
+    "WATCH_INTERVAL",
+    "WATCH_GRACE",
     "AUTO_UPDATE_CHECK",
 ]
 

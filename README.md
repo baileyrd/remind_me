@@ -483,6 +483,99 @@ RestartSec=5
 WantedBy=default.target
 ```
 
+## Claude.ai Custom Connector (Remote MCP)
+
+The `--serve-remote` flag (or `REMIND_ME_REMOTE_MCP=1`) exposes the MCP server
+as a remote connector that the claude.ai **website** can attach to, over the
+Streamable HTTP transport. Two auth modes share the same server:
+
+- **OAuth (recommended)** — set `REMIND_ME_REMOTE_ISSUER` to your public
+  HTTPS origin and the connector serves a minimal single-user OAuth 2.1
+  authorization server (AS metadata, dynamic client registration, PKCE
+  authorization-code flow, refresh, revocation). claude.ai connects with a
+  real, revocable per-client token instead of a secret URL.
+- **Secret-path fallback** — without an issuer, the FT-05 mode applies: the
+  URL `https://<host>/mcp/<connector-token>` is itself the credential. The
+  token is generated on first run and stored at `~/.remind-me/connector_token`
+  (mode 0600, same scheme as the dashboard API key); the full URL path is
+  logged once at generation, redacted afterwards. Header-capable clients
+  (Claude Code, scripts) may instead use `https://<host>/mcp` with
+  `Authorization: Bearer <connector-token>`. The secret path and bearer
+  token keep working even when OAuth is on. Everything else gets a 404/401.
+
+### 1. Expose the port over HTTPS
+
+claude.ai requires a publicly reachable HTTPS endpoint. With Tailscale:
+
+```bash
+tailscale funnel 8768
+# → https://your-machine.your-tailnet.ts.net/
+```
+
+Any HTTPS tunnel works the same way (`cloudflared tunnel --url
+http://localhost:8768`, ngrok, a reverse proxy with TLS, …). The tunnel
+terminates TLS; the connector server itself keeps listening on localhost.
+`GET /health` is an unauthenticated liveness probe for the tunnel.
+
+### 2. Start the connector server
+
+```bash
+REMIND_ME_REMOTE_ISSUER=https://your-machine.your-tailnet.ts.net \
+  remind-me-mcp --serve-remote                    # binds 127.0.0.1:8768
+# or without OAuth: remind-me-mcp --serve-remote
+```
+
+The issuer must be the public **origin only** (https, no path) — it is what
+the OAuth metadata advertises, and it is deliberately never derived from the
+request's Host header.
+
+### 3. Add it as a claude.ai custom connector (OAuth)
+
+1. On claude.ai go to **Settings → Connectors → Add custom connector**
+2. Enter the plain MCP URL — no token in it:
+   `https://your-machine.your-tailnet.ts.net/mcp`
+3. claude.ai discovers the authorization server via the well-known metadata,
+   registers itself as a client, and opens the **authorize page**. Paste your
+   owner token (`cat ~/.remind-me/connector_token`) and click **Approve**.
+4. Done — claude.ai holds a short-lived access token (1 h, auto-refreshed for
+   up to 30 days) scoped to its own client registration.
+
+Without OAuth (legacy fallback), paste the full secret URL instead —
+`https://<host>/mcp/$(cat ~/.remind-me/connector_token)` — and connect
+"without authentication".
+
+### Revoking access
+
+- `remind_me_revoke_clients` (MCP tool) lists every registered OAuth client
+  with live token counts; call it with a `client_id` to revoke that client
+  and all of its tokens immediately. The client must re-register and pass the
+  consent page again to reconnect.
+- `rm ~/.remind-me/oauth.json` revokes **every** OAuth client at once.
+- Clients can also revoke their own tokens at the standard RFC 7009
+  `/revoke` endpoint.
+- The legacy connector token rotates by deleting
+  `~/.remind-me/connector_token` and restarting — note this also invalidates
+  the owner credential used on the consent page.
+
+### Security caveats
+
+- **The owner token is the trust boundary.** Anyone who has it can approve
+  new OAuth clients (and use the legacy URL). Treat
+  `~/.remind-me/connector_token` like a password; `REMIND_ME_REMOTE_TOKEN`
+  overrides the file if you want to manage the secret yourself.
+- **The legacy URL is a password too.** It keeps working alongside OAuth as a
+  fallback. Don't paste it into shared docs or screenshots.
+- **Registration is open by design** (RFC 7591 dynamic client registration,
+  as the MCP spec expects) — but a registration alone grants nothing: every
+  authorization stops at the owner-token consent page, wrong credentials
+  auto-deny, and all comparisons are constant-time.
+- **Always front it with HTTPS.** Over a plain-HTTP tunnel the tokens travel
+  in cleartext. Tailscale Funnel and the usual tunnels handle this for you.
+- OAuth state lives at `~/.remind-me/oauth.json` (0600): client records plus
+  SHA-256 hashes of issued tokens — raw tokens are never written to disk.
+- The remote mode is standalone: run the dashboard (`--serve-ui`) or local
+  MCP HTTP (`--serve-mcp`) in separate processes if you need them too.
+
 ## Search Syntax
 
 The search tool uses SQLite FTS5. Examples:
@@ -506,6 +599,11 @@ The search tool uses SQLite FTS5. Examples:
 | `REMIND_ME_MCP_HTTP_PORT` | `8767` | Port for the MCP HTTP transport |
 | `REMIND_ME_MCP_HTTP_HOST` | `127.0.0.1` | Host to bind the MCP HTTP transport |
 | `REMIND_ME_MCP_HTTP_SECRET` | *(unset)* | Bearer token for MCP HTTP transport authentication |
+| `REMIND_ME_REMOTE_MCP` | `false` | Run the remote MCP connector (Streamable HTTP behind a secret URL path) for claude.ai custom connectors |
+| `REMIND_ME_REMOTE_PORT` | `8768` | Port for the remote MCP connector |
+| `REMIND_ME_REMOTE_HOST` | `127.0.0.1` | Host to bind the remote MCP connector (keep localhost; let the tunnel do the exposing) |
+| `REMIND_ME_REMOTE_TOKEN` | *(auto-generated)* | Connector token (doubles as the secret URL path and the OAuth owner credential). When unset, generated on first run and stored at `~/.remind-me/connector_token` (0600). Delete the file to rotate |
+| `REMIND_ME_REMOTE_ISSUER` | *(unset)* | Public HTTPS origin of the remote connector (e.g. the tunnel hostname). Setting it activates the single-user OAuth 2.1 authorization server; unset falls back to the secret-path mode with a warning |
 | `REMIND_ME_EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | HuggingFace model for semantic embeddings (ONNX backend) |
 | `REMIND_ME_EMBEDDING_BACKEND` | `onnx` | Embedding backend: `onnx` (in-process) or `ollama` (local daemon) |
 | `REMIND_ME_EMBEDDING_DIM` | `384` | Embedding dimension — must match the model (nomic-embed-text=768, bge-m3=1024). Changing it requires recreating the vector table + `remind_me_reindex` |
@@ -547,6 +645,8 @@ remind-me-mcp/
 │   ├── config.py               # Environment configuration, constants
 │   ├── db.py                   # SQLite schema, migrations (v0–v7), helpers
 │   ├── api.py                  # Starlette HTTP API + dashboard HTML
+│   ├── remote.py               # Remote MCP connector (Streamable HTTP; OAuth or secret-path)
+│   ├── oauth.py                # Single-user OAuth 2.1 authorization server (FT-07)
 │   ├── importer.py             # Chat export parser & import engine
 │   ├── embeddings.py           # ONNX embedding engine
 │   ├── formatting.py           # Memory markdown/JSON formatters
@@ -578,6 +678,8 @@ remind-me-mcp --serve-ui --ui-port 8080 --ui-host 0.0.0.0
 remind-me-mcp --serve-mcp                        # MCP HTTP transport on port 8767
 remind-me-mcp --serve-mcp --mcp-host 0.0.0.0     # Bind to all interfaces
 remind-me-mcp --serve-mcp --serve-ui              # Combined: dashboard + MCP HTTP
+remind-me-mcp --serve-remote                      # Remote connector for claude.ai (port 8768)
+remind-me-mcp --serve-remote --remote-port 9000   # Custom connector port
 remind-me-mcp --status               # Check if dashboard is running
 remind-me-mcp --version              # Print installed version
 remind-me-mcp --check-update         # Check for available updates
