@@ -194,6 +194,21 @@ CONNECTOR_TOKEN_FILE = MEMORY_DIR / "connector_token"
 """Location of the auto-generated remote-MCP connector token (0600 perms).
 Delete the file to rotate: a fresh token is generated on next startup."""
 
+REMOTE_MCP_ISSUER: str | None = os.environ.get("REMIND_ME_REMOTE_ISSUER") or None
+"""Public base URL of the remote connector (FT-07) — the HTTPS tunnel origin,
+e.g. ``https://machine.tailnet.ts.net``. Setting it activates the single-user
+OAuth 2.1 authorization server on the remote MCP mode (claude.ai discovers it
+via the well-known metadata and connects with per-client, revocable tokens).
+When unset, the connector falls back to the FT-05 secret-path/bearer mode and
+logs a warning. The value must be an origin only (https, no path/query) — it
+is deliberately NOT derived from the request Host header, which is
+attacker-influenced while DNS-rebinding protection is disabled."""
+
+OAUTH_STATE_FILE = MEMORY_DIR / "oauth.json"
+"""Persisted OAuth state (FT-07): registered clients plus SHA-256 hashes of
+issued access/refresh tokens (0600 perms). Delete the file to revoke every
+client at once; per-client revocation via the remind_me_revoke_clients tool."""
+
 
 def resolve_connector_token() -> str:
     """Return the effective remote-MCP connector token (FT-05).
@@ -349,6 +364,8 @@ __all__ = [
     "REMOTE_MCP_PORT",
     "REMOTE_MCP_TOKEN",
     "CONNECTOR_TOKEN_FILE",
+    "REMOTE_MCP_ISSUER",
+    "OAUTH_STATE_FILE",
     "resolve_connector_token",
     "IMPORT_ROOTS",
     "is_in_import_roots",

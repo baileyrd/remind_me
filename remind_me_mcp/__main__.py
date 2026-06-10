@@ -122,12 +122,15 @@ def _run_combined(args) -> None:
 
 
 def _run_remote(args) -> None:
-    """Run the remote MCP connector (FT-05) on a dedicated Uvicorn instance.
+    """Run the remote MCP connector (FT-05/FT-07) on a dedicated Uvicorn instance.
 
-    Serves the MCP server over Streamable HTTP at /mcp/<connector token>
-    (URL-as-credential, so claude.ai custom connectors can attach without
-    header support) and at /mcp with 'Authorization: Bearer <token>' for
-    clients that can send headers. The token is generated and persisted on
+    Serves the MCP server over Streamable HTTP at /mcp. With
+    REMIND_ME_REMOTE_ISSUER set, a single-user OAuth 2.1 authorization
+    server (FT-07) is mounted alongside — claude.ai adds the connector with
+    just the /mcp URL and approves it on the consent page using the owner
+    token. Without an issuer, the FT-05 secret-path mode applies:
+    /mcp/<connector token> (URL-as-credential) or /mcp with
+    'Authorization: Bearer <token>'. The token is generated and persisted on
     first use (config.resolve_connector_token); the startup log shows it
     redacted — the full URL path is logged once at generation time and
     stored in the token file.
@@ -138,22 +141,39 @@ def _run_remote(args) -> None:
     from remind_me_mcp.remote import build_remote_app, redact_token
 
     token = cfg.resolve_connector_token()
-    app = build_remote_app(token)
+    issuer = cfg.REMOTE_MCP_ISSUER
+    app = build_remote_app(token, issuer=issuer)
 
-    log.info(
-        "Remote MCP connector starting — endpoint: http://%s:%d/mcp/%s "
-        "(token redacted; full token at %s). Header-capable clients may "
-        "instead use http://%s:%d/mcp with 'Authorization: Bearer <token>'. "
-        "Expose via an HTTPS tunnel (e.g. `tailscale funnel %d`) and add the "
-        "public /mcp/<token> URL as a claude.ai custom connector.",
-        args.remote_host,
-        args.remote_port,
-        redact_token(token),
-        cfg.MEMORY_DIR / "connector_token",
-        args.remote_host,
-        args.remote_port,
-        args.remote_port,
-    )
+    if issuer:
+        log.info(
+            "Remote MCP connector starting with OAuth — bind: http://%s:%d, "
+            "public issuer: %s. Add %s/mcp as a claude.ai custom connector; "
+            "approve clients on the consent page with the owner token at %s. "
+            "Revoke clients via the remind_me_revoke_clients tool. The legacy "
+            "secret-path URL (/mcp/%s) keeps working as a fallback.",
+            args.remote_host,
+            args.remote_port,
+            issuer,
+            issuer.rstrip("/"),
+            cfg.MEMORY_DIR / "connector_token",
+            redact_token(token),
+        )
+    else:
+        log.info(
+            "Remote MCP connector starting — endpoint: http://%s:%d/mcp/%s "
+            "(token redacted; full token at %s). Header-capable clients may "
+            "instead use http://%s:%d/mcp with 'Authorization: Bearer <token>'. "
+            "Expose via an HTTPS tunnel (e.g. `tailscale funnel %d`) and add the "
+            "public /mcp/<token> URL as a claude.ai custom connector. Set "
+            "REMIND_ME_REMOTE_ISSUER=https://<public-host> to enable OAuth (FT-07).",
+            args.remote_host,
+            args.remote_port,
+            redact_token(token),
+            cfg.MEMORY_DIR / "connector_token",
+            args.remote_host,
+            args.remote_port,
+            args.remote_port,
+        )
     uvicorn.run(app, host=args.remote_host, port=args.remote_port)
 
 

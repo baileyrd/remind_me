@@ -351,12 +351,15 @@ def test_get_remote_status_disabled(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     """Default config reports the connector disabled with no token on disk."""
     monkeypatch.setattr(cfg, "REMOTE_MCP", False)
     monkeypatch.setattr(cfg, "REMOTE_MCP_TOKEN", None)
+    monkeypatch.setattr(cfg, "REMOTE_MCP_ISSUER", None)
     monkeypatch.setattr(cfg, "MEMORY_DIR", tmp_path)
 
     status = get_remote_status()
     assert status["enabled"] is False
     assert status["token_configured"] is False
     assert status["token_file"] == str(tmp_path / "connector_token")
+    assert status["oauth_enabled"] is False
+    assert status["oauth_clients"] == 0
 
 
 def test_get_remote_status_enabled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -364,6 +367,7 @@ def test_get_remote_status_enabled(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     (tmp_path / "connector_token").write_text("tok\n")
     monkeypatch.setattr(cfg, "REMOTE_MCP", True)
     monkeypatch.setattr(cfg, "REMOTE_MCP_TOKEN", None)
+    monkeypatch.setattr(cfg, "REMOTE_MCP_ISSUER", "https://machine.tailnet.ts.net")
     monkeypatch.setattr(cfg, "REMOTE_MCP_HOST", "0.0.0.0")
     monkeypatch.setattr(cfg, "REMOTE_MCP_PORT", 9999)
     monkeypatch.setattr(cfg, "MEMORY_DIR", tmp_path)
@@ -375,6 +379,10 @@ def test_get_remote_status_enabled(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
         "port": 9999,
         "token_file": str(tmp_path / "connector_token"),
         "token_configured": True,
+        "oauth_enabled": True,
+        "issuer": "https://machine.tailnet.ts.net",
+        "oauth_state_file": str(tmp_path / "oauth.json"),
+        "oauth_clients": 0,
     }
 
 

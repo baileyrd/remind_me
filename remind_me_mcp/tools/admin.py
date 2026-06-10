@@ -392,7 +392,7 @@ async def remind_me_server_status() -> str:
             "auto-ingest a notes/docs folder)"
         )
 
-    # Remote MCP connector (FT-05)
+    # Remote MCP connector (FT-05) + OAuth (FT-07)
     from remind_me_mcp.remote import get_remote_status
 
     remote = get_remote_status()
@@ -402,6 +402,17 @@ async def remind_me_server_status() -> str:
             f"http://{remote['host']}:{remote['port']}/mcp/<token> "
             f"(token at `{remote['token_file']}`; run with --serve-remote)"
         )
+        if remote["oauth_enabled"]:
+            lines.append(
+                f"**Connector OAuth:** ✓ Enabled — issuer {remote['issuer']}, "
+                f"{remote['oauth_clients']} registered client(s) "
+                f"(list/revoke with `remind_me_revoke_clients`)"
+            )
+        else:
+            lines.append(
+                "**Connector OAuth:** ✗ Disabled (set REMIND_ME_REMOTE_ISSUER "
+                "to the public HTTPS origin to enable per-client auth)"
+            )
     elif remote["token_configured"]:
         lines.append(
             f"\n**Remote MCP connector:** ✗ Disabled (token exists at "
@@ -444,6 +455,54 @@ async def remind_me_watch_status() -> str:
     from remind_me_mcp.watcher import get_watch_status
 
     return json.dumps(get_watch_status(), indent=2)
+
+
+@mcp.tool(
+    name="remind_me_revoke_clients",
+    annotations={
+        "title": "List / Revoke OAuth Connector Clients",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def remind_me_revoke_clients(client_id: str = "") -> str:
+    """List OAuth clients registered with the remote connector, or revoke one (FT-07).
+
+    Without a client_id, lists every client that registered against the
+    remote connector's OAuth authorization server (claude.ai registers one
+    per connector) with its live access/refresh token counts. With a
+    client_id, deletes that client's registration and every token it holds —
+    the client is locked out immediately (the running remote server re-reads
+    the state file on each token check) and must re-register and re-obtain
+    the owner's consent to reconnect.
+
+    Args:
+        client_id: The client to revoke. Empty (default) lists clients.
+
+    Returns:
+        str: JSON — the client list, a revocation summary, or an error.
+    """
+    from remind_me_mcp import config as cfg
+    from remind_me_mcp.oauth import OAuthStateStore
+
+    store = OAuthStateStore(cfg.MEMORY_DIR / "oauth.json")
+    if not client_id:
+        # File I/O off the event loop (PF-06 conventions).
+        clients = await asyncio.to_thread(store.list_clients)
+        return json.dumps(
+            {
+                "clients": clients,
+                "state_file": str(store.path),
+                "hint": "Pass client_id to revoke a client and all of its tokens.",
+            },
+            indent=2,
+        )
+    result = await asyncio.to_thread(store.revoke_client, client_id)
+    if result is None:
+        return json.dumps({"status": "error", "error": f"Unknown client_id: {client_id}"})
+    return json.dumps({"status": "revoked", **result}, indent=2)
 
 
 # ---------------------------------------------------------------------------
