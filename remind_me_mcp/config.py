@@ -189,6 +189,26 @@ def is_in_import_roots(path: Path) -> bool:
     """
     return any(path == root or root in path.parents for root in IMPORT_ROOTS)
 
+
+_export_roots_env: str | None = os.environ.get("REMIND_ME_EXPORT_ROOTS")
+EXPORT_ROOTS: list[Path] = (
+    [Path(r.strip()).expanduser().resolve() for r in _export_roots_env.split(":") if r.strip()]
+    if _export_roots_env
+    else [Path.home()]
+)
+"""Allowed filesystem roots for export destinations. Colon-separated paths. Default: user home directory."""
+
+
+def is_in_export_roots(path: Path) -> bool:
+    """Return True when the resolved ``path`` is contained in EXPORT_ROOTS (FT-01).
+
+    Mirrors :func:`is_in_import_roots` (SE-02) for export destinations: shared
+    by the HTTP /api/export route and the ExportInput MCP input model. Callers
+    must pass an already ``expanduser().resolve()``-ed path. Reads EXPORT_ROOTS
+    at call time so tests can monkeypatch it.
+    """
+    return any(path == root or root in path.parents for root in EXPORT_ROOTS)
+
 # ---------------------------------------------------------------------------
 # Updates
 # ---------------------------------------------------------------------------
@@ -230,6 +250,8 @@ __all__ = [
     "resolve_api_key",
     "IMPORT_ROOTS",
     "is_in_import_roots",
+    "EXPORT_ROOTS",
+    "is_in_export_roots",
     "AUTO_UPDATE_CHECK",
 ]
 

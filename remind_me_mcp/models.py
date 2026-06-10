@@ -14,7 +14,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from remind_me_mcp.config import is_in_import_roots
+from remind_me_mcp.config import is_in_export_roots, is_in_import_roots
 
 log = logging.getLogger("remind_me_mcp.models")
 
@@ -218,6 +218,61 @@ class MemoryStatsInput(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
+
+
+class ExportFormat(StrEnum):
+    """Serialization format for memory exports (FT-01)."""
+
+    JSON = "json"
+    JSONL = "jsonl"
+
+
+class ExportInput(BaseModel):
+    """Input for exporting memories to JSON/JSONL (FT-01)."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    format: ExportFormat = Field(
+        default=ExportFormat.JSON,
+        description=(
+            "'json' — single indented JSON array, "
+            "'jsonl' — one JSON record per line"
+        ),
+    )
+    category: str | None = Field(
+        default=None,
+        description="Filter: only export memories with this category",
+    )
+    tags: list[str] | None = Field(
+        default=None, description="Filter: memory must have ALL of these tags"
+    )
+    file_path: str | None = Field(
+        default=None,
+        description=(
+            "Destination file path for the export. When omitted, small exports "
+            "are returned inline. Must be inside the allowed export roots."
+        ),
+    )
+
+    @field_validator("file_path")
+    @classmethod
+    def validate_export_path(cls, v: str | None) -> str | None:
+        """Validate export-root containment and a writable destination (FT-01).
+
+        Mirrors the SE-02 import-root check (shared with the HTTP /api/export
+        route): containment runs first so paths outside EXPORT_ROOTS are
+        rejected without leaking whether they exist.
+        """
+        if v is None or not v.strip():
+            return None
+        p = Path(v).expanduser().resolve()
+        if not is_in_export_roots(p):
+            raise ValueError(f"Path not in allowed export roots: {p}")
+        if p.is_dir():
+            raise ValueError(f"Destination is a directory, not a file: {p}")
+        if not p.parent.is_dir():
+            raise ValueError(f"Parent directory not found: {p.parent}")
+        return str(p)
 
 
 class BulkImportDirInput(BaseModel):
@@ -504,6 +559,8 @@ __all__ = [
     "MemoryDeleteInput",
     "ChatImportInput",
     "MemoryStatsInput",
+    "ExportFormat",
+    "ExportInput",
     "BulkImportDirInput",
     "AutoCaptureInput",
     "MemoryClassification",

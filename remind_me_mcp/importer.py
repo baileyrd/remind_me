@@ -142,6 +142,12 @@ def _extract_messages_from_json(data: Any, extract_mode: str) -> list[dict[str, 
                 messages.append({"role": role, "content": content.strip()})
         return messages
 
+    # Bare single {role, content} message object — the standard chat JSONL
+    # shape (one message per line) and the record format written by the
+    # exporter (FT-01). Reuses the list branch for role/content extraction.
+    if isinstance(data, dict) and ("role" in data or "sender" in data) and "messages" not in data:
+        return _extract_messages_from_json([data], extract_mode)
+
     # Standard {role, content} list
     if isinstance(data, list):
         for item in data:

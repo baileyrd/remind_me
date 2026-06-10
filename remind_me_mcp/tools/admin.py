@@ -1,6 +1,6 @@
 """
-remind_me_mcp.tools.admin — stats / reindex / status / update / import handlers
-and the two MCP resource handlers.
+remind_me_mcp.tools.admin — stats / reindex / status / update / import / export
+handlers and the two MCP resource handlers.
 
 Patchable shared state and cross-module helpers are looked up through the
 ``remind_me_mcp.tools`` package namespace (``_pkg.<name>``) at call time so
@@ -15,10 +15,12 @@ import sqlite3
 
 from remind_me_mcp import tools as _pkg
 from remind_me_mcp.config import EMBED_BATCH_SIZE
+from remind_me_mcp.exporter import EXPORT_INLINE_MAX, export_memories
 from remind_me_mcp.importer import import_chat_file, import_directory
 from remind_me_mcp.models import (
     BulkImportDirInput,
     ChatImportInput,
+    ExportInput,
     MemoryStatsInput,
     ResponseFormat,
 )
@@ -97,6 +99,60 @@ async def memory_import_directory(params: BulkImportDirInput) -> str:
         recursive=params.recursive,
     )
     return json.dumps(summary, indent=2)
+
+
+@mcp.tool(
+    name="remind_me_export_memories",
+    annotations={
+        "title": "Export Memories",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def memory_export(params: ExportInput) -> str:
+    """Export memories to JSON or JSONL for backup or migration to another machine.
+
+    Every column of the memories table is included (id, content, category, tags,
+    source, metadata, timestamps, and lifecycle fields like vitality and
+    superseded_by), so an export is a complete logical backup. Embedding vectors
+    are NOT exported — they are derived data; run remind_me_reindex after
+    importing on the target machine to rebuild them.
+
+    Each record also carries a 'role' key, making the file directly consumable
+    by remind_me_import_chat / remind_me_import_directory (the generic
+    {role, content} message format) for round-trip migration. Re-importing
+    preserves memory content verbatim, but is lossy for everything else: the
+    importer re-chunks long content and assigns fresh ids, category, tags, and
+    source (the originals remain in the export file for manual restoration).
+
+    Small exports are returned inline; pass file_path (inside the allowed
+    export roots) to write larger exports to a file. Optional category/tags
+    filters narrow the export.
+
+    Args:
+        params (ExportInput): Format (json|jsonl), optional category/tag
+            filters, and optional destination file path.
+
+    Returns:
+        str: JSON result — inline export content, or a file-write summary.
+    """
+    try:
+        # File I/O and the full-table scan are blocking — keep them off the
+        # event loop (PF-01/PF-06 conventions).
+        result = await asyncio.to_thread(
+            export_memories,
+            format=params.format.value,
+            category=params.category,
+            tags=params.tags,
+            file_path=params.file_path,
+            inline_max=EXPORT_INLINE_MAX,
+        )
+    except OSError as e:
+        log.error("Export failed for %s: %s", params.file_path, e)
+        return json.dumps({"status": "error", "error": f"Failed to write export: {e}"})
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool(

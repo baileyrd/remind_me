@@ -57,6 +57,7 @@ from remind_me_mcp.models import (
     ConsolidateInput,
     DecomposeBatchInput,
     DecomposeInput,
+    ExportInput,
     MemoryAddInput,
     MemoryDeleteInput,
     MemoryListInput,
@@ -93,6 +94,7 @@ from remind_me_mcp.tools._shared import (
     log,
 )
 from remind_me_mcp.tools.admin import (
+    memory_export,
     memory_import_chat,
     memory_import_directory,
     memory_stats,
@@ -154,6 +156,7 @@ __all__ = [
     "memory_get",
     "memory_update",
     "memory_delete",
+    "memory_export",
     "memory_import_chat",
     "memory_import_directory",
     "memory_stats",

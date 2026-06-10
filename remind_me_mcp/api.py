@@ -18,8 +18,9 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from remind_me_mcp.config import DB_PATH, is_in_import_roots, resolve_api_key
+from remind_me_mcp.config import DB_PATH, is_in_export_roots, is_in_import_roots, resolve_api_key
 from remind_me_mcp.db import _embed_and_store, _get_db, _make_id, _now_iso, _row_to_dict
+from remind_me_mcp.exporter import EXPORT_FORMATS, collect_export_records, export_memories, render_export
 from remind_me_mcp.importer import import_chat_file, import_directory
 
 if TYPE_CHECKING:
@@ -210,7 +211,7 @@ def _build_api_app() -> Starlette:
     from starlette.applications import Starlette
     from starlette.middleware import Middleware
     from starlette.middleware.cors import CORSMiddleware
-    from starlette.responses import HTMLResponse, JSONResponse
+    from starlette.responses import HTMLResponse, JSONResponse, Response
     from starlette.routing import Route
 
     # -- helpers --
@@ -530,6 +531,58 @@ def _build_api_app() -> Starlette:
             log.error("Import failed for %s: %s", file_path, e)
             return _json_err(f"Import error: {e}")
 
+    async def api_export(request: Request) -> Response:
+        """Export memories as JSON or JSONL (FT-01).
+
+        Query parameters: ``format`` (json|jsonl, default json), ``category``,
+        ``tags`` (comma-separated, memory must have ALL), and ``file_path``.
+        Without ``file_path`` the export payload is returned as the response
+        body (``curl .../api/export > backup.json``); with it, the export is
+        written server-side to a path inside EXPORT_ROOTS and a JSON summary
+        is returned. Embedding vectors are excluded (rebuildable via reindex);
+        the records round-trip through POST /api/import.
+        """
+        params = request.query_params
+        fmt = (params.get("format") or "json").strip().lower()
+        if fmt not in EXPORT_FORMATS:
+            return _json_err(f"Invalid format {fmt!r}: use 'json' or 'jsonl'")
+        category = params.get("category") or None
+        tag_param = params.get("tags")
+        tags = tag_param.split(",") if tag_param else None
+        file_path = (params.get("file_path") or "").strip()
+
+        if file_path:
+            p = Path(file_path).expanduser().resolve()
+            # Mirror the SEC-02 import-root containment check for export
+            # destinations (shared helper; checked before existence probes).
+            if not is_in_export_roots(p):
+                return _json_err(f"Path not in allowed export roots: {p}")
+            if p.is_dir():
+                return _json_err(f"file_path is a directory, not a file: {p}")
+            if not p.parent.is_dir():
+                return _json_err(f"Parent directory not found: {p.parent}")
+
+            def _work_file() -> JSONResponse:
+                try:
+                    return _json_ok(
+                        export_memories(
+                            format=fmt, category=category, tags=tags, file_path=str(p)
+                        )
+                    )
+                except OSError as e:
+                    log.error("Export failed for %s: %s", p, e)
+                    return _json_err(f"Export error: {e}", 500)
+
+            return await asyncio.to_thread(_work_file)
+
+        def _work() -> Response:
+            records = collect_export_records(category=category, tags=tags)
+            payload = render_export(records, fmt)
+            media = "application/json" if fmt == "json" else "application/x-ndjson"
+            return Response(payload, media_type=media)
+
+        return await asyncio.to_thread(_work)
+
     async def index(request: Request) -> HTMLResponse:
         """Serve the dashboard UI as a single-page app."""
         return HTMLResponse(_build_dashboard_html())
@@ -545,6 +598,7 @@ def _build_api_app() -> Starlette:
         Route("/api/memories/{memory_id}", api_update, methods=["PUT", "PATCH"]),
         Route("/api/memories/{memory_id}", api_delete, methods=["DELETE"]),
         Route("/api/import", api_import, methods=["POST"]),
+        Route("/api/export", api_export, methods=["GET"]),
     ]
 
     # SE-01: auth is on by default — resolve_api_key() auto-generates and

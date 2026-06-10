@@ -416,6 +416,122 @@ def test_api_import_directory(client: TestClient, db_conn, tmp_path: Path) -> No
 
 
 # ---------------------------------------------------------------------------
+# GET /api/export (FT-01)
+# ---------------------------------------------------------------------------
+
+
+def test_api_export_empty(client: TestClient) -> None:
+    """GET /api/export on an empty store returns an empty JSON array."""
+    response = client.get("/api/export")
+    assert response.status_code == 200
+    assert "application/json" in response.headers["content-type"]
+    assert response.json() == []
+
+
+def test_api_export_json_inline(client: TestClient, memory_factory) -> None:
+    """GET /api/export returns full records including lifecycle columns."""
+    memory_factory(content="Export endpoint memory", category="work", tags=["x"])
+    response = client.get("/api/export")
+    assert response.status_code == 200
+    records = response.json()
+    assert len(records) == 1
+    rec = records[0]
+    assert rec["content"] == "Export endpoint memory"
+    assert rec["category"] == "work"
+    assert rec["tags"] == ["x"]
+    assert rec["role"] == "assistant"
+    assert "id" in rec
+    assert "created_at" in rec
+    assert "superseded_by" in rec
+
+
+def test_api_export_jsonl(client: TestClient, memory_factory) -> None:
+    """GET /api/export?format=jsonl streams one record per line as NDJSON."""
+    import json as _json
+
+    memory_factory(content="JSONL export one")
+    memory_factory(content="JSONL export two")
+    response = client.get("/api/export?format=jsonl")
+    assert response.status_code == 200
+    assert "application/x-ndjson" in response.headers["content-type"]
+    lines = [line for line in response.text.splitlines() if line.strip()]
+    assert len(lines) == 2
+    assert {_json.loads(line)["content"] for line in lines} == {
+        "JSONL export one",
+        "JSONL export two",
+    }
+
+
+def test_api_export_invalid_format(client: TestClient) -> None:
+    """GET /api/export?format=xml is rejected with 400."""
+    response = client.get("/api/export?format=xml")
+    assert response.status_code == 400
+    assert "format" in response.json()["error"].lower()
+
+
+def test_api_export_category_and_tag_filters(client: TestClient, memory_factory) -> None:
+    """Category and tag filters narrow the export."""
+    memory_factory(content="Keep me", category="keep", tags=["a", "b"])
+    memory_factory(content="Wrong category", category="drop", tags=["a", "b"])
+    memory_factory(content="Missing tag", category="keep", tags=["a"])
+
+    response = client.get("/api/export?category=keep&tags=a,b")
+    assert response.status_code == 200
+    records = response.json()
+    assert [r["content"] for r in records] == ["Keep me"]
+
+
+def test_api_export_to_file(client: TestClient, memory_factory, tmp_path: Path) -> None:
+    """GET /api/export?file_path=... writes the file and returns a summary."""
+    memory_factory(content="File endpoint export memory")
+    dest = tmp_path / "api_backup.json"
+    response = client.get(f"/api/export?file_path={dest}")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    assert data["exported"] == 1
+    assert dest.exists()
+
+
+def test_api_export_rejects_path_outside_roots(client: TestClient) -> None:
+    """FT-01 mirrors SE-02: export destinations outside EXPORT_ROOTS are 400."""
+    response = client.get("/api/export?file_path=/etc/exfiltrated.json")
+    assert response.status_code == 400
+    assert "not in allowed export roots" in response.json()["error"].lower()
+
+
+def test_api_export_rejects_missing_parent(client: TestClient, tmp_path: Path) -> None:
+    """A destination in a nonexistent directory is rejected with 400."""
+    dest = tmp_path / "missing" / "backup.json"
+    response = client.get(f"/api/export?file_path={dest}")
+    assert response.status_code == 400
+    assert "parent directory" in response.json()["error"].lower()
+
+
+def test_api_export_requires_auth(client_with_auth: TestClient) -> None:
+    """SEC-03: /api/export is gated by bearer auth like every /api/* route."""
+    assert client_with_auth.get("/api/export").status_code == 401
+    r = client_with_auth.get(
+        "/api/export", headers={"Authorization": "Bearer test-secret-key"}
+    )
+    assert r.status_code == 200
+
+
+def test_api_export_import_round_trip(client: TestClient, memory_factory, tmp_path: Path) -> None:
+    """End-to-end: GET /api/export -> save -> POST /api/import re-creates content."""
+    memory_factory(content="HTTP round trip memory")
+    export_text = client.get("/api/export").text
+    backup = tmp_path / "http_round_trip.json"
+    backup.write_text(export_text)
+
+    response = client.post("/api/import", json={"file_path": str(backup)})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    assert data["memories_created"] == 1
+
+
+# ---------------------------------------------------------------------------
 # Full REST CRUD cycle
 # ---------------------------------------------------------------------------
 
