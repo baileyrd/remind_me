@@ -12,13 +12,13 @@ correctness), **SY** (sync hardening), **SE** (security & server lifecycle),
 
 | ID | P | Status | Item | Review ref |
 |----|---|--------|------|------------|
-| CI-01 | high | todo | Make the 80% coverage gate pass honestly: add tests for `__main__.py` CLI dispatch and `pid.py` lifecycle (currently 0%/33%) | §6 |
-| CI-02 | high | todo | Add mypy step to CI (config exists but never runs) | §6 |
-| CI-03 | high | todo | Add a no-extras CI leg (base install without `[semantic]`) | §6 |
-| CI-04 | med | todo | CI: install from `uv.lock`, enable uv caching, concurrency cancel-in-progress, stop double-running PRs | §6 |
-| CI-05 | med | todo | Add dev dependency group (`pytest`, `pytest-cov`, `pytest-asyncio`, `ruff`, `mypy`) to pyproject; CI installs from it | §6 |
-| CI-06 | med | todo | Move coverage threshold/config into pyproject; add `.coverage` to `.gitignore` | §6 |
-| CI-07 | med | todo | Deflake tests: stable digest seed for FakeEmbedder (`conftest.py:128`), replace `sleep(0.1)` waits with deterministic task awaiting | §6 |
+| CI-01 | high | done | Make the 80% coverage gate pass honestly: add tests for `__main__.py` CLI dispatch and `pid.py` lifecycle (currently 0%/33%) | §6 |
+| CI-02 | high | done | Add mypy step to CI (config exists but never runs) | §6 |
+| CI-03 | high | done | Add a no-extras CI leg (base install without `[semantic]`) | §6 |
+| CI-04 | med | done | CI: install from `uv.lock`, enable uv caching, concurrency cancel-in-progress, stop double-running PRs | §6 |
+| CI-05 | med | done | Add dev dependency group (`pytest`, `pytest-cov`, `pytest-asyncio`, `ruff`, `mypy`) to pyproject; CI installs from it | §6 |
+| CI-06 | med | done | Move coverage threshold/config into pyproject; add `.coverage` to `.gitignore` | §6 |
+| CI-07 | med | done | Deflake tests: stable digest seed for FakeEmbedder (`conftest.py:128`), replace `sleep(0.1)` waits with deterministic task awaiting | §6 |
 | DI-01 | high | todo | `memory_delete` must delete chunk vectors (`_delete_chunks`); reindex must prune orphaned `vec_chunks` rows | §1.2 |
 | DI-02 | high | todo | Filter `superseded_by IS NULL` in both FTS and semantic search tiers | §1.3 |
 | DI-03 | high | todo | Push category/tag/dormant filters into SQL before LIMIT (both `memory_search` and `api_search`) | §1.4 |
