@@ -6,22 +6,38 @@ Persistent, searchable memory that works across **Claude.ai**, **Claude Code**, 
 
 ## Features
 
+**Capture & import**
+- **Chat export import** — ingest JSON, JSONL, or Markdown exports from Claude, ChatGPT, or custom formats
+- **Document ingestion** — import Markdown notes and plain-text files, chunked per-section (heading context preserved) or per-paragraph; `kind=auto` detects chat vs document per file
+- **Bulk directory import** — point at a folder of exports/notes and import them all
+- **Watched folders** — set `REMIND_ME_WATCH_DIRS` and new or changed files auto-ingest in the background; changed files supersede their previous import
+- **Auto-capture** — store a full conversation dialog plus a distilled summary as two linked memories
+- **Deduplication** — re-importing the same file is a safe no-op (tracked by file hash)
+
+**Organize: entity knowledge graph**
+- **Atomic decomposition** — Claude-driven extraction of atomic facts from conversations, linked to parent memories
+- **Structured triples** — subject/predicate/object columns written by add/decompose/annotate for precise query routing
+- **Entity graph** — entities with kinds and aliases, deterministic ids, mention links from memories; backfill via `remind_me_extract_batch` + `remind_me_annotate`, look up with `remind_me_entity`
+- **Tagging & categorization** — organize memories with categories and tags
+- **Memory classification** — 7 memory types with single and batch reclassification tools
+
+**Evolve & maintain**
+- **ACT-R vitality model** — cognitive-science-inspired memory decay with per-category rates, access-based reinforcement, and bridge protection for high-value memories
+- **Vault consolidation** — semantic clustering with Union-Find, canonical selection, and dry-run merge previews
+
+**Search & retrieval**
 - **Full-text search** via SQLite FTS5 — fast, offline, no external services
 - **Hybrid semantic search** — FTS5 keyword matching + vector similarity via `sqlite-vec` and a local ONNX embedding model
 - **RRF rank fusion** — Reciprocal Rank Fusion merges keyword, semantic, recency, and vitality signals for best-match retrieval
+- **Structured queries** — `subject:`, `predicate:`, and `entity:"..."` filters route straight to indexed lookups; opt-in 1-hop graph expansion surfaces related memories
 - **Token budget** — search results are trimmed to fit within an 800-token default cap (configurable), preventing context overflow
-- **ACT-R vitality model** — cognitive-science-inspired memory decay with per-category rates, access-based reinforcement, and bridge protection for high-value memories
-- **Atomic decomposition** — Claude-driven extraction of atomic facts from conversations, linked to parent memories
-- **Structured triples** — optional subject/predicate/object columns for precise query routing
-- **Vault consolidation** — semantic clustering with Union-Find, canonical selection, and dry-run merge previews
-- **Memory classification** — 7 memory types with single and batch reclassification tools
-- **Distributed sync** — offline-first with outbox pattern, Postgres hub, and peer-to-peer sync over Tailscale
-- **Dashboard UI** — browse, search, add, edit, and delete memories from a web interface
-- **Chat export import** — ingest JSON, JSONL, or Markdown exports from Claude, ChatGPT, or custom formats
-- **Bulk directory import** — point at a folder of exports and import them all
-- **Deduplication** — re-importing the same file is a safe no-op (tracked by file hash)
-- **Tagging & categorization** — organize memories with categories and tags
 - **Search transparency** — debug signals, tier breakdown, and dormant exclusion counts in search results
+
+**Sync, backup & access**
+- **Distributed sync** — offline-first with outbox pattern, Postgres hub, and peer-to-peer sync over Tailscale; the entity graph syncs too
+- **Memory export** — full logical backup to JSON/JSONL (entity graph included) via MCP tool or `GET /api/export`, round-trippable through the importer
+- **Dashboard UI** — browse, search, add, edit, and delete memories from a web interface
+- **Claude.ai custom connector** — expose the server over an HTTPS tunnel with single-user OAuth 2.1 (or a secret-path URL fallback) and attach it to claude.ai
 - **WAL mode** — SQLite Write-Ahead Logging ensures safe concurrent reads
 
 ## Quick Start
@@ -131,6 +147,8 @@ When running MCP servers in Claude Desktop via `wsl.exe`, environment variables 
 
 If using the Claude in Chrome extension with MCP support, add the same server configuration to your extension's MCP settings.
 
+To attach the claude.ai **website** itself, run the server as a remote connector instead — see [Claude.ai Custom Connector (Remote MCP)](#claudeai-custom-connector-remote-mcp).
+
 ## Dashboard UI
 
 The server includes a built-in web dashboard for browsing, searching, and managing your memories visually.
@@ -182,17 +200,19 @@ The dashboard is powered by a REST API you can also use directly:
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
+| `GET` | `/health` | Liveness probe (no auth) |
 | `GET` | `/api/stats` | Memory statistics, categories, tags, DB info |
 | `GET` | `/api/memories?category=&tags=&limit=&offset=` | List memories with filters |
 | `GET` | `/api/memories/search?q=&category=&tags=` | Full-text search |
 | `GET` | `/api/memories/{id}` | Get a single memory |
-| `POST` | `/api/memories` | Add a memory (JSON body: `{content, category, tags}`) |
-| `PUT` | `/api/memories/{id}` | Update a memory |
+| `POST` | `/api/memories` | Add a memory (JSON body: `{content, category, tags, source, metadata}`) |
+| `PUT`/`PATCH` | `/api/memories/{id}` | Update a memory |
 | `DELETE` | `/api/memories/{id}` | Delete a memory |
-| `POST` | `/api/import` | Import a chat file (JSON body: `{file_path, extract_mode, tags}`) |
+| `POST` | `/api/import` | Import a chat/document file or directory (JSON body: `{file_path, kind, extract_mode, category, tags, max_length}`; paths must be inside `REMIND_ME_IMPORT_ROOTS`) |
+| `GET` | `/api/export?format=&category=&tags=&file_path=&include_graph=` | Export memories (+ entity graph by default) as JSON/JSONL — streamed as the response body, or written server-side when `file_path` (inside `REMIND_ME_EXPORT_ROOTS`) is given |
+| `GET` | `/api/entity?name=&limit=` | Look up a knowledge-graph entity by name or alias (404 if unknown) |
 
-### Standalone Artifact
-
+All `/api/*` routes require the bearer token described above (`GET /health` does not).
 
 ### Instance Detection
 
@@ -237,31 +257,64 @@ The stats view replaces the main content area with summary cards, horizontal bar
 
 ## MCP Tools
 
+### Search & retrieval
+
 | Tool | Description |
 |------|-------------|
-| `remind_me_add` | Store a new memory with content, category, tags, and metadata |
-| `remind_me_search` | Hybrid search with RRF rank fusion, token budget, and dormant exclusion |
+| `remind_me_search` | Hybrid search with RRF rank fusion, token budget, dormant exclusion, structured `subject:`/`predicate:`/`entity:` queries, and opt-in `expand_entities` graph expansion |
+| `remind_me_entity` | Look up a knowledge-graph entity by name or alias: canonical record, facts, and linked memories |
+
+### CRUD
+
+| Tool | Description |
+|------|-------------|
+| `remind_me_add` | Store a new memory with content, category, tags, metadata, optional SPO triple, and entity mentions |
 | `remind_me_list` | List memories with filters (category, tags, source) and pagination |
 | `remind_me_get` | Retrieve a single memory by ID |
 | `remind_me_update` | Update a memory's content, category, tags, or metadata |
 | `remind_me_delete` | Permanently delete a memory |
-| `remind_me_import_chat` | Import a single chat export file |
-| `remind_me_import_directory` | Bulk import all exports from a directory |
-| `remind_me_stats` | View statistics: counts, categories, recent activity |
+
+### Capture & decomposition
+
+| Tool | Description |
+|------|-------------|
 | `remind_me_auto_capture` | Capture a full conversation dialog + distilled summary as two linked memories |
 | `remind_me_get_capture` | Retrieve a linked dialog/summary pair by their shared capture_id |
-| `remind_me_reclassify` | Apply a memory type classification to a single memory |
-| `remind_me_reclassify_batch` | Batch-classify unclassified memories by type |
-| `remind_me_decompose` | Break a conversation capture into atomic facts with parent-child linking |
-| `remind_me_decompose_batch` | Batch decomposition of undecomposed captures |
-| `remind_me_consolidate` | Find semantically similar memories, preview clusters, and merge duplicates |
+| `remind_me_decompose` | Break a conversation capture into atomic facts with parent-child linking, SPO triples, and entity mentions |
+| `remind_me_decompose_batch` | Fetch captures that have not been decomposed yet |
+
+### Entity graph & annotation
+
+| Tool | Description |
+|------|-------------|
+| `remind_me_extract_batch` | Fetch memories that have no SPO triple and no entity mentions yet (backfill queue) |
+| `remind_me_annotate` | Apply subject/predicate/object triples and entity mentions to existing memories in batch |
+
+### Lifecycle
+
+| Tool | Description |
+|------|-------------|
 | `remind_me_vitality_report` | Generate vault health metrics with decay and vitality scores |
+| `remind_me_reclassify` | Apply a memory type classification to a single memory |
+| `remind_me_reclassify_batch` | Fetch unclassified memories for batch classification |
+| `remind_me_consolidate` | Find semantically similar memories, preview clusters, and merge duplicates |
+
+### Import, export & admin
+
+| Tool | Description |
+|------|-------------|
+| `remind_me_import_chat` | Import a single chat export or document file (`kind`: auto/chat/document) |
+| `remind_me_import_directory` | Bulk import all exports/documents from a directory |
+| `remind_me_export_memories` | Export memories (+ entity graph by default) to JSON/JSONL, inline or to a file inside the export roots |
+| `remind_me_stats` | View statistics: counts, categories, recent activity |
 | `remind_me_reindex` | Build vector embeddings for any memories missing them |
-| `remind_me_server_status` | Check if the dashboard UI is running, get its URL, and verify DB connectivity |
+| `remind_me_server_status` | Check dashboard, embedding, folder-watcher, and remote-connector state and verify DB connectivity |
+| `remind_me_watch_status` | Folder watcher status: watched dirs, scan counters, recent errors |
+| `remind_me_revoke_clients` | List OAuth connector clients, or revoke one (with all of its tokens) |
 | `remind_me_check_update` | Check if a newer version is available on origin/main |
 | `remind_me_self_update` | Pull latest changes from origin and reinstall the package |
 
-21 tools + 2 resources (`stats` and `categories`).
+27 tools + 2 resources (`memory://stats` and `memory://categories`).
 
 ### Auto-Capture: Persisting Full Conversations
 
@@ -327,7 +380,21 @@ This only generates embeddings for memories that don't have them yet — existin
 
 Use `remind_me_server_status` to see how many memories have embeddings and whether the model is loaded.
 
-## Importing Chat Exports
+## Importing Chats & Documents
+
+The import tools (`remind_me_import_chat`, `remind_me_import_directory`, `POST /api/import`) share one pipeline: hash-based deduplication (re-importing the same file content is a no-op), batched embedding, and a `kind` parameter that controls parsing.
+
+### Import Kinds
+
+| Kind | Behavior |
+|------|----------|
+| `auto` *(default)* | `.json`/`.jsonl` always parse as chat. `.md`/`.markdown`/`.txt` are content-sniffed: files with chat role markers (`**User:**`, `## Assistant`, …) import as chat, everything else as a document |
+| `chat` | Force the chat-export parser (chunked per-message) |
+| `document` | Force document chunking (`.md`/`.markdown`/`.txt` only) |
+
+Document imports chunk Markdown per-section (the heading context is kept with each chunk and stored in metadata) and plain text per-paragraph. They get `source: document_import` and default to category `document`.
+
+Imports are restricted to paths inside `REMIND_ME_IMPORT_ROOTS` (default: your home directory) — enforced by both the MCP tools and the HTTP API.
 
 ### Claude Export Format
 
@@ -354,7 +421,61 @@ Use remind_me_import_directory with:
 
 - **JSON**: Claude exports (`chat_messages` with `content` arrays), OpenAI exports (`messages` with `role`/`content`), or any `[{role, content}]` array
 - **JSONL**: One message or conversation per line
-- **Markdown**: Headings or bold markers for roles (`## Human`, `**Assistant:**`, etc.)
+- **Markdown**: Chat exports (headings or bold markers for roles: `## Human`, `**Assistant:**`, …) or plain notes (imported as documents)
+- **Plain text** (`.txt`): imported as documents, chunked per-paragraph
+
+## Exporting & Backup
+
+`remind_me_export_memories` (MCP) and `GET /api/export` (HTTP) dump the memory store to **JSON** (single array) or **JSONL** (one record per line):
+
+- **Complete logical backup** — every column of the memories table is included (id, content, category, tags, source, metadata, timestamps, vitality, superseded_by, …).
+- **Entity graph included by default** — entities and memory-entity links follow the memories as records tagged with a `record_type` discriminator (`entity` / `memory_entity`; memory records carry none — the same wire shape sync uses). Pass `include_graph=false` for a memories-only export.
+- **Embeddings are excluded** — they are derived data; run `remind_me_reindex` after importing on the target machine.
+- **Filters** — optional `category` and `tags` narrow the export (and scope the graph records to the exported memories).
+- **Destination** — small exports (≤200 memories) are returned inline by the MCP tool; pass `file_path` to write to disk. File destinations must be inside `REMIND_ME_EXPORT_ROOTS` (default: your home directory). The HTTP route streams the payload as the response body when no `file_path` is given (`curl .../api/export > backup.json`).
+
+### Round-trip caveats (honest fine print)
+
+Each memory record also carries a `role` key, so the export file is directly consumable by `remind_me_import_chat` / `remind_me_import_directory` (the generic `{role, content}` format). But re-import is **lossy for everything except content**:
+
+- The importer **re-chunks** long content and assigns **fresh ids**, category, tags, and source — the original values stay in the export file for manual restoration.
+- Graph records restore on import: entities **upsert** (deterministic ids, alias union-merge), links insert when the referenced memory still exists under its **original id**. Since a chat re-import assigns new memory ids, links only fully restore into a database that still holds the referenced memories — **dangling links are skipped and counted** in the import result.
+
+## Watched Folders (Auto-Ingest)
+
+Set `REMIND_ME_WATCH_DIRS` (colon-separated, each directory must lie inside `REMIND_ME_IMPORT_ROOTS`) and the server polls those folders in the background, auto-ingesting new or changed `.md`, `.markdown`, `.txt`, `.json`, and `.jsonl` files through the same import pipeline (`kind=auto`, hash dedup applies):
+
+```bash
+REMIND_ME_WATCH_DIRS=~/notes:~/Downloads/exports remind-me-mcp
+```
+
+- **Polling, not inotify** — directories are scanned every `REMIND_ME_WATCH_INTERVAL` seconds (default 60); no extra dependencies.
+- **Debounce** — a file whose mtime is younger than `REMIND_ME_WATCH_GRACE` seconds (default 5) is deferred until a later scan observes the same (mtime, size) signature, so partially-written files are never ingested mid-write.
+- **Changed files supersede** — a changed file has a new hash, so it imports fresh; the watcher then marks every memory from the file's previous import as superseded (`superseded_by` = the new import id). Stale chunks drop out of search results (which filter `superseded_by IS NULL`) but remain in the database for audit.
+- **Status** — the `remind_me_watch_status` tool reports watched dirs, scan counters, ingest/skip/supersede counts, and recent errors; `remind_me_server_status` includes a watcher summary too.
+
+## Entity Knowledge Graph
+
+Memories can carry a structured **subject/predicate/object triple** plus links to **entities** (people, projects, tools, places, orgs — each with a kind and aliases). The graph builds up through normal use:
+
+- **`remind_me_add`** accepts optional `subject`/`predicate`/`object` fields and an `entities` list (`{name, kind, aliases}`).
+- **`remind_me_decompose`** writes SPO triples and entity mentions on every extracted fact.
+- **`remind_me_extract_batch` + `remind_me_annotate`** backfill older memories: the batch tool returns memories with no triple and no entity mentions; Claude reviews them and annotates triples + entities in bulk.
+
+### How identity works
+
+- **Deterministic ids** — an entity's id is derived from its normalized name (lowercased, whitespace-collapsed), so 'Bailey  Robertson ' and 'bailey robertson' are the same entity, and two machines independently creating the same-named entity converge to the same row.
+- **Alias union-merge** — re-upserting an entity merges new aliases into the existing list (deduplicated, existing order preserved) and fills in a missing kind; the canonical name is never auto-merged with a different name.
+
+### Search surfaces
+
+- **`entity:"Bailey Robertson"`** in a search query resolves the name/alias and returns memories linked to that entity or whose SPO subject/object matches it; composes with `subject:`/`predicate:` filters.
+- **`expand_entities=true`** on `remind_me_search` appends up to 5 related memories that share an entity with the results (1-hop graph expansion, in a separate `related_via_entities` section that doesn't affect ranking).
+- **`remind_me_entity`** (or `GET /api/entity?name=`) returns the canonical record, its facts (memories whose SPO subject/object is the entity), and the memories that mention it.
+
+### Sync & export
+
+The graph syncs between machines alongside memories: entity and link records travel with `record_type` discriminators through the outbox/hub and the peer endpoints (`/sync/pull_entities`, `/sync/pull_links`). Deterministic ids make concurrent creation converge; aliases union-merge on receipt; links are immutable insert-or-ignore rows, and a link that arrives before its endpoints simply stays invisible until they do. Exports include the graph by default (see [Exporting & Backup](#exporting--backup)).
 
 ## Multi-Machine Sync
 
@@ -409,6 +530,19 @@ Sync is enabled automatically when `NODE_ID`, `HUB_URL`, and `SYNC_SECRET` are a
 3. Incoming records are upserted with last-write-wins on `updated_at`
 4. Records pulled from the hub are marked as already-sent in the outbox to prevent echo
 5. Optionally, peers discover each other via Tailscale and sync directly
+6. The **entity graph syncs too**: entity and link records carry a `record_type` discriminator on the wire; entities upsert with alias union-merge, links are insert-or-ignore (see [Entity Knowledge Graph](#entity-knowledge-graph))
+
+#### Peer Server Endpoints
+
+Each node runs a small HTTP server (default port 8766, bind via `REMIND_ME_PEER_BIND`) for direct peer sync. Every request requires `Authorization: Bearer <REMIND_ME_SYNC_SECRET>`:
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/health` | Node liveness + node_id |
+| `GET` | `/sync/pull?since=&since_id=&exclude_node=&limit=` | Pull memory records (keyset cursor on `(updated_at, id)` when `since_id` is sent) |
+| `POST` | `/sync/push` | Push records (responds with `processed_ids`) |
+| `GET` | `/sync/pull_entities?since=&since_id=&limit=` | Pull entity records (404 on pre-entity-graph peers is treated as "no entity support") |
+| `GET` | `/sync/pull_links?since=&since_id=&limit=` | Pull memory-entity link records |
 
 ### File-Based Sync (alternative)
 
@@ -512,10 +646,46 @@ tailscale funnel 8768
 # → https://your-machine.your-tailnet.ts.net/
 ```
 
-Any HTTPS tunnel works the same way (`cloudflared tunnel --url
-http://localhost:8768`, ngrok, a reverse proxy with TLS, …). The tunnel
-terminates TLS; the connector server itself keeps listening on localhost.
-`GET /health` is an unauthenticated liveness probe for the tunnel.
+Any HTTPS tunnel works the same way — the tunnel terminates TLS; the
+connector server itself keeps listening on localhost. `GET /health` is an
+unauthenticated liveness probe for the tunnel.
+
+#### Exposure options
+
+- **Tailscale Funnel** (shown above) — stable hostname, automatic TLS, no
+  account beyond your tailnet. The easiest path for OAuth.
+- **cloudflared quick tunnel / ngrok** —
+  `cloudflared tunnel --url http://localhost:8768` or `ngrok http 8768`.
+  Note: the free tiers hand out a **new hostname on every start**. That's
+  fine for the secret-path fallback (just paste the new URL into claude.ai),
+  but OAuth needs a stable `REMIND_ME_REMOTE_ISSUER` — use a **named
+  Cloudflare tunnel** or an ngrok **static domain** if you want OAuth over
+  these.
+- **VPS + reverse proxy** — terminate TLS on a box you control (e.g. Caddy)
+  and feed it from your home machine with a persistent reverse SSH tunnel:
+
+  ```bash
+  # on the home machine — keeps a reverse tunnel up through restarts
+  autossh -M 0 -N -R 127.0.0.1:8768:localhost:8768 user@vps
+  ```
+
+  ```caddyfile
+  # /etc/caddy/Caddyfile on the VPS
+  memory.example.com {
+      reverse_proxy 127.0.0.1:8768
+  }
+  ```
+
+  Stable hostname, so OAuth works (`REMIND_ME_REMOTE_ISSUER=https://memory.example.com`).
+- **SSH-based tunnel services** — `ssh -R 80:localhost:8768 nokey@localhost.run`
+  (or pinggy and similar) need nothing installed, but the hostnames are
+  ephemeral: fine for trying out the secret-path mode, not for OAuth.
+- **What does NOT work: plain `ssh -L` local forwarding.** claude.ai
+  connectors are fetched by **Anthropic's servers**, not by your browser — a
+  port forwarded to your own laptop is invisible to them. `ssh -L` *is* the
+  right tool for reaching the connector from your own other machines (point
+  a header-capable client like Claude Code at the forwarded port with
+  `Authorization: Bearer <connector-token>`), just not for claude.ai.
 
 ### 2. Start the connector server
 
@@ -573,12 +743,15 @@ Without OAuth (legacy fallback), paste the full secret URL instead —
   in cleartext. Tailscale Funnel and the usual tunnels handle this for you.
 - OAuth state lives at `~/.remind-me/oauth.json` (0600): client records plus
   SHA-256 hashes of issued tokens — raw tokens are never written to disk.
+- The OAuth issuer comes **only** from `REMIND_ME_REMOTE_ISSUER` — it is never
+  derived from the request's Host header, which is attacker-influenced behind
+  a tunnel.
 - The remote mode is standalone: run the dashboard (`--serve-ui`) or local
   MCP HTTP (`--serve-mcp`) in separate processes if you need them too.
 
 ## Search Syntax
 
-The search tool uses SQLite FTS5. Examples:
+The search tool uses SQLite FTS5 for keyword queries. Examples:
 
 | Query | Matches |
 |-------|---------|
@@ -587,6 +760,18 @@ The search tool uses SQLite FTS5. Examples:
 | `python NOT django` | Python memories excluding Django |
 | `"exact phrase"` | Memories with the exact phrase |
 | `deploy*` | Prefix matching: deploy, deployment, deployed… |
+
+### Structured Queries
+
+Queries containing `subject:`, `predicate:`, or `entity:` prefixes route to an indexed structured lookup instead of full-text search (values can be quoted for multi-word matches):
+
+| Query | Matches |
+|-------|---------|
+| `subject:Bailey` | Memories whose SPO subject is "Bailey" |
+| `subject:"Bailey Robertson" predicate:works_at` | Subject AND predicate combined |
+| `entity:"remind_me"` | Memories linked to that entity in the graph, or whose SPO subject/object is its canonical name (resolves aliases, case-insensitive) |
+
+An unresolvable `entity:` filter returns an empty result with a message (no silent fallback); if a structured lookup finds nothing, the remaining query words fall back to hybrid search. Pass `expand_entities=true` to append up to 5 related memories that share an entity with the results (1-hop graph expansion).
 
 ## Environment Variables
 
@@ -609,8 +794,16 @@ The search tool uses SQLite FTS5. Examples:
 | `REMIND_ME_EMBEDDING_DIM` | `384` | Embedding dimension — must match the model (nomic-embed-text=768, bge-m3=1024). Changing it requires recreating the vector table + `remind_me_reindex` |
 | `REMIND_ME_OLLAMA_URL` | `http://localhost:11434` | Ollama daemon URL (when backend is `ollama`) |
 | `REMIND_ME_OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Ollama embedding model name |
+| `REMIND_ME_EMBED_CHUNK_CHARS` | `1600` | Character window size for sliding-window embedding of long content |
+| `REMIND_ME_EMBED_CHUNK_OVERLAP` | `200` | Overlap between embedding windows |
+| `REMIND_ME_EMBED_MAX_CHUNKS` | `16` | Max embedding chunks per memory |
+| `REMIND_ME_EMBED_BATCH_SIZE` | `32` | Memories embedded per batch during reindex and import |
 | `REMIND_ME_API_KEY` | *(auto-generated)* | Bearer token for `/api/*` routes. When unset, a key is generated on first run and stored at `~/.remind-me/api_key` (0600) — check the server log or that file for the value. Set to `disabled` to explicitly turn dashboard auth off |
 | `REMIND_ME_IMPORT_ROOTS` | `$HOME` | Colon-separated allowed filesystem roots for import operations (enforced by both the HTTP API and the MCP import tools) |
+| `REMIND_ME_EXPORT_ROOTS` | `$HOME` | Colon-separated allowed filesystem roots for export destinations (enforced by both the HTTP API and the MCP export tool) |
+| `REMIND_ME_WATCH_DIRS` | *(unset)* | Colon-separated directories for the folder watcher to auto-ingest. Empty = watcher disabled. Each directory must lie inside `REMIND_ME_IMPORT_ROOTS` |
+| `REMIND_ME_WATCH_INTERVAL` | `60` | Seconds between folder watcher scan passes |
+| `REMIND_ME_WATCH_GRACE` | `5` | Debounce grace period in seconds — files modified more recently than this are deferred until a scan sees a stable (mtime, size) |
 | `REMIND_ME_AUTO_UPDATE_CHECK` | `true` | Set to `false` to skip the background `git fetch` update check at server startup (the manual check/update tools keep working) |
 | `REMIND_ME_RRF_K` | `60` | Smoothing constant for Reciprocal Rank Fusion scoring |
 | `REMIND_ME_RRF_W_KEYWORD` | `1.0` | RRF weight for the keyword (FTS5) signal |
@@ -629,6 +822,8 @@ The search tool uses SQLite FTS5. Examples:
 | `REMIND_ME_SYNC_SECRET` | *(unset)* | Shared bearer token for hub and peer authentication |
 | `REMIND_ME_SYNC_INTERVAL` | `60` | Seconds between sync cycles |
 | `REMIND_ME_PEER_PORT` | `8766` | Local port for the peer-to-peer sync server |
+| `REMIND_ME_PEER_BIND` | `0.0.0.0` | Bind address for the peer sync server (set to a Tailscale IP or `127.0.0.1` to narrow exposure; every request still requires the sync secret) |
+| `REMIND_ME_OUTBOX_RETENTION_DAYS` | `30` | Sync outbox rows older than this are pruned each sync cycle |
 | `REMIND_ME_STATIC_PEERS` | `[]` | JSON array of static peer configs (for environments without Tailscale) |
 | `REMIND_ME_TAILSCALE_SOCKET` | *(unset)* | Path to Tailscale socket for peer discovery (auto-detected if empty) |
 
@@ -636,36 +831,51 @@ The search tool uses SQLite FTS5. Examples:
 
 ```
 remind-me-mcp/
-├── remind_me_mcp/              # Main package (13 modules + dashboard subpackage)
+├── remind_me_mcp/              # Main package
 │   ├── __init__.py             # Package exports, version
 │   ├── __main__.py             # CLI entry point, mode dispatch
 │   ├── server.py               # FastMCP instance, app lifespan
-│   ├── tools.py                # 21 MCP tools + 2 resources
+│   ├── tools/                  # 27 MCP tools + 2 resources
+│   │   ├── search.py           # Hybrid search + structured/entity queries
+│   │   ├── crud.py             # add / list / get / update / delete
+│   │   ├── capture.py          # auto-capture, decompose, extract/annotate
+│   │   ├── lifecycle.py        # vitality, reclassify, consolidate
+│   │   ├── entity.py           # entity lookup
+│   │   └── admin.py            # import/export, stats, status, updates, OAuth revocation
 │   ├── models.py               # Pydantic input models
 │   ├── config.py               # Environment configuration, constants
-│   ├── db.py                   # SQLite schema, migrations (v0–v7), helpers
+│   ├── db.py                   # SQLite schema, migrations (v0–v10), entity helpers
 │   ├── api.py                  # Starlette HTTP API + dashboard HTML
 │   ├── remote.py               # Remote MCP connector (Streamable HTTP; OAuth or secret-path)
-│   ├── oauth.py                # Single-user OAuth 2.1 authorization server (FT-07)
-│   ├── importer.py             # Chat export parser & import engine
-│   ├── embeddings.py           # ONNX embedding engine
+│   ├── oauth.py                # Single-user OAuth 2.1 authorization server
+│   ├── importer.py             # Chat export + document parser & import engine
+│   ├── exporter.py             # Memory + entity-graph export engine
+│   ├── watcher.py              # Watched-folder auto-ingest (poll, debounce, supersede)
+│   ├── embeddings.py           # ONNX/Ollama embedding engine
 │   ├── formatting.py           # Memory markdown/JSON formatters
 │   ├── retrieval.py            # RRF rank fusion, recency signals, token budget
+│   ├── reranker.py             # Optional ONNX cross-encoder reranking
+│   ├── query_expansion.py      # Optional HyDE query expansion (Ollama)
 │   ├── vitality.py             # ACT-R decay model, access recording, bridge protection
 │   ├── consolidation.py        # Semantic clustering (Union-Find), canonical selection, merge
 │   ├── pid.py                  # PID file management, instance detection
 │   ├── updater.py              # Version checking, self-update logic
-│   ├── sync.py                 # Background sync engine (hub + peer push/pull)
+│   ├── sync.py                 # Background sync engine (hub + peer push/pull, entity graph)
 │   ├── peer_server.py          # Lightweight HTTP server for peer-to-peer sync
 │   └── dashboard/
 │       └── App.jsx             # React dashboard component
-├── tests/                      # Test suite — 308 tests (pytest + pytest-asyncio)
+├── benchmarks/                 # Retrieval benchmark harness (LongMemEval)
+├── tests/                      # Test suite — 850+ tests (pytest + pytest-asyncio)
 ├── pyproject.toml              # Package configuration and dependencies
 └── README.md                   # This file
 
 ~/.remind-me/                   # Data directory (synced across machines)
-├── memory.db                   # SQLite database with FTS5 + sqlite-vec (schema v7)
+├── memory.db                   # SQLite database with FTS5 + sqlite-vec (schema v10)
 ├── models/                     # Cached ONNX embedding model (~80MB, auto-downloaded)
+├── api_key                     # Auto-generated dashboard API key (0600)
+├── connector_token             # Auto-generated remote-connector token (0600)
+├── oauth.json                  # OAuth client registrations + token hashes (0600)
+├── import_log.json             # Import history
 └── server.pid                  # PID file when dashboard is running
 ```
 
@@ -688,6 +898,25 @@ remind-me-mcp --update               # Pull latest and reinstall
 
 You can also run via `python -m remind_me_mcp` with the same flags.
 
+| Flag | Default | Description |
+|------|---------|-------------|
+| *(none)* | — | MCP stdio mode for Claude Code / Claude Desktop |
+| `--serve-ui` | off | Start the HTTP dashboard server |
+| `--ui-port PORT` | `5199` | Dashboard port |
+| `--ui-host HOST` | `127.0.0.1` | Dashboard bind address |
+| `--serve-mcp` | off | MCP server over Streamable HTTP transport |
+| `--mcp-port PORT` | `8767` | MCP HTTP port |
+| `--mcp-host HOST` | `127.0.0.1` | MCP HTTP bind address |
+| `--serve-remote` | off | Remote MCP connector for claude.ai (standalone mode — `--serve-ui`/`--serve-mcp` are ignored when set) |
+| `--remote-port PORT` | `8768` | Remote connector port |
+| `--remote-host HOST` | `127.0.0.1` | Remote connector bind address (keep localhost; let the tunnel do the exposing) |
+| `--status` | — | Check if the dashboard is running, then exit |
+| `--version` | — | Print the installed version, then exit |
+| `--check-update` | — | Check for available updates, then exit |
+| `--update` | — | Pull latest changes from origin and reinstall, then exit |
+
+Each serve flag has an environment-variable equivalent (`REMIND_ME_MCP_SERVE_UI`, `REMIND_ME_MCP_SERVE_HTTP`, `REMIND_ME_REMOTE_MCP`) — see the table above.
+
 ## Architecture
 
 The server uses:
@@ -697,14 +926,17 @@ The server uses:
 - **RRF rank fusion** (k=60) — merges keyword, semantic, recency, and vitality signals without score normalization
 - **Token budget** — search results are trimmed to an 800-token default cap to prevent LLM context overflow
 - **ACT-R vitality model** — cognitive-science decay with per-category rates, access reinforcement, and bridge protection
-- **Structured triples** — optional subject/predicate/object columns with indexed query routing
+- **Structured triples** — subject/predicate/object columns with indexed query routing
+- **Entity knowledge graph** — `entities` and `memory_entities` tables with deterministic name-derived ids, alias union-merge, and 1-hop search expansion
 - **Union-Find clustering** — transitive semantic similarity grouping for vault consolidation
-- **Outbox-based sync** — local writes are captured in `sync_outbox`, pushed to hub/peers in background
+- **Section-aware document chunking** — Markdown imports split per heading section, plain text per paragraph
+- **Polling folder watcher** — mtime/size scans with a debounce grace window and changed-file supersession (no inotify dependency)
+- **Outbox-based sync** — local writes (memories, entities, links) are captured in `sync_outbox`, pushed to hub/peers in background
 - **Postgres hub** — central sync point with last-write-wins conflict resolution
 - **Peer-to-peer sync** — direct machine-to-machine sync via Tailscale peer discovery
 - **WAL journal mode** for safe concurrent access
 - **Content-based hashing** for deduplication
-- **stdio + Streamable HTTP transports** — stdio for local Claude interfaces; HTTP for remote access via Tailscale or SSH tunnel
+- **stdio + Streamable HTTP transports** — stdio for local Claude interfaces; HTTP for remote access via Tailscale or SSH tunnel; a hardened remote-connector mode (OAuth 2.1 or secret-path) for claude.ai
 - **Starlette + Uvicorn** for the optional HTTP dashboard and REST API
 - **Self-contained HTML** — the dashboard is served as a single inline page with no build step
 - **Graceful degradation** — semantic search, vitality scoring, and distributed sync are all optional; core functionality works with just FTS5 and local storage
