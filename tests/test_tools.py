@@ -2316,6 +2316,41 @@ async def test_structured_search_excludes_superseded(
     assert "Bailey prefers light mode" not in contents
 
 
+async def test_rerank_pool_extends_beyond_limit(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reranker sees a pool of max(limit, RERANK_TOP_K) candidates so it can
+    promote matches beyond the head; the limit applies after reranking (DI-07)."""
+    import remind_me_mcp.tools as _tools_mod
+
+    for i in range(6):
+        memory_factory(content=f"rerank pool candidate {i} mentions walrus")
+
+    seen: dict = {}
+
+    def fake_rerank(query: str, memories: list[dict]) -> list[dict]:
+        seen["order"] = [m["id"] for m in memories]
+        return list(reversed(memories))  # promote the tail
+
+    monkeypatch.setattr(_tools_mod, "maybe_rerank", fake_rerank)
+
+    params = MemorySearchInput(
+        query="walrus", limit=2, response_format=ResponseFormat.JSON
+    )
+    result = await memory_search(params)
+    data = json.loads(result)
+
+    # The reranker received the whole candidate pool, not just `limit` heads...
+    assert len(seen["order"]) == 6
+    # ...the limit still applies to the response...
+    assert data["returned"] == 2
+    # ...and candidates promoted from beyond the old head are returned.
+    returned_ids = [m["id"] for m in data["memories"]]
+    assert returned_ids == list(reversed(seen["order"]))[:2]
+
+
 async def test_search_category_filter_applies_before_limit(
     db_conn: sqlite3.Connection, memory_factory
 ) -> None:

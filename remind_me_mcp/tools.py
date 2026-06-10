@@ -51,7 +51,7 @@ from remind_me_mcp.models import (
 )
 from remind_me_mcp.pid import get_server_status
 from remind_me_mcp.query_expansion import expand_query
-from remind_me_mcp.reranker import maybe_rerank
+from remind_me_mcp.reranker import RERANK_TOP_K, maybe_rerank
 from remind_me_mcp.retrieval import (
     apply_token_budget,
     build_debug_signals,
@@ -518,11 +518,14 @@ async def memory_search(params: MemorySearchInput) -> str:
         if mid in fts_ids and mid in sem_ids:
             m["_search_method"] = "hybrid"
 
+    # --- Optional cross-encoder rerank of the top candidates (lever D) ---
+    # Rerank a pool larger than the response limit so the cross-encoder can
+    # promote candidates beyond the head, THEN truncate (DI-07).
+    rerank_pool = max(params.limit, RERANK_TOP_K)
+    ranked = await asyncio.to_thread(maybe_rerank, params.query, ranked[:rerank_pool])
+
     # --- Apply limit, then token budget ---
     ranked = ranked[:params.limit]
-
-    # --- Optional cross-encoder rerank of the top candidates (lever D) ---
-    ranked = await asyncio.to_thread(maybe_rerank, params.query, ranked)
 
     if params.token_budget == 0:
         envelope = apply_token_budget(ranked, 0)
