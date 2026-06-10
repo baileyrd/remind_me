@@ -41,13 +41,13 @@ correctness), **SY** (sync hardening), **SE** (security & server lifecycle),
 | SY-07 | med | todo | Prune sent outbox rows on a retention window; don't accumulate when sync disabled | §2 |
 | SY-08 | med | todo | One canonical UTC ISO timestamp format (triggers vs `_now_iso()` vs hub) | §2 |
 | SY-09 | med | todo | Peer server hardening: ThreadingHTTPServer, body/limit caps, JSON error handling, configurable bind, `hmac.compare_digest`, honor `STATIC_PEERS`/`TAILSCALE_SOCKET`, index on `memories(updated_at)` | §2 |
-| SE-01 | high | todo | Dashboard API: require/generate API key by default; reject non-JSON Content-Type on mutating routes (CSRF) | §3 |
-| SE-02 | high | todo | Enforce `IMPORT_ROOTS` in MCP import tool inputs (parity with HTTP API) | §3 |
-| SE-03 | high | todo | Fix combined-mode lifespan loss; fix `FastMCP.run()` host/port kwargs | §1.5 |
-| SE-04 | med | todo | Unauthenticated `/health` endpoint; pid health check works with auth enabled | §3 |
-| SE-05 | med | todo | `hmac.compare_digest` for all secret comparisons; share one bearer middleware | §3 |
-| SE-06 | med | todo | Opt-out env var for startup `git fetch` / self-update | §3 |
-| SE-07 | med | todo | DB shutdown: per-thread connection close (or `check_same_thread=False`), lifespan `try/finally`, stop sync/peer threads before close | §7 |
+| SE-01 | high | done | Dashboard API: require/generate API key by default; reject non-JSON Content-Type on mutating routes (CSRF) | §3 |
+| SE-02 | high | done | Enforce `IMPORT_ROOTS` in MCP import tool inputs (parity with HTTP API) | §3 |
+| SE-03 | high | done | Fix combined-mode lifespan loss; fix `FastMCP.run()` host/port kwargs | §1.5 |
+| SE-04 | med | done | Unauthenticated `/health` endpoint; pid health check works with auth enabled | §3 |
+| SE-05 | med | done | `hmac.compare_digest` for all secret comparisons; share one bearer middleware | §3 |
+| SE-06 | med | done | Opt-out env var for startup `git fetch` / self-update | §3 |
+| SE-07 | med | done | DB shutdown: per-thread connection close (or `check_same_thread=False`), lifespan `try/finally`, stop sync/peer threads before close | §7 |
 
 ## Wave 3 — performance + hygiene
 
