@@ -239,25 +239,37 @@ def test_default_mode_logs_running_dashboard(monkeypatch: pytest.MonkeyPatch, ca
 
 
 def test_serve_mcp_standalone(monkeypatch: pytest.MonkeyPatch) -> None:
-    """--serve-mcp runs FastMCP with the streamable-http transport on the given host/port."""
+    """--serve-mcp runs FastMCP with the streamable-http transport on the given host/port.
+
+    SE-03: FastMCP.run() accepts no host/port kwargs (it would raise TypeError
+    on the installed SDK); the bind address must go through mcp.settings.
+    """
     calls: list[dict] = []
     monkeypatch.setattr(main_mod.mcp, "run", lambda *a, **kw: calls.append(kw))
+    monkeypatch.setattr(main_mod.mcp.settings, "host", "sentinel-host")
+    monkeypatch.setattr(main_mod.mcp.settings, "port", -1)
 
     _run_main(monkeypatch, "--serve-mcp", "--mcp-host", "0.0.0.0", "--mcp-port", "9999")
 
-    assert calls == [{"transport": "streamable-http", "host": "0.0.0.0", "port": 9999}]
+    assert calls == [{"transport": "streamable-http"}]
+    assert main_mod.mcp.settings.host == "0.0.0.0"
+    assert main_mod.mcp.settings.port == 9999
 
 
 def test_serve_mcp_default_host_port(monkeypatch: pytest.MonkeyPatch) -> None:
-    """--serve-mcp defaults come from config (127.0.0.1:8767)."""
+    """--serve-mcp defaults come from config (127.0.0.1:8767), applied via mcp.settings."""
     from remind_me_mcp.config import MCP_HTTP_HOST, MCP_HTTP_PORT
 
     calls: list[dict] = []
     monkeypatch.setattr(main_mod.mcp, "run", lambda *a, **kw: calls.append(kw))
+    monkeypatch.setattr(main_mod.mcp.settings, "host", "sentinel-host")
+    monkeypatch.setattr(main_mod.mcp.settings, "port", -1)
 
     _run_main(monkeypatch, "--serve-mcp")
 
-    assert calls == [{"transport": "streamable-http", "host": MCP_HTTP_HOST, "port": MCP_HTTP_PORT}]
+    assert calls == [{"transport": "streamable-http"}]
+    assert main_mod.mcp.settings.host == MCP_HTTP_HOST
+    assert main_mod.mcp.settings.port == MCP_HTTP_PORT
 
 
 # ---------------------------------------------------------------------------
@@ -397,3 +409,96 @@ def test_run_combined_bearer_auth_rejects_unauthorized(monkeypatch: pytest.Monke
     client = TestClient(captured[0], raise_server_exceptions=False)
     assert client.get("/mcp/").status_code == 401
     assert client.get("/mcp/", headers={"Authorization": "Bearer wrong"}).status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# SE-03: combined mode must run the MCP app's lifespan
+# ---------------------------------------------------------------------------
+
+
+_MCP_INITIALIZE = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+        "protocolVersion": "2025-03-26",
+        "capabilities": {},
+        "clientInfo": {"name": "se03-test", "version": "0"},
+    },
+}
+_MCP_HEADERS = {"Accept": "application/json, text/event-stream"}
+
+
+@pytest.fixture()
+def _combined_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Prepare an isolated combined-app build: no MCP secret, dashboard auth
+    off, startup git-fetch disabled (SE-06), and a fresh StreamableHTTP
+    session manager (its .run() is once-only per instance)."""
+    import remind_me_mcp.config as cfg
+
+    monkeypatch.setattr(cfg, "MCP_HTTP_SECRET", None)
+    monkeypatch.setattr(cfg, "API_KEY", "disabled")
+    monkeypatch.setattr(cfg, "AUTO_UPDATE_CHECK", False)
+    monkeypatch.setattr(main_mod.mcp, "_session_manager", None)
+
+
+def test_combined_app_lifespan_starts_mcp_session_manager(
+    monkeypatch: pytest.MonkeyPatch, _combined_env: None
+) -> None:
+    """SE-03 regression: the combined app delegates its lifespan to the MCP
+    sub-app, so the StreamableHTTP session manager is running and a real MCP
+    initialize request on /mcp succeeds (previously: 'Task group is not
+    initialized' / 500 on every /mcp request, and the app lifespan that opens
+    the DB and starts sync never ran)."""
+    from starlette.testclient import TestClient
+
+    app = main_mod._build_combined_app()
+    # TestClient as context manager runs the lifespan; base_url must be a
+    # localhost host to satisfy the SDK's DNS-rebinding protection.
+    with TestClient(app, base_url="http://127.0.0.1:5199") as client:
+        r = client.post("/mcp", json=_MCP_INITIALIZE, headers=_MCP_HEADERS)
+        assert r.status_code == 200, r.text
+        assert "protocolVersion" in r.text
+
+        # The dashboard app is still mounted and served alongside /mcp
+        assert client.get("/health").status_code == 200
+        assert client.get("/").status_code == 200
+
+
+def test_combined_app_serves_mcp_at_exact_mcp_path(
+    monkeypatch: pytest.MonkeyPatch, _combined_env: None
+) -> None:
+    """SE-03: the MCP endpoint lives at /mcp exactly (not /mcp/mcp as the old
+    nested-mount layout produced)."""
+    app = main_mod._build_combined_app()
+    route_paths = {route.path for route in app.routes}
+    assert "/mcp" in route_paths
+    assert "/mcp/mcp" not in route_paths
+
+
+def test_combined_app_accepts_valid_mcp_token_with_lifespan(
+    monkeypatch: pytest.MonkeyPatch, _combined_env: None
+) -> None:
+    """SE-03/SE-05: with MCP_HTTP_SECRET set, the shared bearer middleware
+    admits the correct token and the request reaches a live session manager."""
+    from starlette.testclient import TestClient
+
+    import remind_me_mcp.config as cfg
+
+    monkeypatch.setattr(cfg, "MCP_HTTP_SECRET", "s3cret")
+
+    app = main_mod._build_combined_app()
+    with TestClient(app, base_url="http://127.0.0.1:5199", raise_server_exceptions=False) as client:
+        # Wrong/missing token -> 401 from the shared middleware
+        assert client.post("/mcp", json=_MCP_INITIALIZE, headers=_MCP_HEADERS).status_code == 401
+
+        # Correct token -> full MCP initialize round-trip
+        r = client.post(
+            "/mcp",
+            json=_MCP_INITIALIZE,
+            headers={**_MCP_HEADERS, "Authorization": "Bearer s3cret"},
+        )
+        assert r.status_code == 200, r.text
+
+        # Dashboard routes are not gated by the MCP secret
+        assert client.get("/health").status_code == 200

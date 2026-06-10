@@ -39,40 +39,65 @@ log = logging.getLogger("remind_me_mcp.__main__")
 __all__ = ["main"]
 
 
-def _run_combined(args) -> None:
-    """Run dashboard API and MCP HTTP transport on the same Uvicorn instance."""
-    import uvicorn
+def _build_combined_app():
+    """Build the combined Starlette app: dashboard API at / and MCP HTTP at /mcp.
+
+    SE-03 fixes:
+      - The combined app delegates its lifespan to the MCP app's lifespan
+        (which starts the StreamableHTTP session manager). Starlette does not
+        propagate lifespans to mounted/lifted sub-app routes, so without this
+        every /mcp request fails with an uninitialised task group and the app
+        lifespan (DB, sync, peer server) never runs.
+      - MCP_HTTP_SECRET auth is applied as ASGI middleware on the combined app
+        (the shared BearerAuthMiddleware from api.py, SE-05, gating only
+        /mcp paths) instead of re-instantiating Starlette around the MCP
+        routes, which discarded the lifespan again.
+    """
+    from contextlib import asynccontextmanager
+
     from starlette.applications import Starlette
+    from starlette.middleware import Middleware
     from starlette.routing import Mount
 
+    from remind_me_mcp.api import BearerAuthMiddleware
     from remind_me_mcp.config import MCP_HTTP_SECRET
 
     dashboard_app = _build_api_app()
+    # The MCP app serves its endpoint at settings.streamable_http_path
+    # (default "/mcp"). Its Route objects are lifted directly into the
+    # combined app — nesting it under Mount("/mcp") would serve /mcp/mcp.
     mcp_http_app = mcp.streamable_http_app()
 
-    # Wrap with bearer auth if secret is configured
-    if MCP_HTTP_SECRET:
-        from starlette.middleware.base import BaseHTTPMiddleware
-        from starlette.responses import Response
+    @asynccontextmanager
+    async def _combined_lifespan(app):
+        """Run the MCP app's lifespan for the lifetime of the combined app."""
+        async with mcp_http_app.router.lifespan_context(mcp_http_app):
+            yield
 
-        secret = MCP_HTTP_SECRET
-
-        class _BearerAuth(BaseHTTPMiddleware):
-            async def dispatch(self, request, call_next):
-                auth = request.headers.get("Authorization", "")
-                if auth != f"Bearer {secret}":
-                    return Response("Unauthorized", status_code=401)
-                return await call_next(request)
-
-        mcp_http_app = Starlette(routes=list(mcp_http_app.routes))
-        mcp_http_app.add_middleware(_BearerAuth)
-
-    combined = Starlette(
-        routes=[
-            Mount("/mcp", app=mcp_http_app),
-            Mount("/", app=dashboard_app),
-        ]
+    # Gate the MCP endpoint with bearer auth when a secret is configured
+    # (shared middleware, SE-05); dashboard paths keep their own auth from
+    # _build_api_app.
+    middleware = (
+        [Middleware(BearerAuthMiddleware, secret=MCP_HTTP_SECRET, protect_prefix="/mcp")]
+        if MCP_HTTP_SECRET
+        else []
     )
+
+    return Starlette(
+        routes=[
+            *mcp_http_app.routes,
+            Mount("/", app=dashboard_app),
+        ],
+        middleware=middleware,
+        lifespan=_combined_lifespan,
+    )
+
+
+def _run_combined(args) -> None:
+    """Run dashboard API and MCP HTTP transport on the same Uvicorn instance."""
+    import uvicorn
+
+    combined = _build_combined_app()
 
     log.info(
         "Combined server starting — dashboard: http://%s:%d  MCP HTTP: http://%s:%d/mcp",
@@ -206,11 +231,11 @@ def main() -> None:
     # -- MCP HTTP standalone mode --
     if args.serve_mcp:
         log.info("Starting MCP HTTP transport on %s:%d", args.mcp_host, args.mcp_port)
-        mcp.run(  # type: ignore[call-arg]  # FastMCP type stubs omit host/port kwargs
-            transport="streamable-http",
-            host=args.mcp_host,
-            port=args.mcp_port,
-        )
+        # SE-03: FastMCP.run() accepts no host/port kwargs (TypeError on the
+        # installed SDK); the bind address comes from mcp.settings instead.
+        mcp.settings.host = args.mcp_host
+        mcp.settings.port = args.mcp_port
+        mcp.run(transport="streamable-http")
         return
 
     # -- UI server mode --
