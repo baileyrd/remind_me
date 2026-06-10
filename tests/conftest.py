@@ -8,6 +8,7 @@ here to prevent MCP registration side effects at collection time.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from typing import TYPE_CHECKING
@@ -125,7 +126,8 @@ class FakeEmbedder:
         """Return a deterministic (len(texts), 384) float32 array, L2-normalised."""
         rows: list[np.ndarray] = []
         for text in texts:
-            seed = hash(text) & 0xFFFFFFFF  # positive 32-bit seed
+            # Stable across processes — Python's hash() is salted per run.
+            seed = int.from_bytes(hashlib.sha256(text.encode("utf-8")).digest()[:4], "big")
             rng = np.random.default_rng(seed=seed)
             vec = rng.standard_normal(384).astype(np.float32)
             norm = np.linalg.norm(vec)

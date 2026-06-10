@@ -1401,12 +1401,25 @@ async def test_search_record_access_called(
 
     monkeypatch.setattr(_tools_mod, "record_access", fake_record_access)
 
+    # Capture the fire-and-forget task so we can await it deterministically
+    # instead of sleeping for an arbitrary duration.
+    import asyncio
+
+    created_tasks: list[asyncio.Task] = []
+    real_create_task = asyncio.create_task
+
+    def capture_task(coro, **kwargs):
+        task = real_create_task(coro, **kwargs)
+        created_tasks.append(task)
+        return task
+
+    monkeypatch.setattr(asyncio, "create_task", capture_task)
+
     search_params = MemorySearchInput(query="record access test eta")
     await memory_search(search_params)
 
-    # Give fire-and-forget task a moment to execute
-    import asyncio
-    await asyncio.sleep(0.1)
+    assert created_tasks, "memory_search should schedule a record-access task"
+    await asyncio.gather(*created_tasks)
 
     assert mem["id"] in called_ids
 
