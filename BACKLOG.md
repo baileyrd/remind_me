@@ -75,3 +75,4 @@ not from the review).
 | FT-02 | med | todo | Collect — generic document ingestion: extend the importer beyond chat exports to plain Markdown, text, and notes files (per-file/per-section chunking instead of per-message) | — |
 | FT-03 | med | todo | Collect — source connectors: watch a configured notes/docs folder and auto-ingest new or changed files (reuse import dedup-by-hash), as a path toward email/app connectors | — |
 | FT-04 | med | todo | Organize — entity & link extraction: during decomposition, extract entities and relations and store them as structured metadata/links between memories (lightweight knowledge-graph layer over SQLite) | — |
+| FT-05 | med | todo | Use — claude.ai web MCP support: expose the MCP server as a remote connector (Streamable HTTP transport, OAuth/bearer auth, public reachability e.g. Tailscale Funnel or tunnel) so claude.ai custom connectors can attach remind_me from the website | — |
