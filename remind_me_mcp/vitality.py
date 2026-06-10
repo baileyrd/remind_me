@@ -21,6 +21,7 @@ Key concepts:
 from __future__ import annotations
 
 import math
+from datetime import UTC, datetime
 
 from remind_me_mcp.db import _get_db, _now_iso
 
@@ -115,6 +116,51 @@ def is_dormant(vitality: float) -> bool:
     return vitality < VITALITY_FLOOR
 
 
+def effective_vitality(memory: dict, now: datetime | None = None) -> float:
+    """Compute a memory's read-time vitality with real elapsed-days decay.
+
+    The stored ``vitality`` column is a snapshot taken when the memory was last
+    accessed (computed with days_since=0), so it never decays on its own. This
+    recomputes the ACT-R formula using the days actually elapsed since
+    ``accessed_at`` (falling back to ``created_at``), with bridge protection
+    applied. Use this wherever vitality drives ranking, dormancy checks,
+    ``min_vitality`` filtering, or reporting.
+
+    Args:
+        memory: A memory dict (e.g. from ``_row_to_dict``). Missing vitality
+            columns fall back to schema defaults.
+        now: Clock override for tests. Defaults to the current UTC time.
+
+    Returns:
+        The effective vitality score as a non-negative float.
+    """
+    if now is None:
+        now = datetime.now(UTC)
+
+    access_count = memory.get("access_count") or 0
+    base_weight = memory.get("base_weight") or 1.0
+    decay_rate = memory.get("decay_rate")
+    if decay_rate is None:
+        decay_rate = DECAY_RATES.get(
+            memory.get("memory_type") or "unclassified", DECAY_RATES["unclassified"]
+        )
+    effective_rate = get_effective_decay_rate(decay_rate, access_count)
+
+    days = 0.0
+    last = memory.get("accessed_at") or memory.get("created_at")
+    if last:
+        try:
+            last_dt = datetime.fromisoformat(str(last))
+        except (TypeError, ValueError):
+            last_dt = None
+        if last_dt is not None:
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=UTC)
+            days = max(0.0, (now - last_dt).total_seconds() / 86400.0)
+
+    return compute_vitality(base_weight, access_count, effective_rate, days)
+
+
 # ---------------------------------------------------------------------------
 # Database integration
 # ---------------------------------------------------------------------------
@@ -181,6 +227,7 @@ __all__ = [
     "DECAY_RATES",
     "VITALITY_FLOOR",
     "compute_vitality",
+    "effective_vitality",
     "get_effective_decay_rate",
     "is_dormant",
     "record_access",

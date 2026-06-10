@@ -333,6 +333,34 @@ def test_api_search_no_results(client: TestClient) -> None:
     assert data["count"] == 0
 
 
+def test_api_search_category_filter_applies_before_limit(
+    client: TestClient, memory_factory
+) -> None:
+    """api_search pushes the category filter into SQL before LIMIT (DI-03)."""
+    memory_factory(content="falcon falcon falcon field notes", category="noise")
+    memory_factory(content="a falcon fact", category="birds")
+
+    response = client.get("/api/memories/search?q=falcon&limit=1&category=birds")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 1
+    assert data["memories"][0]["content"] == "a falcon fact"
+
+
+def test_api_search_tag_filter_applies_before_limit(
+    client: TestClient, memory_factory
+) -> None:
+    """api_search pushes the tag filter into SQL before LIMIT (DI-03)."""
+    memory_factory(content="otter otter otter river survey", tags=["noise"])
+    memory_factory(content="one otter spotted", tags=["river", "mammal"])
+
+    response = client.get("/api/memories/search?q=otter&limit=1&tags=river,mammal")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 1
+    assert data["memories"][0]["content"] == "one otter spotted"
+
+
 # ---------------------------------------------------------------------------
 # POST /api/import
 # ---------------------------------------------------------------------------

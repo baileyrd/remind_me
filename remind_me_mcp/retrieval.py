@@ -91,14 +91,18 @@ def rank_rrf(
     if w_vitality is None:
         w_vitality = RRF_W_VITALITY
 
-    # Collect unique memories by id, preserving dict contents
+    # Collect unique memories by id, preserving dict contents. A memory hit by
+    # both tiers merges the second occurrence's keys (e.g. semantic_distance)
+    # without overwriting non-null keys from the first.
     seen: dict[str, dict] = {}
-    for mem in keyword_results:
-        if mem["id"] not in seen:
+    for mem in [*keyword_results, *semantic_results]:
+        existing = seen.get(mem["id"])
+        if existing is None:
             seen[mem["id"]] = dict(mem)
-    for mem in semantic_results:
-        if mem["id"] not in seen:
-            seen[mem["id"]] = dict(mem)
+        else:
+            for key, value in mem.items():
+                if existing.get(key) is None:
+                    existing[key] = value
 
     if not seen:
         return []

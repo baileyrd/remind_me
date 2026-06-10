@@ -69,6 +69,97 @@ def test_compute_vitality_formula_exact() -> None:
 
 
 # ---------------------------------------------------------------------------
+# effective_vitality — read-time decay (DI-04)
+# ---------------------------------------------------------------------------
+
+
+def _decayed_memory(days_ago: float, **overrides) -> dict:
+    """Build a memory dict whose accessed_at lies *days_ago* in the past."""
+    from datetime import UTC, datetime, timedelta
+
+    accessed = (datetime.now(UTC) - timedelta(days=days_ago)).isoformat()
+    mem = {
+        "accessed_at": accessed,
+        "created_at": accessed,
+        "access_count": 0,
+        "decay_rate": 0.1,
+        "base_weight": 1.0,
+    }
+    mem.update(overrides)
+    return mem
+
+
+def test_effective_vitality_decays_with_elapsed_days() -> None:
+    """effective_vitality applies real elapsed-days decay since accessed_at."""
+    from datetime import UTC, datetime, timedelta
+
+    from remind_me_mcp.vitality import effective_vitality
+
+    now = datetime.now(UTC)
+    mem = {
+        "accessed_at": (now - timedelta(days=30)).isoformat(),
+        "access_count": 0,
+        "decay_rate": 0.1,
+        "base_weight": 1.0,
+    }
+    expected = compute_vitality(1.0, 0, 0.1, 30.0)
+    assert effective_vitality(mem, now=now) == pytest.approx(expected)
+
+
+def test_effective_vitality_fresh_access_is_snapshot() -> None:
+    """A just-accessed memory has effective vitality equal to its at-access snapshot."""
+    from remind_me_mcp.vitality import effective_vitality
+
+    mem = _decayed_memory(0.0, access_count=3)
+    assert effective_vitality(mem) == pytest.approx(compute_vitality(1.0, 3, 0.1, 0.0), rel=1e-3)
+
+
+def test_effective_vitality_falls_back_to_created_at() -> None:
+    """Without accessed_at, decay is measured from created_at."""
+    from datetime import UTC, datetime, timedelta
+
+    from remind_me_mcp.vitality import effective_vitality
+
+    now = datetime.now(UTC)
+    mem = {
+        "accessed_at": None,
+        "created_at": (now - timedelta(days=10)).isoformat(),
+        "access_count": 0,
+        "decay_rate": 0.1,
+        "base_weight": 1.0,
+    }
+    expected = compute_vitality(1.0, 0, 0.1, 10.0)
+    assert effective_vitality(mem, now=now) == pytest.approx(expected)
+
+
+def test_effective_vitality_applies_bridge_protection() -> None:
+    """Bridge-protected memories (access_count >= threshold) decay at half rate."""
+    from datetime import UTC, datetime
+
+    from remind_me_mcp.vitality import effective_vitality
+
+    now = datetime.now(UTC)
+    mem = _decayed_memory(20.0, access_count=BRIDGE_THRESHOLD)
+    expected = compute_vitality(1.0, BRIDGE_THRESHOLD, 0.05, 20.0)
+    assert effective_vitality(mem, now=now) == pytest.approx(expected, rel=1e-3)
+
+
+def test_effective_vitality_missing_fields_defaults() -> None:
+    """A dict without vitality columns yields the default fresh vitality of 1.0."""
+    from remind_me_mcp.vitality import effective_vitality
+
+    assert effective_vitality({"created_at": _now_iso()}) == pytest.approx(1.0, rel=1e-3)
+
+
+def test_effective_vitality_old_memory_goes_dormant() -> None:
+    """A long-unaccessed memory decays below the dormancy floor."""
+    from remind_me_mcp.vitality import effective_vitality
+
+    mem = _decayed_memory(365.0)
+    assert is_dormant(effective_vitality(mem))
+
+
+# ---------------------------------------------------------------------------
 # get_effective_decay_rate — bridge protection
 # ---------------------------------------------------------------------------
 

@@ -861,6 +861,33 @@ def _delete_chunks(db: sqlite3.Connection, memory_rowid: int) -> None:
     db.execute("DELETE FROM vec_chunks WHERE memory_rowid = ?", (memory_rowid,))
 
 
+def _prune_orphan_chunks(db: sqlite3.Connection) -> int:
+    """Remove chunk vectors whose parent memory no longer exists.
+
+    SQLite reuses freed rowids, so an orphaned ``vec_chunks`` row would make a
+    new memory inherit a deleted memory's embedding (and reindex would skip it
+    because the rowid already looks embedded). Called by reindex to heal
+    databases written before deletes cleaned up chunk vectors.
+
+    Args:
+        db: An open SQLite connection.
+
+    Returns:
+        The number of orphaned chunk rows removed.
+    """
+    orphans = db.execute(
+        """SELECT vec_rowid FROM vec_chunks
+           WHERE memory_rowid NOT IN (SELECT rowid FROM memories)"""
+    ).fetchall()
+    if not orphans:
+        return 0
+    for (vec_rowid,) in orphans:
+        db.execute("DELETE FROM memories_vec WHERE rowid = ?", (vec_rowid,))
+        db.execute("DELETE FROM vec_chunks WHERE vec_rowid = ?", (vec_rowid,))
+    db.commit()
+    return len(orphans)
+
+
 def _embed_and_store_rows(rows: list[tuple[int, str]]) -> int:
     """Embed and store sliding-window chunk vectors for several memories at once.
 
@@ -967,7 +994,11 @@ def _fuse_query_embedding(embedder, texts: list[str]) -> bytes:
 
 
 def _semantic_search(
-    query: str, limit: int = 20, extra_texts: list[str] | None = None
+    query: str,
+    limit: int = 20,
+    extra_texts: list[str] | None = None,
+    category: str | None = None,
+    tags: list[str] | None = None,
 ) -> list[dict]:
     """Search memories by semantic similarity using the chunked vector index.
 
@@ -975,14 +1006,17 @@ def _semantic_search(
     then deduplicates to distinct parent memories — keeping each memory's best
     (smallest-distance) chunk. Because one memory may own several chunks, the
     KNN over-fetches ``limit * _CHUNK_KNN_FANOUT`` chunk hits so enough distinct
-    memories survive the dedupe. Results carry a 'semantic_distance' key (lower =
-    more similar). Returns [] when the embedder or vector table is unavailable.
+    memories survive the dedupe (a further 4x when category/tag filters prune
+    candidates). Results carry a 'semantic_distance' key (lower = more similar).
+    Returns [] when the embedder or vector table is unavailable.
 
     Args:
         query: The search query text to embed and compare.
         limit: Maximum number of distinct memories to return.
         extra_texts: Optional expansion texts (e.g. a HyDE passage) whose
             embeddings are averaged with the query's before the KNN.
+        category: If set, only return memories with this category.
+        tags: If set, only return memories that have ALL of these tags.
 
     Returns:
         List of memory dicts (from _row_to_dict) with an added
@@ -997,17 +1031,33 @@ def _semantic_search(
             query_bytes = _fuse_query_embedding(embedder, [query, *extra_texts])
         else:
             query_bytes = embedder.embed_one(query)
-        knn_k = max(limit, limit * _CHUNK_KNN_FANOUT)
+        # Filters are applied after the KNN, so over-fetch harder when they
+        # can prune candidates (DI-03).
+        fanout = _CHUNK_KNN_FANOUT * (4 if (category or tags) else 1)
+        knn_k = max(limit, limit * fanout)
+        conditions = ""
+        bindings: list = [query_bytes, knn_k]
+        if category:
+            conditions += " AND m.category = ?"
+            bindings.append(category)
+        for i, tag in enumerate(tags or []):
+            alias = f"mt{i}"
+            conditions += (
+                f" AND EXISTS (SELECT 1 FROM memory_tags {alias}"
+                f" WHERE {alias}.memory_id = m.id AND {alias}.tag = ?)"
+            )
+            bindings.append(tag)
         rows = db.execute(
-            """SELECT m.*, MIN(mv.distance) AS distance
+            f"""SELECT m.*, MIN(mv.distance) AS distance
                FROM memories_vec mv
                JOIN vec_chunks vc ON vc.vec_rowid = mv.rowid
                JOIN memories m ON m.rowid = vc.memory_rowid
                WHERE mv.embedding MATCH ?
                AND mv.k = ?
+               AND m.superseded_by IS NULL{conditions}
                GROUP BY m.rowid
                ORDER BY distance""",
-            (query_bytes, knn_k),
+            bindings,
         ).fetchall()
         results = []
         for r in rows[:limit]:
@@ -1090,8 +1140,10 @@ __all__ = [
     "_close_db",
     "_ensure_schema",
     "_migrate_schema",
+    "_delete_chunks",
     "_embed_and_store",
     "_embed_and_store_rows",
+    "_prune_orphan_chunks",
     "_fuse_query_embedding",
     "_semantic_search",
     "_now_iso",

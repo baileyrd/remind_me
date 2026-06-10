@@ -9,6 +9,7 @@ circular imports.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -18,11 +19,13 @@ from typing import Any
 from remind_me_mcp.config import CLIENT, NODE_ID
 from remind_me_mcp.consolidation import find_clusters, merge_cluster, pick_canonical
 from remind_me_mcp.db import (
+    _delete_chunks,
     _embed_and_store,
     _embed_and_store_rows,
     _get_db,
     _make_id,
     _now_iso,
+    _prune_orphan_chunks,
     _row_to_dict,
     _semantic_search,
 )
@@ -48,7 +51,7 @@ from remind_me_mcp.models import (
 )
 from remind_me_mcp.pid import get_server_status
 from remind_me_mcp.query_expansion import expand_query
-from remind_me_mcp.reranker import maybe_rerank
+from remind_me_mcp.reranker import RERANK_TOP_K, maybe_rerank
 from remind_me_mcp.retrieval import (
     apply_token_budget,
     build_debug_signals,
@@ -57,7 +60,14 @@ from remind_me_mcp.retrieval import (
 )
 from remind_me_mcp.server import mcp
 from remind_me_mcp.updater import pop_update_notice
-from remind_me_mcp.vitality import DECAY_RATES, compute_vitality, get_effective_decay_rate, record_access
+from remind_me_mcp.vitality import (
+    DECAY_RATES,
+    compute_vitality,
+    effective_vitality,
+    get_effective_decay_rate,
+    is_dormant,
+    record_access,
+)
 
 log = logging.getLogger("remind_me_mcp.tools")
 
@@ -332,14 +342,19 @@ async def memory_search(params: MemorySearchInput) -> str:
             limit=params.limit,
         )
         if structured_results:
+            # Read-time vitality decay (DI-04): the stored column is an
+            # at-access snapshot; recompute with real elapsed days.
+            for m in structured_results:
+                m["vitality"] = effective_vitality(m)
+
             # Apply filters (category, tags, dormant, vitality)
             filtered = _apply_filters(structured_results, params.category, params.tags)
             if not params.include_dormant:
-                filtered = [m for m in filtered if m.get("status") != "dormant"]
+                filtered = [m for m in filtered if not is_dormant(m["vitality"])]
             if params.min_vitality > 0:
                 filtered = [
                     m for m in filtered
-                    if (m.get("vitality") or 1.0) >= params.min_vitality
+                    if m["vitality"] >= params.min_vitality
                 ]
 
             # Wrap in token budget envelope and return
@@ -390,17 +405,38 @@ async def memory_search(params: MemorySearchInput) -> str:
                 )
             return "_No memories found._"
 
+    # Dormancy and min_vitality are filtered in Python after the SQL fetch, so
+    # over-fetch when they can prune candidates (DI-03); category/tag filters
+    # go straight into the SQL of both tiers below.
+    fetch_limit = params.limit
+    if params.min_vitality > 0 or not params.include_dormant:
+        fetch_limit = params.limit * 4
+
     # --- FTS5 keyword search ---
     fts_memories: list[dict] = []
 
     def _run_fts(match_query: str) -> list[dict]:
+        conditions = ""
+        bindings: list[Any] = [match_query]
+        if params.category:
+            conditions += " AND m.category = ?"
+            bindings.append(params.category)
+        for i, tag in enumerate(params.tags or []):
+            alias = f"mt{i}"
+            conditions += (
+                f" AND EXISTS (SELECT 1 FROM memory_tags {alias}"
+                f" WHERE {alias}.memory_id = m.id AND {alias}.tag = ?)"
+            )
+            bindings.append(tag)
+        bindings.append(fetch_limit)
         rows = db.execute(
-            """SELECT m.* FROM memories m
+            f"""SELECT m.* FROM memories m
                JOIN memories_fts fts ON m.rowid = fts.rowid
                WHERE memories_fts MATCH ?
+               AND m.superseded_by IS NULL{conditions}
                ORDER BY rank
                LIMIT ?""",
-            (match_query, params.limit),
+            bindings,
         ).fetchall()
         return [_row_to_dict(r) for r in rows]
 
@@ -424,9 +460,18 @@ async def memory_search(params: MemorySearchInput) -> str:
             log.warning("FTS5 query syntax error for query %r: %s", params.query, raw_err)
 
     # --- Semantic vector search (optionally HyDE-expanded) ---
-    extra_texts = await asyncio.to_thread(expand_query, params.query)
+    # HyDE output is only consumed by the semantic tier — skip the (slow)
+    # generation entirely when no embedder is available (DI-08).
+    extra_texts: list[str] = []
+    if _get_embedder() is not None:
+        extra_texts = await asyncio.to_thread(expand_query, params.query)
     sem_memories = await asyncio.to_thread(
-        _semantic_search, params.query, limit=params.limit, extra_texts=extra_texts
+        _semantic_search,
+        params.query,
+        limit=fetch_limit,
+        extra_texts=extra_texts,
+        category=params.category,
+        tags=params.tags,
     )
 
     # --- Tag search method on raw results before RRF ---
@@ -437,31 +482,35 @@ async def memory_search(params: MemorySearchInput) -> str:
     for m in sem_memories:
         m["_search_method"] = "semantic"
 
-    # --- Apply category/tag filters BEFORE RRF ranking ---
-    filtered_fts = _apply_filters(fts_memories, params.category, params.tags)
-    filtered_sem = _apply_filters(sem_memories, params.category, params.tags)
+    # --- Read-time vitality decay (DI-04): the stored column is an at-access
+    # snapshot; recompute with real elapsed days so decay, dormancy, and the
+    # RRF vitality signal reflect reality. ---
+    for m in (*fts_memories, *sem_memories):
+        m["vitality"] = effective_vitality(m)
+
+    # Category/tag filters are already applied in the SQL of both tiers (DI-03).
+    filtered_fts = fts_memories
+    filtered_sem = sem_memories
 
     # --- Count dormant memories BEFORE exclusion (unique by ID) ---
     dormant_ids: set[str] = set()
     for m in filtered_fts + filtered_sem:
-        if m.get("status") == "dormant":
+        if is_dormant(m["vitality"]):
             dormant_ids.add(m["id"])
     dormant_excluded = len(dormant_ids) if not params.include_dormant else 0
 
     # --- Dormant exclusion BEFORE RRF ranking ---
     if not params.include_dormant:
-        filtered_fts = [m for m in filtered_fts if m.get("status") != "dormant"]
-        filtered_sem = [m for m in filtered_sem if m.get("status") != "dormant"]
+        filtered_fts = [m for m in filtered_fts if not is_dormant(m["vitality"])]
+        filtered_sem = [m for m in filtered_sem if not is_dormant(m["vitality"])]
 
     # --- Min vitality filter ---
     if params.min_vitality > 0:
         filtered_fts = [
-            m for m in filtered_fts
-            if (m.get("vitality") or 1.0) >= params.min_vitality
+            m for m in filtered_fts if m["vitality"] >= params.min_vitality
         ]
         filtered_sem = [
-            m for m in filtered_sem
-            if (m.get("vitality") or 1.0) >= params.min_vitality
+            m for m in filtered_sem if m["vitality"] >= params.min_vitality
         ]
 
     # --- RRF ranking ---
@@ -473,11 +522,14 @@ async def memory_search(params: MemorySearchInput) -> str:
         if mid in fts_ids and mid in sem_ids:
             m["_search_method"] = "hybrid"
 
+    # --- Optional cross-encoder rerank of the top candidates (lever D) ---
+    # Rerank a pool larger than the response limit so the cross-encoder can
+    # promote candidates beyond the head, THEN truncate (DI-07).
+    rerank_pool = max(params.limit, RERANK_TOP_K)
+    ranked = await asyncio.to_thread(maybe_rerank, params.query, ranked[:rerank_pool])
+
     # --- Apply limit, then token budget ---
     ranked = ranked[:params.limit]
-
-    # --- Optional cross-encoder rerank of the top candidates (lever D) ---
-    ranked = await asyncio.to_thread(maybe_rerank, params.query, ranked)
 
     if params.token_budget == 0:
         envelope = apply_token_budget(ranked, 0)
@@ -714,10 +766,17 @@ async def memory_delete(params: MemoryDeleteInput) -> str:
         str: Confirmation or error message.
     """
     db = _get_db()
-    result = db.execute("DELETE FROM memories WHERE id = ?", (params.memory_id,))
-    db.commit()
-    if result.rowcount == 0:
+    row = db.execute(
+        "SELECT rowid FROM memories WHERE id = ?", (params.memory_id,)
+    ).fetchone()
+    if row is None:
         return f"Memory `{params.memory_id}` not found."
+    # Remove chunk vectors first — FTS and tags are cleaned by triggers, but
+    # vec_chunks/memories_vec are not, and SQLite reuses freed rowids (DI-01).
+    with contextlib.suppress(sqlite3.OperationalError):
+        _delete_chunks(db, row[0])
+    db.execute("DELETE FROM memories WHERE id = ?", (params.memory_id,))
+    db.commit()
     return f"✓ Memory `{params.memory_id}` deleted."
 
 
@@ -1090,6 +1149,14 @@ async def remind_me_reindex() -> str:
         )
 
     db = _get_db()
+    # Prune chunk vectors orphaned by old deletes — a reused rowid would
+    # otherwise keep the deleted memory's embedding and be skipped below (DI-01).
+    pruned = 0
+    try:
+        pruned = await asyncio.to_thread(_prune_orphan_chunks, db)
+    except sqlite3.OperationalError as e:
+        log.debug("Chunk tables not available for pruning: %s", e)
+
     # Find memories without chunk embeddings (a memory is "embedded" once it owns
     # at least one row in vec_chunks).
     all_rows = db.execute("SELECT id, rowid, content FROM memories").fetchall()
@@ -1118,7 +1185,8 @@ async def remind_me_reindex() -> str:
         f"**Total memories:** {len(all_rows)}\n"
         f"**Already embedded:** {len(embedded_rowids)}\n"
         f"**Newly embedded:** {created}\n"
-        f"**Failed:** {len(missing) - created}"
+        f"**Failed:** {len(missing) - created}\n"
+        f"**Orphaned chunks pruned:** {pruned}"
     )
 
 
@@ -1210,18 +1278,18 @@ async def remind_me_vitality_report(params: VitalityReportInput) -> str:
     """
     db = _get_db()
 
-    # Core counts
-    total = db.execute("SELECT COUNT(*) as cnt FROM memories").fetchone()["cnt"]
-    active_count = db.execute(
-        "SELECT COUNT(*) as cnt FROM memories WHERE status = 'active'"
-    ).fetchone()["cnt"]
-    dormant_count = db.execute(
-        "SELECT COUNT(*) as cnt FROM memories WHERE status = 'dormant'"
-    ).fetchone()["cnt"]
+    # Effective (read-time) vitality per memory — the stored column is a
+    # stale at-access snapshot (DI-04).
+    rows = db.execute("SELECT * FROM memories").fetchall()
+    total = len(rows)
+    vitalities = [effective_vitality(_row_to_dict(r)) for r in rows]
+
+    # Core counts (dormancy from effective vitality, not the stored status)
+    dormant_count = sum(1 for v in vitalities if is_dormant(v))
+    active_count = total - dormant_count
 
     # Average vitality
-    avg_row = db.execute("SELECT AVG(vitality) as avg_v FROM memories").fetchone()
-    avg_vitality = round(avg_row["avg_v"], 2) if avg_row["avg_v"] is not None else 0.0
+    avg_vitality = round(sum(vitalities) / total, 2) if total > 0 else 0.0
 
     # Decay distribution by memory_type
     type_rows = db.execute(
@@ -1229,21 +1297,25 @@ async def remind_me_vitality_report(params: VitalityReportInput) -> str:
     ).fetchall()
     decay_distribution = {r["memory_type"]: r["cnt"] for r in type_rows}
 
-    # Vitality buckets
+    # Vitality buckets. The top bucket is open-ended: accessed memories exceed
+    # 1.0 (one access -> sqrt(2) ~= 1.41), so a closed bucket would lose them
+    # and the counts wouldn't sum to the total (DI-04).
     bucket_ranges = [
         ("0.00-0.05", 0.0, 0.05),
         ("0.05-0.25", 0.05, 0.25),
         ("0.25-0.50", 0.25, 0.50),
         ("0.50-0.75", 0.50, 0.75),
-        ("0.75-1.00", 0.75, 1.01),  # 1.01 to include vitality=1.0
     ]
-    vitality_buckets: dict[str, int] = {}
-    for label, low, high in bucket_ranges:
-        count = db.execute(
-            "SELECT COUNT(*) as cnt FROM memories WHERE vitality >= ? AND vitality < ?",
-            (low, high),
-        ).fetchone()["cnt"]
-        vitality_buckets[label] = count
+    top_bucket = "0.75+"
+    vitality_buckets: dict[str, int] = {label: 0 for label, _, _ in bucket_ranges}
+    vitality_buckets[top_bucket] = 0
+    for v in vitalities:
+        for label, low, high in bucket_ranges:
+            if low <= v < high:
+                vitality_buckets[label] += 1
+                break
+        else:
+            vitality_buckets[top_bucket] += 1
 
     # Vault health score
     health_pct = round(active_count / total * 100) if total > 0 else 0
