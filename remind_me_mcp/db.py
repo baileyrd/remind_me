@@ -16,6 +16,10 @@ Current schema versions:
   5 -> 6: Add source_capture_id column for atomic decomposition
   6 -> 7: Add subject, predicate, object, superseded_by columns for structured memory
   7 -> 8: Add vec_chunks map for multi-vector (sliding-window) embeddings
+  8 -> 9: Sync hardening — per-remote send tracking (sync_sends), keyset pull
+          cursor (sync_log.last_pull_id), sync_flags gate so outbox triggers
+          only fire when sync is enabled, canonical ISO-8601 UTC timestamps in
+          the outbox triggers, and an index on memories(updated_at)
 """
 
 from __future__ import annotations
@@ -47,6 +51,9 @@ _local = threading.local()
 _all_connections: list[sqlite3.Connection] = []
 _connections_lock = threading.Lock()
 _schema_ready = False
+# Incremented by _close_db() so threads holding a reference to a closed
+# connection in their threading.local detect staleness and reconnect (SE-07).
+_db_generation = 0
 
 
 def _get_db() -> sqlite3.Connection:
@@ -58,16 +65,19 @@ def _get_db() -> sqlite3.Connection:
     available. Schema initialisation runs once (guarded by a lock) on the
     first connection created.
 
-    All connections are tracked in ``_all_connections`` so ``_close_db()``
-    can shut them down at application exit.
+    Connections are created with ``check_same_thread=False`` so the lifespan
+    thread can actually close every tracked connection at shutdown (SE-07);
+    thread isolation is still provided by the per-thread ``threading.local``
+    registry. All connections are tracked in ``_all_connections`` so
+    ``_close_db()`` can shut them down at application exit.
     """
     global _schema_ready
 
     conn = getattr(_local, "connection", None)
-    if conn is not None:
+    if conn is not None and getattr(_local, "generation", None) == _db_generation:
         return conn
 
-    db = sqlite3.connect(str(DB_PATH), timeout=10)
+    db = sqlite3.connect(str(DB_PATH), timeout=10, check_same_thread=False)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA busy_timeout=5000")
@@ -93,24 +103,31 @@ def _get_db() -> sqlite3.Connection:
         _all_connections.append(db)
 
     _local.connection = db
+    _local.generation = _db_generation
     return db
 
 
 def _close_db() -> None:
-    """Close all per-thread database connections and reset state.
+    """Close all tracked database connections (any thread's) and reset state.
 
     Safe to call even if no connections have been opened (no-op).
-    After this call, the next ``_get_db()`` invocation on any thread will
-    open a fresh connection. Used during application shutdown and in tests
-    to reset state.
+    Connections are created with ``check_same_thread=False`` (SE-07), so the
+    calling thread can genuinely close every tracked connection — releasing
+    file descriptors and letting SQLite checkpoint the WAL on the last close.
+    The generation counter is bumped so threads still holding a reference to
+    a closed connection in their ``threading.local`` reconnect on the next
+    ``_get_db()`` call.
     """
-    global _schema_ready
+    global _schema_ready, _db_generation
     with _connections_lock:
         for conn in _all_connections:
-            with contextlib.suppress(Exception):
+            try:
                 conn.close()
+            except sqlite3.Error:  # pragma: no cover — defensive; close is expected to succeed
+                log.warning("Failed to close a tracked DB connection", exc_info=True)
         _all_connections.clear()
         _schema_ready = False
+        _db_generation += 1
     # Clear the calling thread's local reference
     _local.connection = None
 
@@ -202,7 +219,7 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 # Current target schema version.  Increment when adding a new migration step.
-_SCHEMA_VERSION = 8
+_SCHEMA_VERSION = 9
 
 
 
@@ -262,7 +279,16 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         db.execute("PRAGMA user_version = 8")
         current_version = 8
 
+    if current_version < 9:
+        _migrate_v8_to_v9(db)
+        db.execute("PRAGMA user_version = 9")
+        current_version = 9
+
     db.commit()
+
+    # Align the sync_flags gate (and outbox contents) with the current
+    # SYNC_ENABLED configuration on every startup.
+    _reconcile_sync_enabled_flag(db)
 
 
 def _migrate_v0_to_v1(db: sqlite3.Connection) -> None:
@@ -846,6 +872,156 @@ def _migrate_v7_to_v8(db: sqlite3.Connection) -> None:
         )
 
 
+# All memory columns mirrored into sync_outbox payloads. Single source of
+# truth for the v9 triggers and the enable-time backfill.
+_OUTBOX_PAYLOAD_COLUMNS = (
+    "id", "content", "category", "tags", "source", "metadata",
+    "created_at", "updated_at", "capture_id", "node_id", "client",
+    "accessed_at", "access_count", "decay_rate", "vitality", "base_weight",
+    "status", "memory_type", "source_capture_id",
+    "subject", "predicate", "object", "superseded_by",
+)
+
+# Canonical UTC ISO-8601 timestamp in SQL, string-comparable with Python's
+# datetime.now(UTC).isoformat(). Replaces the previous datetime('now','utc'),
+# which is documented-incorrect SQLite usage ('now' is already UTC) and
+# produced a different, non-ISO format ('YYYY-MM-DD HH:MM:SS').
+_SQL_NOW_ISO = "strftime('%Y-%m-%dT%H:%M:%f000', 'now') || '+00:00'"
+
+
+def _outbox_payload_sql(prefix: str) -> str:
+    """Build the json_object(...) expression for an outbox payload."""
+    pairs = ", ".join(f"'{col}', {prefix}{col}" for col in _OUTBOX_PAYLOAD_COLUMNS)
+    return f"json_object({pairs})"
+
+
+def _migrate_v8_to_v9(db: sqlite3.Connection) -> None:
+    """v8 -> v9: Sync hardening support tables, triggers, and indexes.
+
+    - ``sync_sends(remote_id, outbox_id, sent_at)``: per-remote outbox send
+      tracking, so every configured hub/peer receives every row (SY-02).
+    - ``sync_log.last_pull_id``: id half of the keyset pull cursor
+      ``(updated_at, id)`` so page-boundary timestamp ties are never lost (SY-04).
+    - ``sync_flags``: small key/value table; the outbox triggers are gated on
+      ``sync_enabled = '1'`` so the outbox does not accumulate when sync is
+      disabled (SY-07). The flag is reconciled with config at every startup by
+      :func:`_reconcile_sync_enabled_flag`.
+    - Outbox triggers recreated with a canonical ISO-8601 UTC ``created_at``
+      instead of the incorrect ``datetime('now','utc')`` (SY-08); legacy
+      outbox timestamps are normalized in place.
+    - ``idx_memories_updated_at`` so peer pull pagination does not scan the
+      whole table (SY-09), plus an index on ``sync_outbox(created_at)`` for
+      retention pruning (SY-07).
+
+    Args:
+        db: An open SQLite connection.
+    """
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS sync_sends (
+            remote_id  TEXT NOT NULL,
+            outbox_id  INTEGER NOT NULL,
+            sent_at    TEXT NOT NULL,
+            PRIMARY KEY (remote_id, outbox_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS sync_flags (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_memories_updated_at
+            ON memories(updated_at);
+
+        CREATE INDEX IF NOT EXISTS idx_outbox_created_at
+            ON sync_outbox(created_at);
+    """)
+
+    with contextlib.suppress(sqlite3.OperationalError):
+        db.execute(
+            "ALTER TABLE sync_log ADD COLUMN last_pull_id TEXT NOT NULL DEFAULT ''"
+        )
+
+    # Normalize legacy outbox timestamps ('YYYY-MM-DD HH:MM:SS' from the old
+    # triggers) into the canonical ISO format so string comparisons (pruning,
+    # ordering) stay coherent.
+    db.execute("""
+        UPDATE sync_outbox
+           SET created_at = replace(created_at, ' ', 'T') || '+00:00'
+         WHERE created_at LIKE '____-__-__ __:__:__'
+    """)
+
+    payload = _outbox_payload_sql("NEW.")
+    db.executescript(f"""
+        DROP TRIGGER IF EXISTS memories_outbox_ai;
+        DROP TRIGGER IF EXISTS memories_outbox_au;
+
+        CREATE TRIGGER IF NOT EXISTS memories_outbox_ai
+        AFTER INSERT ON memories
+        WHEN COALESCE((SELECT value FROM sync_flags WHERE key = 'sync_enabled'), '0') = '1'
+        BEGIN
+            INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+            VALUES (NEW.id, 'insert', {payload}, {_SQL_NOW_ISO});
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS memories_outbox_au
+        AFTER UPDATE ON memories
+        WHEN COALESCE((SELECT value FROM sync_flags WHERE key = 'sync_enabled'), '0') = '1'
+        BEGIN
+            INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+            VALUES (NEW.id, 'update', {payload}, {_SQL_NOW_ISO});
+        END;
+    """)
+
+
+def _reconcile_sync_enabled_flag(db: sqlite3.Connection) -> None:
+    """Align the sync_flags gate with config.SYNC_ENABLED at startup (SY-07).
+
+    The outbox triggers only fire while ``sync_flags['sync_enabled'] = '1'``.
+    On every startup this function compares the stored flag with the current
+    configuration:
+
+    - enabled -> disabled: the outbox (and per-remote send log) is truncated —
+      nothing will consume it.
+    - disabled -> enabled: the outbox is backfilled from all current memories
+      so changes made while sync was off still reach the remotes.
+    - unset (pre-v9 database or fresh schema): no backfill is needed — pre-v9
+      triggers were unconditional, so the outbox is already complete.
+
+    Args:
+        db: An open SQLite connection.
+    """
+    from remind_me_mcp import config as _config
+
+    desired = "1" if _config.SYNC_ENABLED else "0"
+    row = db.execute(
+        "SELECT value FROM sync_flags WHERE key = 'sync_enabled'"
+    ).fetchone()
+    stored = row[0] if row is not None else None
+    if stored == desired:
+        return
+
+    if desired == "1":
+        if stored == "0":
+            # Triggers were off while sync was disabled — backfill so every
+            # memory reaches the remotes.
+            payload = _outbox_payload_sql("")
+            db.execute(f"""
+                INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+                SELECT id, 'insert', {payload}, {_SQL_NOW_ISO}
+                FROM memories
+            """)
+    else:
+        db.execute("DELETE FROM sync_outbox")
+        db.execute("DELETE FROM sync_sends")
+
+    db.execute(
+        """INSERT INTO sync_flags (key, value) VALUES ('sync_enabled', ?)
+           ON CONFLICT (key) DO UPDATE SET value = excluded.value""",
+        (desired,),
+    )
+    db.commit()
+
+
 # ---------------------------------------------------------------------------
 # Embedding helpers
 # ---------------------------------------------------------------------------
@@ -859,6 +1035,33 @@ def _delete_chunks(db: sqlite3.Connection, memory_rowid: int) -> None:
     for (vec_rowid,) in old:
         db.execute("DELETE FROM memories_vec WHERE rowid = ?", (vec_rowid,))
     db.execute("DELETE FROM vec_chunks WHERE memory_rowid = ?", (memory_rowid,))
+
+
+def _prune_orphan_chunks(db: sqlite3.Connection) -> int:
+    """Remove chunk vectors whose parent memory no longer exists.
+
+    SQLite reuses freed rowids, so an orphaned ``vec_chunks`` row would make a
+    new memory inherit a deleted memory's embedding (and reindex would skip it
+    because the rowid already looks embedded). Called by reindex to heal
+    databases written before deletes cleaned up chunk vectors.
+
+    Args:
+        db: An open SQLite connection.
+
+    Returns:
+        The number of orphaned chunk rows removed.
+    """
+    orphans = db.execute(
+        """SELECT vec_rowid FROM vec_chunks
+           WHERE memory_rowid NOT IN (SELECT rowid FROM memories)"""
+    ).fetchall()
+    if not orphans:
+        return 0
+    for (vec_rowid,) in orphans:
+        db.execute("DELETE FROM memories_vec WHERE rowid = ?", (vec_rowid,))
+        db.execute("DELETE FROM vec_chunks WHERE vec_rowid = ?", (vec_rowid,))
+    db.commit()
+    return len(orphans)
 
 
 def _embed_and_store_rows(rows: list[tuple[int, str]]) -> int:
@@ -891,8 +1094,8 @@ def _embed_and_store_rows(rows: list[tuple[int, str]]) -> int:
         flat_chunks.extend(chunks)
     if not flat_chunks:
         return 0
+    db = _get_db()
     try:
-        db = _get_db()
         vecs = embedder.embed(flat_chunks)
         stored = 0
         for memory_rowid, offset, count in plan:
@@ -912,9 +1115,16 @@ def _embed_and_store_rows(rows: list[tuple[int, str]]) -> int:
         return stored
     except sqlite3.DatabaseError as e:
         log.warning("Database error storing chunk embeddings: %s", e)
+        # PF-05: undo any uncommitted chunk DELETEs/INSERTs, otherwise they
+        # would silently ride along with the next unrelated commit on this
+        # connection — deleting a memory's existing embeddings.
+        with contextlib.suppress(sqlite3.Error):
+            db.rollback()
         return 0
     except (ValueError, TypeError) as e:
         log.warning("Embedding computation failed: %s", e)
+        with contextlib.suppress(sqlite3.Error):
+            db.rollback()  # PF-05: see above
         return 0
 
 
@@ -967,7 +1177,11 @@ def _fuse_query_embedding(embedder, texts: list[str]) -> bytes:
 
 
 def _semantic_search(
-    query: str, limit: int = 20, extra_texts: list[str] | None = None
+    query: str,
+    limit: int = 20,
+    extra_texts: list[str] | None = None,
+    category: str | None = None,
+    tags: list[str] | None = None,
 ) -> list[dict]:
     """Search memories by semantic similarity using the chunked vector index.
 
@@ -975,14 +1189,17 @@ def _semantic_search(
     then deduplicates to distinct parent memories — keeping each memory's best
     (smallest-distance) chunk. Because one memory may own several chunks, the
     KNN over-fetches ``limit * _CHUNK_KNN_FANOUT`` chunk hits so enough distinct
-    memories survive the dedupe. Results carry a 'semantic_distance' key (lower =
-    more similar). Returns [] when the embedder or vector table is unavailable.
+    memories survive the dedupe (a further 4x when category/tag filters prune
+    candidates). Results carry a 'semantic_distance' key (lower = more similar).
+    Returns [] when the embedder or vector table is unavailable.
 
     Args:
         query: The search query text to embed and compare.
         limit: Maximum number of distinct memories to return.
         extra_texts: Optional expansion texts (e.g. a HyDE passage) whose
             embeddings are averaged with the query's before the KNN.
+        category: If set, only return memories with this category.
+        tags: If set, only return memories that have ALL of these tags.
 
     Returns:
         List of memory dicts (from _row_to_dict) with an added
@@ -997,17 +1214,33 @@ def _semantic_search(
             query_bytes = _fuse_query_embedding(embedder, [query, *extra_texts])
         else:
             query_bytes = embedder.embed_one(query)
-        knn_k = max(limit, limit * _CHUNK_KNN_FANOUT)
+        # Filters are applied after the KNN, so over-fetch harder when they
+        # can prune candidates (DI-03).
+        fanout = _CHUNK_KNN_FANOUT * (4 if (category or tags) else 1)
+        knn_k = max(limit, limit * fanout)
+        conditions = ""
+        bindings: list = [query_bytes, knn_k]
+        if category:
+            conditions += " AND m.category = ?"
+            bindings.append(category)
+        for i, tag in enumerate(tags or []):
+            alias = f"mt{i}"
+            conditions += (
+                f" AND EXISTS (SELECT 1 FROM memory_tags {alias}"
+                f" WHERE {alias}.memory_id = m.id AND {alias}.tag = ?)"
+            )
+            bindings.append(tag)
         rows = db.execute(
-            """SELECT m.*, MIN(mv.distance) AS distance
+            f"""SELECT m.*, MIN(mv.distance) AS distance
                FROM memories_vec mv
                JOIN vec_chunks vc ON vc.vec_rowid = mv.rowid
                JOIN memories m ON m.rowid = vc.memory_rowid
                WHERE mv.embedding MATCH ?
                AND mv.k = ?
+               AND m.superseded_by IS NULL{conditions}
                GROUP BY m.rowid
                ORDER BY distance""",
-            (query_bytes, knn_k),
+            bindings,
         ).fetchall()
         results = []
         for r in rows[:limit]:
@@ -1090,8 +1323,10 @@ __all__ = [
     "_close_db",
     "_ensure_schema",
     "_migrate_schema",
+    "_delete_chunks",
     "_embed_and_store",
     "_embed_and_store_rows",
+    "_prune_orphan_chunks",
     "_fuse_query_embedding",
     "_semantic_search",
     "_now_iso",

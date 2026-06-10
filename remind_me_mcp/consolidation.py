@@ -26,19 +26,26 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 
-def _bytes_to_vector(raw: bytes, dim: int = 384) -> np.ndarray:
+def _bytes_to_vector(raw: bytes, dim: int | None = None) -> np.ndarray:
     """Convert raw float32 bytes to a numpy vector.
 
     Args:
         raw: Raw bytes containing float32 values.
-        dim: Expected dimensionality of the vector.
+        dim: Expected dimensionality of the vector. When None (the default),
+            the dimension is inferred as ``len(raw) // 4`` so any embedding
+            backend (384, 768, 1024, ...) works.
 
     Returns:
         A 1-D float32 numpy array of length ``dim``.
 
     Raises:
-        ValueError: If byte length does not match expected dimension.
+        ValueError: If byte length does not match the expected dimension (or
+            is not a whole number of float32 values when inferring).
     """
+    if dim is None:
+        if len(raw) % 4 != 0:
+            raise ValueError(f"Expected a multiple of 4 bytes (float32), got {len(raw)}")
+        dim = len(raw) // 4
     expected = dim * 4  # float32 = 4 bytes
     if len(raw) != expected:
         raise ValueError(f"Expected {expected} bytes for dim={dim}, got {len(raw)}")

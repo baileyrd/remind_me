@@ -11,6 +11,7 @@ import pytest
 
 from remind_me_mcp.db import (
     _embed_and_store,
+    _embed_and_store_rows,
     _make_id,
     _now_iso,
     _semantic_search,
@@ -222,3 +223,55 @@ def test_migration_backfills_legacy_vectors(
 
     results = _semantic_search(content, limit=5)
     assert any(r["id"] == mem_id for r in results)
+
+
+# ---------------------------------------------------------------------------
+# PF-05: failed embeds must roll back uncommitted chunk DELETEs
+# ---------------------------------------------------------------------------
+
+
+class _WrongDimEmbedder:
+    """Embedder whose vectors don't fit the vec0 table — INSERT fails after
+    the old chunks were already DELETEd inside the same transaction."""
+
+    def embed(self, texts):
+        import numpy as np
+
+        return np.zeros((len(texts), 8), dtype=np.float32)
+
+    def embed_one(self, text):
+        return self.embed([text])[0].tobytes()
+
+
+def test_failed_embed_rolls_back_chunk_deletes(
+    db_conn_with_vec: sqlite3.Connection, mock_embedder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PF-05: when storing new chunk vectors fails, the in-flight DELETE of
+    the memory's existing chunks is rolled back — it must not ride along
+    with the next unrelated commit on the same connection."""
+    import remind_me_mcp.db as db_mod
+
+    content = "rollback survival test memory with enough text to embed"
+    mem_id = _insert_memory(db_conn_with_vec, content)
+    assert _embed_and_store(mem_id, content) is True
+
+    rowid = db_conn_with_vec.execute(
+        "SELECT rowid FROM memories WHERE id = ?", (mem_id,)
+    ).fetchone()[0]
+    before = db_conn_with_vec.execute(
+        "SELECT COUNT(*) FROM vec_chunks WHERE memory_rowid = ?", (rowid,)
+    ).fetchone()[0]
+    assert before >= 1
+
+    # Re-embed with an embedder whose vectors can't be INSERTed: the failure
+    # hits after _delete_chunks already ran in the same transaction.
+    monkeypatch.setattr(db_mod, "_get_embedder", lambda: _WrongDimEmbedder())
+    assert _embed_and_store_rows([(rowid, content)]) == 0
+
+    # An unrelated commit on this connection must not sweep the chunk
+    # DELETEs along — the original embeddings survive.
+    db_conn_with_vec.commit()
+    after = db_conn_with_vec.execute(
+        "SELECT COUNT(*) FROM vec_chunks WHERE memory_rowid = ?", (rowid,)
+    ).fetchone()[0]
+    assert after == before

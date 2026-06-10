@@ -87,6 +87,38 @@ class TestFindClusters:
 
         assert len(clusters) == 0
 
+    def test_cluster_with_768_dim_embeddings(self) -> None:
+        """Non-384-dim backends (e.g. nomic-embed-text, 768) cluster correctly (DI-06)."""
+        vec = _unit_vector(768, index=0)
+        emb_bytes = _make_embedding(vec)
+
+        memories = [
+            {"id": "mem-1", "content": "A", "vitality": 0.9, "access_count": 5, "accessed_at": "2026-01-01T00:00:00Z", "tags": []},
+            {"id": "mem-2", "content": "B", "vitality": 0.8, "access_count": 3, "accessed_at": "2026-01-02T00:00:00Z", "tags": []},
+        ]
+        embeddings = {"mem-1": emb_bytes, "mem-2": emb_bytes}
+
+        clusters = find_clusters(memories, embeddings, similarity_threshold=0.85)
+
+        assert len(clusters) == 1
+        assert len(clusters[0]) == 2
+
+    def test_bytes_to_vector_infers_dim_from_blob_length(self) -> None:
+        """_bytes_to_vector infers the dimension from the byte length (DI-06)."""
+        from remind_me_mcp.consolidation import _bytes_to_vector
+
+        for dim in (384, 768, 1024):
+            vec = _bytes_to_vector(_unit_vector(dim, index=0).tobytes())
+            assert vec.shape == (dim,)
+            assert vec[0] == 1.0
+
+    def test_bytes_to_vector_rejects_partial_float(self) -> None:
+        """A blob whose length isn't a multiple of 4 raises ValueError."""
+        from remind_me_mcp.consolidation import _bytes_to_vector
+
+        with pytest.raises(ValueError):
+            _bytes_to_vector(b"\x00\x00\x00")
+
     def test_single_memory_no_cluster(self) -> None:
         """A single memory returns no clusters (clusters must have 2+ members)."""
         vec = _unit_vector(384, index=0)

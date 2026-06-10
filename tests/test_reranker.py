@@ -203,13 +203,19 @@ async def test_memory_search_applies_reranker(monkeypatch, db_conn, memory_facto
         )
     )
     monkeypatch.setattr(rr, "_get_reranker", lambda: engine)
-    monkeypatch.setattr(tools_mod, "record_access", lambda *_a, **_k: None)
+    monkeypatch.setattr(tools_mod, "record_accesses", lambda *_a, **_k: 0)
 
     raw = await tools_mod.memory_search(
         MemorySearchInput(
-            query="quick fox", response_format=ResponseFormat.JSON, token_budget=0
+            query="quick fox",
+            response_format=ResponseFormat.JSON,
+            token_budget=0,
+            verbose=True,
         )
     )
     payload = json.loads(raw)
     assert payload["memories"][0]["id"] == "m2"
-    assert payload["memories"][0]["_rerank_score"] == pytest.approx(2.0)
+    # HY-05: internal _rerank_score never leaks into the JSON payload; the
+    # score is exposed through debug_signals when verbose=True.
+    assert "_rerank_score" not in payload["memories"][0]
+    assert payload["memories"][0]["debug_signals"]["rerank_score"] == pytest.approx(2.0)

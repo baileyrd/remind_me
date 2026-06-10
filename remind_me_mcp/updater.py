@@ -390,7 +390,15 @@ def start_background_check() -> None:
 
     Called from ``app_lifespan`` at server startup. Non-blocking — the thread
     runs in the background and sets the notice state if an update is found.
+
+    SE-06: honors REMIND_ME_AUTO_UPDATE_CHECK=false as an opt-out for the
+    startup ``git fetch``; the manual check/update tools are unaffected.
     """
+    from remind_me_mcp import config
+
+    if not config.AUTO_UPDATE_CHECK:
+        log.info("Startup update check disabled (REMIND_ME_AUTO_UPDATE_CHECK)")
+        return
     thread = threading.Thread(target=_background_check, daemon=True, name="update-check")
     thread.start()
 

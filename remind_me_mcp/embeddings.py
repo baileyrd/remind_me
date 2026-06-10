@@ -11,6 +11,8 @@ are not installed.
 from __future__ import annotations
 
 import logging
+import time
+from typing import Any
 
 import numpy as np
 
@@ -27,6 +29,15 @@ from remind_me_mcp.config import (
 )
 
 log = logging.getLogger("remind_me_mcp.embeddings")
+
+# Availability/initialisation results are cached briefly so hot paths (every
+# search calls _get_embedder()) don't repeat network probes (Ollama) or
+# HuggingFace downloads (ONNX) on each invocation (PF-01). The monotonic
+# clock makes the TTLs immune to wall-clock adjustments.
+AVAILABILITY_SUCCESS_TTL = 60.0
+"""Seconds a successful availability probe stays cached."""
+AVAILABILITY_FAILURE_TTL = 30.0
+"""Seconds a failed availability probe / model load stays cached before a retry."""
 
 
 # ---------------------------------------------------------------------------
@@ -111,14 +122,33 @@ class _Embedder:
         """
         self.model_name = model_name
         self.dim = dim
-        self._session = None
-        self._tokenizer = None
+        # Typed as Any: onnxruntime/tokenizers objects assigned lazily in _ensure_loaded().
+        self._session: Any = None
+        self._tokenizer: Any = None
         self._ready = False
+        # Failure caching (PF-01): missing dependencies are permanent for this
+        # process; other load failures (e.g. offline HuggingFace download) are
+        # retried only after AVAILABILITY_FAILURE_TTL instead of on every call.
+        self._deps_missing = False
+        self._failed_until = 0.0
 
     def _ensure_loaded(self) -> None:
-        """Lazily load the ONNX model and tokenizer from HuggingFace Hub."""
+        """Lazily load the ONNX model and tokenizer from HuggingFace Hub.
+
+        Load failures are cached (PF-01): an ImportError marks the embedder
+        permanently unavailable for this process, while any other failure
+        (network, corrupt model, ...) is only retried after
+        AVAILABILITY_FAILURE_TTL seconds, so an offline machine doesn't
+        re-attempt a HuggingFace download on every search.
+        """
         if self._ready:
             return
+        if self._deps_missing:
+            raise RuntimeError("Embedding dependencies are not installed (cached failure)")
+        if time.monotonic() < self._failed_until:
+            raise RuntimeError(
+                "Embedding model failed to load recently (cached failure; will retry later)"
+            )
         try:
             import onnxruntime as ort
             from huggingface_hub import hf_hub_download
@@ -145,6 +175,7 @@ class _Embedder:
             log.info("Embedding model loaded (%d dimensions)", self.dim)
 
         except ImportError as e:
+            self._deps_missing = True
             log.warning(
                 "Embedding dependencies not installed (%s). "
                 "Install with: pip install onnxruntime tokenizers huggingface-hub numpy. "
@@ -153,6 +184,7 @@ class _Embedder:
             )
             raise
         except Exception as e:  # Broad catch intentional: ONNX Runtime raises non-stdlib exceptions (e.g., onnxruntime.capi.onnxruntime_pybind11_state.InvalidGraph)
+            self._failed_until = time.monotonic() + AVAILABILITY_FAILURE_TTL
             log.warning(
                 "Failed to load embedding model: %s. Semantic search unavailable.", e
             )
@@ -250,28 +282,44 @@ class OllamaEmbedder:
         self.url = url.rstrip("/")
         self.dim = dim
         self.timeout = timeout
+        # Availability cache (PF-01): every embed() outcome refreshes it, so
+        # `available` only sends a real "ping" probe when the cache is cold.
+        self._available: bool | None = None
+        self._avail_expires = 0.0
+
+    def _note_availability(self, ok: bool) -> None:
+        """Record an embed outcome in the availability cache (PF-01)."""
+        self._available = ok
+        self._avail_expires = time.monotonic() + (
+            AVAILABILITY_SUCCESS_TTL if ok else AVAILABILITY_FAILURE_TTL
+        )
 
     def embed(self, texts: list[str]) -> np.ndarray:
         """Embed a batch of texts via Ollama, returning L2-normalised float32 vectors."""
         import httpx
 
-        resp = httpx.post(
-            f"{self.url}/api/embed",
-            json={"model": self.model, "input": texts},
-            timeout=self.timeout,
-        )
-        resp.raise_for_status()
-        vectors = resp.json().get("embeddings")
-        if not vectors:
-            raise ValueError(f"Ollama returned no embeddings for model {self.model!r}")
-
-        arr = np.asarray(vectors, dtype=np.float32)
-        if arr.ndim != 2 or arr.shape[1] != self.dim:
-            raise ValueError(
-                f"Ollama model {self.model!r} returned dim {arr.shape[-1]}, "
-                f"but REMIND_ME_EMBEDDING_DIM is {self.dim}. Set the dimension to match "
-                "the model and run remind_me_reindex on a fresh vector table."
+        try:
+            resp = httpx.post(
+                f"{self.url}/api/embed",
+                json={"model": self.model, "input": texts},
+                timeout=self.timeout,
             )
+            resp.raise_for_status()
+            vectors = resp.json().get("embeddings")
+            if not vectors:
+                raise ValueError(f"Ollama returned no embeddings for model {self.model!r}")
+
+            arr = np.asarray(vectors, dtype=np.float32)
+            if arr.ndim != 2 or arr.shape[1] != self.dim:
+                raise ValueError(
+                    f"Ollama model {self.model!r} returned dim {arr.shape[-1]}, "
+                    f"but REMIND_ME_EMBEDDING_DIM is {self.dim}. Set the dimension to match "
+                    "the model and run remind_me_reindex on a fresh vector table."
+                )
+        except Exception:
+            self._note_availability(False)
+            raise
+        self._note_availability(True)
         norms = np.linalg.norm(arr, axis=1, keepdims=True).clip(min=1e-9)
         return (arr / norms).astype(np.float32)
 
@@ -281,7 +329,15 @@ class OllamaEmbedder:
 
     @property
     def available(self) -> bool:
-        """Return True if the Ollama daemon answers an embedding request."""
+        """Return True if the Ollama daemon answers an embedding request.
+
+        The result is cached (PF-01): a success is trusted for
+        AVAILABILITY_SUCCESS_TTL seconds and a failure for
+        AVAILABILITY_FAILURE_TTL seconds, so the hot search path doesn't pay
+        a real HTTP "ping" round-trip on every call.
+        """
+        if self._available is not None and time.monotonic() < self._avail_expires:
+            return self._available
         try:
             self.embed(["ping"])
             return True

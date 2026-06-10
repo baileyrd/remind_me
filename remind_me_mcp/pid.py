@@ -85,7 +85,9 @@ def _remove_pid_file() -> None:
 def _check_ui_server_health(url: str) -> bool:
     """Perform a quick HTTP health check against the UI server.
 
-    Sends a GET request to {url}/api/stats with a 2-second timeout.
+    Sends a GET request to the unauthenticated {url}/health liveness route
+    with a 2-second timeout (SE-04 — /api/stats requires a bearer token, so
+    probing it would report a healthy authenticated server as down).
     Used to distinguish a live server from a stale PID file.
 
     Args:
@@ -96,7 +98,7 @@ def _check_ui_server_health(url: str) -> bool:
     """
     import urllib.request
     try:
-        req = urllib.request.Request(url + "/api/stats", method="GET")
+        req = urllib.request.Request(url + "/health", method="GET")
         with urllib.request.urlopen(req, timeout=2) as resp:
             return resp.status == 200
     except OSError:

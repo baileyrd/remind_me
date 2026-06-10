@@ -159,6 +159,34 @@ class TestRankRRF:
         result = rank_rrf([a], [a], k=60)
         assert len(result) == 1
 
+    def test_rrf_hybrid_hit_keeps_semantic_distance(self):
+        """A memory in both lists merges the semantic occurrence's keys (DI-05).
+
+        The keyword-tier dict has no semantic_distance; the semantic-tier dict
+        does. Dedup must not drop it.
+        """
+        from remind_me_mcp.retrieval import rank_rrf
+
+        kw = _mem("A", created_at=_ts(0), _search_method="keyword")
+        sem = _mem("A", created_at=_ts(0), semantic_distance=0.42, _search_method="semantic")
+
+        result = rank_rrf([kw], [sem], k=60)
+
+        assert len(result) == 1
+        assert result[0]["semantic_distance"] == 0.42
+
+    def test_rrf_merge_does_not_overwrite_first_occurrence(self):
+        """Merging the second occurrence never clobbers non-null keys from the first."""
+        from remind_me_mcp.retrieval import rank_rrf
+
+        kw = _mem("A", created_at=_ts(0), _search_method="keyword", extra="first")
+        sem = _mem("A", created_at=_ts(0), _search_method="semantic", extra="second")
+
+        result = rank_rrf([kw], [sem], k=60)
+
+        assert result[0]["_search_method"] == "keyword"
+        assert result[0]["extra"] == "first"
+
 
 # ---------------------------------------------------------------------------
 # RRF_K env var
@@ -402,7 +430,7 @@ class TestBuildDebugSignals:
         assert signals["days_old"] == 10
 
     def test_returns_correct_keys(self):
-        """build_debug_signals returns dict with exactly the 5 expected keys."""
+        """build_debug_signals returns dict with exactly the 8 expected keys."""
         from remind_me_mcp.retrieval import build_debug_signals
 
         mem = _mem("A", created_at=_ts(0))
@@ -414,8 +442,28 @@ class TestBuildDebugSignals:
         signals = build_debug_signals(mem)
 
         assert set(signals.keys()) == {
-            "semantic_rank", "keyword_rank", "recency_rank", "vitality_rank", "days_old"
+            "semantic_rank", "keyword_rank", "recency_rank", "vitality_rank",
+            "rrf_score", "rerank_score", "search_method", "days_old",
         }
+
+    def test_exposes_score_and_method_signals(self):
+        """HY-05: the stripped internal fields are surfaced via debug_signals."""
+        from remind_me_mcp.retrieval import build_debug_signals
+
+        mem = _mem("A", created_at=_ts(0))
+        mem["_keyword_rank"] = 1
+        mem["_semantic_rank"] = 1
+        mem["_recency_rank"] = 1
+        mem["_vitality_rank"] = 1
+        mem["_rrf_score"] = 0.123
+        mem["_rerank_score"] = 4.56
+        mem["_search_method"] = "hybrid"
+
+        signals = build_debug_signals(mem)
+
+        assert signals["rrf_score"] == 0.123
+        assert signals["rerank_score"] == 4.56
+        assert signals["search_method"] == "hybrid"
 
     def test_missing_created_at_returns_none_days_old(self):
         """build_debug_signals handles missing created_at gracefully (days_old=None)."""

@@ -25,6 +25,15 @@ semantic = [
 [project.scripts]
 remind-me-mcp = "remind_me_mcp.__main__:main"
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.15,<0.16",
+    "mypy>=1.11",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -47,12 +56,33 @@ known-first-party = ["remind_me_mcp"]
 
 [tool.mypy]
 python_version = "3.11"
-warn_return_any = true
+# warn_return_any disabled: sqlite3/numpy/json return values propagate as Any
+# through thin wrappers (db.py, embeddings.py, vitality.py); flagging every
+# return adds noise without catching real bugs here.
+warn_return_any = false
 warn_unused_configs = true
 disallow_untyped_defs = false
 check_untyped_defs = true
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = ["remind_me_mcp.tools", "remind_me_mcp.tools.*"]
+# FastMCP's @mcp.tool(annotations=...) accepts plain dicts at runtime but the
+# stubs declare ToolAnnotations | None — every tool registration (22 sites)
+# would need an inline ignore otherwise.
+disable_error_code = ["arg-type"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["remind_me_mcp"]
+branch = false
+
+[tool.coverage.report]
+# Single source of truth for the CI coverage gate — local `pytest --cov` and
+# CI both enforce the same threshold from here.
+fail_under = 80
+show_missing = true
+precision = 2

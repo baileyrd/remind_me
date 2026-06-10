@@ -8,17 +8,16 @@ here to prevent MCP registration side effects at collection time.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
-from typing import TYPE_CHECKING
+import tempfile
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 from remind_me_mcp.db import _ensure_schema, _make_id, _now_iso
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Config path isolation
@@ -48,6 +47,14 @@ def tmp_memory_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     mp.setattr(_cfg, "DB_PATH", tmp_db)
     mp.setattr(_cfg, "PID_FILE", tmp_pid)
     mp.setattr(_cfg, "IMPORT_LOG", tmp_import_log)
+    # SE-02: import-root containment is enforced in the MCP input models too.
+    # Allow the system temp dir (pytest tmp_path and NamedTemporaryFile live
+    # there) alongside $HOME so import fixtures pass the containment check.
+    mp.setattr(
+        _cfg,
+        "IMPORT_ROOTS",
+        [Path.home(), Path(tempfile.gettempdir()).resolve()],
+    )
 
     # Patch direct imports in sibling modules
     import remind_me_mcp.api as _api_mod
@@ -125,7 +132,8 @@ class FakeEmbedder:
         """Return a deterministic (len(texts), 384) float32 array, L2-normalised."""
         rows: list[np.ndarray] = []
         for text in texts:
-            seed = hash(text) & 0xFFFFFFFF  # positive 32-bit seed
+            # Stable across processes — Python's hash() is salted per run.
+            seed = int.from_bytes(hashlib.sha256(text.encode("utf-8")).digest()[:4], "big")
             rng = np.random.default_rng(seed=seed)
             vec = rng.standard_normal(384).astype(np.float32)
             norm = np.linalg.norm(vec)

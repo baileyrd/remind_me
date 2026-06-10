@@ -55,8 +55,15 @@ async def app_lifespan(app: FastMCP):
         start_sync_thread()
         log.info("Sync started")
 
-    yield {"db": db}
-    _close_db()
+    try:
+        yield {"db": db}
+    finally:
+        # SE-07: always close every tracked connection, even when the body
+        # raised — otherwise file descriptors leak and the WAL is never
+        # checkpointed. NOTE: sync/peer threads are daemon threads with no
+        # stop mechanism yet (see SY-* workstream); once one exists it should
+        # be signalled here *before* closing the connections.
+        _close_db()
 
 # ---------------------------------------------------------------------------
 # MCP server instance

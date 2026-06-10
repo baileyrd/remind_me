@@ -326,6 +326,74 @@ async def test_memory_delete_exists(db_conn: sqlite3.Connection, memory_factory)
     assert "not found" in get_result.lower()
 
 
+async def test_memory_delete_removes_chunk_vectors(
+    db_conn_with_vec: sqlite3.Connection,
+    mock_embedder,
+) -> None:
+    """Deleting a memory removes its chunk vectors from vec_chunks/memories_vec (DI-01)."""
+    await memory_add(MemoryAddInput(content="Chunk cleanup test memory"))
+    row = db_conn_with_vec.execute("SELECT rowid, id FROM memories").fetchone()
+
+    chunk_count = db_conn_with_vec.execute(
+        "SELECT COUNT(*) FROM vec_chunks WHERE memory_rowid = ?", (row["rowid"],)
+    ).fetchone()[0]
+    assert chunk_count > 0, "precondition: memory was embedded"
+
+    result = await memory_delete(MemoryDeleteInput(memory_id=row["id"]))
+    assert "deleted" in result
+
+    assert db_conn_with_vec.execute("SELECT COUNT(*) FROM vec_chunks").fetchone()[0] == 0
+    assert db_conn_with_vec.execute("SELECT COUNT(*) FROM memories_vec").fetchone()[0] == 0
+
+
+async def test_reindex_prunes_orphaned_chunks_for_reused_rowid(
+    db_conn_with_vec: sqlite3.Connection,
+    mock_embedder,
+) -> None:
+    """Reindex prunes vec_chunks rows whose memory no longer exists (DI-01).
+
+    SQLite reuses freed rowids: without pruning, a new memory inherits the
+    deleted memory's embedding and reindex skips it forever.
+    """
+    from remind_me_mcp.db import _make_id, _now_iso, _semantic_search
+
+    await memory_add(MemoryAddInput(content="Old deleted memory about sailing boats"))
+    old = db_conn_with_vec.execute("SELECT rowid, id FROM memories").fetchone()
+
+    # Simulate the historical buggy delete: row removed, chunk vectors orphaned.
+    db_conn_with_vec.execute("DELETE FROM memories WHERE id = ?", (old["id"],))
+    db_conn_with_vec.commit()
+    assert db_conn_with_vec.execute("SELECT COUNT(*) FROM vec_chunks").fetchone()[0] > 0
+
+    # Reindex must prune the orphaned chunk vectors.
+    await remind_me_reindex()
+    assert db_conn_with_vec.execute("SELECT COUNT(*) FROM vec_chunks").fetchone()[0] == 0
+    assert db_conn_with_vec.execute("SELECT COUNT(*) FROM memories_vec").fetchone()[0] == 0
+
+    # Insert a new memory directly (no embedding) — it reuses the freed rowid.
+    new_content = "Brand new memory about quantum chess strategies"
+    new_id = _make_id(new_content)
+    now = _now_iso()
+    db_conn_with_vec.execute(
+        """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
+           VALUES (?, ?, 'general', '[]', 'manual', '{}', ?, ?)""",
+        (new_id, new_content, now, now),
+    )
+    db_conn_with_vec.commit()
+    new_rowid = db_conn_with_vec.execute(
+        "SELECT rowid FROM memories WHERE id = ?", (new_id,)
+    ).fetchone()[0]
+    assert new_rowid == old["rowid"], "precondition: rowid was reused"
+
+    # Without the prune, reindex would have seen this rowid as already embedded
+    # and the new memory would keep the deleted memory's embedding forever.
+    await remind_me_reindex()
+    results = _semantic_search(new_content, limit=1)
+    assert results, "new memory should have a real embedding after reindex"
+    assert results[0]["id"] == new_id
+    assert results[0]["semantic_distance"] < 0.1
+
+
 async def test_memory_delete_not_found(db_conn: sqlite3.Connection) -> None:
     """Deleting a nonexistent memory ID returns a not-found message."""
     delete_params = MemoryDeleteInput(memory_id="ghost_id_xyz")
@@ -1090,12 +1158,15 @@ async def test_search_rrf_ranking_smoke(
     memory_factory,
 ) -> None:
     """RRF ranking path produces valid envelope response (smoke test)."""
-    # Create memories with different timestamps to exercise recency signal
+    # Create memories with different timestamps to exercise the recency signal.
+    # accessed_at is kept fresh so read-time vitality decay (DI-04) doesn't
+    # mark months-old created_at values dormant.
     for i in range(3):
         memory_factory(
             content=f"RRF smoke test content item {i} with searchable text",
             category="test",
             created_at=f"2026-01-0{i + 1}T00:00:00Z",
+            accessed_at=_days_ago_iso(i),
         )
 
     search_params = MemorySearchInput(
@@ -1111,10 +1182,11 @@ async def test_search_rrf_ranking_smoke(
     assert isinstance(data["memories"], list)
     assert len(data["memories"]) == data["returned"]
 
-    # Verify each memory has RRF metadata attached
+    # HY-05: internal RRF metadata must NOT leak into the JSON payload
     for mem in data["memories"]:
-        assert "_rrf_score" in mem
-        assert "_keyword_rank" in mem
+        assert not any(k.startswith("_") for k in mem), (
+            f"internal fields leaked into JSON response: {sorted(mem)}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1291,22 +1363,33 @@ async def test_reclassify_batch_empty_when_all_classified(
 # ---------------------------------------------------------------------------
 
 
+def _days_ago_iso(days: float) -> str:
+    """ISO timestamp *days* in the past (UTC), for staging vitality decay."""
+    from datetime import UTC, datetime, timedelta
+
+    return (datetime.now(UTC) - timedelta(days=days)).isoformat()
+
+
 async def test_search_excludes_dormant_by_default(
     db_conn: sqlite3.Connection,
     memory_factory,
 ) -> None:
-    """Dormant memories (status='dormant') are excluded from search by default."""
+    """Memories whose effective vitality has decayed below the floor are excluded by default (DI-04).
+
+    Dormancy is computed at read time from accessed_at, not from the stored
+    status/vitality snapshot.
+    """
     memory_factory(
         content="Active vitality test memory alpha",
         category="test",
-        status="active",
-        vitality=0.8,
+        accessed_at=_days_ago_iso(0),
     )
+    # 90 days unaccessed at decay_rate 0.1 -> e^-9 ~= 0.0001 < VITALITY_FLOOR
     memory_factory(
         content="Dormant vitality test memory beta",
         category="test",
-        status="dormant",
-        vitality=0.01,
+        accessed_at=_days_ago_iso(90),
+        decay_rate=0.1,
     )
 
     search_params = MemorySearchInput(query="vitality test memory")
@@ -1320,18 +1403,17 @@ async def test_search_include_dormant_shows_all(
     db_conn: sqlite3.Connection,
     memory_factory,
 ) -> None:
-    """include_dormant=True includes dormant memories in search results."""
+    """include_dormant=True includes effectively dormant memories in search results."""
     memory_factory(
         content="Active include dormant test gamma",
         category="test",
-        status="active",
-        vitality=0.8,
+        accessed_at=_days_ago_iso(0),
     )
     memory_factory(
         content="Dormant include dormant test delta",
         category="test",
-        status="dormant",
-        vitality=0.01,
+        accessed_at=_days_ago_iso(90),
+        decay_rate=0.1,
     )
 
     search_params = MemorySearchInput(
@@ -1351,18 +1433,18 @@ async def test_search_min_vitality_filter(
     db_conn: sqlite3.Connection,
     memory_factory,
 ) -> None:
-    """min_vitality=0.5 excludes memories with vitality below 0.5."""
+    """min_vitality=0.5 excludes memories whose effective vitality decayed below 0.5 (DI-04)."""
     memory_factory(
         content="High vitality filter test epsilon",
         category="test",
-        status="active",
-        vitality=0.8,
+        accessed_at=_days_ago_iso(0),
     )
+    # 15 days at decay_rate 0.1 -> e^-1.5 ~= 0.22 < 0.5
     memory_factory(
         content="Low vitality filter test zeta",
         category="test",
-        status="active",
-        vitality=0.3,
+        accessed_at=_days_ago_iso(15),
+        decay_rate=0.1,
     )
 
     search_params = MemorySearchInput(
@@ -1378,12 +1460,63 @@ async def test_search_min_vitality_filter(
     assert not any("zeta" in c for c in contents)
 
 
+async def test_search_vitality_is_recomputed_at_read_time(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """Returned vitality reflects elapsed-days decay, not the stale stored snapshot (DI-04)."""
+    import math
+
+    # Stored snapshot says 1.0, but ~6.93 days at decay_rate 0.1 halves it.
+    days = math.log(2) / 0.1
+    memory_factory(
+        content="Read time decay check memory",
+        vitality=1.0,
+        decay_rate=0.1,
+        accessed_at=_days_ago_iso(days),
+    )
+
+    search_params = MemorySearchInput(
+        query="read time decay check",
+        response_format=ResponseFormat.JSON,
+    )
+    result = await memory_search(search_params)
+    data = json.loads(result)
+
+    assert len(data["memories"]) == 1
+    assert data["memories"][0]["vitality"] == pytest.approx(0.5, abs=0.01)
+
+
+async def test_search_counts_effectively_dormant_in_dormant_excluded(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """dormant_excluded counts read-time dormancy even when stored status is 'active' (DI-04)."""
+    memory_factory(
+        content="Stale status dormant counter memory",
+        status="active",
+        vitality=1.0,
+        accessed_at=_days_ago_iso(90),
+        decay_rate=0.1,
+    )
+
+    search_params = MemorySearchInput(
+        query="stale status dormant counter",
+        response_format=ResponseFormat.JSON,
+    )
+    result = await memory_search(search_params)
+    data = json.loads(result)
+
+    assert data["memories"] == []
+    assert data["dormant_excluded"] == 1
+
+
 async def test_search_record_access_called(
     db_conn: sqlite3.Connection,
     memory_factory,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """record_access is called for returned search results."""
+    """record_accesses is called once with all returned search result ids (PF-02)."""
     import remind_me_mcp.tools as _tools_mod
 
     mem = memory_factory(
@@ -1394,21 +1527,38 @@ async def test_search_record_access_called(
     )
 
     called_ids: list[str] = []
+    call_count = {"n": 0}
 
-    def fake_record_access(mid: str) -> float | None:
-        called_ids.append(mid)
-        return 0.9
+    def fake_record_accesses(ids: list[str]) -> int:
+        call_count["n"] += 1
+        called_ids.extend(ids)
+        return len(ids)
 
-    monkeypatch.setattr(_tools_mod, "record_access", fake_record_access)
+    monkeypatch.setattr(_tools_mod, "record_accesses", fake_record_accesses)
+
+    # Capture the fire-and-forget task so we can await it deterministically
+    # instead of sleeping for an arbitrary duration.
+    import asyncio
+
+    created_tasks: list[asyncio.Task] = []
+    real_create_task = asyncio.create_task
+
+    def capture_task(coro, **kwargs):
+        task = real_create_task(coro, **kwargs)
+        created_tasks.append(task)
+        return task
+
+    monkeypatch.setattr(asyncio, "create_task", capture_task)
 
     search_params = MemorySearchInput(query="record access test eta")
     await memory_search(search_params)
 
-    # Give fire-and-forget task a moment to execute
-    import asyncio
-    await asyncio.sleep(0.1)
+    assert created_tasks, "memory_search should schedule a record-access task"
+    await asyncio.gather(*created_tasks)
 
     assert mem["id"] in called_ids
+    # PF-02: one batched call per search, not one call per returned memory.
+    assert call_count["n"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1420,13 +1570,18 @@ async def test_vitality_report_basic_counts(
     db_conn: sqlite3.Connection,
     memory_factory,
 ) -> None:
-    """remind_me_vitality_report returns total_memories, active_count, dormant_count."""
+    """remind_me_vitality_report returns total_memories, active_count, dormant_count.
+
+    Counts reflect effective (read-time) vitality, not the stored status (DI-04).
+    """
     from remind_me_mcp.models import VitalityReportInput
     from remind_me_mcp.tools import remind_me_vitality_report
 
-    memory_factory(content="Active report test 1", status="active", vitality=0.8)
-    memory_factory(content="Active report test 2", status="active", vitality=0.6)
-    memory_factory(content="Dormant report test 1", status="dormant", vitality=0.01)
+    memory_factory(content="Active report test 1", accessed_at=_days_ago_iso(0))
+    memory_factory(content="Active report test 2", accessed_at=_days_ago_iso(1))
+    memory_factory(
+        content="Dormant report test 1", accessed_at=_days_ago_iso(90), decay_rate=0.1
+    )
 
     params = VitalityReportInput()
     result = await remind_me_vitality_report(params)
@@ -1441,12 +1596,17 @@ async def test_vitality_report_average_vitality(
     db_conn: sqlite3.Connection,
     memory_factory,
 ) -> None:
-    """Report includes average_vitality across all memories."""
+    """Report includes average_vitality across all memories (effective vitality, DI-04)."""
+    import math
+
     from remind_me_mcp.models import VitalityReportInput
     from remind_me_mcp.tools import remind_me_vitality_report
 
-    memory_factory(content="Avg test 1", status="active", vitality=1.0)
-    memory_factory(content="Avg test 2", status="active", vitality=0.5)
+    # Fresh memory -> 1.0; one half-life (ln2/0.1 days) old -> 0.5; avg 0.75.
+    memory_factory(content="Avg test 1", accessed_at=_days_ago_iso(0))
+    memory_factory(
+        content="Avg test 2", accessed_at=_days_ago_iso(math.log(2) / 0.1), decay_rate=0.1
+    )
 
     params = VitalityReportInput()
     result = await remind_me_vitality_report(params)
@@ -1479,15 +1639,21 @@ async def test_vitality_report_vitality_buckets(
     db_conn: sqlite3.Connection,
     memory_factory,
 ) -> None:
-    """Report includes vitality_buckets with counts in defined ranges."""
+    """Report buckets effective vitality, with an open-ended top bucket (DI-04)."""
+    import math
+
     from remind_me_mcp.models import VitalityReportInput
     from remind_me_mcp.tools import remind_me_vitality_report
 
-    memory_factory(content="Bucket test 1", status="dormant", vitality=0.01)   # 0.00-0.05
-    memory_factory(content="Bucket test 2", status="active", vitality=0.10)    # 0.05-0.25
-    memory_factory(content="Bucket test 3", status="active", vitality=0.30)    # 0.25-0.50
-    memory_factory(content="Bucket test 4", status="active", vitality=0.60)    # 0.50-0.75
-    memory_factory(content="Bucket test 5", status="active", vitality=0.90)    # 0.75-1.00
+    def _staged(target: float) -> float:
+        """Days ago at decay_rate 0.1 yielding effective vitality *target*."""
+        return -math.log(target) / 0.1
+
+    memory_factory(content="Bucket test 1", accessed_at=_days_ago_iso(_staged(0.01)), decay_rate=0.1)  # 0.00-0.05
+    memory_factory(content="Bucket test 2", accessed_at=_days_ago_iso(_staged(0.10)), decay_rate=0.1)  # 0.05-0.25
+    memory_factory(content="Bucket test 3", accessed_at=_days_ago_iso(_staged(0.30)), decay_rate=0.1)  # 0.25-0.50
+    memory_factory(content="Bucket test 4", accessed_at=_days_ago_iso(_staged(0.60)), decay_rate=0.1)  # 0.50-0.75
+    memory_factory(content="Bucket test 5", accessed_at=_days_ago_iso(0))                              # 0.75+
 
     params = VitalityReportInput()
     result = await remind_me_vitality_report(params)
@@ -1497,7 +1663,30 @@ async def test_vitality_report_vitality_buckets(
     assert data["vitality_buckets"]["0.05-0.25"] == 1
     assert data["vitality_buckets"]["0.25-0.50"] == 1
     assert data["vitality_buckets"]["0.50-0.75"] == 1
-    assert data["vitality_buckets"]["0.75-1.00"] == 1
+    assert data["vitality_buckets"]["0.75+"] == 1
+
+
+async def test_vitality_report_top_bucket_counts_accessed_memories(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """Accessed memories (vitality > 1.0, e.g. sqrt(2)~=1.41) land in the open top bucket
+    and bucket counts sum to the total (DI-04)."""
+    from remind_me_mcp.models import VitalityReportInput
+    from remind_me_mcp.tools import remind_me_vitality_report
+
+    # One access just now: effective vitality = sqrt(2) ~= 1.41 > 1.01, which the
+    # old closed 0.75-1.01 bucket silently dropped.
+    memory_factory(
+        content="Boosted bucket memory", access_count=1, accessed_at=_days_ago_iso(0)
+    )
+
+    params = VitalityReportInput()
+    result = await remind_me_vitality_report(params)
+    data = json.loads(result)
+
+    assert data["vitality_buckets"]["0.75+"] == 1
+    assert sum(data["vitality_buckets"].values()) == data["total_memories"] == 1
 
 
 async def test_vitality_report_vault_health_score(
@@ -1508,10 +1697,10 @@ async def test_vitality_report_vault_health_score(
     from remind_me_mcp.models import VitalityReportInput
     from remind_me_mcp.tools import remind_me_vitality_report
 
-    memory_factory(content="Health test 1", status="active", vitality=0.8)
-    memory_factory(content="Health test 2", status="active", vitality=0.7)
-    memory_factory(content="Health test 3", status="dormant", vitality=0.01)
-    memory_factory(content="Health test 4", status="dormant", vitality=0.02)
+    memory_factory(content="Health test 1", accessed_at=_days_ago_iso(0))
+    memory_factory(content="Health test 2", accessed_at=_days_ago_iso(1))
+    memory_factory(content="Health test 3", accessed_at=_days_ago_iso(90), decay_rate=0.1)
+    memory_factory(content="Health test 4", accessed_at=_days_ago_iso(91), decay_rate=0.1)
 
     params = VitalityReportInput()
     result = await remind_me_vitality_report(params)
@@ -2032,22 +2221,21 @@ async def test_structured_search_respects_category_filter(
 async def test_structured_search_respects_dormant_filter(
     db_conn: sqlite3.Connection, memory_factory
 ) -> None:
-    """Structured lookup respects include_dormant filter."""
+    """Structured lookup respects include_dormant filter (read-time dormancy, DI-04)."""
     memory_factory(
         content="Bailey prefers vim",
         subject="Bailey",
         predicate="prefers",
         object="vim",
-        status="dormant",
-        vitality=0.01,
+        accessed_at=_days_ago_iso(90),
+        decay_rate=0.1,
     )
     memory_factory(
         content="Bailey prefers dark mode",
         subject="Bailey",
         predicate="prefers",
         object="dark mode",
-        status="active",
-        vitality=0.8,
+        accessed_at=_days_ago_iso(0),
     )
 
     params = MemorySearchInput(
@@ -2065,20 +2253,21 @@ async def test_structured_search_respects_dormant_filter(
 async def test_structured_search_respects_min_vitality(
     db_conn: sqlite3.Connection, memory_factory
 ) -> None:
-    """Structured lookup respects min_vitality filter."""
+    """Structured lookup respects min_vitality filter (effective vitality, DI-04)."""
     memory_factory(
         content="Bailey prefers tabs",
         subject="Bailey",
         predicate="prefers",
         object="tabs",
-        vitality=0.3,
+        accessed_at=_days_ago_iso(15),
+        decay_rate=0.1,
     )
     memory_factory(
         content="Bailey prefers dark mode",
         subject="Bailey",
         predicate="prefers",
         object="dark mode",
-        vitality=0.8,
+        accessed_at=_days_ago_iso(0),
     )
 
     params = MemorySearchInput(
@@ -2143,6 +2332,153 @@ async def test_structured_search_excludes_superseded(
     contents = [m["content"] for m in data["memories"]]
     assert "Bailey prefers dark mode" in contents
     assert "Bailey prefers light mode" not in contents
+
+
+async def test_rerank_pool_extends_beyond_limit(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reranker sees a pool of max(limit, RERANK_TOP_K) candidates so it can
+    promote matches beyond the head; the limit applies after reranking (DI-07)."""
+    import remind_me_mcp.tools as _tools_mod
+
+    for i in range(6):
+        memory_factory(content=f"rerank pool candidate {i} mentions walrus")
+
+    seen: dict = {}
+
+    def fake_rerank(query: str, memories: list[dict]) -> list[dict]:
+        seen["order"] = [m["id"] for m in memories]
+        return list(reversed(memories))  # promote the tail
+
+    monkeypatch.setattr(_tools_mod, "maybe_rerank", fake_rerank)
+
+    params = MemorySearchInput(
+        query="walrus", limit=2, response_format=ResponseFormat.JSON
+    )
+    result = await memory_search(params)
+    data = json.loads(result)
+
+    # The reranker received the whole candidate pool, not just `limit` heads...
+    assert len(seen["order"]) == 6
+    # ...the limit still applies to the response...
+    assert data["returned"] == 2
+    # ...and candidates promoted from beyond the old head are returned.
+    returned_ids = [m["id"] for m in data["memories"]]
+    assert returned_ids == list(reversed(seen["order"]))[:2]
+
+
+async def test_search_category_filter_applies_before_limit(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """Category filter is pushed into SQL, so matches past the fetch limit are found (DI-03)."""
+    # This memory matches the query more strongly (more term hits) but has the
+    # wrong category; with limit=1 it used to crowd out the real match before
+    # the Python-side filter dropped it.
+    memory_factory(content="zebra zebra zebra observation notes", category="noise")
+    memory_factory(content="single zebra sighting", category="wildlife")
+
+    params = MemorySearchInput(
+        query="zebra", category="wildlife", limit=1, response_format=ResponseFormat.JSON
+    )
+    result = await memory_search(params)
+    data = json.loads(result)
+
+    contents = [m["content"] for m in data["memories"]]
+    assert contents == ["single zebra sighting"]
+
+
+async def test_search_tag_filter_applies_before_limit(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """Tag filter is pushed into SQL, so matches past the fetch limit are found (DI-03)."""
+    memory_factory(content="kayak kayak kayak rental brochure", tags=["noise"])
+    memory_factory(content="one kayak trip", tags=["water", "sport"])
+
+    params = MemorySearchInput(
+        query="kayak",
+        tags=["water", "sport"],
+        limit=1,
+        response_format=ResponseFormat.JSON,
+    )
+    result = await memory_search(params)
+    data = json.loads(result)
+
+    contents = [m["content"] for m in data["memories"]]
+    assert contents == ["one kayak trip"]
+
+
+async def test_semantic_search_category_and_tag_filters_in_sql(
+    db_conn_with_vec: sqlite3.Connection, mock_embedder
+) -> None:
+    """_semantic_search filters category/tags in SQL before the limit (DI-03)."""
+    from remind_me_mcp.db import _semantic_search
+
+    await memory_add(
+        MemoryAddInput(content="perfectly matching decoy text", category="noise")
+    )
+    await memory_add(
+        MemoryAddInput(
+            content="loosely related target text",
+            category="target",
+            tags=["keep"],
+        )
+    )
+
+    # The decoy is the nearest neighbour; with limit=1 a post-hoc filter
+    # would return nothing.
+    results = _semantic_search("perfectly matching decoy text", limit=1, category="target")
+    assert [m["category"] for m in results] == ["target"]
+
+    results = _semantic_search("perfectly matching decoy text", limit=1, tags=["keep"])
+    assert [m["category"] for m in results] == ["target"]
+
+
+async def test_fts_search_excludes_superseded(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """The FTS keyword tier excludes superseded memories (DI-02)."""
+    canonical = memory_factory(content="Consolidated note about espresso machines")
+    memory_factory(
+        content="Duplicate note about espresso machines",
+        superseded_by=canonical["id"],
+    )
+
+    params = MemorySearchInput(
+        query="espresso machines", response_format=ResponseFormat.JSON
+    )
+    result = await memory_search(params)
+    data = json.loads(result)
+
+    contents = [m["content"] for m in data["memories"]]
+    assert "Consolidated note about espresso machines" in contents
+    assert "Duplicate note about espresso machines" not in contents
+
+
+async def test_semantic_search_excludes_superseded(
+    db_conn_with_vec: sqlite3.Connection, mock_embedder
+) -> None:
+    """The semantic vector tier excludes superseded memories (DI-02)."""
+    from remind_me_mcp.db import _semantic_search
+
+    await memory_add(MemoryAddInput(content="Canonical fact about hummingbird wings"))
+    await memory_add(MemoryAddInput(content="Old duplicate fact about hummingbird wings"))
+
+    canonical_id = db_conn_with_vec.execute(
+        "SELECT id FROM memories WHERE content LIKE 'Canonical%'"
+    ).fetchone()[0]
+    db_conn_with_vec.execute(
+        "UPDATE memories SET superseded_by = ? WHERE content LIKE 'Old duplicate%'",
+        (canonical_id,),
+    )
+    db_conn_with_vec.commit()
+
+    results = _semantic_search("Old duplicate fact about hummingbird wings", limit=10)
+
+    ids = [m["id"] for m in results]
+    assert canonical_id in ids
+    assert all(m.get("superseded_by") is None for m in results)
 
 
 # ---------------------------------------------------------------------------
@@ -2236,10 +2572,13 @@ async def test_search_dormant_excluded_count_accurate(
     memory_factory,
 ) -> None:
     """dormant_excluded count matches actual number of dormant memories excluded."""
-    # Create 2 active, 1 dormant memory
+    # Create 2 active, 1 effectively dormant memory (90 unaccessed days at
+    # decay_rate 0.1 -> read-time vitality well below the floor, DI-04)
     memory_factory(content="Active memory alpha")
     memory_factory(content="Active memory beta")
-    memory_factory(content="Dormant memory gamma", status="dormant", vitality=0.01)
+    memory_factory(
+        content="Dormant memory gamma", accessed_at=_days_ago_iso(90), decay_rate=0.1
+    )
 
     params = MemorySearchInput(
         query="memory",
@@ -2287,3 +2626,34 @@ async def test_search_markdown_always_shows_tier_line(
 
     assert "Tiers:" in result
     assert "dormant excluded" in result
+
+
+# ---------------------------------------------------------------------------
+# PF-04: fire-and-forget tasks keep a strong reference until done
+# ---------------------------------------------------------------------------
+
+
+async def test_spawn_task_holds_strong_reference_until_done() -> None:
+    """_spawn_task registers the task in the module-level set (so the event
+    loop's weak reference is not the only one) and discards it on completion."""
+    import asyncio
+
+    from remind_me_mcp.tools import _background_tasks, _spawn_task
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def waiter() -> str:
+        started.set()
+        await release.wait()
+        return "done"
+
+    task = _spawn_task(waiter())
+    await started.wait()
+    assert task in _background_tasks  # strong reference held while in flight
+
+    release.set()
+    assert await task == "done"
+    # The done-callback runs via call_soon; yield once so it executes.
+    await asyncio.sleep(0)
+    assert task not in _background_tasks  # no leak after completion

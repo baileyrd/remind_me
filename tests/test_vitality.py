@@ -21,6 +21,7 @@ from remind_me_mcp.vitality import (
     get_effective_decay_rate,
     is_dormant,
     record_access,
+    record_accesses,
 )
 
 if TYPE_CHECKING:
@@ -66,6 +67,97 @@ def test_compute_vitality_formula_exact() -> None:
     expected = bw * (ac + 1) ** 0.5 * math.exp(-dr * days)
     result = compute_vitality(base_weight=bw, access_count=ac, decay_rate=dr, days_since_last_access=days)
     assert result == pytest.approx(expected)
+
+
+# ---------------------------------------------------------------------------
+# effective_vitality — read-time decay (DI-04)
+# ---------------------------------------------------------------------------
+
+
+def _decayed_memory(days_ago: float, **overrides) -> dict:
+    """Build a memory dict whose accessed_at lies *days_ago* in the past."""
+    from datetime import UTC, datetime, timedelta
+
+    accessed = (datetime.now(UTC) - timedelta(days=days_ago)).isoformat()
+    mem = {
+        "accessed_at": accessed,
+        "created_at": accessed,
+        "access_count": 0,
+        "decay_rate": 0.1,
+        "base_weight": 1.0,
+    }
+    mem.update(overrides)
+    return mem
+
+
+def test_effective_vitality_decays_with_elapsed_days() -> None:
+    """effective_vitality applies real elapsed-days decay since accessed_at."""
+    from datetime import UTC, datetime, timedelta
+
+    from remind_me_mcp.vitality import effective_vitality
+
+    now = datetime.now(UTC)
+    mem = {
+        "accessed_at": (now - timedelta(days=30)).isoformat(),
+        "access_count": 0,
+        "decay_rate": 0.1,
+        "base_weight": 1.0,
+    }
+    expected = compute_vitality(1.0, 0, 0.1, 30.0)
+    assert effective_vitality(mem, now=now) == pytest.approx(expected)
+
+
+def test_effective_vitality_fresh_access_is_snapshot() -> None:
+    """A just-accessed memory has effective vitality equal to its at-access snapshot."""
+    from remind_me_mcp.vitality import effective_vitality
+
+    mem = _decayed_memory(0.0, access_count=3)
+    assert effective_vitality(mem) == pytest.approx(compute_vitality(1.0, 3, 0.1, 0.0), rel=1e-3)
+
+
+def test_effective_vitality_falls_back_to_created_at() -> None:
+    """Without accessed_at, decay is measured from created_at."""
+    from datetime import UTC, datetime, timedelta
+
+    from remind_me_mcp.vitality import effective_vitality
+
+    now = datetime.now(UTC)
+    mem = {
+        "accessed_at": None,
+        "created_at": (now - timedelta(days=10)).isoformat(),
+        "access_count": 0,
+        "decay_rate": 0.1,
+        "base_weight": 1.0,
+    }
+    expected = compute_vitality(1.0, 0, 0.1, 10.0)
+    assert effective_vitality(mem, now=now) == pytest.approx(expected)
+
+
+def test_effective_vitality_applies_bridge_protection() -> None:
+    """Bridge-protected memories (access_count >= threshold) decay at half rate."""
+    from datetime import UTC, datetime
+
+    from remind_me_mcp.vitality import effective_vitality
+
+    now = datetime.now(UTC)
+    mem = _decayed_memory(20.0, access_count=BRIDGE_THRESHOLD)
+    expected = compute_vitality(1.0, BRIDGE_THRESHOLD, 0.05, 20.0)
+    assert effective_vitality(mem, now=now) == pytest.approx(expected, rel=1e-3)
+
+
+def test_effective_vitality_missing_fields_defaults() -> None:
+    """A dict without vitality columns yields the default fresh vitality of 1.0."""
+    from remind_me_mcp.vitality import effective_vitality
+
+    assert effective_vitality({"created_at": _now_iso()}) == pytest.approx(1.0, rel=1e-3)
+
+
+def test_effective_vitality_old_memory_goes_dormant() -> None:
+    """A long-unaccessed memory decays below the dormancy floor."""
+    from remind_me_mcp.vitality import effective_vitality
+
+    mem = _decayed_memory(365.0)
+    assert is_dormant(effective_vitality(mem))
 
 
 # ---------------------------------------------------------------------------
@@ -209,3 +301,85 @@ def test_record_access_increments_multiple_times(db_conn: sqlite3.Connection) ->
         "SELECT access_count FROM memories WHERE id = ?", (mem_id,)
     ).fetchone()
     assert row[0] == 3, f"Expected access_count=3, got {row[0]}"
+
+
+# ---------------------------------------------------------------------------
+# record_accesses — batched database integration (PF-02)
+# ---------------------------------------------------------------------------
+
+
+def _insert_access_row(db_conn: sqlite3.Connection, content: str, access_count: int = 0) -> str:
+    """Insert a memory row with vitality columns populated; return its id."""
+    now = _now_iso()
+    mem_id = _make_id(content)
+    db_conn.execute(
+        """INSERT INTO memories (id, content, category, tags, source, metadata,
+           created_at, updated_at, accessed_at, access_count, decay_rate, vitality, base_weight, status, memory_type)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (mem_id, content, "general", "[]", "manual", "{}", now, now, now,
+         access_count, 0.1, 1.0, 1.0, "active", "unclassified"),
+    )
+    db_conn.commit()
+    return mem_id
+
+
+def test_record_accesses_batch_updates_all(db_conn: sqlite3.Connection) -> None:
+    """record_accesses updates accessed_at/access_count/vitality for every id."""
+    ids = [_insert_access_row(db_conn, f"batch-access-test-{i}") for i in range(3)]
+
+    updated = record_accesses(ids)
+    assert updated == 3
+
+    for mem_id in ids:
+        row = db_conn.execute(
+            "SELECT access_count, vitality, accessed_at, status FROM memories WHERE id = ?",
+            (mem_id,),
+        ).fetchone()
+        assert row["access_count"] == 1
+        assert row["vitality"] > 0
+        assert row["accessed_at"] is not None
+        assert row["status"] == "active"
+
+
+def test_record_accesses_matches_record_access(db_conn: sqlite3.Connection) -> None:
+    """The batched path computes the same vitality as the single-id path."""
+    single_id = _insert_access_row(db_conn, "equivalence-single", access_count=4)
+    batch_id = _insert_access_row(db_conn, "equivalence-batch", access_count=4)
+
+    single_vitality = record_access(single_id)
+    assert record_accesses([batch_id]) == 1
+
+    row = db_conn.execute(
+        "SELECT vitality, access_count FROM memories WHERE id = ?", (batch_id,)
+    ).fetchone()
+    assert row["access_count"] == 5
+    assert row["vitality"] == single_vitality
+
+
+def test_record_accesses_skips_unknown_ids(db_conn: sqlite3.Connection) -> None:
+    """Unknown ids are skipped; known ones in the same batch still update."""
+    known = _insert_access_row(db_conn, "partial-batch-known")
+
+    assert record_accesses([known, "nonexistent-id-abc"]) == 1
+    row = db_conn.execute(
+        "SELECT access_count FROM memories WHERE id = ?", (known,)
+    ).fetchone()
+    assert row["access_count"] == 1
+
+
+def test_record_accesses_empty_list_is_noop(db_conn: sqlite3.Connection) -> None:
+    """An empty id list returns 0 without touching the database."""
+    assert record_accesses([]) == 0
+
+
+def test_record_accesses_applies_bridge_protection(db_conn: sqlite3.Connection) -> None:
+    """Crossing BRIDGE_THRESHOLD in a batch halves the decay rate, like record_access."""
+    mem_id = _insert_access_row(
+        db_conn, "batch-bridge-test", access_count=BRIDGE_THRESHOLD - 1
+    )
+
+    assert record_accesses([mem_id]) == 1
+    row = db_conn.execute(
+        "SELECT access_count FROM memories WHERE id = ?", (mem_id,)
+    ).fetchone()
+    assert row["access_count"] == BRIDGE_THRESHOLD

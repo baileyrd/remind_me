@@ -21,6 +21,7 @@ Key concepts:
 from __future__ import annotations
 
 import math
+from datetime import UTC, datetime
 
 from remind_me_mcp.db import _get_db, _now_iso
 
@@ -115,9 +116,106 @@ def is_dormant(vitality: float) -> bool:
     return vitality < VITALITY_FLOOR
 
 
+def effective_vitality(memory: dict, now: datetime | None = None) -> float:
+    """Compute a memory's read-time vitality with real elapsed-days decay.
+
+    The stored ``vitality`` column is a snapshot taken when the memory was last
+    accessed (computed with days_since=0), so it never decays on its own. This
+    recomputes the ACT-R formula using the days actually elapsed since
+    ``accessed_at`` (falling back to ``created_at``), with bridge protection
+    applied. Use this wherever vitality drives ranking, dormancy checks,
+    ``min_vitality`` filtering, or reporting.
+
+    Args:
+        memory: A memory dict (e.g. from ``_row_to_dict``). Missing vitality
+            columns fall back to schema defaults.
+        now: Clock override for tests. Defaults to the current UTC time.
+
+    Returns:
+        The effective vitality score as a non-negative float.
+    """
+    if now is None:
+        now = datetime.now(UTC)
+
+    access_count = memory.get("access_count") or 0
+    base_weight = memory.get("base_weight") or 1.0
+    decay_rate = memory.get("decay_rate")
+    if decay_rate is None:
+        decay_rate = DECAY_RATES.get(
+            memory.get("memory_type") or "unclassified", DECAY_RATES["unclassified"]
+        )
+    effective_rate = get_effective_decay_rate(decay_rate, access_count)
+
+    days = 0.0
+    last = memory.get("accessed_at") or memory.get("created_at")
+    if last:
+        try:
+            last_dt = datetime.fromisoformat(str(last))
+        except (TypeError, ValueError):
+            last_dt = None
+        if last_dt is not None:
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=UTC)
+            days = max(0.0, (now - last_dt).total_seconds() / 86400.0)
+
+    return compute_vitality(base_weight, access_count, effective_rate, days)
+
+
 # ---------------------------------------------------------------------------
 # Database integration
 # ---------------------------------------------------------------------------
+
+
+def record_accesses(memory_ids: list[str]) -> int:
+    """Batch-record accesses for several memories in one transaction (PF-02).
+
+    Equivalent to calling :func:`record_access` once per id, but performs a
+    single SELECT plus one ``executemany`` UPDATE and one commit instead of a
+    round-trip (SELECT + UPDATE + commit) per memory. The search hot path
+    records every returned hit, so for a 20-result search this turns ~60
+    statements/20 commits into 2 statements/1 commit.
+
+    Args:
+        memory_ids: Text primary keys of the memories to record access for.
+
+    Returns:
+        The number of memories actually updated (unknown ids are skipped).
+    """
+    if not memory_ids:
+        return 0
+
+    db = _get_db()
+    placeholders = ",".join("?" for _ in memory_ids)
+    rows = db.execute(
+        f"SELECT id, access_count, decay_rate, base_weight FROM memories "
+        f"WHERE id IN ({placeholders})",
+        memory_ids,
+    ).fetchall()
+    if not rows:
+        return 0
+
+    now = _now_iso()
+    updates: list[tuple[str, int, float, str, str]] = []
+    for row in rows:
+        new_access_count = row["access_count"] + 1
+        effective_rate = get_effective_decay_rate(row["decay_rate"], new_access_count)
+        new_vitality = compute_vitality(
+            base_weight=row["base_weight"],
+            access_count=new_access_count,
+            decay_rate=effective_rate,
+            days_since_last_access=0.0,
+        )
+        new_status = "dormant" if is_dormant(new_vitality) else "active"
+        updates.append((now, new_access_count, new_vitality, new_status, row["id"]))
+
+    db.executemany(
+        """UPDATE memories
+           SET accessed_at = ?, access_count = ?, vitality = ?, status = ?
+           WHERE id = ?""",
+        updates,
+    )
+    db.commit()
+    return len(updates)
 
 
 def record_access(memory_id: str) -> float | None:
@@ -181,7 +279,9 @@ __all__ = [
     "DECAY_RATES",
     "VITALITY_FLOOR",
     "compute_vitality",
+    "effective_vitality",
     "get_effective_decay_rate",
     "is_dormant",
     "record_access",
+    "record_accesses",
 ]

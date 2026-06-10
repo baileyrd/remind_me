@@ -45,6 +45,14 @@ _HYDE_PROMPT = (
     "Question: {query}\n\nPassage:"
 )
 
+# Successful expansions cached per query (insertion-ordered dict used as a
+# small LRU) so identical queries don't re-run the generation. Failures are
+# never cached — the daemon may come back. Module-level state, like the
+# config constants above; a plain bounded dict because callers run
+# expand_query from worker threads and lru_cache can't skip caching failures.
+_EXPANSION_CACHE: dict[str, list[str]] = {}
+_EXPANSION_CACHE_MAX = 128
+
 
 # ---------------------------------------------------------------------------
 # Generation + expansion
@@ -96,6 +104,7 @@ def expand_query(query: str) -> list[str]:
     The returned texts are embedded alongside the query and averaged into a
     single search vector (see ``db._semantic_search``). Disabled mode returns
     ``[]``, which leaves the search vector exactly the query embedding.
+    Successful expansions are cached (bounded LRU) per query (DI-08).
 
     Args:
         query: The natural-language search query.
@@ -105,8 +114,18 @@ def expand_query(query: str) -> list[str]:
     """
     if EXPANSION_MODE != "hyde" or not query.strip():
         return []
+    cached = _EXPANSION_CACHE.get(query)
+    if cached is not None:
+        # Re-insert so hot queries survive eviction (LRU behaviour).
+        _EXPANSION_CACHE[query] = _EXPANSION_CACHE.pop(query)
+        return list(cached)
     passage = hyde_passage(query)
-    return [passage] if passage else []
+    if not passage:
+        return []
+    _EXPANSION_CACHE[query] = [passage]
+    while len(_EXPANSION_CACHE) > _EXPANSION_CACHE_MAX:
+        _EXPANSION_CACHE.pop(next(iter(_EXPANSION_CACHE)))
+    return [passage]
 
 
 # ---------------------------------------------------------------------------

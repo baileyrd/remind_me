@@ -29,19 +29,16 @@ def client(db_conn, monkeypatch):
     remind_me_mcp.importer._get_db so the /api/import route uses the same
     isolated in-memory connection.
 
-    IMPORT_ROOTS is patched to include /tmp so that test fixtures using
-    pytest's tmp_path (which lives under /tmp) are not rejected by the
-    SEC-02 path guard.
+    API_KEY is set to the explicit "disabled" opt-out so the open-access
+    behavior is exercised (SE-01: auth is otherwise on by default with an
+    auto-generated key). IMPORT_ROOTS containment relies on the session
+    fixture, which allows $HOME and the system temp dir.
     """
-    import remind_me_mcp.api as _api_mod
     import remind_me_mcp.config as _cfg
     import remind_me_mcp.importer as _importer_mod
 
     monkeypatch.setattr(_importer_mod, "_get_db", lambda: db_conn)
-
-    # Patch IMPORT_ROOTS to include tmp dirs used by test fixtures
-    monkeypatch.setattr(_cfg, "IMPORT_ROOTS", [Path.home(), Path("/tmp").resolve()])
-    monkeypatch.setattr(_api_mod, "IMPORT_ROOTS", [Path.home(), Path("/tmp").resolve()])
+    monkeypatch.setattr(_cfg, "API_KEY", "disabled")
 
     app = _build_api_app()
     return TestClient(app)
@@ -51,16 +48,15 @@ def client(db_conn, monkeypatch):
 def client_with_auth(db_conn, monkeypatch):
     """Build a Starlette TestClient with API key authentication enabled.
 
-    Patches API_KEY to 'test-secret-key' in both config and api modules,
-    then rebuilds the app so BearerAuthMiddleware picks up the key.
+    Patches API_KEY to 'test-secret-key' in the config module (the api module
+    resolves the key through config.resolve_api_key at app build time), then
+    rebuilds the app so BearerAuthMiddleware picks up the key.
     """
-    import remind_me_mcp.api as _api_mod
     import remind_me_mcp.config as _cfg
     import remind_me_mcp.importer as _importer_mod
 
     monkeypatch.setattr(_importer_mod, "_get_db", lambda: db_conn)
     monkeypatch.setattr(_cfg, "API_KEY", "test-secret-key")
-    monkeypatch.setattr(_api_mod, "API_KEY", "test-secret-key")
 
     app = _build_api_app()
     return TestClient(app)
@@ -333,6 +329,34 @@ def test_api_search_no_results(client: TestClient) -> None:
     assert data["count"] == 0
 
 
+def test_api_search_category_filter_applies_before_limit(
+    client: TestClient, memory_factory
+) -> None:
+    """api_search pushes the category filter into SQL before LIMIT (DI-03)."""
+    memory_factory(content="falcon falcon falcon field notes", category="noise")
+    memory_factory(content="a falcon fact", category="birds")
+
+    response = client.get("/api/memories/search?q=falcon&limit=1&category=birds")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 1
+    assert data["memories"][0]["content"] == "a falcon fact"
+
+
+def test_api_search_tag_filter_applies_before_limit(
+    client: TestClient, memory_factory
+) -> None:
+    """api_search pushes the tag filter into SQL before LIMIT (DI-03)."""
+    memory_factory(content="otter otter otter river survey", tags=["noise"])
+    memory_factory(content="one otter spotted", tags=["river", "mammal"])
+
+    response = client.get("/api/memories/search?q=otter&limit=1&tags=river,mammal")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 1
+    assert data["memories"][0]["content"] == "one otter spotted"
+
+
 # ---------------------------------------------------------------------------
 # POST /api/import
 # ---------------------------------------------------------------------------
@@ -553,7 +577,6 @@ def test_import_allows_path_inside_home(client: TestClient, sample_chat_json: Pa
 
 def test_import_custom_roots(client: TestClient, monkeypatch, tmp_path: Path) -> None:
     """SEC-02: Custom IMPORT_ROOTS restricts to configured paths only."""
-    import remind_me_mcp.api as _api_mod
     import remind_me_mcp.config as _cfg
 
     custom_root = tmp_path / "allowed"
@@ -563,7 +586,6 @@ def test_import_custom_roots(client: TestClient, monkeypatch, tmp_path: Path) ->
 
     restricted_roots = [custom_root.resolve()]
     monkeypatch.setattr(_cfg, "IMPORT_ROOTS", restricted_roots)
-    monkeypatch.setattr(_api_mod, "IMPORT_ROOTS", restricted_roots)
 
     # File inside custom root: allowed
     r = client.post("/api/import", json={"file_path": str(test_file)})
@@ -606,10 +628,148 @@ def test_dashboard_accessible_without_auth(client_with_auth: TestClient) -> None
     assert "text/html" in r.headers["content-type"]
 
 
-def test_api_open_when_no_key_configured(client: TestClient) -> None:
-    """SEC-03: When API_KEY is None (default), all routes are open without auth."""
+def test_api_open_when_auth_explicitly_disabled(client: TestClient) -> None:
+    """SE-01: REMIND_ME_API_KEY=disabled is the explicit opt-out — routes are open."""
     r = client.get("/api/stats")
     assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# SE-01: auth on by default — auto-generated, persisted API key
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def isolated_key_dir(monkeypatch, tmp_path: Path) -> Path:
+    """Point MEMORY_DIR at a fresh per-test dir and clear any env API_KEY."""
+    import remind_me_mcp.config as _cfg
+
+    monkeypatch.setattr(_cfg, "API_KEY", None)
+    monkeypatch.setattr(_cfg, "MEMORY_DIR", tmp_path)
+    return tmp_path
+
+
+def test_default_app_generates_and_persists_api_key(db_conn, isolated_key_dir: Path) -> None:
+    """SE-01: with no env key, building the app generates a key file (0600) and enforces auth."""
+    app = _build_api_app()
+    test_client = TestClient(app)
+
+    key_file = isolated_key_dir / "api_key"
+    assert key_file.is_file(), "API key must be auto-generated and persisted on first run"
+    assert (key_file.stat().st_mode & 0o777) == 0o600, "key file must be private (0600)"
+    key = key_file.read_text().strip()
+    assert len(key) >= 32
+
+    # No token -> 401; persisted token -> 200
+    assert test_client.get("/api/stats").status_code == 401
+    r = test_client.get("/api/stats", headers={"Authorization": f"Bearer {key}"})
+    assert r.status_code == 200
+
+
+def test_default_app_reuses_persisted_api_key(db_conn, isolated_key_dir: Path) -> None:
+    """SE-01: subsequent app builds reuse the persisted key instead of regenerating."""
+    from remind_me_mcp.config import resolve_api_key
+
+    first = resolve_api_key()
+    second = resolve_api_key()
+    assert first == second
+    assert (isolated_key_dir / "api_key").read_text().strip() == first
+
+
+def test_env_api_key_wins_over_key_file(db_conn, isolated_key_dir: Path, monkeypatch) -> None:
+    """SE-01: an explicit REMIND_ME_API_KEY beats the persisted key file."""
+    import remind_me_mcp.config as _cfg
+
+    (isolated_key_dir / "api_key").write_text("file-key\n")
+    monkeypatch.setattr(_cfg, "API_KEY", "env-key")
+
+    app = _build_api_app()
+    test_client = TestClient(app)
+    assert test_client.get("/api/stats", headers={"Authorization": "Bearer env-key"}).status_code == 200
+    assert test_client.get("/api/stats", headers={"Authorization": "Bearer file-key"}).status_code == 401
+
+
+def test_disabled_opt_out_creates_no_key_file(db_conn, isolated_key_dir: Path, monkeypatch) -> None:
+    """SE-01: REMIND_ME_API_KEY=disabled opens the API and writes no key file."""
+    import remind_me_mcp.config as _cfg
+
+    monkeypatch.setattr(_cfg, "API_KEY", "Disabled")  # case-insensitive
+
+    app = _build_api_app()
+    test_client = TestClient(app)
+    assert test_client.get("/api/stats").status_code == 200
+    assert not (isolated_key_dir / "api_key").exists()
+
+
+# ---------------------------------------------------------------------------
+# SE-01: CSRF hardening — mutating routes require a JSON Content-Type (415)
+# ---------------------------------------------------------------------------
+
+
+def test_post_rejects_non_json_content_type(client: TestClient) -> None:
+    """SE-01: cross-origin 'simple' POST bodies (text/plain, form) are rejected with 415."""
+    for content_type in ("text/plain", "application/x-www-form-urlencoded", "multipart/form-data"):
+        r = client.post(
+            "/api/memories",
+            content=b'{"content": "csrf attempt"}',
+            headers={"content-type": content_type},
+        )
+        assert r.status_code == 415, f"{content_type} must be rejected"
+        assert "application/json" in r.json()["error"]
+
+
+def test_post_rejects_missing_content_type(client: TestClient) -> None:
+    """SE-01: a mutating request with no JSON Content-Type at all is rejected with 415."""
+    r = client.request("POST", "/api/import", content=b'{"file_path": "/etc/passwd"}')
+    assert r.status_code == 415
+
+
+def test_put_rejects_non_json_content_type(client: TestClient, memory_factory) -> None:
+    """SE-01: PUT with a form Content-Type is rejected with 415."""
+    mem = memory_factory(content="content-type guard memory")
+    r = client.put(
+        f"/api/memories/{mem['id']}",
+        content=b'{"content": "x"}',
+        headers={"content-type": "text/plain"},
+    )
+    assert r.status_code == 415
+
+
+def test_json_content_type_with_charset_accepted(client: TestClient) -> None:
+    """SE-01: 'application/json; charset=utf-8' passes the Content-Type gate."""
+    r = client.post(
+        "/api/memories",
+        content=b'{"content": "charset ok"}',
+        headers={"content-type": "application/json; charset=utf-8"},
+    )
+    assert r.status_code == 201
+
+
+def test_get_and_delete_unaffected_by_content_type_gate(client: TestClient, memory_factory) -> None:
+    """SE-01: GET and DELETE (no body, preflighted anyway) bypass the JSON gate."""
+    mem = memory_factory(content="delete without content type")
+    assert client.get("/api/stats").status_code == 200
+    assert client.delete(f"/api/memories/{mem['id']}").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# SE-04: unauthenticated /health liveness route
+# ---------------------------------------------------------------------------
+
+
+def test_health_route_open_without_auth(client_with_auth: TestClient) -> None:
+    """SE-04: /health returns 200 with no token even when auth is enabled."""
+    r = client_with_auth.get("/health")
+    assert r.status_code == 200
+    assert r.json() == {"status": "ok"}
+
+
+def test_health_route_reveals_no_data(client: TestClient, memory_factory) -> None:
+    """SE-04: /health is a pure liveness probe — no memory data in the body."""
+    memory_factory(content="secret memory content")
+    r = client.get("/health")
+    assert r.status_code == 200
+    assert r.json() == {"status": "ok"}
 
 
 def test_auth_does_not_block_cors_preflight(client_with_auth: TestClient) -> None:
@@ -646,13 +806,11 @@ def test_auth_protects_all_api_routes(client_with_auth: TestClient) -> None:
 
 def test_api_add_creates_embedding(db_conn_with_vec, mock_embedder, monkeypatch) -> None:
     """EMBD-01: POST /api/memories creates a corresponding row in memories_vec."""
-    import remind_me_mcp.api as _api_mod
     import remind_me_mcp.config as _cfg
     import remind_me_mcp.importer as _importer_mod
 
     monkeypatch.setattr(_importer_mod, "_get_db", lambda: db_conn_with_vec)
-    monkeypatch.setattr(_cfg, "IMPORT_ROOTS", [Path.home(), Path("/tmp").resolve()])
-    monkeypatch.setattr(_api_mod, "IMPORT_ROOTS", [Path.home(), Path("/tmp").resolve()])
+    monkeypatch.setattr(_cfg, "API_KEY", "disabled")
 
     app = _build_api_app()
     client = TestClient(app)
@@ -675,13 +833,11 @@ def test_api_add_creates_embedding(db_conn_with_vec, mock_embedder, monkeypatch)
 
 def test_api_add_creates_chunk_vectors(db_conn_with_vec, mock_embedder, monkeypatch) -> None:
     """EMBD-01: Adding a memory links its chunk vectors to the memory via vec_chunks."""
-    import remind_me_mcp.api as _api_mod
     import remind_me_mcp.config as _cfg
     import remind_me_mcp.importer as _importer_mod
 
     monkeypatch.setattr(_importer_mod, "_get_db", lambda: db_conn_with_vec)
-    monkeypatch.setattr(_cfg, "IMPORT_ROOTS", [Path.home(), Path("/tmp").resolve()])
-    monkeypatch.setattr(_api_mod, "IMPORT_ROOTS", [Path.home(), Path("/tmp").resolve()])
+    monkeypatch.setattr(_cfg, "API_KEY", "disabled")
 
     app = _build_api_app()
     client = TestClient(app)
@@ -706,13 +862,11 @@ def test_api_add_creates_chunk_vectors(db_conn_with_vec, mock_embedder, monkeypa
 
 def test_api_update_content_regenerates_embedding(db_conn_with_vec, mock_embedder, monkeypatch) -> None:
     """EMBD-02: PUT /api/memories/{id} with new content updates the memories_vec row."""
-    import remind_me_mcp.api as _api_mod
     import remind_me_mcp.config as _cfg
     import remind_me_mcp.importer as _importer_mod
 
     monkeypatch.setattr(_importer_mod, "_get_db", lambda: db_conn_with_vec)
-    monkeypatch.setattr(_cfg, "IMPORT_ROOTS", [Path.home(), Path("/tmp").resolve()])
-    monkeypatch.setattr(_api_mod, "IMPORT_ROOTS", [Path.home(), Path("/tmp").resolve()])
+    monkeypatch.setattr(_cfg, "API_KEY", "disabled")
 
     app = _build_api_app()
     client = TestClient(app)
@@ -740,13 +894,11 @@ def test_api_update_content_regenerates_embedding(db_conn_with_vec, mock_embedde
 
 def test_api_update_no_content_preserves_embedding(db_conn_with_vec, mock_embedder, monkeypatch) -> None:
     """EMBD-02: PUT /api/memories/{id} with only tags does NOT alter the memories_vec row."""
-    import remind_me_mcp.api as _api_mod
     import remind_me_mcp.config as _cfg
     import remind_me_mcp.importer as _importer_mod
 
     monkeypatch.setattr(_importer_mod, "_get_db", lambda: db_conn_with_vec)
-    monkeypatch.setattr(_cfg, "IMPORT_ROOTS", [Path.home(), Path("/tmp").resolve()])
-    monkeypatch.setattr(_api_mod, "IMPORT_ROOTS", [Path.home(), Path("/tmp").resolve()])
+    monkeypatch.setattr(_cfg, "API_KEY", "disabled")
 
     app = _build_api_app()
     client = TestClient(app)
@@ -781,14 +933,12 @@ def test_rest_and_mcp_memories_equally_findable_by_semantic_search(
     db_conn_with_vec, mock_embedder, monkeypatch
 ) -> None:
     """Parity: REST API and MCP tool memories are equally retrievable via _semantic_search."""
-    import remind_me_mcp.api as _api_mod
     import remind_me_mcp.config as _cfg
     import remind_me_mcp.importer as _importer_mod
     from remind_me_mcp.db import _embed_and_store, _make_id, _now_iso, _semantic_search
 
     monkeypatch.setattr(_importer_mod, "_get_db", lambda: db_conn_with_vec)
-    monkeypatch.setattr(_cfg, "IMPORT_ROOTS", [Path.home(), Path("/tmp").resolve()])
-    monkeypatch.setattr(_api_mod, "IMPORT_ROOTS", [Path.home(), Path("/tmp").resolve()])
+    monkeypatch.setattr(_cfg, "API_KEY", "disabled")
 
     app = _build_api_app()
     client = TestClient(app)
@@ -997,3 +1147,37 @@ def test_api_update_metadata_only(client: TestClient, memory_factory) -> None:
     assert response.status_code == 200
     data = response.json()
     assert data["metadata"].get("project") == "remind_me"
+
+
+# ---------------------------------------------------------------------------
+# HY-06: garbage query parameters answer 400, not 500
+# ---------------------------------------------------------------------------
+
+
+def test_api_list_invalid_limit_returns_400(client: TestClient) -> None:
+    """GET /api/memories?limit=garbage should be a client error, not a crash."""
+    response = client.get("/api/memories", params={"limit": "garbage"})
+    assert response.status_code == 400
+    assert "limit" in response.json()["error"]
+
+
+def test_api_list_invalid_offset_returns_400(client: TestClient) -> None:
+    """GET /api/memories?offset=NaN should be a client error, not a crash."""
+    response = client.get("/api/memories", params={"offset": "NaN"})
+    assert response.status_code == 400
+    assert "offset" in response.json()["error"]
+
+
+def test_api_search_invalid_limit_returns_400(client: TestClient) -> None:
+    """GET /api/memories/search?q=x&limit=zzz should be a client error."""
+    response = client.get("/api/memories/search", params={"q": "x", "limit": "zzz"})
+    assert response.status_code == 400
+    assert "limit" in response.json()["error"]
+
+
+def test_api_list_blank_limit_uses_default(client: TestClient, memory_factory) -> None:
+    """A blank limit parameter falls back to the default instead of erroring."""
+    memory_factory(content="Blank limit default test")
+    response = client.get("/api/memories", params={"limit": ""})
+    assert response.status_code == 200
+    assert response.json()["total"] == 1

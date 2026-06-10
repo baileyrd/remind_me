@@ -18,15 +18,124 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from remind_me_mcp.config import API_KEY, DB_PATH, IMPORT_ROOTS
+from remind_me_mcp.config import DB_PATH, is_in_import_roots, resolve_api_key
 from remind_me_mcp.db import _embed_and_store, _get_db, _make_id, _now_iso, _row_to_dict
 from remind_me_mcp.importer import import_chat_file, import_directory
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable, MutableMapping
+
     from starlette.applications import Starlette
     from starlette.requests import Request
 
+    _Scope = MutableMapping[str, Any]
+    _Receive = Callable[[], Awaitable[MutableMapping[str, Any]]]
+    _Send = Callable[[MutableMapping[str, Any]], Awaitable[None]]
+    _ASGIApp = Callable[[_Scope, _Receive, _Send], Awaitable[None]]
+
 log = logging.getLogger("remind_me_mcp.api")
+
+
+# ---------------------------------------------------------------------------
+# Shared ASGI middleware (no Starlette dependency — usable in stdio mode too)
+# ---------------------------------------------------------------------------
+
+
+async def _send_json(send: _Send, status: int, payload: dict[str, Any]) -> None:
+    """Send a minimal JSON HTTP response over a raw ASGI ``send`` callable."""
+    body = json.dumps(payload).encode("utf-8")
+    await send({
+        "type": "http.response.start",
+        "status": status,
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode("ascii")),
+        ],
+    })
+    await send({"type": "http.response.body", "body": body})
+
+
+def _header(scope: _Scope, name: bytes) -> str:
+    """Return the first value of an ASGI request header, or '' when absent."""
+    for key, value in scope.get("headers", []):
+        if key == name:
+            return str(value.decode("latin-1"))
+    return ""
+
+
+class BearerAuthMiddleware:
+    """Pure-ASGI bearer-token middleware (SE-05).
+
+    Shared by the dashboard API app (gating ``/api/*``) and the combined-mode
+    MCP HTTP wrapper in ``__main__`` (gating everything). The token comparison
+    uses ``hmac.compare_digest`` to avoid timing side channels.
+
+    Args:
+        app: The downstream ASGI application.
+        secret: The expected bearer token; ``None`` disables auth entirely.
+        protect_prefix: Only paths starting with this prefix are gated.
+        allow_paths: Exact paths that always pass (e.g. ``/health``).
+    """
+
+    def __init__(
+        self,
+        app: _ASGIApp,
+        secret: str | None,
+        protect_prefix: str = "/",
+        allow_paths: tuple[str, ...] = (),
+    ) -> None:
+        self.app = app
+        self.secret = secret
+        self.protect_prefix = protect_prefix
+        self.allow_paths = allow_paths
+
+    async def __call__(self, scope: _Scope, receive: _Receive, send: _Send) -> None:
+        """Enforce bearer auth on protected HTTP paths; pass everything else through."""
+        if scope["type"] != "http" or self.secret is None:
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path", "")
+        if path in self.allow_paths or not path.startswith(self.protect_prefix):
+            await self.app(scope, receive, send)
+            return
+        auth = _header(scope, b"authorization")
+        expected = f"Bearer {self.secret}"
+        if hmac.compare_digest(auth.encode("utf-8"), expected.encode("utf-8")):
+            await self.app(scope, receive, send)
+            return
+        await _send_json(send, 401, {"error": "Unauthorized"})
+
+
+class JSONContentTypeMiddleware:
+    """Reject mutating API requests whose Content-Type is not JSON (SE-01).
+
+    Browsers send cross-origin "simple" requests (no CORS preflight) only with
+    text/plain, multipart/form-data, or application/x-www-form-urlencoded
+    bodies. Requiring ``application/json`` on POST/PUT/PATCH forces a
+    preflight, which the localhost-only CORS policy denies for foreign
+    origins — closing the CSRF hole even when auth is explicitly disabled.
+    """
+
+    _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH"})
+
+    def __init__(self, app: _ASGIApp, protect_prefix: str = "/api/") -> None:
+        self.app = app
+        self.protect_prefix = protect_prefix
+
+    async def __call__(self, scope: _Scope, receive: _Receive, send: _Send) -> None:
+        """Return 415 for mutating /api/* requests without a JSON Content-Type."""
+        if (
+            scope["type"] == "http"
+            and scope.get("method", "").upper() in self._MUTATING_METHODS
+            and scope.get("path", "").startswith(self.protect_prefix)
+        ):
+            content_type = _header(scope, b"content-type").split(";")[0].strip().lower()
+            if content_type != "application/json":
+                await _send_json(
+                    send, 415, {"error": "Content-Type must be application/json"}
+                )
+                return
+        await self.app(scope, receive, send)
 
 # ---------------------------------------------------------------------------
 # Dashboard HTML builder
@@ -43,6 +152,11 @@ def _build_dashboard_html() -> str:
     jsx_path = Path(__file__).parent / "dashboard" / "App.jsx"
     jsx_content = jsx_path.read_text(encoding="utf-8")
 
+    # HY-04: CDN assets are pinned to exact versions with Subresource Integrity
+    # (sha384 computed from the corresponding npm tarballs, which are the exact
+    # bytes unpkg serves), so a compromised or substituted CDN response cannot
+    # execute. NOTE: the dashboard still requires network access to unpkg.com
+    # on first load (assets are not vendored), so it does not work offline.
     return """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -61,9 +175,15 @@ def _build_dashboard_html() -> str:
 </head>
 <body>
 <div id="root"></div>
-<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"
+        integrity="sha384-DGyLxAyjq0f9SPpVevD6IgztCFlnMF6oW/XQGmfe+IsZ8TqEiDrcHkMLKI6fiB/Z"
+        crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"
+        integrity="sha384-gTGxhz21lVGYNMcdJOyq01Edg0jhn/c22nsx0kyqP0TxaV5WVdsSH1fSDUf5YJj1"
+        crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.7/babel.min.js"
+        integrity="sha384-ezQ6HS3FLspd9te19o2McUV6FAK091+GG7KO54f/R8DKgCDi7fULhapNrd5LY+vG"
+        crossorigin="anonymous"></script>
 <script type="text/babel">
 """ + jsx_content + """
 </script>
@@ -89,33 +209,9 @@ def _build_api_app() -> Starlette:
     """
     from starlette.applications import Starlette
     from starlette.middleware import Middleware
-    from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.middleware.cors import CORSMiddleware
     from starlette.responses import HTMLResponse, JSONResponse
     from starlette.routing import Route
-
-    class BearerAuthMiddleware(BaseHTTPMiddleware):
-        """Gate all /api/* routes behind Bearer token auth when REMIND_ME_API_KEY is set.
-
-        When api_key is None (env var unset), all requests pass through unchanged
-        preserving backward compatibility for existing deployments.
-        """
-
-        def __init__(self, app, api_key: str | None = None) -> None:
-            super().__init__(app)
-            self.api_key = api_key
-
-        async def dispatch(self, request, call_next):
-            """Pass requests through when auth is disabled; enforce bearer token otherwise."""
-            if self.api_key is None:
-                return await call_next(request)
-            if not request.url.path.startswith("/api/"):
-                return await call_next(request)
-            auth = request.headers.get("Authorization", "")
-            expected = f"Bearer {self.api_key}"
-            if hmac.compare_digest(auth, expected):
-                return await call_next(request)
-            return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
     # -- helpers --
     def _json_ok(data: Any, status: int = 200) -> JSONResponse:
@@ -124,39 +220,72 @@ def _build_api_app() -> Starlette:
     def _json_err(msg: str, status: int = 400) -> JSONResponse:
         return JSONResponse({"error": msg}, status_code=status)
 
+    def _int_param(params: Any, name: str, default: int) -> int:
+        """Parse an integer query parameter (HY-06).
+
+        Raises ValueError with a client-friendly message for garbage input so
+        handlers can answer 400 instead of crashing with a 500.
+        """
+        raw = params.get(name)
+        if raw is None or raw == "":
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            raise ValueError(
+                f"Invalid integer for query parameter {name!r}: {raw!r}"
+            ) from None
+
     # -- routes --
+    #
+    # PF-06: every handler runs its (blocking) SQLite work in a worker thread
+    # via asyncio.to_thread instead of on the event loop. Each closure calls
+    # _get_db() *inside* the thread — connections are threading.local-based,
+    # so the to_thread pool thread gets (or creates) its own connection
+    # rather than borrowing the event loop thread's.
+
+    async def health(request: Request) -> JSONResponse:
+        """Unauthenticated liveness probe (SE-04) — reveals no data.
+
+        Used by the pid.py health check so `--status` and the already-running
+        guard keep working when API auth is enabled.
+        """
+        return JSONResponse({"status": "ok"})
 
     async def api_stats(request: Request) -> JSONResponse:
         """Return aggregate statistics about the memory store."""
-        db = _get_db()
-        total = db.execute("SELECT COUNT(*) as cnt FROM memories").fetchone()["cnt"]
-        categories = db.execute(
-            "SELECT category, COUNT(*) as cnt FROM memories GROUP BY category ORDER BY cnt DESC"
-        ).fetchall()
-        sources = db.execute(
-            "SELECT source, COUNT(*) as cnt FROM memories GROUP BY source ORDER BY cnt DESC"
-        ).fetchall()
-        imports = db.execute("SELECT COUNT(*) as cnt FROM chat_imports").fetchone()["cnt"]
-        all_tags: dict[str, int] = {}
-        for row in db.execute("SELECT tags FROM memories").fetchall():
-            try:
-                for t in json.loads(row["tags"]):
-                    all_tags[t] = all_tags.get(t, 0) + 1
-            except (json.JSONDecodeError, TypeError) as e:
-                log.debug("Malformed tags field skipped during stats aggregation: %s", e)
-        return _json_ok({
-            "total": total,
-            "imports": imports,
-            "categories": {r["category"]: r["cnt"] for r in categories},
-            "sources": {r["source"]: r["cnt"] for r in sources},
-            "tags": dict(sorted(all_tags.items(), key=lambda x: -x[1])),
-            "db_path": str(DB_PATH),
-            "db_size_mb": round(DB_PATH.stat().st_size / 1_048_576, 2) if DB_PATH.exists() else 0,
-        })
+
+        def _work() -> JSONResponse:
+            db = _get_db()
+            total = db.execute("SELECT COUNT(*) as cnt FROM memories").fetchone()["cnt"]
+            categories = db.execute(
+                "SELECT category, COUNT(*) as cnt FROM memories GROUP BY category ORDER BY cnt DESC"
+            ).fetchall()
+            sources = db.execute(
+                "SELECT source, COUNT(*) as cnt FROM memories GROUP BY source ORDER BY cnt DESC"
+            ).fetchall()
+            imports = db.execute("SELECT COUNT(*) as cnt FROM chat_imports").fetchone()["cnt"]
+            all_tags: dict[str, int] = {}
+            for row in db.execute("SELECT tags FROM memories").fetchall():
+                try:
+                    for t in json.loads(row["tags"]):
+                        all_tags[t] = all_tags.get(t, 0) + 1
+                except (json.JSONDecodeError, TypeError) as e:
+                    log.debug("Malformed tags field skipped during stats aggregation: %s", e)
+            return _json_ok({
+                "total": total,
+                "imports": imports,
+                "categories": {r["category"]: r["cnt"] for r in categories},
+                "sources": {r["source"]: r["cnt"] for r in sources},
+                "tags": dict(sorted(all_tags.items(), key=lambda x: -x[1])),
+                "db_path": str(DB_PATH),
+                "db_size_mb": round(DB_PATH.stat().st_size / 1_048_576, 2) if DB_PATH.exists() else 0,
+            })
+
+        return await asyncio.to_thread(_work)
 
     async def api_list(request: Request) -> JSONResponse:
         """List memories with optional category, source, and tag filters."""
-        db = _get_db()
         params = request.query_params
         conditions: list[str] = []
         bindings: list[Any] = []
@@ -179,64 +308,91 @@ def _build_api_app() -> Starlette:
                 bindings.append(tag)
 
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        limit = min(int(params.get("limit", 50)), 200)
-        offset = max(int(params.get("offset", 0)), 0)
+        try:
+            limit = min(_int_param(params, "limit", 50), 200)
+            offset = max(_int_param(params, "offset", 0), 0)
+        except ValueError as e:
+            return _json_err(str(e))
 
-        total = db.execute(f"SELECT COUNT(*) as cnt FROM memories m {where}", bindings).fetchone()["cnt"]
-        rows = db.execute(
-            f"SELECT m.* FROM memories m {where} ORDER BY m.created_at DESC LIMIT ? OFFSET ?",
-            bindings + [limit, offset],
-        ).fetchall()
-        memories = [_row_to_dict(r) for r in rows]
+        def _work() -> JSONResponse:
+            db = _get_db()
+            total = db.execute(f"SELECT COUNT(*) as cnt FROM memories m {where}", bindings).fetchone()["cnt"]
+            rows = db.execute(
+                f"SELECT m.* FROM memories m {where} ORDER BY m.created_at DESC LIMIT ? OFFSET ?",
+                bindings + [limit, offset],
+            ).fetchall()
+            memories = [_row_to_dict(r) for r in rows]
 
-        return _json_ok({
-            "total": total,
-            "count": len(memories),
-            "offset": offset,
-            "has_more": total > offset + limit,
-            "memories": memories,
-        })
+            return _json_ok({
+                "total": total,
+                "count": len(memories),
+                "offset": offset,
+                "has_more": total > offset + limit,
+                "memories": memories,
+            })
+
+        return await asyncio.to_thread(_work)
 
     async def api_search(request: Request) -> JSONResponse:
         """Full-text search memories using FTS5 with optional category/tag filters."""
         import sqlite3 as _sqlite3
 
-        db = _get_db()
         params = request.query_params
         query = params.get("q", "").strip()
         if not query:
             return _json_err("Missing 'q' parameter")
 
-        limit = min(int(params.get("limit", 50)), 200)
         try:
-            rows = db.execute(
-                """SELECT m.* FROM memories m
-                   JOIN memories_fts fts ON m.rowid = fts.rowid
-                   WHERE memories_fts MATCH ?
-                   ORDER BY rank LIMIT ?""",
-                (query, limit),
-            ).fetchall()
-        except _sqlite3.OperationalError as e:
-            return _json_err(f"Search error: {e}")
-
-        memories = [_row_to_dict(r) for r in rows]
-
+            limit = min(_int_param(params, "limit", 50), 200)
+        except ValueError as e:
+            return _json_err(str(e))
+        # Category/tag predicates go into the SQL so they apply before LIMIT
+        # (DI-03; same pattern as api_list's DATA-02 fix).
+        conditions = ""
+        bindings: list[Any] = [query]
         if cat := params.get("category"):
-            memories = [m for m in memories if m["category"] == cat]
+            conditions += " AND m.category = ?"
+            bindings.append(cat)
         if tag_param := params.get("tags"):
-            tag_set = set(tag_param.split(","))
-            memories = [m for m in memories if tag_set.issubset(set(m.get("tags", [])))]
+            for i, tag in enumerate(tag_param.split(",")):
+                alias = f"mt{i}"
+                conditions += (
+                    f" AND EXISTS (SELECT 1 FROM memory_tags {alias}"
+                    f" WHERE {alias}.memory_id = m.id AND {alias}.tag = ?)"
+                )
+                bindings.append(tag)
+        bindings.append(limit)
 
-        return _json_ok({"count": len(memories), "memories": memories})
+        def _work() -> JSONResponse:
+            db = _get_db()
+            try:
+                rows = db.execute(
+                    f"""SELECT m.* FROM memories m
+                       JOIN memories_fts fts ON m.rowid = fts.rowid
+                       WHERE memories_fts MATCH ?{conditions}
+                       ORDER BY rank LIMIT ?""",
+                    bindings,
+                ).fetchall()
+            except _sqlite3.OperationalError as e:
+                return _json_err(f"Search error: {e}")
+
+            memories = [_row_to_dict(r) for r in rows]
+            return _json_ok({"count": len(memories), "memories": memories})
+
+        return await asyncio.to_thread(_work)
 
     async def api_get(request: Request) -> JSONResponse:
         """Retrieve a single memory by its ID."""
-        db = _get_db()
         memory_id = request.path_params["memory_id"]
-        row = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
-        if not row:
-            return _json_err("Not found", 404)
-        return _json_ok(_row_to_dict(row))
+
+        def _work() -> JSONResponse:
+            db = _get_db()
+            row = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+            if not row:
+                return _json_err("Not found", 404)
+            return _json_ok(_row_to_dict(row))
+
+        return await asyncio.to_thread(_work)
 
     async def api_add(request: Request) -> JSONResponse:
         """Create a new memory from a JSON request body."""
@@ -249,23 +405,26 @@ def _build_api_app() -> Starlette:
         if not content:
             return _json_err("'content' is required")
 
-        db = _get_db()
-        mem_id = _make_id(content)
-        now = _now_iso()
         category = body.get("category", "general")
         tags = body.get("tags", [])
         source = body.get("source", "manual")
         metadata = body.get("metadata", {})
 
-        db.execute(
-            """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (mem_id, content, category, json.dumps(tags), source, json.dumps(metadata), now, now),
-        )
-        db.commit()
-        await asyncio.to_thread(_embed_and_store, mem_id, content)
-        row = db.execute("SELECT * FROM memories WHERE id = ?", (mem_id,)).fetchone()
-        return _json_ok(_row_to_dict(row), status=201)
+        def _work() -> JSONResponse:
+            db = _get_db()
+            mem_id = _make_id(content)
+            now = _now_iso()
+            db.execute(
+                """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (mem_id, content, category, json.dumps(tags), source, json.dumps(metadata), now, now),
+            )
+            db.commit()
+            _embed_and_store(mem_id, content)
+            row = db.execute("SELECT * FROM memories WHERE id = ?", (mem_id,)).fetchone()
+            return _json_ok(_row_to_dict(row), status=201)
+
+        return await asyncio.to_thread(_work)
 
     async def api_update(request: Request) -> JSONResponse:
         """Update fields on an existing memory by its ID."""
@@ -274,11 +433,6 @@ def _build_api_app() -> Starlette:
             body = await request.json()
         except (json.JSONDecodeError, TypeError, ValueError) as e:
             return _json_err(f"Invalid JSON body: {e}")
-
-        db = _get_db()
-        row = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
-        if not row:
-            return _json_err("Not found", 404)
 
         sets: list[str] = []
         bindings: list[Any] = []
@@ -300,22 +454,34 @@ def _build_api_app() -> Starlette:
         bindings.append(_now_iso())
         bindings.append(memory_id)
 
-        db.execute(f"UPDATE memories SET {', '.join(sets)} WHERE id = ?", bindings)
-        db.commit()
-        if "content" in body and body["content"] is not None:
-            await asyncio.to_thread(_embed_and_store, memory_id, body["content"])
-        updated = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
-        return _json_ok(_row_to_dict(updated))
+        def _work() -> JSONResponse:
+            db = _get_db()
+            row = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+            if not row:
+                return _json_err("Not found", 404)
+
+            db.execute(f"UPDATE memories SET {', '.join(sets)} WHERE id = ?", bindings)
+            db.commit()
+            if "content" in body and body["content"] is not None:
+                _embed_and_store(memory_id, body["content"])
+            updated = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+            return _json_ok(_row_to_dict(updated))
+
+        return await asyncio.to_thread(_work)
 
     async def api_delete(request: Request) -> JSONResponse:
         """Permanently delete a memory by its ID."""
         memory_id = request.path_params["memory_id"]
-        db = _get_db()
-        result = db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
-        db.commit()
-        if result.rowcount == 0:
-            return _json_err("Not found", 404)
-        return _json_ok({"deleted": memory_id})
+
+        def _work() -> JSONResponse:
+            db = _get_db()
+            result = db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+            db.commit()
+            if result.rowcount == 0:
+                return _json_err("Not found", 404)
+            return _json_ok({"deleted": memory_id})
+
+        return await asyncio.to_thread(_work)
 
     async def api_import(request: Request) -> JSONResponse:
         """Import a chat export file or directory into the memory store."""
@@ -330,8 +496,8 @@ def _build_api_app() -> Starlette:
 
         p = Path(file_path).expanduser().resolve()
 
-        # SEC-02: Reject paths outside configured import roots
-        if not any(p == root or root in p.parents for root in IMPORT_ROOTS):
+        # SEC-02: Reject paths outside configured import roots (shared helper, SE-02)
+        if not is_in_import_roots(p):
             return _json_err(f"Path not in allowed import roots: {p}")
 
         if not p.exists():
@@ -355,8 +521,10 @@ def _build_api_app() -> Starlette:
                 )
                 return _json_ok(summary)
             else:
-                # Single file import
-                result = import_chat_file(str(p), category, tags, extract_mode, max_length)
+                # Single file import — blocking parse/DB/embed work off-loop (PF-06)
+                result = await asyncio.to_thread(
+                    import_chat_file, str(p), category, tags, extract_mode, max_length
+                )
                 return _json_ok(result)
         except (FileNotFoundError, OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
             log.error("Import failed for %s: %s", file_path, e)
@@ -368,6 +536,7 @@ def _build_api_app() -> Starlette:
 
     routes = [
         Route("/", index),
+        Route("/health", health),
         Route("/api/stats", api_stats),
         Route("/api/memories", api_list, methods=["GET"]),
         Route("/api/memories", api_add, methods=["POST"]),
@@ -378,6 +547,10 @@ def _build_api_app() -> Starlette:
         Route("/api/import", api_import, methods=["POST"]),
     ]
 
+    # SE-01: auth is on by default — resolve_api_key() auto-generates and
+    # persists a key on first run; REMIND_ME_API_KEY=disabled opts out.
+    api_key = resolve_api_key()
+
     middleware = [
         Middleware(
             CORSMiddleware,
@@ -385,7 +558,8 @@ def _build_api_app() -> Starlette:
             allow_methods=["*"],
             allow_headers=["*"],
         ),
-        Middleware(BearerAuthMiddleware, api_key=API_KEY),
+        Middleware(BearerAuthMiddleware, secret=api_key, protect_prefix="/api/"),
+        Middleware(JSONContentTypeMiddleware),
     ]
 
     return Starlette(routes=routes, middleware=middleware)
@@ -396,6 +570,8 @@ def _build_api_app() -> Starlette:
 # ---------------------------------------------------------------------------
 
 __all__ = [
+    "BearerAuthMiddleware",
+    "JSONContentTypeMiddleware",
     "_build_api_app",
     "_build_dashboard_html",
 ]

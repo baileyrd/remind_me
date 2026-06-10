@@ -324,13 +324,15 @@ def test_import_embed_id_matches_insert_id(
     """
     import remind_me_mcp.importer as _importer_mod
 
-    # Spy: record every (memory_id, content) pair passed to _embed_and_store
-    embedded_ids: list[str] = []
+    # Spy: record every (memory_rowid, content) pair passed to the batched
+    # _embed_and_store_rows (PF-03 replaced per-chunk _embed_and_store calls)
+    embedded_rowids: list[int] = []
 
-    def fake_embed_and_store(memory_id: str, content: str) -> None:
-        embedded_ids.append(memory_id)
+    def fake_embed_and_store_rows(rows: list[tuple[int, str]]) -> int:
+        embedded_rowids.extend(rowid for rowid, _content in rows)
+        return len(rows)
 
-    monkeypatch.setattr(_importer_mod, "_embed_and_store", fake_embed_and_store)
+    monkeypatch.setattr(_importer_mod, "_embed_and_store_rows", fake_embed_and_store_rows)
 
     # Write a small chat JSON file with two assistant messages
     data = {
@@ -358,14 +360,14 @@ def test_import_embed_id_matches_insert_id(
     assert result["status"] == "ok"
     assert result["memories_created"] >= 1
 
-    # Every ID passed to _embed_and_store must exist in the memories table
-    assert len(embedded_ids) >= 1, "Expected at least one embedding call"
-    for mem_id in embedded_ids:
+    # Every rowid passed to _embed_and_store_rows must exist in the memories table
+    assert len(embedded_rowids) >= 1, "Expected at least one embedding call"
+    for rowid in embedded_rowids:
         row = db_conn.execute(
-            "SELECT id FROM memories WHERE id = ?", (mem_id,)
+            "SELECT rowid FROM memories WHERE rowid = ?", (rowid,)
         ).fetchone()
         assert row is not None, (
-            f"_embed_and_store was called with mem_id={mem_id!r} but no matching "
+            f"_embed_and_store_rows was called with rowid={rowid!r} but no matching "
             f"row exists in memories — this indicates the BUGF-01 ID mismatch bug."
         )
 
@@ -388,7 +390,7 @@ def test_import_jsonl_format(
     import remind_me_mcp.importer as _importer_mod
 
     monkeypatch.setattr(_importer_mod, "_get_db", lambda: db_conn)
-    monkeypatch.setattr(_importer_mod, "_embed_and_store", lambda mem_id, content: None)
+    monkeypatch.setattr(_importer_mod, "_embed_and_store_rows", lambda rows: 0)
 
     jsonl_file = tmp_path / "chat.jsonl"
     # Each JSONL line is a conversation object with chat_messages
@@ -423,7 +425,7 @@ def test_import_multi_conversation_json(
     import remind_me_mcp.importer as _importer_mod
 
     monkeypatch.setattr(_importer_mod, "_get_db", lambda: db_conn)
-    monkeypatch.setattr(_importer_mod, "_embed_and_store", lambda mem_id, content: None)
+    monkeypatch.setattr(_importer_mod, "_embed_and_store_rows", lambda rows: 0)
 
     multi_conv = [
         {"chat_messages": [{"sender": "assistant", "content": "First conversation answer"}]},
@@ -484,7 +486,7 @@ def test_import_jsonl_with_malformed_line(
     import remind_me_mcp.importer as _importer_mod
 
     monkeypatch.setattr(_importer_mod, "_get_db", lambda: db_conn)
-    monkeypatch.setattr(_importer_mod, "_embed_and_store", lambda mem_id, content: None)
+    monkeypatch.setattr(_importer_mod, "_embed_and_store_rows", lambda rows: 0)
 
     jsonl_file = tmp_path / "mixed.jsonl"
     jsonl_file.write_text(
@@ -593,3 +595,103 @@ def test_filter_conversations_empty_messages() -> None:
     """
     result = _filter_messages([], "conversations")
     assert result == []
+
+
+# ---------------------------------------------------------------------------
+# PF-03: chunker guards, early dedup, and batched embedding outside the lock
+# ---------------------------------------------------------------------------
+
+
+def test_chunk_text_whitespace_only_returns_empty() -> None:
+    """Whitespace-only input yields no chunks instead of [''] junk (PF-03)."""
+    assert _chunk_text("   ", max_len=100) == []
+    assert _chunk_text("", max_len=100) == []
+
+
+def test_chunk_text_leading_whitespace_window_not_stored() -> None:
+    """A window that strips to '' (e.g. a long run of spaces) is dropped (PF-03)."""
+    text = " " * 60 + "hello world"
+    result = _chunk_text(text, max_len=50)
+    assert all(chunk.strip() for chunk in result)
+    assert any("hello world" in chunk for chunk in result)
+
+
+def test_reimport_short_circuits_before_parsing(
+    db_conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Re-importing a file is detected by hash BEFORE any parse/chunk work (PF-03)."""
+    from pathlib import Path as _Path
+
+    import remind_me_mcp.importer as _importer_mod
+
+    monkeypatch.setattr(_importer_mod, "_embed_and_store_rows", lambda rows: 0)
+
+    data = {"chat_messages": [{"sender": "assistant", "content": "Dedup phase test."}]}
+    chat_file = tmp_path / "dedup_early.json"
+    chat_file.write_text(json.dumps(data))
+
+    first = import_chat_file(str(chat_file), "test", [], "assistant_messages", 10000)
+    assert first["status"] == "ok"
+
+    # Any parsing on the second import would now blow up — the hash check
+    # must short-circuit before the file is read or parsed.
+    def explode(*_a, **_k):  # pragma: no cover - must never be called
+        raise AssertionError("re-import must not parse the file")
+
+    monkeypatch.setattr(_importer_mod, "_extract_messages_from_json", explode)
+    monkeypatch.setattr(_importer_mod, "_chunk_text", explode)
+    monkeypatch.setattr(_Path, "read_text", explode)
+
+    second = import_chat_file(str(chat_file), "test", [], "assistant_messages", 10000)
+    assert second["status"] == "skipped"
+    assert second["import_id"] == first["import_id"]
+
+
+def test_import_embeds_in_batches_outside_lock(
+    db_conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Embedding is batched via _embed_and_store_rows and runs with the import
+    lock released (PF-03), so concurrent import workers are not serialized on
+    the (slow) embedding step."""
+    import remind_me_mcp.importer as _importer_mod
+    from remind_me_mcp.config import EMBED_BATCH_SIZE
+
+    batches: list[list[tuple[int, str]]] = []
+    lock_states: list[bool] = []
+
+    def spy_rows(rows: list[tuple[int, str]]) -> int:
+        batches.append(list(rows))
+        lock_states.append(_importer_mod._import_lock.locked())
+        return len(rows)
+
+    monkeypatch.setattr(_importer_mod, "_embed_and_store_rows", spy_rows)
+
+    n_messages = EMBED_BATCH_SIZE + 3
+    data = {
+        "chat_messages": [
+            {"sender": "assistant", "content": f"Batch embed message number {i}"}
+            for i in range(n_messages)
+        ]
+    }
+    chat_file = tmp_path / "batch_embed.json"
+    chat_file.write_text(json.dumps(data))
+
+    result = import_chat_file(str(chat_file), "test", [], "assistant_messages", 10000)
+    assert result["status"] == "ok"
+    assert result["memories_created"] == n_messages
+
+    # Batched: EMBED_BATCH_SIZE rows then the remainder — not one call per chunk.
+    assert [len(b) for b in batches] == [EMBED_BATCH_SIZE, 3]
+    # Outside the lock: the import lock must be released during embedding.
+    assert lock_states == [False, False]
+    # Every embedded rowid maps to a stored memory row.
+    for rowid, content in (pair for batch in batches for pair in batch):
+        row = db_conn.execute(
+            "SELECT content FROM memories WHERE rowid = ?", (rowid,)
+        ).fetchone()
+        assert row is not None
+        assert row["content"] == content
