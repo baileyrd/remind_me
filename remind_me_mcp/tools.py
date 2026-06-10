@@ -14,9 +14,12 @@ import json
 import logging
 import re
 import sqlite3
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from remind_me_mcp.config import CLIENT, NODE_ID
+if TYPE_CHECKING:
+    from collections.abc import Coroutine
+
+from remind_me_mcp.config import CLIENT, EMBED_BATCH_SIZE, NODE_ID
 from remind_me_mcp.consolidation import find_clusters, merge_cluster, pick_canonical
 from remind_me_mcp.db import (
     _delete_chunks,
@@ -66,18 +69,60 @@ from remind_me_mcp.vitality import (
     effective_vitality,
     get_effective_decay_rate,
     is_dormant,
-    record_access,
+    record_accesses,
 )
 
 log = logging.getLogger("remind_me_mcp.tools")
-
-EMBED_BATCH_SIZE = 32
 
 # When True, a query that isn't valid FTS5 (e.g. a natural-language question with
 # punctuation) is retried as a sanitized OR-of-terms expression instead of being
 # dropped. Disable to restore the legacy "skip keyword tier on syntax error"
 # behavior — used by the before/after benchmark to quantify the fix's impact.
 FTS_SANITIZE_FALLBACK = True
+
+
+# ---------------------------------------------------------------------------
+# Fire-and-forget background tasks (PF-04)
+# ---------------------------------------------------------------------------
+
+# The event loop holds only weak references to tasks: a fire-and-forget
+# asyncio.create_task() result with no other reference can be garbage
+# collected mid-flight, silently dropping embeddings or access updates.
+_background_tasks: set[asyncio.Task[Any]] = set()
+
+
+def _spawn_task(coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
+    """Schedule *coro* fire-and-forget while keeping a strong reference (PF-04).
+
+    The task is held in a module-level set and discards itself on completion,
+    so it can neither be garbage-collected mid-flight nor leak.
+
+    Args:
+        coro: The coroutine to run in the background.
+
+    Returns:
+        The created task (callers usually ignore it).
+    """
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+def _public_memory(memory: dict) -> dict:
+    """Return a copy of *memory* without internal underscore-prefixed fields (HY-05).
+
+    Ranking internals (``_rrf_score``, ``_keyword_rank``, ``_search_method``,
+    ``_rerank_score``, ...) must not leak into JSON responses; the useful ones
+    are exposed via the ``debug_signals`` block when ``verbose`` is set.
+
+    Args:
+        memory: A memory dict possibly augmented with internal ranking keys.
+
+    Returns:
+        A shallow copy with all underscore-prefixed keys removed.
+    """
+    return {k: v for k, v in memory.items() if not k.startswith("_")}
 
 
 # ---------------------------------------------------------------------------
@@ -360,13 +405,11 @@ async def memory_search(params: MemorySearchInput) -> str:
             # Wrap in token budget envelope and return
             envelope = apply_token_budget(filtered, params.token_budget)
 
-            # Record access for returned results (fire-and-forget)
+            # Record access for returned results (fire-and-forget, one
+            # batched transaction — PF-02/PF-04)
             returned_ids = [m["id"] for m in envelope["memories"]]
             if returned_ids:
-                async def _record_accesses(ids: list[str]) -> None:
-                    for mid in ids:
-                        await asyncio.to_thread(record_access, mid)
-                asyncio.create_task(_record_accesses(returned_ids))
+                _spawn_task(asyncio.to_thread(record_accesses, returned_ids))
 
             if params.response_format == ResponseFormat.JSON:
                 return json.dumps(
@@ -376,7 +419,7 @@ async def memory_search(params: MemorySearchInput) -> str:
                         "trimmed": envelope["trimmed"],
                         "tokens_used": envelope["tokens_used"],
                         "budget": envelope["budget"],
-                        "memories": envelope["memories"],
+                        "memories": [_public_memory(m) for m in envelope["memories"]],
                     },
                     indent=2,
                     default=str,
@@ -460,11 +503,18 @@ async def memory_search(params: MemorySearchInput) -> str:
             log.warning("FTS5 query syntax error for query %r: %s", params.query, raw_err)
 
     # --- Semantic vector search (optionally HyDE-expanded) ---
-    # HyDE output is only consumed by the semantic tier — skip the (slow)
-    # generation entirely when no embedder is available (DI-08).
-    extra_texts: list[str] = []
-    if _get_embedder() is not None:
-        extra_texts = await asyncio.to_thread(expand_query, params.query)
+    # Embedder availability can mean a network probe (Ollama) or a model load
+    # (ONNX) — never run it on the event loop (PF-01). HyDE output is only
+    # consumed by the semantic tier — skip the (slow) generation entirely
+    # when no embedder is available (DI-08).
+    def _probe_embedder_and_expand(query: str) -> tuple[bool, list[str]]:
+        if _get_embedder() is None:
+            return False, []
+        return True, expand_query(query)
+
+    sem_available, extra_texts = await asyncio.to_thread(
+        _probe_embedder_and_expand, params.query
+    )
     sem_memories = await asyncio.to_thread(
         _semantic_search,
         params.query,
@@ -536,14 +586,11 @@ async def memory_search(params: MemorySearchInput) -> str:
     else:
         envelope = apply_token_budget(ranked, params.token_budget)
 
-    # --- Record access for returned results (fire-and-forget) ---
+    # --- Record access for returned results (fire-and-forget, one batched
+    # transaction — PF-02/PF-04) ---
     returned_ids = [m["id"] for m in envelope["memories"]]
     if returned_ids:
-        async def _record_accesses(ids: list[str]) -> None:
-            for mid in ids:
-                await asyncio.to_thread(record_access, mid)
-
-        asyncio.create_task(_record_accesses(returned_ids))
+        _spawn_task(asyncio.to_thread(record_accesses, returned_ids))
 
     # --- Attach debug signals if verbose ---
     if params.verbose:
@@ -564,7 +611,9 @@ async def memory_search(params: MemorySearchInput) -> str:
                 "budget": envelope["budget"],
                 "tier_breakdown": tier_breakdown,
                 "dormant_excluded": dormant_excluded,
-                "memories": envelope["memories"],
+                # HY-05: internal ranking fields stay out of the payload;
+                # verbose=True exposes them via debug_signals instead.
+                "memories": [_public_memory(m) for m in envelope["memories"]],
             },
             indent=2,
             default=str,
@@ -574,8 +623,13 @@ async def memory_search(params: MemorySearchInput) -> str:
         return "_No memories found._"
 
     parts: list[str] = []  # type: ignore[no-redef]  # also annotated in the structured-path branch above
-    sem_available = len(sem_memories) > 0 or _get_embedder() is not None
-    method_label = "hybrid (keyword + semantic)" if sem_available else "keyword only"
+    # Availability was probed off-loop above (PF-01); non-empty semantic
+    # results also prove the semantic tier ran.
+    method_label = (
+        "hybrid (keyword + semantic)"
+        if sem_available or sem_memories
+        else "keyword only"
+    )
     parts.append(f"**{envelope['returned']} results** via {method_label} search")
     if envelope["trimmed"] > 0:
         parts.append(
@@ -1140,7 +1194,9 @@ async def remind_me_reindex() -> str:
     """
     from remind_me_mcp.embeddings import _get_embedder
 
-    embedder = _get_embedder()
+    # Availability may probe Ollama or download the ONNX model — keep it off
+    # the event loop (PF-01).
+    embedder = await asyncio.to_thread(_get_embedder)
     if embedder is None:
         return (
             "Embedding model not available. Install dependencies:\n"
@@ -1226,8 +1282,8 @@ async def remind_me_server_status() -> str:
     lines.append(f"**DB exists:** {'yes' if status['db_exists'] else 'no'}")
     lines.append("\n**MCP (stdio):** ✓ Active (this connection)")
 
-    # Embedding status
-    embedder = _get_embedder()
+    # Embedding status — the availability probe may hit the network (PF-01).
+    embedder = await asyncio.to_thread(_get_embedder)
     if embedder is not None:
         db = _get_db()
         total_mems = db.execute("SELECT COUNT(*) as cnt FROM memories").fetchone()["cnt"]
@@ -1679,10 +1735,8 @@ async def remind_me_decompose(params: DecomposeInput) -> str:
 
         fact_ids.append(fact_id)
 
-        # Fire-and-forget embed
-        asyncio.create_task(
-            asyncio.to_thread(_embed_and_store, fact_id, fact.content)
-        )
+        # Fire-and-forget embed (reference held in _background_tasks, PF-04)
+        _spawn_task(asyncio.to_thread(_embed_and_store, fact_id, fact.content))
 
     db.commit()
 
@@ -1960,8 +2014,9 @@ async def remind_me_consolidate(params: ConsolidateInput) -> str:
         total_superseded += len(members)
         canonical_ids.append(canonical["id"])
 
-        # Fire-and-forget re-embed canonical with merged content
-        asyncio.create_task(
+        # Fire-and-forget re-embed canonical with merged content (reference
+        # held in _background_tasks, PF-04)
+        _spawn_task(
             asyncio.to_thread(_embed_and_store, canonical["id"], merged["merged_content"])
         )
 

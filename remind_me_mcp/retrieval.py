@@ -238,8 +238,10 @@ def build_debug_signals(memory: dict) -> dict:
     """Extract ranking debug signals from an RRF-ranked memory dict.
 
     Returns a dict with keys: semantic_rank, keyword_rank, recency_rank,
-    vitality_rank, and days_old. If ``created_at`` is missing or unparseable,
-    ``days_old`` is set to ``None``.
+    vitality_rank, rrf_score, rerank_score, search_method, and days_old.
+    If ``created_at`` is missing or unparseable, ``days_old`` is set to
+    ``None``. This is the public surface for the internal underscore-prefixed
+    ranking fields, which are stripped from JSON responses (HY-05).
 
     Args:
         memory: A memory dict augmented by :func:`rank_rrf` with rank metadata.
@@ -263,6 +265,9 @@ def build_debug_signals(memory: dict) -> dict:
         "keyword_rank": memory.get("_keyword_rank"),
         "recency_rank": memory.get("_recency_rank"),
         "vitality_rank": memory.get("_vitality_rank"),
+        "rrf_score": memory.get("_rrf_score"),
+        "rerank_score": memory.get("_rerank_score"),
+        "search_method": memory.get("_search_method"),
         "days_old": days_old,
     }
 

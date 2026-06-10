@@ -223,7 +223,7 @@ async def test_memory_search_passes_expansion(monkeypatch, db_conn, memory_facto
     monkeypatch.setattr(emb_mod, "_get_embedder", lambda: object())
     monkeypatch.setattr(tools_mod, "expand_query", lambda q: ["hypothetical passage"])
     monkeypatch.setattr(tools_mod, "_semantic_search", fake_semantic)
-    monkeypatch.setattr(tools_mod, "record_access", lambda *_a, **_k: None)
+    monkeypatch.setattr(tools_mod, "record_accesses", lambda *_a, **_k: 0)
 
     raw = await tools_mod.memory_search(
         MemorySearchInput(query="quick fox", response_format=ResponseFormat.JSON)
@@ -254,7 +254,7 @@ async def test_memory_search_skips_expansion_without_embedder(
         return []
 
     monkeypatch.setattr(tools_mod, "expand_query", spy_expand)
-    monkeypatch.setattr(tools_mod, "record_access", lambda *_a, **_k: None)
+    monkeypatch.setattr(tools_mod, "record_accesses", lambda *_a, **_k: 0)
 
     raw = await tools_mod.memory_search(
         MemorySearchInput(query="expansion gate test", response_format=ResponseFormat.JSON)

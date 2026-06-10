@@ -1182,10 +1182,11 @@ async def test_search_rrf_ranking_smoke(
     assert isinstance(data["memories"], list)
     assert len(data["memories"]) == data["returned"]
 
-    # Verify each memory has RRF metadata attached
+    # HY-05: internal RRF metadata must NOT leak into the JSON payload
     for mem in data["memories"]:
-        assert "_rrf_score" in mem
-        assert "_keyword_rank" in mem
+        assert not any(k.startswith("_") for k in mem), (
+            f"internal fields leaked into JSON response: {sorted(mem)}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1515,7 +1516,7 @@ async def test_search_record_access_called(
     memory_factory,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """record_access is called for returned search results."""
+    """record_accesses is called once with all returned search result ids (PF-02)."""
     import remind_me_mcp.tools as _tools_mod
 
     mem = memory_factory(
@@ -1526,12 +1527,14 @@ async def test_search_record_access_called(
     )
 
     called_ids: list[str] = []
+    call_count = {"n": 0}
 
-    def fake_record_access(mid: str) -> float | None:
-        called_ids.append(mid)
-        return 0.9
+    def fake_record_accesses(ids: list[str]) -> int:
+        call_count["n"] += 1
+        called_ids.extend(ids)
+        return len(ids)
 
-    monkeypatch.setattr(_tools_mod, "record_access", fake_record_access)
+    monkeypatch.setattr(_tools_mod, "record_accesses", fake_record_accesses)
 
     # Capture the fire-and-forget task so we can await it deterministically
     # instead of sleeping for an arbitrary duration.
@@ -1554,6 +1557,8 @@ async def test_search_record_access_called(
     await asyncio.gather(*created_tasks)
 
     assert mem["id"] in called_ids
+    # PF-02: one batched call per search, not one call per returned memory.
+    assert call_count["n"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -2621,3 +2626,34 @@ async def test_search_markdown_always_shows_tier_line(
 
     assert "Tiers:" in result
     assert "dormant excluded" in result
+
+
+# ---------------------------------------------------------------------------
+# PF-04: fire-and-forget tasks keep a strong reference until done
+# ---------------------------------------------------------------------------
+
+
+async def test_spawn_task_holds_strong_reference_until_done() -> None:
+    """_spawn_task registers the task in the module-level set (so the event
+    loop's weak reference is not the only one) and discards it on completion."""
+    import asyncio
+
+    from remind_me_mcp.tools import _background_tasks, _spawn_task
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def waiter() -> str:
+        started.set()
+        await release.wait()
+        return "done"
+
+    task = _spawn_task(waiter())
+    await started.wait()
+    assert task in _background_tasks  # strong reference held while in flight
+
+    release.set()
+    assert await task == "done"
+    # The done-callback runs via call_soon; yield once so it executes.
+    await asyncio.sleep(0)
+    assert task not in _background_tasks  # no leak after completion
