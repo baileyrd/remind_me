@@ -6,7 +6,8 @@ messages. Status: `todo` / `in-progress` / `done` / `wontfix`.
 
 Workstreams: **CI** (pipeline/tooling), **DI** (data integrity & retrieval
 correctness), **SY** (sync hardening), **SE** (security & server lifecycle),
-**PF** (performance), **HY** (hygiene & refactoring).
+**PF** (performance), **HY** (hygiene & refactoring), **FT** (new features,
+not from the review).
 
 ## Wave 1 — CI honesty + data integrity
 
@@ -65,3 +66,9 @@ correctness), **SY** (sync hardening), **SE** (security & server lifecycle),
 | HY-04 | low | done | Pin/vendor dashboard CDN assets (SRI at minimum) | §7 |
 | HY-05 | low | done | Strip internal `_rrf_score`/`_keyword_rank` fields from JSON responses (or move under `debug_signals`) | §5 |
 | HY-06 | low | done | Misc robustness: 400 on bad query params, guarded env parsing, no import-time `basicConfig`, longer memory IDs, empty-chunk guard in importer | §5, §7 |
+
+## Features
+
+| ID | P | Status | Item | Review ref |
+|----|---|--------|------|------------|
+| FT-01 | med | todo | Data export: `export_memories` MCP tool (plus HTTP API endpoint) that dumps all memories to JSON/JSONL in an importer-compatible format, enabling backup and round-trip migration between machines | — |
