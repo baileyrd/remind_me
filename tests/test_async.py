@@ -237,3 +237,129 @@ def test_per_thread_connections(tmp_path) -> None:
         _db_mod._connections_lock = orig_lock
         _db_mod._schema_ready = orig_ready
         _db_mod.DB_PATH = orig_db_path
+
+
+# ---------------------------------------------------------------------------
+# SE-07: shutdown really closes every thread's connection
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def isolated_db_module(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    """Reset remind_me_mcp.db connection-registry state against a temp DB file.
+
+    monkeypatch restores the original module state (and any generation bump
+    performed via the module globals) at teardown.
+    """
+    import remind_me_mcp.db as _db_mod
+
+    monkeypatch.setattr(_db_mod, "_local", threading.local())
+    monkeypatch.setattr(_db_mod, "_all_connections", [])
+    monkeypatch.setattr(_db_mod, "_connections_lock", threading.Lock())
+    monkeypatch.setattr(_db_mod, "_schema_ready", False)
+    monkeypatch.setattr(_db_mod, "_db_generation", 0)
+    monkeypatch.setattr(_db_mod, "DB_PATH", tmp_path / "se07_close.db")
+    return _db_mod
+
+
+def test_close_db_closes_other_threads_connections(isolated_db_module) -> None:
+    """SE-07: _close_db, called from one thread, genuinely closes connections
+    created by other threads (check_same_thread=False) instead of suppressing
+    a cross-thread ProgrammingError and leaking the file descriptors."""
+    _db_mod = isolated_db_module
+
+    main_conn = _db_mod._get_db()
+    worker_conn: list = [None]
+
+    def worker() -> None:
+        worker_conn[0] = _db_mod._get_db()
+
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join()
+    assert len(_db_mod._all_connections) == 2
+
+    _db_mod._close_db()
+
+    assert _db_mod._all_connections == []
+    for conn in (main_conn, worker_conn[0]):
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
+
+
+def test_close_db_checkpoints_wal(isolated_db_module) -> None:
+    """SE-07: closing the last connection lets SQLite checkpoint and remove the WAL file."""
+    _db_mod = isolated_db_module
+
+    db = _db_mod._get_db()
+    db.execute(
+        "INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)"
+        " VALUES ('walid1', 'wal test', 'general', '[]', 'manual', '{}', '2026-01-01', '2026-01-01')"
+    )
+    db.commit()
+    wal_path = _db_mod.DB_PATH.with_name(_db_mod.DB_PATH.name + "-wal")
+    assert wal_path.exists(), "WAL file must exist while a connection is open"
+
+    _db_mod._close_db()
+
+    assert not wal_path.exists(), "WAL must be checkpointed away on clean close"
+
+
+def test_get_db_after_close_reconnects_same_thread(isolated_db_module) -> None:
+    """SE-07: after _close_db, the same thread transparently gets a fresh working connection."""
+    _db_mod = isolated_db_module
+
+    first = _db_mod._get_db()
+    _db_mod._close_db()
+    second = _db_mod._get_db()
+
+    assert second is not first
+    assert second.execute("SELECT 1").fetchone()[0] == 1
+
+
+def test_worker_thread_detects_stale_handle_after_close(isolated_db_module) -> None:
+    """SE-07: a long-lived worker thread holding a closed handle in its
+    threading.local reconnects on the next _get_db call (generation bump)
+    instead of reusing the stale connection."""
+    _db_mod = isolated_db_module
+
+    results: dict = {}
+    got_first = threading.Event()
+    closed = threading.Event()
+
+    def worker() -> None:
+        results["first"] = _db_mod._get_db()
+        got_first.set()
+        assert closed.wait(timeout=5), "main thread must signal close"
+        results["second"] = _db_mod._get_db()
+        results["value"] = results["second"].execute("SELECT 1").fetchone()[0]
+
+    t = threading.Thread(target=worker)
+    t.start()
+    assert got_first.wait(timeout=5)
+
+    _db_mod._close_db()
+    closed.set()
+    t.join(timeout=5)
+    assert not t.is_alive()
+
+    assert results["second"] is not results["first"]
+    assert results["value"] == 1
+
+
+async def test_app_lifespan_closes_db_when_body_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SE-07: app_lifespan wraps its yield in try/finally — the DB is closed
+    even when the server body raises during shutdown."""
+    import remind_me_mcp.server as _srv_mod
+    import remind_me_mcp.updater as _updater_mod
+
+    closed: list[bool] = []
+    monkeypatch.setattr(_srv_mod, "_get_db", lambda: object())
+    monkeypatch.setattr(_srv_mod, "_close_db", lambda: closed.append(True))
+    monkeypatch.setattr(_updater_mod, "start_background_check", lambda: None)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        async with _srv_mod.app_lifespan(None):
+            raise RuntimeError("boom")
+
+    assert closed == [True]

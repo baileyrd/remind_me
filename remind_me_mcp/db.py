@@ -47,6 +47,9 @@ _local = threading.local()
 _all_connections: list[sqlite3.Connection] = []
 _connections_lock = threading.Lock()
 _schema_ready = False
+# Incremented by _close_db() so threads holding a reference to a closed
+# connection in their threading.local detect staleness and reconnect (SE-07).
+_db_generation = 0
 
 
 def _get_db() -> sqlite3.Connection:
@@ -58,16 +61,19 @@ def _get_db() -> sqlite3.Connection:
     available. Schema initialisation runs once (guarded by a lock) on the
     first connection created.
 
-    All connections are tracked in ``_all_connections`` so ``_close_db()``
-    can shut them down at application exit.
+    Connections are created with ``check_same_thread=False`` so the lifespan
+    thread can actually close every tracked connection at shutdown (SE-07);
+    thread isolation is still provided by the per-thread ``threading.local``
+    registry. All connections are tracked in ``_all_connections`` so
+    ``_close_db()`` can shut them down at application exit.
     """
     global _schema_ready
 
     conn = getattr(_local, "connection", None)
-    if conn is not None:
+    if conn is not None and getattr(_local, "generation", None) == _db_generation:
         return conn
 
-    db = sqlite3.connect(str(DB_PATH), timeout=10)
+    db = sqlite3.connect(str(DB_PATH), timeout=10, check_same_thread=False)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA busy_timeout=5000")
@@ -93,24 +99,31 @@ def _get_db() -> sqlite3.Connection:
         _all_connections.append(db)
 
     _local.connection = db
+    _local.generation = _db_generation
     return db
 
 
 def _close_db() -> None:
-    """Close all per-thread database connections and reset state.
+    """Close all tracked database connections (any thread's) and reset state.
 
     Safe to call even if no connections have been opened (no-op).
-    After this call, the next ``_get_db()`` invocation on any thread will
-    open a fresh connection. Used during application shutdown and in tests
-    to reset state.
+    Connections are created with ``check_same_thread=False`` (SE-07), so the
+    calling thread can genuinely close every tracked connection — releasing
+    file descriptors and letting SQLite checkpoint the WAL on the last close.
+    The generation counter is bumped so threads still holding a reference to
+    a closed connection in their ``threading.local`` reconnect on the next
+    ``_get_db()`` call.
     """
-    global _schema_ready
+    global _schema_ready, _db_generation
     with _connections_lock:
         for conn in _all_connections:
-            with contextlib.suppress(Exception):
+            try:
                 conn.close()
+            except sqlite3.Error:  # pragma: no cover — defensive; close is expected to succeed
+                log.warning("Failed to close a tracked DB connection", exc_info=True)
         _all_connections.clear()
         _schema_ready = False
+        _db_generation += 1
     # Clear the calling thread's local reference
     _local.connection = None
 
