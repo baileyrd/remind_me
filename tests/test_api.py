@@ -1346,3 +1346,111 @@ def test_api_list_blank_limit_uses_default(client: TestClient, memory_factory) -
     response = client.get("/api/memories", params={"limit": ""})
     assert response.status_code == 200
     assert response.json()["total"] == 1
+
+
+# ---------------------------------------------------------------------------
+# FT-04 part 2: GET /api/entity and entity: search syntax parity
+# ---------------------------------------------------------------------------
+
+
+def _api_mention(db_conn, memory_id: str, name: str, kind=None, aliases=None) -> str:
+    """Upsert an entity, link it to *memory_id*, commit, return the entity id."""
+    from remind_me_mcp.db import _link_memory_entity, _upsert_entity
+
+    eid = _upsert_entity(db_conn, name, kind, aliases)
+    _link_memory_entity(db_conn, memory_id, eid)
+    db_conn.commit()
+    return eid
+
+
+def test_api_entity_lookup(client: TestClient, db_conn, memory_factory) -> None:
+    """GET /api/entity?name= returns the entity, its facts, and linked memories."""
+    mem = memory_factory(content="Tailscale config notes")
+    _api_mention(db_conn, mem["id"], "Tailscale", kind="tool", aliases=["ts"])
+    memory_factory(
+        content="remind_me syncs over Tailscale",
+        subject="remind_me", predicate="syncs over", object="Tailscale",
+    )
+
+    response = client.get("/api/entity", params={"name": "Tailscale"})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["entity"]["name"] == "Tailscale"
+    assert data["entity"]["kind"] == "tool"
+    assert data["entity"]["aliases"] == ["ts"]
+    assert [m["id"] for m in data["memories"]] == [mem["id"]]
+    assert data["total_linked_memories"] == 1
+    assert [f["content"] for f in data["facts"]] == ["remind_me syncs over Tailscale"]
+
+
+def test_api_entity_lookup_by_alias(client: TestClient, db_conn, memory_factory) -> None:
+    mem = memory_factory(content="Bailey's notes")
+    _api_mention(db_conn, mem["id"], "Bailey Robertson", aliases=["BR"])
+
+    response = client.get("/api/entity", params={"name": "br"})
+    assert response.status_code == 200
+    assert response.json()["entity"]["name"] == "Bailey Robertson"
+
+
+def test_api_entity_not_found(client: TestClient, db_conn) -> None:
+    response = client.get("/api/entity", params={"name": "Ghost"})
+    assert response.status_code == 404
+    assert "No entity found" in response.json()["error"]
+
+
+def test_api_entity_missing_name(client: TestClient, db_conn) -> None:
+    response = client.get("/api/entity")
+    assert response.status_code == 400
+    assert "name" in response.json()["error"]
+
+
+def test_api_entity_requires_auth(client_with_auth: TestClient) -> None:
+    """GET /api/entity sits under /api/ so bearer auth gates it (SE-05)."""
+    response = client_with_auth.get("/api/entity", params={"name": "x"})
+    assert response.status_code == 401
+
+
+def test_api_search_entity_only_lists_linked_memories(
+    client: TestClient, db_conn, memory_factory
+) -> None:
+    """q='entity:NAME' with no free text lists the entity's memories."""
+    linked = memory_factory(content="Tailscale handles the mesh")
+    memory_factory(content="unrelated memory")
+    stale = memory_factory(content="stale mention", superseded_by="newer")
+    eid = _api_mention(db_conn, linked["id"], "Tailscale")
+    _api_mention(db_conn, stale["id"], "Tailscale")
+    assert eid
+
+    response = client.get("/api/memories/search", params={"q": "entity:Tailscale"})
+    assert response.status_code == 200
+    data = response.json()
+    assert [m["id"] for m in data["memories"]] == [linked["id"]]
+
+
+def test_api_search_entity_with_free_text(
+    client: TestClient, db_conn, memory_factory
+) -> None:
+    """entity: filter composes with the FTS remainder."""
+    match = memory_factory(content="Tailscale mesh networking guide")
+    other = memory_factory(content="mesh networking with something else")
+    _api_mention(db_conn, match["id"], "Tailscale")
+
+    response = client.get(
+        "/api/memories/search", params={"q": 'entity:"Tailscale" mesh'}
+    )
+    assert response.status_code == 200
+    ids = [m["id"] for m in response.json()["memories"]]
+    assert ids == [match["id"]]
+    assert other["id"] not in ids
+
+
+def test_api_search_entity_unresolved_returns_empty_with_message(
+    client: TestClient, db_conn, memory_factory
+) -> None:
+    memory_factory(content="Ghost stories are fun")
+    response = client.get("/api/memories/search", params={"q": "entity:Ghost"})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 0
+    assert data["memories"] == []
+    assert "No entity found" in data["message"]

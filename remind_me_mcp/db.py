@@ -1561,6 +1561,118 @@ def _link_memory_entity(
     return cur.rowcount > 0
 
 
+def _resolve_entity(db: sqlite3.Connection, query: str) -> dict[str, Any] | None:
+    """Resolve a name or alias to its canonical entity row (FT-04 part 2).
+
+    Resolution order:
+
+      1. Deterministic-id lookup: ``_entity_id(query)`` — an indexed primary
+         key hit whenever the query is the entity's canonical name (identity
+         is case/whitespace-insensitive by construction).
+      2. Fallback scan over all entities: case-insensitive canonical-name
+         match first (defensive — ids are derived from names, so this only
+         fires for rows whose stored name diverged from its id), then a
+         match against the JSON ``aliases`` array.
+
+    Args:
+        db: An open SQLite connection.
+        query: An entity name or alias (any casing/whitespace).
+
+    Returns:
+        The entity row as a dict (aliases deserialized), or None when nothing
+        matches.
+    """
+    row = db.execute(
+        "SELECT * FROM entities WHERE id = ?", (_entity_id(query),)
+    ).fetchone()
+    if row is not None:
+        return _row_to_dict(row)
+
+    norm = _normalize_entity_name(query)
+    if not norm:
+        return None
+    alias_hit: dict[str, Any] | None = None
+    for r in db.execute("SELECT * FROM entities").fetchall():
+        d = _row_to_dict(r)
+        if _normalize_entity_name(str(d["name"])) == norm:
+            return d
+        if alias_hit is None:
+            aliases = d.get("aliases")
+            if isinstance(aliases, list) and any(
+                isinstance(a, str) and _normalize_entity_name(a) == norm
+                for a in aliases
+            ):
+                alias_hit = d
+    return alias_hit
+
+
+def _entity_profile(
+    db: sqlite3.Connection, query: str, limit: int = 20
+) -> dict[str, Any] | None:
+    """Build the full lookup payload for an entity: row + facts + memories.
+
+    Shared by the ``remind_me_entity`` MCP tool and ``GET /api/entity``.
+    Facts are non-superseded memories whose SPO subject or object equals the
+    entity's canonical name (part 1 writes SPO values verbatim from the
+    caller, so the comparison is case-insensitive — ``lower()`` on both
+    sides; the canonical name is already whitespace-collapsed). Linked
+    memories come from ``memory_entities`` via INNER joins, so dangling
+    links (sync may deliver a link before its endpoints) are invisible.
+    Superseded memories are excluded everywhere (DI-02).
+
+    Args:
+        db: An open SQLite connection.
+        query: An entity name or alias (resolved via :func:`_resolve_entity`).
+        limit: Maximum facts and maximum linked memories to return.
+
+    Returns:
+        Dict with ``entity``, ``facts``, ``memories``, and
+        ``total_linked_memories`` keys, or None when the entity is unknown.
+    """
+    ent = _resolve_entity(db, query)
+    if ent is None:
+        return None
+
+    canon = _normalize_entity_name(str(ent["name"]))
+    fact_rows = db.execute(
+        """SELECT id, content, subject, predicate, object, category, created_at
+           FROM memories
+           WHERE superseded_by IS NULL
+             AND (lower(subject) = ? OR lower(object) = ?)
+           ORDER BY created_at DESC
+           LIMIT ?""",
+        (canon, canon, limit),
+    ).fetchall()
+
+    memory_rows = db.execute(
+        """SELECT m.id, substr(m.content, 1, 300) AS content_snippet,
+                  m.category, m.created_at
+           FROM memory_entities me
+           JOIN memories m ON m.id = me.memory_id
+           WHERE me.entity_id = ? AND m.superseded_by IS NULL
+           ORDER BY m.created_at DESC
+           LIMIT ?""",
+        (ent["id"], limit),
+    ).fetchall()
+    total_linked = db.execute(
+        """SELECT COUNT(*) AS cnt
+           FROM memory_entities me
+           JOIN memories m ON m.id = me.memory_id
+           WHERE me.entity_id = ? AND m.superseded_by IS NULL""",
+        (ent["id"],),
+    ).fetchone()["cnt"]
+
+    return {
+        "entity": {
+            k: ent.get(k)
+            for k in ("id", "name", "kind", "aliases", "created_at", "updated_at")
+        },
+        "facts": [dict(r) for r in fact_rows],
+        "memories": [dict(r) for r in memory_rows],
+        "total_linked_memories": total_linked,
+    }
+
+
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     """Convert a sqlite3.Row to a plain dict, deserializing JSON fields.
 
@@ -1606,5 +1718,7 @@ __all__ = [
     "_entity_id",
     "_upsert_entity",
     "_link_memory_entity",
+    "_resolve_entity",
+    "_entity_profile",
     "_row_to_dict",
 ]

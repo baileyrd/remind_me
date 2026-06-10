@@ -1,5 +1,5 @@
 """
-remind_me_mcp.tools — All 25 MCP tool handlers and 2 resource handlers.
+remind_me_mcp.tools — All 26 MCP tool handlers and 2 resource handlers.
 
 All handlers are registered on the `mcp` instance imported from server.py.
 This package imports mcp from server (not the other way around) to avoid
@@ -11,6 +11,7 @@ Formerly a single ~2000-line module; split into submodules (HY-02):
   - ``search``    — remind_me_search + structured-query helpers and filters
   - ``crud``      — add / get / list / update / delete
   - ``capture``   — auto_capture / get_capture / decompose(+batch)
+  - ``entity``    — remind_me_entity knowledge-graph lookup (FT-04)
   - ``lifecycle`` — vitality_report / reclassify(+batch) / consolidate
   - ``admin``     — stats / reindex / server_status / updates / imports / resources
 
@@ -42,12 +43,14 @@ from remind_me_mcp.db import (
     _embed_and_store,
     _embed_and_store_rows,
     _entity_id,
+    _entity_profile,
     _get_db,
     _link_memory_entity,
     _make_id,
     _normalize_entity_name,
     _now_iso,
     _prune_orphan_chunks,
+    _resolve_entity,
     _row_to_dict,
     _semantic_search,
     _upsert_entity,
@@ -63,6 +66,7 @@ from remind_me_mcp.models import (
     DecomposeBatchInput,
     DecomposeInput,
     EntityInput,
+    EntityLookupInput,
     ExportInput,
     ExtractBatchInput,
     MemoryAddInput,
@@ -91,7 +95,7 @@ from remind_me_mcp.server import mcp
 # registering every handler on the shared FastMCP instance. These imports
 # must come after the shared-state imports above so the package namespace is
 # fully populated before any handler can run.
-from remind_me_mcp.tools import admin, capture, crud, lifecycle, search
+from remind_me_mcp.tools import admin, capture, crud, entity, lifecycle, search
 from remind_me_mcp.tools._shared import (
     FTS_SANITIZE_FALLBACK,
     _background_tasks,
@@ -128,6 +132,7 @@ from remind_me_mcp.tools.crud import (
     memory_list,
     memory_update,
 )
+from remind_me_mcp.tools.entity import remind_me_entity
 from remind_me_mcp.tools.lifecycle import (
     remind_me_consolidate,
     remind_me_reclassify,
@@ -139,6 +144,7 @@ from remind_me_mcp.tools.search import (
     _apply_filters,
     _detect_structured_query,
     _envelope_json,
+    _expand_via_entities,
     _record_envelope_access,
     _sanitize_fts_query,
     _strip_structured_prefixes,
@@ -184,6 +190,7 @@ __all__ = [
     "remind_me_decompose_batch",
     "remind_me_extract_batch",
     "remind_me_annotate",
+    "remind_me_entity",
     "remind_me_consolidate",
     "resource_stats",
     "resource_categories",

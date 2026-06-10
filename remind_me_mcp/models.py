@@ -166,6 +166,37 @@ class MemorySearchInput(BaseModel):
         default=False,
         description="Include debug ranking signals (semantic_rank, keyword_rank, recency_rank, vitality_rank, days_old) per result",
     )
+    expand_entities: bool = Field(
+        default=False,
+        description=(
+            "Opt-in 1-hop knowledge-graph expansion (FT-04): after ranking, append "
+            "up to 5 additional non-superseded memories that share a mentioned "
+            "entity with the returned results, in a separate related_via_entities "
+            "section. Does not affect the main ranking."
+        ),
+    )
+
+
+class EntityLookupInput(BaseModel):
+    """Input for the remind_me_entity tool: look up an entity by name or alias."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    name: str = Field(
+        ...,
+        description=(
+            "Entity name or alias to look up (case/whitespace-insensitive, "
+            "e.g. 'Bailey Robertson' or 'Bailey')"
+        ),
+        min_length=1,
+        max_length=200,
+    )
+    limit: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="Max facts and max linked memories to return",
+    )
 
 
 class MemoryListInput(BaseModel):
@@ -738,6 +769,7 @@ __all__ = [
     "DecomposeInput",
     "DecomposeBatchInput",
     "EntityInput",
+    "EntityLookupInput",
     "MemoryAnnotation",
     "AnnotateInput",
     "ExtractBatchInput",

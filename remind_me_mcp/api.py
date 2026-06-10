@@ -15,11 +15,21 @@ import asyncio
 import hmac
 import json
 import logging
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from remind_me_mcp.config import DB_PATH, is_in_export_roots, is_in_import_roots, resolve_api_key
-from remind_me_mcp.db import _embed_and_store, _get_db, _make_id, _now_iso, _row_to_dict
+from remind_me_mcp.db import (
+    _embed_and_store,
+    _entity_profile,
+    _get_db,
+    _make_id,
+    _normalize_entity_name,
+    _now_iso,
+    _resolve_entity,
+    _row_to_dict,
+)
 from remind_me_mcp.exporter import EXPORT_FORMATS, collect_export_records, export_memories, render_export
 from remind_me_mcp.importer import IMPORT_KINDS, import_chat_file, import_directory
 
@@ -35,6 +45,10 @@ if TYPE_CHECKING:
     _ASGIApp = Callable[[_Scope, _Receive, _Send], Awaitable[None]]
 
 log = logging.getLogger("remind_me_mcp.api")
+
+# FT-04: entity:NAME / entity:"Full Name" filter token in the search query —
+# parity with the MCP search surface's structured-query syntax.
+_ENTITY_QUERY_PATTERN = re.compile(r'entity:"([^"]+)"|entity:(\S+)')
 
 
 # ---------------------------------------------------------------------------
@@ -335,22 +349,40 @@ def _build_api_app() -> Starlette:
         return await asyncio.to_thread(_work)
 
     async def api_search(request: Request) -> JSONResponse:
-        """Full-text search memories using FTS5 with optional category/tag filters."""
+        """Full-text search memories using FTS5 with optional category/tag filters.
+
+        FT-04 parity with the MCP search surface: an ``entity:NAME`` (or
+        ``entity:"Full Name"``) token in ``q`` filters results to memories
+        linked to the resolved entity via memory_entities OR whose structured
+        subject/object equals the entity's canonical name. The entity path
+        excludes superseded memories (DI-02). With no free text remaining,
+        matching memories are listed newest-first instead of FTS-ranked; an
+        unknown entity yields an empty result with a message.
+        """
         import sqlite3 as _sqlite3
 
         params = request.query_params
-        query = params.get("q", "").strip()
-        if not query:
+        raw_query = params.get("q", "").strip()
+        if not raw_query:
             return _json_err("Missing 'q' parameter")
 
         try:
             limit = min(_int_param(params, "limit", 50), 200)
         except ValueError as e:
             return _json_err(str(e))
+
+        # Extract an optional entity: token (FT-04); the remainder stays the
+        # FTS query.
+        entity_query: str | None = None
+        query = raw_query
+        if entity_match := _ENTITY_QUERY_PATTERN.search(raw_query):
+            entity_query = entity_match.group(1) or entity_match.group(2)
+            query = " ".join(_ENTITY_QUERY_PATTERN.sub("", raw_query).split())
+
         # Category/tag predicates go into the SQL so they apply before LIMIT
         # (DI-03; same pattern as api_list's DATA-02 fix).
         conditions = ""
-        bindings: list[Any] = [query]
+        bindings: list[Any] = []
         if cat := params.get("category"):
             conditions += " AND m.category = ?"
             bindings.append(cat)
@@ -362,23 +394,80 @@ def _build_api_app() -> Starlette:
                     f" WHERE {alias}.memory_id = m.id AND {alias}.tag = ?)"
                 )
                 bindings.append(tag)
-        bindings.append(limit)
 
         def _work() -> JSONResponse:
             db = _get_db()
+
+            entity_conditions = ""
+            entity_bindings: list[Any] = []
+            if entity_query is not None:
+                ent = _resolve_entity(db, entity_query)
+                if ent is None:
+                    return _json_ok({
+                        "count": 0,
+                        "memories": [],
+                        "message": f"No entity found matching {entity_query!r}.",
+                    })
+                canon = _normalize_entity_name(str(ent["name"]))
+                entity_conditions = (
+                    " AND m.superseded_by IS NULL"
+                    " AND (EXISTS (SELECT 1 FROM memory_entities me"
+                    " WHERE me.memory_id = m.id AND me.entity_id = ?)"
+                    " OR lower(m.subject) = ? OR lower(m.object) = ?)"
+                )
+                entity_bindings = [ent["id"], canon, canon]
+
             try:
-                rows = db.execute(
-                    f"""SELECT m.* FROM memories m
-                       JOIN memories_fts fts ON m.rowid = fts.rowid
-                       WHERE memories_fts MATCH ?{conditions}
-                       ORDER BY rank LIMIT ?""",
-                    bindings,
-                ).fetchall()
+                if query:
+                    rows = db.execute(
+                        f"""SELECT m.* FROM memories m
+                           JOIN memories_fts fts ON m.rowid = fts.rowid
+                           WHERE memories_fts MATCH ?{conditions}{entity_conditions}
+                           ORDER BY rank LIMIT ?""",
+                        [query, *bindings, *entity_bindings, limit],
+                    ).fetchall()
+                else:
+                    # entity:-only query — no FTS text left; list the
+                    # entity's memories newest-first.
+                    rows = db.execute(
+                        f"""SELECT m.* FROM memories m
+                           WHERE 1=1{conditions}{entity_conditions}
+                           ORDER BY m.created_at DESC LIMIT ?""",
+                        [*bindings, *entity_bindings, limit],
+                    ).fetchall()
             except _sqlite3.OperationalError as e:
                 return _json_err(f"Search error: {e}")
 
             memories = [_row_to_dict(r) for r in rows]
             return _json_ok({"count": len(memories), "memories": memories})
+
+        return await asyncio.to_thread(_work)
+
+    async def api_entity(request: Request) -> JSONResponse:
+        """Look up a knowledge-graph entity by name or alias (FT-04).
+
+        Query parameters: ``name`` (required), ``limit`` (max facts and max
+        linked memories, default 20, capped at 100). Mirrors the
+        remind_me_entity MCP tool: deterministic-id resolution on the
+        canonical name first, then a case-insensitive name/alias scan;
+        superseded memories are excluded and dangling sync links are
+        invisible.
+        """
+        params = request.query_params
+        name = (params.get("name") or "").strip()
+        if not name:
+            return _json_err("Missing 'name' parameter")
+        try:
+            limit = min(_int_param(params, "limit", 20), 100)
+        except ValueError as e:
+            return _json_err(str(e))
+
+        def _work() -> JSONResponse:
+            db = _get_db()
+            profile = _entity_profile(db, name, limit=limit)
+            if profile is None:
+                return _json_err(f"No entity found matching {name!r}", 404)
+            return _json_ok(profile)
 
         return await asyncio.to_thread(_work)
 
@@ -608,6 +697,7 @@ def _build_api_app() -> Starlette:
         Route("/api/memories/{memory_id}", api_delete, methods=["DELETE"]),
         Route("/api/import", api_import, methods=["POST"]),
         Route("/api/export", api_export, methods=["GET"]),
+        Route("/api/entity", api_entity, methods=["GET"]),
     ]
 
     # SE-01: auth is on by default — resolve_api_key() auto-generates and
