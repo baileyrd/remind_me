@@ -53,15 +53,15 @@ correctness), **SY** (sync hardening), **SE** (security & server lifecycle),
 
 | ID | P | Status | Item | Review ref |
 |----|---|--------|------|------------|
-| PF-01 | high | todo | Cache embedder availability/failure (TTL); never probe Ollama/HF synchronously in async handlers | §4 |
-| PF-02 | med | todo | Batch `record_access` into one UPDATE/transaction per search | §4 |
-| PF-03 | med | todo | Import: dedup by hash before parsing; embed in batches outside `_import_lock` | §4 |
-| PF-04 | med | todo | Hold references to fire-and-forget `asyncio.create_task` tasks | §4 |
-| PF-05 | med | todo | `db.rollback()` on failure paths in `_embed_and_store_rows` | §4 |
-| PF-06 | low | todo | `asyncio.to_thread` for DB work in API handlers | §4 |
-| HY-01 | med | todo | Remove root `remind_me_dashboard.jsx` duplicate, `remind_me_spec.docx`; untrack `.planning/` | §7 |
+| PF-01 | high | done | Cache embedder availability/failure (TTL); never probe Ollama/HF synchronously in async handlers | §4 |
+| PF-02 | med | done | Batch `record_access` into one UPDATE/transaction per search | §4 |
+| PF-03 | med | done | Import: dedup by hash before parsing; embed in batches outside `_import_lock` | §4 |
+| PF-04 | med | done | Hold references to fire-and-forget `asyncio.create_task` tasks | §4 |
+| PF-05 | med | done | `db.rollback()` on failure paths in `_embed_and_store_rows` | §4 |
+| PF-06 | low | done | `asyncio.to_thread` for DB work in API handlers | §4 |
+| HY-01 | med | done | Remove root `remind_me_dashboard.jsx` duplicate, `remind_me_spec.docx`; untrack `.planning/` | §7 |
 | HY-02 | med | todo | Split `tools.py` into `tools/` package (search/crud/capture/lifecycle/admin); dedupe structured-path envelope logic | §7 |
 | HY-03 | med | done | Generate outbox triggers from a single column list in `db.py` | §7 |
 | HY-04 | low | todo | Pin/vendor dashboard CDN assets (SRI at minimum) | §7 |
-| HY-05 | low | todo | Strip internal `_rrf_score`/`_keyword_rank` fields from JSON responses (or move under `debug_signals`) | §5 |
-| HY-06 | low | todo | Misc robustness: 400 on bad query params, guarded env parsing, no import-time `basicConfig`, longer memory IDs, empty-chunk guard in importer | §5, §7 |
+| HY-05 | low | done | Strip internal `_rrf_score`/`_keyword_rank` fields from JSON responses (or move under `debug_signals`) | §5 |
+| HY-06 | low | done | Misc robustness: 400 on bad query params, guarded env parsing, no import-time `basicConfig`, longer memory IDs, empty-chunk guard in importer | §5, §7 |
