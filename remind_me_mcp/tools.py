@@ -60,7 +60,14 @@ from remind_me_mcp.retrieval import (
 )
 from remind_me_mcp.server import mcp
 from remind_me_mcp.updater import pop_update_notice
-from remind_me_mcp.vitality import DECAY_RATES, compute_vitality, get_effective_decay_rate, record_access
+from remind_me_mcp.vitality import (
+    DECAY_RATES,
+    compute_vitality,
+    effective_vitality,
+    get_effective_decay_rate,
+    is_dormant,
+    record_access,
+)
 
 log = logging.getLogger("remind_me_mcp.tools")
 
@@ -335,14 +342,19 @@ async def memory_search(params: MemorySearchInput) -> str:
             limit=params.limit,
         )
         if structured_results:
+            # Read-time vitality decay (DI-04): the stored column is an
+            # at-access snapshot; recompute with real elapsed days.
+            for m in structured_results:
+                m["vitality"] = effective_vitality(m)
+
             # Apply filters (category, tags, dormant, vitality)
             filtered = _apply_filters(structured_results, params.category, params.tags)
             if not params.include_dormant:
-                filtered = [m for m in filtered if m.get("status") != "dormant"]
+                filtered = [m for m in filtered if not is_dormant(m["vitality"])]
             if params.min_vitality > 0:
                 filtered = [
                     m for m in filtered
-                    if (m.get("vitality") or 1.0) >= params.min_vitality
+                    if m["vitality"] >= params.min_vitality
                 ]
 
             # Wrap in token budget envelope and return
@@ -466,6 +478,12 @@ async def memory_search(params: MemorySearchInput) -> str:
     for m in sem_memories:
         m["_search_method"] = "semantic"
 
+    # --- Read-time vitality decay (DI-04): the stored column is an at-access
+    # snapshot; recompute with real elapsed days so decay, dormancy, and the
+    # RRF vitality signal reflect reality. ---
+    for m in (*fts_memories, *sem_memories):
+        m["vitality"] = effective_vitality(m)
+
     # Category/tag filters are already applied in the SQL of both tiers (DI-03).
     filtered_fts = fts_memories
     filtered_sem = sem_memories
@@ -473,24 +491,22 @@ async def memory_search(params: MemorySearchInput) -> str:
     # --- Count dormant memories BEFORE exclusion (unique by ID) ---
     dormant_ids: set[str] = set()
     for m in filtered_fts + filtered_sem:
-        if m.get("status") == "dormant":
+        if is_dormant(m["vitality"]):
             dormant_ids.add(m["id"])
     dormant_excluded = len(dormant_ids) if not params.include_dormant else 0
 
     # --- Dormant exclusion BEFORE RRF ranking ---
     if not params.include_dormant:
-        filtered_fts = [m for m in filtered_fts if m.get("status") != "dormant"]
-        filtered_sem = [m for m in filtered_sem if m.get("status") != "dormant"]
+        filtered_fts = [m for m in filtered_fts if not is_dormant(m["vitality"])]
+        filtered_sem = [m for m in filtered_sem if not is_dormant(m["vitality"])]
 
     # --- Min vitality filter ---
     if params.min_vitality > 0:
         filtered_fts = [
-            m for m in filtered_fts
-            if (m.get("vitality") or 1.0) >= params.min_vitality
+            m for m in filtered_fts if m["vitality"] >= params.min_vitality
         ]
         filtered_sem = [
-            m for m in filtered_sem
-            if (m.get("vitality") or 1.0) >= params.min_vitality
+            m for m in filtered_sem if m["vitality"] >= params.min_vitality
         ]
 
     # --- RRF ranking ---
@@ -1255,18 +1271,18 @@ async def remind_me_vitality_report(params: VitalityReportInput) -> str:
     """
     db = _get_db()
 
-    # Core counts
-    total = db.execute("SELECT COUNT(*) as cnt FROM memories").fetchone()["cnt"]
-    active_count = db.execute(
-        "SELECT COUNT(*) as cnt FROM memories WHERE status = 'active'"
-    ).fetchone()["cnt"]
-    dormant_count = db.execute(
-        "SELECT COUNT(*) as cnt FROM memories WHERE status = 'dormant'"
-    ).fetchone()["cnt"]
+    # Effective (read-time) vitality per memory — the stored column is a
+    # stale at-access snapshot (DI-04).
+    rows = db.execute("SELECT * FROM memories").fetchall()
+    total = len(rows)
+    vitalities = [effective_vitality(_row_to_dict(r)) for r in rows]
+
+    # Core counts (dormancy from effective vitality, not the stored status)
+    dormant_count = sum(1 for v in vitalities if is_dormant(v))
+    active_count = total - dormant_count
 
     # Average vitality
-    avg_row = db.execute("SELECT AVG(vitality) as avg_v FROM memories").fetchone()
-    avg_vitality = round(avg_row["avg_v"], 2) if avg_row["avg_v"] is not None else 0.0
+    avg_vitality = round(sum(vitalities) / total, 2) if total > 0 else 0.0
 
     # Decay distribution by memory_type
     type_rows = db.execute(
@@ -1274,21 +1290,25 @@ async def remind_me_vitality_report(params: VitalityReportInput) -> str:
     ).fetchall()
     decay_distribution = {r["memory_type"]: r["cnt"] for r in type_rows}
 
-    # Vitality buckets
+    # Vitality buckets. The top bucket is open-ended: accessed memories exceed
+    # 1.0 (one access -> sqrt(2) ~= 1.41), so a closed bucket would lose them
+    # and the counts wouldn't sum to the total (DI-04).
     bucket_ranges = [
         ("0.00-0.05", 0.0, 0.05),
         ("0.05-0.25", 0.05, 0.25),
         ("0.25-0.50", 0.25, 0.50),
         ("0.50-0.75", 0.50, 0.75),
-        ("0.75-1.00", 0.75, 1.01),  # 1.01 to include vitality=1.0
     ]
-    vitality_buckets: dict[str, int] = {}
-    for label, low, high in bucket_ranges:
-        count = db.execute(
-            "SELECT COUNT(*) as cnt FROM memories WHERE vitality >= ? AND vitality < ?",
-            (low, high),
-        ).fetchone()["cnt"]
-        vitality_buckets[label] = count
+    top_bucket = "0.75+"
+    vitality_buckets: dict[str, int] = {label: 0 for label, _, _ in bucket_ranges}
+    vitality_buckets[top_bucket] = 0
+    for v in vitalities:
+        for label, low, high in bucket_ranges:
+            if low <= v < high:
+                vitality_buckets[label] += 1
+                break
+        else:
+            vitality_buckets[top_bucket] += 1
 
     # Vault health score
     health_pct = round(active_count / total * 100) if total > 0 else 0

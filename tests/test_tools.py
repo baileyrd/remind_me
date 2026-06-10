@@ -1158,12 +1158,15 @@ async def test_search_rrf_ranking_smoke(
     memory_factory,
 ) -> None:
     """RRF ranking path produces valid envelope response (smoke test)."""
-    # Create memories with different timestamps to exercise recency signal
+    # Create memories with different timestamps to exercise the recency signal.
+    # accessed_at is kept fresh so read-time vitality decay (DI-04) doesn't
+    # mark months-old created_at values dormant.
     for i in range(3):
         memory_factory(
             content=f"RRF smoke test content item {i} with searchable text",
             category="test",
             created_at=f"2026-01-0{i + 1}T00:00:00Z",
+            accessed_at=_days_ago_iso(i),
         )
 
     search_params = MemorySearchInput(
@@ -1359,22 +1362,33 @@ async def test_reclassify_batch_empty_when_all_classified(
 # ---------------------------------------------------------------------------
 
 
+def _days_ago_iso(days: float) -> str:
+    """ISO timestamp *days* in the past (UTC), for staging vitality decay."""
+    from datetime import UTC, datetime, timedelta
+
+    return (datetime.now(UTC) - timedelta(days=days)).isoformat()
+
+
 async def test_search_excludes_dormant_by_default(
     db_conn: sqlite3.Connection,
     memory_factory,
 ) -> None:
-    """Dormant memories (status='dormant') are excluded from search by default."""
+    """Memories whose effective vitality has decayed below the floor are excluded by default (DI-04).
+
+    Dormancy is computed at read time from accessed_at, not from the stored
+    status/vitality snapshot.
+    """
     memory_factory(
         content="Active vitality test memory alpha",
         category="test",
-        status="active",
-        vitality=0.8,
+        accessed_at=_days_ago_iso(0),
     )
+    # 90 days unaccessed at decay_rate 0.1 -> e^-9 ~= 0.0001 < VITALITY_FLOOR
     memory_factory(
         content="Dormant vitality test memory beta",
         category="test",
-        status="dormant",
-        vitality=0.01,
+        accessed_at=_days_ago_iso(90),
+        decay_rate=0.1,
     )
 
     search_params = MemorySearchInput(query="vitality test memory")
@@ -1388,18 +1402,17 @@ async def test_search_include_dormant_shows_all(
     db_conn: sqlite3.Connection,
     memory_factory,
 ) -> None:
-    """include_dormant=True includes dormant memories in search results."""
+    """include_dormant=True includes effectively dormant memories in search results."""
     memory_factory(
         content="Active include dormant test gamma",
         category="test",
-        status="active",
-        vitality=0.8,
+        accessed_at=_days_ago_iso(0),
     )
     memory_factory(
         content="Dormant include dormant test delta",
         category="test",
-        status="dormant",
-        vitality=0.01,
+        accessed_at=_days_ago_iso(90),
+        decay_rate=0.1,
     )
 
     search_params = MemorySearchInput(
@@ -1419,18 +1432,18 @@ async def test_search_min_vitality_filter(
     db_conn: sqlite3.Connection,
     memory_factory,
 ) -> None:
-    """min_vitality=0.5 excludes memories with vitality below 0.5."""
+    """min_vitality=0.5 excludes memories whose effective vitality decayed below 0.5 (DI-04)."""
     memory_factory(
         content="High vitality filter test epsilon",
         category="test",
-        status="active",
-        vitality=0.8,
+        accessed_at=_days_ago_iso(0),
     )
+    # 15 days at decay_rate 0.1 -> e^-1.5 ~= 0.22 < 0.5
     memory_factory(
         content="Low vitality filter test zeta",
         category="test",
-        status="active",
-        vitality=0.3,
+        accessed_at=_days_ago_iso(15),
+        decay_rate=0.1,
     )
 
     search_params = MemorySearchInput(
@@ -1444,6 +1457,57 @@ async def test_search_min_vitality_filter(
     contents = [m["content"].lower() for m in data["memories"]]
     assert any("epsilon" in c for c in contents)
     assert not any("zeta" in c for c in contents)
+
+
+async def test_search_vitality_is_recomputed_at_read_time(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """Returned vitality reflects elapsed-days decay, not the stale stored snapshot (DI-04)."""
+    import math
+
+    # Stored snapshot says 1.0, but ~6.93 days at decay_rate 0.1 halves it.
+    days = math.log(2) / 0.1
+    memory_factory(
+        content="Read time decay check memory",
+        vitality=1.0,
+        decay_rate=0.1,
+        accessed_at=_days_ago_iso(days),
+    )
+
+    search_params = MemorySearchInput(
+        query="read time decay check",
+        response_format=ResponseFormat.JSON,
+    )
+    result = await memory_search(search_params)
+    data = json.loads(result)
+
+    assert len(data["memories"]) == 1
+    assert data["memories"][0]["vitality"] == pytest.approx(0.5, abs=0.01)
+
+
+async def test_search_counts_effectively_dormant_in_dormant_excluded(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """dormant_excluded counts read-time dormancy even when stored status is 'active' (DI-04)."""
+    memory_factory(
+        content="Stale status dormant counter memory",
+        status="active",
+        vitality=1.0,
+        accessed_at=_days_ago_iso(90),
+        decay_rate=0.1,
+    )
+
+    search_params = MemorySearchInput(
+        query="stale status dormant counter",
+        response_format=ResponseFormat.JSON,
+    )
+    result = await memory_search(search_params)
+    data = json.loads(result)
+
+    assert data["memories"] == []
+    assert data["dormant_excluded"] == 1
 
 
 async def test_search_record_access_called(
@@ -1488,13 +1552,18 @@ async def test_vitality_report_basic_counts(
     db_conn: sqlite3.Connection,
     memory_factory,
 ) -> None:
-    """remind_me_vitality_report returns total_memories, active_count, dormant_count."""
+    """remind_me_vitality_report returns total_memories, active_count, dormant_count.
+
+    Counts reflect effective (read-time) vitality, not the stored status (DI-04).
+    """
     from remind_me_mcp.models import VitalityReportInput
     from remind_me_mcp.tools import remind_me_vitality_report
 
-    memory_factory(content="Active report test 1", status="active", vitality=0.8)
-    memory_factory(content="Active report test 2", status="active", vitality=0.6)
-    memory_factory(content="Dormant report test 1", status="dormant", vitality=0.01)
+    memory_factory(content="Active report test 1", accessed_at=_days_ago_iso(0))
+    memory_factory(content="Active report test 2", accessed_at=_days_ago_iso(1))
+    memory_factory(
+        content="Dormant report test 1", accessed_at=_days_ago_iso(90), decay_rate=0.1
+    )
 
     params = VitalityReportInput()
     result = await remind_me_vitality_report(params)
@@ -1509,12 +1578,17 @@ async def test_vitality_report_average_vitality(
     db_conn: sqlite3.Connection,
     memory_factory,
 ) -> None:
-    """Report includes average_vitality across all memories."""
+    """Report includes average_vitality across all memories (effective vitality, DI-04)."""
+    import math
+
     from remind_me_mcp.models import VitalityReportInput
     from remind_me_mcp.tools import remind_me_vitality_report
 
-    memory_factory(content="Avg test 1", status="active", vitality=1.0)
-    memory_factory(content="Avg test 2", status="active", vitality=0.5)
+    # Fresh memory -> 1.0; one half-life (ln2/0.1 days) old -> 0.5; avg 0.75.
+    memory_factory(content="Avg test 1", accessed_at=_days_ago_iso(0))
+    memory_factory(
+        content="Avg test 2", accessed_at=_days_ago_iso(math.log(2) / 0.1), decay_rate=0.1
+    )
 
     params = VitalityReportInput()
     result = await remind_me_vitality_report(params)
@@ -1547,15 +1621,21 @@ async def test_vitality_report_vitality_buckets(
     db_conn: sqlite3.Connection,
     memory_factory,
 ) -> None:
-    """Report includes vitality_buckets with counts in defined ranges."""
+    """Report buckets effective vitality, with an open-ended top bucket (DI-04)."""
+    import math
+
     from remind_me_mcp.models import VitalityReportInput
     from remind_me_mcp.tools import remind_me_vitality_report
 
-    memory_factory(content="Bucket test 1", status="dormant", vitality=0.01)   # 0.00-0.05
-    memory_factory(content="Bucket test 2", status="active", vitality=0.10)    # 0.05-0.25
-    memory_factory(content="Bucket test 3", status="active", vitality=0.30)    # 0.25-0.50
-    memory_factory(content="Bucket test 4", status="active", vitality=0.60)    # 0.50-0.75
-    memory_factory(content="Bucket test 5", status="active", vitality=0.90)    # 0.75-1.00
+    def _staged(target: float) -> float:
+        """Days ago at decay_rate 0.1 yielding effective vitality *target*."""
+        return -math.log(target) / 0.1
+
+    memory_factory(content="Bucket test 1", accessed_at=_days_ago_iso(_staged(0.01)), decay_rate=0.1)  # 0.00-0.05
+    memory_factory(content="Bucket test 2", accessed_at=_days_ago_iso(_staged(0.10)), decay_rate=0.1)  # 0.05-0.25
+    memory_factory(content="Bucket test 3", accessed_at=_days_ago_iso(_staged(0.30)), decay_rate=0.1)  # 0.25-0.50
+    memory_factory(content="Bucket test 4", accessed_at=_days_ago_iso(_staged(0.60)), decay_rate=0.1)  # 0.50-0.75
+    memory_factory(content="Bucket test 5", accessed_at=_days_ago_iso(0))                              # 0.75+
 
     params = VitalityReportInput()
     result = await remind_me_vitality_report(params)
@@ -1565,7 +1645,30 @@ async def test_vitality_report_vitality_buckets(
     assert data["vitality_buckets"]["0.05-0.25"] == 1
     assert data["vitality_buckets"]["0.25-0.50"] == 1
     assert data["vitality_buckets"]["0.50-0.75"] == 1
-    assert data["vitality_buckets"]["0.75-1.00"] == 1
+    assert data["vitality_buckets"]["0.75+"] == 1
+
+
+async def test_vitality_report_top_bucket_counts_accessed_memories(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """Accessed memories (vitality > 1.0, e.g. sqrt(2)~=1.41) land in the open top bucket
+    and bucket counts sum to the total (DI-04)."""
+    from remind_me_mcp.models import VitalityReportInput
+    from remind_me_mcp.tools import remind_me_vitality_report
+
+    # One access just now: effective vitality = sqrt(2) ~= 1.41 > 1.01, which the
+    # old closed 0.75-1.01 bucket silently dropped.
+    memory_factory(
+        content="Boosted bucket memory", access_count=1, accessed_at=_days_ago_iso(0)
+    )
+
+    params = VitalityReportInput()
+    result = await remind_me_vitality_report(params)
+    data = json.loads(result)
+
+    assert data["vitality_buckets"]["0.75+"] == 1
+    assert sum(data["vitality_buckets"].values()) == data["total_memories"] == 1
 
 
 async def test_vitality_report_vault_health_score(
@@ -1576,10 +1679,10 @@ async def test_vitality_report_vault_health_score(
     from remind_me_mcp.models import VitalityReportInput
     from remind_me_mcp.tools import remind_me_vitality_report
 
-    memory_factory(content="Health test 1", status="active", vitality=0.8)
-    memory_factory(content="Health test 2", status="active", vitality=0.7)
-    memory_factory(content="Health test 3", status="dormant", vitality=0.01)
-    memory_factory(content="Health test 4", status="dormant", vitality=0.02)
+    memory_factory(content="Health test 1", accessed_at=_days_ago_iso(0))
+    memory_factory(content="Health test 2", accessed_at=_days_ago_iso(1))
+    memory_factory(content="Health test 3", accessed_at=_days_ago_iso(90), decay_rate=0.1)
+    memory_factory(content="Health test 4", accessed_at=_days_ago_iso(91), decay_rate=0.1)
 
     params = VitalityReportInput()
     result = await remind_me_vitality_report(params)
@@ -2100,22 +2203,21 @@ async def test_structured_search_respects_category_filter(
 async def test_structured_search_respects_dormant_filter(
     db_conn: sqlite3.Connection, memory_factory
 ) -> None:
-    """Structured lookup respects include_dormant filter."""
+    """Structured lookup respects include_dormant filter (read-time dormancy, DI-04)."""
     memory_factory(
         content="Bailey prefers vim",
         subject="Bailey",
         predicate="prefers",
         object="vim",
-        status="dormant",
-        vitality=0.01,
+        accessed_at=_days_ago_iso(90),
+        decay_rate=0.1,
     )
     memory_factory(
         content="Bailey prefers dark mode",
         subject="Bailey",
         predicate="prefers",
         object="dark mode",
-        status="active",
-        vitality=0.8,
+        accessed_at=_days_ago_iso(0),
     )
 
     params = MemorySearchInput(
@@ -2133,20 +2235,21 @@ async def test_structured_search_respects_dormant_filter(
 async def test_structured_search_respects_min_vitality(
     db_conn: sqlite3.Connection, memory_factory
 ) -> None:
-    """Structured lookup respects min_vitality filter."""
+    """Structured lookup respects min_vitality filter (effective vitality, DI-04)."""
     memory_factory(
         content="Bailey prefers tabs",
         subject="Bailey",
         predicate="prefers",
         object="tabs",
-        vitality=0.3,
+        accessed_at=_days_ago_iso(15),
+        decay_rate=0.1,
     )
     memory_factory(
         content="Bailey prefers dark mode",
         subject="Bailey",
         predicate="prefers",
         object="dark mode",
-        vitality=0.8,
+        accessed_at=_days_ago_iso(0),
     )
 
     params = MemorySearchInput(
@@ -2416,10 +2519,13 @@ async def test_search_dormant_excluded_count_accurate(
     memory_factory,
 ) -> None:
     """dormant_excluded count matches actual number of dormant memories excluded."""
-    # Create 2 active, 1 dormant memory
+    # Create 2 active, 1 effectively dormant memory (90 unaccessed days at
+    # decay_rate 0.1 -> read-time vitality well below the floor, DI-04)
     memory_factory(content="Active memory alpha")
     memory_factory(content="Active memory beta")
-    memory_factory(content="Dormant memory gamma", status="dormant", vitality=0.01)
+    memory_factory(
+        content="Dormant memory gamma", accessed_at=_days_ago_iso(90), decay_rate=0.1
+    )
 
     params = MemorySearchInput(
         query="memory",
