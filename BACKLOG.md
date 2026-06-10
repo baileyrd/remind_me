@@ -71,4 +71,7 @@ not from the review).
 
 | ID | P | Status | Item | Review ref |
 |----|---|--------|------|------------|
-| FT-01 | med | todo | Data export: `export_memories` MCP tool (plus HTTP API endpoint) that dumps all memories to JSON/JSONL in an importer-compatible format, enabling backup and round-trip migration between machines | — |
+| FT-01 | med | todo | Govern — data export: `export_memories` MCP tool (plus HTTP API endpoint) that dumps all memories to JSON/JSONL in an importer-compatible format, enabling backup and round-trip migration between machines | — |
+| FT-02 | med | todo | Collect — generic document ingestion: extend the importer beyond chat exports to plain Markdown, text, and notes files (per-file/per-section chunking instead of per-message) | — |
+| FT-03 | med | todo | Collect — source connectors: watch a configured notes/docs folder and auto-ingest new or changed files (reuse import dedup-by-hash), as a path toward email/app connectors | — |
+| FT-04 | med | todo | Organize — entity & link extraction: during decomposition, extract entities and relations and store them as structured metadata/links between memories (lightweight knowledge-graph layer over SQLite) | — |
