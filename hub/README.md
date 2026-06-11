@@ -109,28 +109,52 @@ starting the hub — the hub's startup migration upgrades the legacy schema
 (TIMESTAMPTZ columns, pre-entity-graph) automatically, so the order is:
 
 ```bash
-# 1. Postgres up, hub stopped
+# 1. Postgres up, hub stopped (the hub only migrates at startup, and it
+#    must not serve clients mid-restore)
 systemctl --user start remind-me-postgres.service
 systemctl --user stop  remind-me-hub.service
 
-# 2. Load the dump (single transaction, abort on first error)
+# 2. Load the dump. Expect (and ignore) "role remindme already exists";
+#    pipe stderr through a filter so real errors still surface.
 podman exec -i remind-me-postgres \
-  psql -v ON_ERROR_STOP=1 --single-transaction -U remindme -d remindme \
-  < ~/postgres-backup.sql
+  psql -U remindme -d remindme \
+  < ~/postgres-backup.sql \
+  2>&1 | grep -E 'ERROR|FATAL' | grep -v 'already exists'
 
-# 3. Start the hub — it converts timestamps to canonical ISO TEXT and adds
-#    the columns/tables introduced since the legacy hub
-systemctl --user start remind-me-hub.service
-journalctl --user -u remind-me-hub.service | grep -i migrat
+# 3. The dump may contain ALTER ROLE ... PASSWORD, which silently resets
+#    the remindme password to whatever the OLD deployment used. Set it
+#    back to match your env files (the in-container socket is trusted,
+#    so this works even while password auth is broken):
+PGPW=$(grep -oP '^POSTGRES_PASSWORD=\K.*' ~/remind-me-hub/postgres.env)
+podman exec remind-me-postgres psql -U remindme -d postgres \
+  -c "ALTER USER remindme WITH PASSWORD '$PGPW';"
 
-# 4. Verify
+# 4. RESTART the hub (not start — start is a no-op on a running service).
+#    Startup converts timestamps to canonical ISO TEXT and adds the
+#    columns/tables introduced since the legacy hub.
+systemctl --user restart remind-me-hub.service
+journalctl --user -u remind-me-hub.service --since '1 min ago' | grep -i migrat
+
+# 5. Verify — max should be ISO text (2026-...T...+00:00), data_type text
 podman exec -it remind-me-postgres psql -U remindme -d remindme \
   -c "SELECT COUNT(*), MAX(updated_at) FROM memories;"
+curl -s http://127.0.0.1:8765/health
 ```
 
 If the dump contains `CREATE DATABASE` / `\connect` lines, strip them or
 restore with `psql -d postgres` instead — the container already created the
 `remindme` database.
+
+To re-run a restore from scratch (e.g. the hub already created the new empty
+schema before the data was loaded), drop and recreate the database first so
+the hub's startup migration sees the genuine legacy schema:
+
+```bash
+systemctl --user stop remind-me-hub.service
+podman exec remind-me-postgres psql -U remindme -d postgres \
+  -c "DROP DATABASE remindme;" -c "CREATE DATABASE remindme OWNER remindme;"
+# then continue from step 2 above
+```
 
 ## Client Access (SSH tunnel)
 
