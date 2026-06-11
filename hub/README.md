@@ -63,8 +63,17 @@ mkdir -p ~/remind-me-hub/postgres-data ~/.config/containers/systemd
 cp ~/remind_me/hub/deploy/postgres.env.example ~/remind-me-hub/postgres.env
 cp ~/remind_me/hub/deploy/hub.env.example      ~/remind-me-hub/hub.env
 chmod 600 ~/remind-me-hub/*.env
-# Edit both: set the same Postgres password in each, and pick the
-# SYNC_SECRET your clients will use as REMIND_ME_SYNC_SECRET.
+
+# Generate the secrets (hex: safe to inline in env vars and bash -c strings).
+# The Postgres password lives in BOTH files and must match.
+PGPW=$(openssl rand -hex 24)
+SECRET=$(openssl rand -hex 32)
+sed -i "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$PGPW|" ~/remind-me-hub/postgres.env
+sed -i "s|change-me@|$PGPW@|"                             ~/remind-me-hub/hub.env
+sed -i "s|^SYNC_SECRET=.*|SYNC_SECRET=$SECRET|"           ~/remind-me-hub/hub.env
+
+# Copy this into each client's REMIND_ME_SYNC_SECRET:
+echo "$SECRET"
 ```
 
 ### 4. Install the Quadlet units
