@@ -1,0 +1,14 @@
+FROM docker.io/library/python:3.12-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir \
+    "fastapi>=0.115,<1" \
+    "uvicorn[standard]>=0.30,<1" \
+    "psycopg[binary]>=3.2,<4"
+
+COPY main.py .
+
+EXPOSE 8765
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8765"]
