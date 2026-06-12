@@ -34,7 +34,7 @@ git clone https://github.com/baileyrd/remind_me.git ~/projects/remind_me
 ~/projects/remind_me/hub/client-setup.sh \
     --node-id work-pc-wsl \
     --tunnel you@your-server:22 \
-    --apply-code
+    --apply-code --apply-instructions
 ```
 
 It installs the package (`.venv`), sets up a persistent SSH tunnel (dedicated
@@ -44,6 +44,14 @@ Desktop** — with `--apply-code`, the Claude Code entry is merged into
 `~/.claude.json` for you (timestamped backup written first). Drop `--tunnel`
 on machines that reach the hub another way (e.g. Tailscale) and pass
 `--hub-url` instead. See `--help` for all options.
+
+`--apply-instructions` also teaches Claude Code *how to use* the memory: it
+installs a block into `~/.claude/CLAUDE.md` telling Claude to search
+remind-me before answering questions about you or your projects, to
+auto-capture every substantive conversation, and to save durable facts and
+preferences as they come up. The same instructions are printed for pasting
+into Claude Desktop / claude.ai personal preferences (those settings are
+account-side, so a local script cannot write them).
 
 Day-2 commands:
 

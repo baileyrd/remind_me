@@ -16,6 +16,12 @@
 #                       port on each machine that shares a network).
 #   --apply-code        Merge the MCP server entry into ~/.claude.json
 #                       (Claude Code). A timestamped backup is written first.
+#   --apply-instructions
+#                       Install the memory-usage instructions (search before
+#                       answering, auto-capture conversations) into
+#                       ~/.claude/CLAUDE.md so Claude Code follows them.
+#                       Idempotent: the marker-delimited block is replaced
+#                       on re-runs.
 #   --skip-install      Don't create/verify the .venv (e.g. installed via
 #                       'uv tool install' instead).
 #
@@ -26,6 +32,9 @@
 #   4. prints ready-to-paste MCP config for Claude Code and Claude Desktop
 #      (Claude Desktop on Windows/WSL needs env vars INLINED in the command
 #      string — the config's env block does not cross the wsl.exe boundary)
+#   5. prints the memory-usage instructions for Claude Desktop / claude.ai
+#      (their settings are account-side and cannot be written by a script);
+#      with --apply-instructions, installs them for Claude Code locally
 
 set -euo pipefail
 
@@ -42,6 +51,7 @@ HUB_URL="http://127.0.0.1:8765"
 TUNNEL=""
 PEER_PORT=8766
 APPLY_CODE=0
+APPLY_INSTRUCTIONS=0
 SKIP_INSTALL=0
 
 log()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
@@ -60,8 +70,9 @@ while (( $# )); do
         --tunnel)       TUNNEL="${2:?}"; shift ;;
         --peer-port)    PEER_PORT="${2:?}"; shift ;;
         --apply-code)   APPLY_CODE=1 ;;
+        --apply-instructions) APPLY_INSTRUCTIONS=1 ;;
         --skip-install) SKIP_INSTALL=1 ;;
-        -h|--help)      sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)      sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown argument: $1 (see --help)" ;;
     esac
     shift
@@ -250,6 +261,74 @@ EOF
 if [ -z "$DISTRO" ]; then
     warn "not running under WSL — replace <your-wsl-distro> with the distro name (wsl.exe -l on Windows)"
 fi
+
+# ---------------------------------------------------------------------------
+# 5. Memory-usage instructions (search-first + auto-capture)
+# ---------------------------------------------------------------------------
+
+INSTRUCTIONS=$(cat <<'EOF'
+## Persistent memory (remind-me)
+
+You have persistent, cross-machine memory via the remind-me MCP tools.
+
+**Search before answering.** When a question concerns the user, their
+projects, preferences, decisions, or anything that may have come up in a
+past conversation, call `remind_me_search` FIRST and ground your answer in
+what it returns. Use `entity:"Name"`, `subject:`, or `predicate:` filters
+when a specific person, project, or tool is named.
+
+**Capture conversations.** At the end of every substantive conversation,
+call `remind_me_auto_capture` to save the full dialog plus a concise
+summary covering: topics discussed, decisions made, facts learned,
+preferences expressed, and action items. Use a descriptive title and
+relevant tags. Do this automatically, without being asked.
+
+**Save durable facts immediately.** When the user states a lasting fact or
+preference mid-conversation, store it right away with `remind_me_add`
+(category `preference` or `fact`, with tags) instead of waiting for the
+end of the conversation.
+EOF
+)
+
+echo
+if (( APPLY_INSTRUCTIONS )); then
+    log "Installing memory-usage instructions into ~/.claude/CLAUDE.md (Claude Code)"
+    mkdir -p "$HOME/.claude"
+    INSTRUCTIONS="$INSTRUCTIONS" python3 - <<'PYEOF'
+import os, re
+
+path = os.path.expanduser("~/.claude/CLAUDE.md")
+begin = "<!-- >>> remind-me memory instructions >>> -->"
+end = "<!-- <<< remind-me memory instructions <<< -->"
+block = f"{begin}\n{os.environ['INSTRUCTIONS']}\n{end}\n"
+
+text = ""
+if os.path.exists(path):
+    with open(path) as f:
+        text = f.read()
+
+pattern = re.compile(re.escape(begin) + r".*?" + re.escape(end) + r"\n?", re.S)
+if pattern.search(text):
+    text = pattern.sub(block, text)
+    print("    replaced existing block")
+else:
+    if text and not text.endswith("\n"):
+        text += "\n"
+    text += ("\n" if text else "") + block
+    print(f"    added to {path}")
+with open(path, "w") as f:
+    f.write(text)
+PYEOF
+else
+    log "Claude Code — to make Claude search memory and capture conversations,"
+    echo "    re-run with --apply-instructions (writes ~/.claude/CLAUDE.md), or add the block below yourself."
+fi
+
+echo
+log "Claude Desktop / claude.ai — paste this into Settings -> Profile ->"
+echo "    'personal preferences' (it cannot be set by a script):"
+echo
+printf '%s\n' "$INSTRUCTIONS"
 
 echo
 log "Done. Restart Claude Code / Claude Desktop, then verify on the server:"
