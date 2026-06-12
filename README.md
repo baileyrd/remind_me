@@ -492,11 +492,19 @@ The built-in sync engine provides automatic, offline-first synchronization acros
 
 #### Setting Up the Hub
 
-The sync hub is a FastAPI server backed by Postgres. Deploy it with Podman or Docker:
+The sync hub is a FastAPI server backed by Postgres, and it lives in this repo under [`hub/`](hub/) with one-command deployment for Fedora + rootless Podman:
 
-1. Run a Postgres instance (e.g., via Podman Quadlet or Docker Compose)
-2. Deploy the sync hub container pointing at the Postgres instance
-3. Ensure the hub is reachable from all machines (e.g., via Tailscale)
+```bash
+# on the server
+git clone https://github.com/baileyrd/remind_me.git ~/remind_me
+~/remind_me/hub/setup.sh install                          # secrets, Quadlets, image, services
+~/remind_me/hub/setup.sh restore /path/to/backup.sql      # optional: restore a previous database
+
+# on each client (Fedora/WSL)
+~/projects/remind_me/hub/client-setup.sh --node-id my-pc --tunnel you@server --apply-code
+```
+
+See [`hub/README.md`](hub/README.md) for the protocol details, manual setup reference, restore procedure, and operations guide.
 
 #### Configuring a Node
 

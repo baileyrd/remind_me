@@ -9,6 +9,59 @@ nothing is exposed beyond `127.0.0.1:8765` on the server.
 client (sync.py) ──ssh -L 8765──► server 127.0.0.1:8765 (hub) ──► postgres
 ```
 
+## Quick Start
+
+**On the server** (Fedora with Podman ≥ 4.4):
+
+```bash
+git clone https://github.com/baileyrd/remind_me.git ~/remind_me
+~/remind_me/hub/setup.sh install
+~/remind_me/hub/setup.sh restore /path/to/postgres-backup.sql   # optional
+```
+
+`install` is idempotent: it generates secrets (kept on re-runs), installs the
+Quadlet units, builds the hub image, starts everything, and prints the
+`SYNC_SECRET` your clients need. `restore` encodes the full field-tested
+procedure — drop/recreate when needed (`--force` for a non-empty database),
+tolerant dump loading, the post-restore password reset, the hub restart that
+triggers the legacy-schema migration, and verification that the migration
+actually ran.
+
+**On each client** (inside Fedora/WSL):
+
+```bash
+git clone https://github.com/baileyrd/remind_me.git ~/projects/remind_me
+~/projects/remind_me/hub/client-setup.sh \
+    --node-id work-pc-wsl \
+    --tunnel you@your-server:22 \
+    --apply-code --apply-instructions
+```
+
+It installs the package (`.venv`), sets up a persistent SSH tunnel (dedicated
+key + `~/.ssh/config` block + systemd user service), checks hub connectivity,
+and prints ready-to-paste MCP config for **Claude Code** and **Claude
+Desktop** — with `--apply-code`, the Claude Code entry is merged into
+`~/.claude.json` for you (timestamped backup written first). Drop `--tunnel`
+on machines that reach the hub another way (e.g. Tailscale) and pass
+`--hub-url` instead. See `--help` for all options.
+
+`--apply-instructions` also teaches Claude Code *how to use* the memory: it
+installs a block into `~/.claude/CLAUDE.md` telling Claude to search
+remind-me before answering questions about you or your projects, to
+auto-capture every substantive conversation, and to save durable facts and
+preferences as they come up. The same instructions are printed for pasting
+into Claude Desktop / claude.ai personal preferences (those settings are
+account-side, so a local script cannot write them).
+
+Day-2 commands:
+
+```bash
+~/remind_me/hub/setup.sh status    # services, health, per-node memory counts
+~/remind_me/hub/setup.sh update    # git pull, rebuild image, restart hub
+```
+
+## Protocol
+
 The hub implements the same wire protocol as the peer server
 (`remind_me_mcp/peer_server.py`): bearer-authenticated `/sync/push` with
 `processed_ids` responses, keyset-cursor `/sync/pull`, and the FT-04
@@ -34,67 +87,60 @@ hub is pull-only (peers push to each other; nobody pushes hub state to you):
 |------|---------|
 | `main.py` | The hub server (FastAPI + psycopg) |
 | `Containerfile` | Hub container image |
+| `setup.sh` | Server installer: `install` / `restore` / `status` / `update` |
+| `client-setup.sh` | Client configurator: venv, SSH tunnel, MCP config |
+| `e2e_test.py` | End-to-end test driving the hub with the real client |
 | `deploy/remind-me.network` | Quadlet network (container-name DNS, no static IPs) |
 | `deploy/remind-me-postgres.container` | Quadlet unit for Postgres |
 | `deploy/remind-me-hub.container` | Quadlet unit for the hub |
 | `deploy/postgres.env.example` | Postgres credentials template |
 | `deploy/hub.env.example` | Hub `DATABASE_URL` + `SYNC_SECRET` template |
 
-## Server Setup (Fedora, rootless Podman)
+Layout the installer manages on the server:
 
-### 1. Prerequisites
+```
+~/remind-me-hub/postgres.env       Postgres credentials        (chmod 600)
+~/remind-me-hub/hub.env            DATABASE_URL + SYNC_SECRET  (chmod 600)
+~/remind-me-hub/postgres-data/     Postgres data (bind mount)
+~/.config/containers/systemd/      Quadlet units
+```
+
+## Manual Setup (reference)
+
+Everything `setup.sh` and `client-setup.sh` do, spelled out — useful for
+debugging or non-standard environments.
+
+<details>
+<summary>Server: install by hand</summary>
 
 ```bash
 sudo dnf install -y podman
-# Let your user's services run without an active login session
 loginctl enable-linger $USER
-```
 
-### 2. Get the files onto the server
-
-```bash
 git clone https://github.com/baileyrd/remind_me.git ~/remind_me
 mkdir -p ~/remind-me-hub/postgres-data ~/.config/containers/systemd
-```
 
-### 3. Create the env files (secrets — never committed)
-
-```bash
+# Env files (secrets — never committed). The Postgres password lives in
+# BOTH files and must match; hex secrets inline safely into bash -c strings.
 cp ~/remind_me/hub/deploy/postgres.env.example ~/remind-me-hub/postgres.env
 cp ~/remind_me/hub/deploy/hub.env.example      ~/remind-me-hub/hub.env
 chmod 600 ~/remind-me-hub/*.env
-
-# Generate the secrets (hex: safe to inline in env vars and bash -c strings).
-# The Postgres password lives in BOTH files and must match.
 PGPW=$(openssl rand -hex 24)
 SECRET=$(openssl rand -hex 32)
 sed -i "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=$PGPW|" ~/remind-me-hub/postgres.env
 sed -i "s|change-me@|$PGPW@|"                             ~/remind-me-hub/hub.env
 sed -i "s|^SYNC_SECRET=.*|SYNC_SECRET=$SECRET|"           ~/remind-me-hub/hub.env
+echo "$SECRET"   # → each client's REMIND_ME_SYNC_SECRET
 
-# Copy this into each client's REMIND_ME_SYNC_SECRET:
-echo "$SECRET"
-```
-
-### 4. Install the Quadlet units
-
-```bash
+# Quadlets, image, services
 cp ~/remind_me/hub/deploy/remind-me.network \
    ~/remind_me/hub/deploy/remind-me-postgres.container \
    ~/remind_me/hub/deploy/remind-me-hub.container \
    ~/.config/containers/systemd/
-```
-
-### 5. Build the hub image and start everything
-
-```bash
 podman build -t remind-me-hub:latest ~/remind_me/hub
-
 systemctl --user daemon-reload
 systemctl --user start remind-me-postgres.service
 systemctl --user start remind-me-hub.service
-
-systemctl --user status remind-me-postgres.service remind-me-hub.service
 curl -s http://127.0.0.1:8765/health
 # {"status":"ok","role":"hub","db":"ok","time":"..."}
 ```
@@ -102,17 +148,22 @@ curl -s http://127.0.0.1:8765/health
 The hub creates (or migrates) the database schema itself at startup, and
 waits up to two minutes for Postgres to come up first.
 
-## Restoring a Backup
+</details>
 
-For a plain-SQL dump (`postgres-backup.sql`), restore **before or after**
-starting the hub — the hub's startup migration upgrades the legacy schema
-(TIMESTAMPTZ columns, pre-entity-graph) automatically, so the order is:
+<details>
+<summary>Server: restore a backup by hand</summary>
 
 ```bash
 # 1. Postgres up, hub stopped (the hub only migrates at startup, and it
 #    must not serve clients mid-restore)
 systemctl --user start remind-me-postgres.service
 systemctl --user stop  remind-me-hub.service
+
+# 1b. If the database is not pristine (the hub already created the new empty
+#     schema, or an earlier restore went in), drop and recreate it first so
+#     the hub's startup migration sees the genuine legacy schema:
+podman exec remind-me-postgres psql -U remindme -d postgres \
+  -c "DROP DATABASE remindme;" -c "CREATE DATABASE remindme OWNER remindme;"
 
 # 2. Load the dump. Expect (and ignore) "role remindme already exists";
 #    pipe stderr through a filter so real errors still surface.
@@ -145,18 +196,10 @@ If the dump contains `CREATE DATABASE` / `\connect` lines, strip them or
 restore with `psql -d postgres` instead — the container already created the
 `remindme` database.
 
-To re-run a restore from scratch (e.g. the hub already created the new empty
-schema before the data was loaded), drop and recreate the database first so
-the hub's startup migration sees the genuine legacy schema:
+</details>
 
-```bash
-systemctl --user stop remind-me-hub.service
-podman exec remind-me-postgres psql -U remindme -d postgres \
-  -c "DROP DATABASE remindme;" -c "CREATE DATABASE remindme OWNER remindme;"
-# then continue from step 2 above
-```
-
-## Client Access (SSH tunnel)
+<details>
+<summary>Client: SSH tunnel + MCP config by hand</summary>
 
 Each client machine keeps a forward to the server open and points
 `REMIND_ME_HUB_URL` at localhost:
@@ -168,7 +211,7 @@ Host remind-me-hub
     User <you>
     IdentityFile ~/.ssh/remind-me-tunnel
     IdentitiesOnly yes
-    LocalForward 8765 localhost:8765
+    LocalForward 8765 127.0.0.1:8765
     ServerAliveInterval 30
     ServerAliveCountMax 3
     ExitOnForwardFailure yes
@@ -204,16 +247,26 @@ REMIND_ME_SYNC_SECRET=<the SYNC_SECRET from hub.env>
 REMIND_ME_NODE_ID=<unique per machine>
 ```
 
+Claude Code takes these in the `env` block of its `mcpServers` entry
+(`~/.claude.json`). Claude Desktop on Windows launching into WSL does NOT
+pass the `env` block through `wsl.exe` — inline the variables in the
+`bash -c` command string instead (see the main README's WSL section).
+`client-setup.sh` prints both forms with your values filled in.
+
+</details>
+
 ## Operations
 
 ```bash
+# One-stop overview: services, health, per-node counts
+~/remind_me/hub/setup.sh status
+
 # Logs
 journalctl --user -u remind-me-hub.service -f
 journalctl --user -u remind-me-postgres.service -f
 
-# Rebuild + redeploy the hub after a code change
-podman build -t remind-me-hub:latest ~/remind_me/hub
-systemctl --user restart remind-me-hub.service
+# Update after a code change (pull, rebuild, restart)
+~/remind_me/hub/setup.sh update
 
 # Backup
 podman exec remind-me-postgres pg_dump -U remindme remindme \
