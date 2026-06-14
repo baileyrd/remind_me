@@ -392,6 +392,21 @@ async def remind_me_server_status() -> str:
             "auto-ingest a notes/docs folder)"
         )
 
+    # LLM Wiki (FT-08)
+    try:
+        from remind_me_mcp import wiki
+
+        # db may be unbound above (it is only fetched in the embedder branch).
+        page_count = _pkg._get_db().execute(
+            "SELECT COUNT(*) AS cnt FROM wiki_pages"
+        ).fetchone()["cnt"]
+        lines.append(
+            f"\n**LLM Wiki:** ✓ {page_count} page(s) at `{wiki.wiki_dir()}` "
+            f"(load with `remind_me_wiki_load`, build with `remind_me_wiki_compile`)"
+        )
+    except sqlite3.OperationalError as e:
+        log.debug("Wiki tables not available for status check: %s", e)
+
     # Remote MCP connector (FT-05) + OAuth (FT-07)
     from remind_me_mcp.remote import get_remote_status
 

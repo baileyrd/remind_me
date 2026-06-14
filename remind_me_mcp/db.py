@@ -23,6 +23,11 @@ Current schema versions:
   9 -> 10: FT-04 entity graph — entities + memory_entities tables with
            deterministic entity ids (sha256 of the normalized canonical name)
            and outbox triggers so the graph syncs between peers
+  10 -> 11: FT-08 LLM Wiki — wiki_pages (+ external-content wiki_fts),
+            wiki_links (backlink graph), and wiki_meta (compile watermark)
+            tables. The wiki's source of truth is markdown files on disk; these
+            tables are a search/index cache only, so there are deliberately NO
+            sync outbox triggers (the file layer is what would be synced).
 """
 
 from __future__ import annotations
@@ -222,7 +227,7 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 # Current target schema version.  Increment when adding a new migration step.
-_SCHEMA_VERSION = 10
+_SCHEMA_VERSION = 11
 
 
 
@@ -291,6 +296,11 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         _migrate_v9_to_v10(db)
         db.execute("PRAGMA user_version = 10")
         current_version = 10
+
+    if current_version < 11:
+        _migrate_v10_to_v11(db)
+        db.execute("PRAGMA user_version = 11")
+        current_version = 11
 
     db.commit()
 
@@ -1096,6 +1106,71 @@ def _migrate_v9_to_v10(db: sqlite3.Connection) -> None:
         BEGIN
             INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
             VALUES (NEW.memory_id, 'insert', {link_payload}, {_SQL_NOW_ISO});
+        END;
+    """)
+
+
+def _migrate_v10_to_v11(db: sqlite3.Connection) -> None:
+    """v10 -> v11: FT-08 LLM Wiki index tables.
+
+    The wiki's source of truth is plain markdown files on disk (see
+    :mod:`remind_me_mcp.wiki`); these tables are a rebuildable search/index
+    cache reconciled from the files, so they carry NO sync outbox triggers
+    (unlike memories/entities). ``wiki_fts`` is an external-content FTS5 table
+    mirroring ``wiki_pages`` via the same ai/ad/au trigger pattern as
+    ``memories_fts``. ``wiki_links`` records the ``[[wikilink]]`` graph for
+    backlink lookups; ``wiki_meta`` holds small key/value state such as the
+    compile watermark.
+
+    Args:
+        db: An open SQLite connection.
+    """
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS wiki_pages (
+            slug        TEXT PRIMARY KEY,
+            title       TEXT NOT NULL,
+            content     TEXT NOT NULL,
+            summary     TEXT NOT NULL DEFAULT '',
+            mtime       REAL NOT NULL DEFAULT 0,
+            updated_at  TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS wiki_links (
+            src_slug   TEXT NOT NULL,
+            dst_slug   TEXT NOT NULL,
+            dst_title  TEXT NOT NULL,
+            PRIMARY KEY (src_slug, dst_slug)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_wiki_links_dst ON wiki_links(dst_slug);
+
+        CREATE TABLE IF NOT EXISTS wiki_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        -- External-content FTS5 over wiki_pages (mirrors memories_fts).
+        CREATE VIRTUAL TABLE IF NOT EXISTS wiki_fts USING fts5(
+            title, content,
+            content='wiki_pages',
+            content_rowid='rowid'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS wiki_pages_ai AFTER INSERT ON wiki_pages BEGIN
+            INSERT INTO wiki_fts(rowid, title, content)
+            VALUES (new.rowid, new.title, new.content);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS wiki_pages_ad AFTER DELETE ON wiki_pages BEGIN
+            INSERT INTO wiki_fts(wiki_fts, rowid, title, content)
+            VALUES ('delete', old.rowid, old.title, old.content);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS wiki_pages_au AFTER UPDATE ON wiki_pages BEGIN
+            INSERT INTO wiki_fts(wiki_fts, rowid, title, content)
+            VALUES ('delete', old.rowid, old.title, old.content);
+            INSERT INTO wiki_fts(rowid, title, content)
+            VALUES (new.rowid, new.title, new.content);
         END;
     """)
 

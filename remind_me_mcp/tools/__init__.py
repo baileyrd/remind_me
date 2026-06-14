@@ -1,5 +1,5 @@
 """
-remind_me_mcp.tools — All 26 MCP tool handlers and 2 resource handlers.
+remind_me_mcp.tools — All MCP tool handlers and resource handlers.
 
 All handlers are registered on the `mcp` instance imported from server.py.
 This package imports mcp from server (not the other way around) to avoid
@@ -13,6 +13,7 @@ Formerly a single ~2000-line module; split into submodules (HY-02):
   - ``capture``   — auto_capture / get_capture / decompose(+batch)
   - ``entity``    — remind_me_entity knowledge-graph lookup (FT-04)
   - ``lifecycle`` — vitality_report / reclassify(+batch) / consolidate
+  - ``wiki``      — LLM Wiki: page read/write/list/search/load/delete + compile (FT-08)
   - ``admin``     — stats / reindex / server_status / updates / imports / resources
 
 Import compatibility: every name the old ``remind_me_mcp.tools`` module
@@ -95,7 +96,7 @@ from remind_me_mcp.server import mcp
 # registering every handler on the shared FastMCP instance. These imports
 # must come after the shared-state imports above so the package namespace is
 # fully populated before any handler can run.
-from remind_me_mcp.tools import admin, capture, crud, entity, lifecycle, search
+from remind_me_mcp.tools import admin, capture, crud, entity, lifecycle, search, wiki
 from remind_me_mcp.tools._shared import (
     FTS_SANITIZE_FALLBACK,
     _background_tasks,
@@ -151,6 +152,17 @@ from remind_me_mcp.tools.search import (
     _structured_lookup,
     memory_search,
 )
+from remind_me_mcp.tools.wiki import (
+    resource_wiki_index,
+    resource_wiki_schema,
+    wiki_compile,
+    wiki_delete,
+    wiki_list,
+    wiki_load,
+    wiki_read,
+    wiki_search,
+    wiki_write,
+)
 from remind_me_mcp.updater import pop_update_notice
 from remind_me_mcp.vitality import (
     DECAY_RATES,
@@ -192,6 +204,15 @@ __all__ = [
     "remind_me_annotate",
     "remind_me_entity",
     "remind_me_consolidate",
+    "wiki_write",
+    "wiki_read",
+    "wiki_list",
+    "wiki_search",
+    "wiki_load",
+    "wiki_delete",
+    "wiki_compile",
     "resource_stats",
     "resource_categories",
+    "resource_wiki_schema",
+    "resource_wiki_index",
 ]
