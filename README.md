@@ -21,6 +21,11 @@ Persistent, searchable memory that works across **Claude.ai**, **Claude Code**, 
 - **Tagging & categorization** — organize memories with categories and tags
 - **Memory classification** — 7 memory types with single and batch reclassification tools
 
+**Synthesise: LLM Wiki**
+- **LLM Wiki layer** (Karpathy pattern) — a *synthesis* layer over the raw memory store: Claude distils memories into a small set of interlinked markdown pages you can load directly into context instead of retrieving fragments
+- **Files are the source of truth** — pages live as plain `.md` files (`REMIND_ME_WIKI_DIR`), with `[[wikilinks]]` + backlinks, an auto-generated `index.md`, an append-only `log.md`, and a seeded `SCHEMA.md` maintainer contract; the database is just a reconcile-from-files search index
+- **Compile workflow** — `remind_me_wiki_compile` surfaces pending raw memories plus the current wiki state and schema, then advances a watermark once the batch is integrated
+
 **Evolve & maintain**
 - **ACT-R vitality model** — cognitive-science-inspired memory decay with per-category rates, access-based reinforcement, and bridge protection for high-value memories
 - **Vault consolidation** — semantic clustering with Union-Find, canonical selection, and dry-run merge previews
@@ -299,6 +304,18 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_reclassify_batch` | Fetch unclassified memories for batch classification |
 | `remind_me_consolidate` | Find semantically similar memories, preview clusters, and merge duplicates |
 
+### LLM Wiki
+
+| Tool | Description |
+|------|-------------|
+| `remind_me_wiki_write` | Create or replace a wiki page (full markdown body; H1 title added if absent; refreshes `index.md`/`log.md`) |
+| `remind_me_wiki_read` | Read one page with its outgoing links and backlinks |
+| `remind_me_wiki_list` | List all pages with their one-line summaries (the index) |
+| `remind_me_wiki_search` | Full-text search the synthesised pages (distinct from `remind_me_search`, which searches raw memories) |
+| `remind_me_wiki_load` | Load the whole wiki into context as one markdown document (token-budgeted) |
+| `remind_me_wiki_delete` | Delete a page by title or slug |
+| `remind_me_wiki_compile` | Two-phase synthesis: surface pending raw memories + the schema, then advance the watermark once integrated |
+
 ### Import, export & admin
 
 | Tool | Description |
@@ -314,7 +331,7 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_check_update` | Check if a newer version is available on origin/main |
 | `remind_me_self_update` | Pull latest changes from origin and reinstall the package |
 
-27 tools + 2 resources (`memory://stats` and `memory://categories`).
+34 tools + 4 resources (`memory://stats`, `memory://categories`, `wiki://schema`, `wiki://index`).
 
 ### Auto-Capture: Persisting Full Conversations
 
@@ -453,6 +470,7 @@ REMIND_ME_WATCH_DIRS=~/notes:~/Downloads/exports remind-me-mcp
 - **Debounce** — a file whose mtime is younger than `REMIND_ME_WATCH_GRACE` seconds (default 5) is deferred until a later scan observes the same (mtime, size) signature, so partially-written files are never ingested mid-write.
 - **Changed files supersede** — a changed file has a new hash, so it imports fresh; the watcher then marks every memory from the file's previous import as superseded (`superseded_by` = the new import id). Stale chunks drop out of search results (which filter `superseded_by IS NULL`) but remain in the database for audit.
 - **Status** — the `remind_me_watch_status` tool reports watched dirs, scan counters, ingest/skip/supersede counts, and recent errors; `remind_me_server_status` includes a watcher summary too.
+- **Wiki is downstream, not automatic** — the watcher feeds the **memory store**, not the wiki. Synthesis into wiki pages is a separate LLM-driven step (`remind_me_wiki_compile`). So both status tools also report `pending_wiki_compile` — the count of non-superseded memories created since the last compile watermark — as a nudge that newly ingested files are waiting to be folded into the wiki.
 
 ## Entity Knowledge Graph
 
@@ -476,6 +494,36 @@ Memories can carry a structured **subject/predicate/object triple** plus links t
 ### Sync & export
 
 The graph syncs between machines alongside memories: entity and link records travel with `record_type` discriminators through the outbox/hub and the peer endpoints (`/sync/pull_entities`, `/sync/pull_links`). Deterministic ids make concurrent creation converge; aliases union-merge on receipt; links are immutable insert-or-ignore rows, and a link that arrives before its endpoints simply stays invisible until they do. Exports include the graph by default (see [Exporting & Backup](#exporting--backup)).
+
+## LLM Wiki
+
+The entity graph and semantic search are *retrieval* tools: they fetch raw memories on demand. The **LLM Wiki** is the opposite move — a *synthesis* layer inspired by [Andrej Karpathy's "LLM Wiki" pattern](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f). Instead of re-deriving knowledge from fragments every time, Claude distils memories into a small set of interlinked markdown pages that can be loaded straight into context. RAG retrieves and forgets; a wiki accumulates and compounds.
+
+Three layers:
+
+1. **Raw sources** — the existing `memories` store (captures, imports, decomposed facts). Immutable from the wiki's point of view.
+2. **The wiki** — plain markdown files under `REMIND_ME_WIKI_DIR` (default `~/.remind-me/wiki`), one concept/entity/project per page, cross-linked with `[[Wikilinks]]`, plus an auto-generated `index.md` catalogue and an append-only `log.md`.
+3. **The schema** — `SCHEMA.md`, the maintainer contract Claude follows (seeded with a sensible default on first use, surfaced as the `wiki://schema` resource).
+
+### Files are the source of truth
+
+Pages are real files on disk — edit them by hand, version them with `git`, sync the folder however you like. The database (`wiki_pages` / `wiki_links` / `wiki_fts`) is only a search/index cache: every read path **reconciles** it from the files first (a cheap mtime comparison), so external edits, deletions, and `git pull`s are picked up automatically. Because the files are canonical, these tables deliberately carry **no sync outbox triggers** — wiki sync is the file layer's job, not the database's.
+
+### The compile workflow
+
+`remind_me_wiki_compile` drives synthesis in two phases:
+
+1. **Brief** (default) — returns the maintainer schema, the current page index, and up to `limit` raw memories created since the last compile (the *pending sources*). Calling it repeatedly is safe; it never advances anything on its own.
+2. **Mark integrated** (`mark_integrated=true`) — call this *after* writing the pages (with `remind_me_wiki_write`) to advance the compile watermark past the surfaced batch, so the same sources aren't re-served next time.
+
+A typical session: `remind_me_wiki_compile` → read the brief → write/revise several pages, flag contradictions, add cross-links → `remind_me_wiki_compile(mark_integrated=true)`. To consume the wiki, `remind_me_wiki_load` pulls the whole thing into context (token-budgeted, newest pages first), or `remind_me_wiki_read` / `remind_me_wiki_search` navigate it page by page.
+
+```bash
+# Point the wiki somewhere git-friendly (optional; defaults to ~/.remind-me/wiki)
+export REMIND_ME_WIKI_DIR=~/notes/wiki
+# Cap the default whole-wiki load (estimated tokens; 0 = unlimited)
+export REMIND_ME_WIKI_LOAD_TOKEN_BUDGET=12000
+```
 
 ## Multi-Machine Sync
 
@@ -786,6 +834,8 @@ An unresolvable `entity:` filter returns an empty result with a message (no sile
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `REMIND_ME_MCP_DIR` | `~/.remind-me` | Directory for the SQLite database |
+| `REMIND_ME_WIKI_DIR` | `~/.remind-me/wiki` | Root directory for the LLM Wiki markdown files (the source of truth; the DB only indexes them) |
+| `REMIND_ME_WIKI_LOAD_TOKEN_BUDGET` | `12000` | Default estimated-token ceiling for `remind_me_wiki_load`. `0` = unlimited |
 | `REMIND_ME_MCP_SERVE_UI` | `false` | Start the HTTP dashboard server instead of stdio MCP |
 | `REMIND_ME_MCP_UI_PORT` | `5199` | Port for the dashboard server |
 | `REMIND_ME_MCP_SERVE_HTTP` | `false` | Run MCP server over Streamable HTTP transport |
@@ -843,16 +893,18 @@ remind-me-mcp/
 │   ├── __init__.py             # Package exports, version
 │   ├── __main__.py             # CLI entry point, mode dispatch
 │   ├── server.py               # FastMCP instance, app lifespan
-│   ├── tools/                  # 27 MCP tools + 2 resources
+│   ├── tools/                  # 34 MCP tools + 4 resources
 │   │   ├── search.py           # Hybrid search + structured/entity queries
 │   │   ├── crud.py             # add / list / get / update / delete
 │   │   ├── capture.py          # auto-capture, decompose, extract/annotate
 │   │   ├── lifecycle.py        # vitality, reclassify, consolidate
 │   │   ├── entity.py           # entity lookup
+│   │   ├── wiki.py             # LLM Wiki: page read/write/list/search/load/delete + compile
 │   │   └── admin.py            # import/export, stats, status, updates, OAuth revocation
 │   ├── models.py               # Pydantic input models
 │   ├── config.py               # Environment configuration, constants
-│   ├── db.py                   # SQLite schema, migrations (v0–v10), entity helpers
+│   ├── wiki.py                 # LLM Wiki engine: file IO, wikilinks, index/log, reconcile
+│   ├── db.py                   # SQLite schema, migrations (v0–v11), entity helpers
 │   ├── api.py                  # Starlette HTTP API + dashboard HTML
 │   ├── remote.py               # Remote MCP connector (Streamable HTTP; OAuth or secret-path)
 │   ├── oauth.py                # Single-user OAuth 2.1 authorization server
@@ -878,7 +930,8 @@ remind-me-mcp/
 └── README.md                   # This file
 
 ~/.remind-me/                   # Data directory (synced across machines)
-├── memory.db                   # SQLite database with FTS5 + sqlite-vec (schema v10)
+├── memory.db                   # SQLite database with FTS5 + sqlite-vec (schema v11)
+├── wiki/                       # LLM Wiki markdown files (source of truth: pages, index.md, log.md, SCHEMA.md)
 ├── models/                     # Cached ONNX embedding model (~80MB, auto-downloaded)
 ├── api_key                     # Auto-generated dashboard API key (0600)
 ├── connector_token             # Auto-generated remote-connector token (0600)

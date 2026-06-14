@@ -392,6 +392,29 @@ async def remind_me_server_status() -> str:
             "auto-ingest a notes/docs folder)"
         )
 
+    # LLM Wiki (FT-08)
+    try:
+        from remind_me_mcp import wiki
+
+        # db may be unbound above (it is only fetched in the embedder branch).
+        page_count = _pkg._get_db().execute(
+            "SELECT COUNT(*) AS cnt FROM wiki_pages"
+        ).fetchone()["cnt"]
+        pending = wiki.pending_compile_count()
+        lines.append(
+            f"\n**LLM Wiki:** ✓ {page_count} page(s) at `{wiki.wiki_dir()}` "
+            f"(load with `remind_me_wiki_load`)"
+        )
+        if pending:
+            lines.append(
+                f"_⚠ {pending} raw memory(ies) pending synthesis — run "
+                f"`remind_me_wiki_compile` to fold them in._"
+            )
+        else:
+            lines.append("_Wiki is current with the memory store._")
+    except sqlite3.OperationalError as e:
+        log.debug("Wiki tables not available for status check: %s", e)
+
     # Remote MCP connector (FT-05) + OAuth (FT-07)
     from remind_me_mcp.remote import get_remote_status
 
@@ -449,12 +472,17 @@ async def remind_me_watch_status() -> str:
 
     Returns:
         str: JSON status — enabled/running flags, watched dirs, scan
-        interval, last scan time, ingest/skip/supersede counters, and
-        recent errors. When disabled, includes a configuration hint.
+        interval, last scan time, ingest/skip/supersede counters, recent
+        errors, and ``pending_wiki_compile`` (raw memories awaiting wiki
+        synthesis — the watcher feeds the memory store, not the wiki). When
+        disabled, includes a configuration hint.
     """
+    from remind_me_mcp import wiki
     from remind_me_mcp.watcher import get_watch_status
 
-    return json.dumps(get_watch_status(), indent=2)
+    status = get_watch_status()
+    status["pending_wiki_compile"] = wiki.pending_compile_count()
+    return json.dumps(status, indent=2)
 
 
 @mcp.tool(

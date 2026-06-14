@@ -505,9 +505,9 @@ def test_v4_to_v5_indexes_exist(db_conn: sqlite3.Connection) -> None:
 def test_schema_version_is_current(db_conn: sqlite3.Connection) -> None:
     """After migration, _SCHEMA_VERSION and PRAGMA user_version match the latest."""
     from remind_me_mcp.db import _SCHEMA_VERSION
-    assert _SCHEMA_VERSION == 10
+    assert _SCHEMA_VERSION == 11
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 10, f"Expected user_version 10, got {version}"
+    assert version == 11, f"Expected user_version 11, got {version}"
 
 
 def test_v6_to_v7_new_columns_exist(db_conn: sqlite3.Connection) -> None:

@@ -60,6 +60,17 @@ async def app_lifespan(app: FastMCP):
     from remind_me_mcp.watcher import start_watcher, stop_watcher
     start_watcher()
 
+    # FT-08: LLM Wiki — seed the maintainer schema and reconcile the file-backed
+    # index into the DB at startup so external edits (hand edits, git pull) are
+    # picked up. Best-effort: a wiki problem must never block server startup.
+    try:
+        from remind_me_mcp import wiki
+        wiki.ensure_schema_file()
+        stats = wiki.reconcile()
+        log.info("Wiki ready at %s — %d page(s) indexed", wiki.wiki_dir(), stats["pages"])
+    except Exception:  # noqa: BLE001 — never let the wiki layer break startup
+        log.warning("Wiki startup reconcile failed", exc_info=True)
+
     try:
         yield {"db": db}
     finally:

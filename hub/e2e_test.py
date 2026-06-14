@@ -24,7 +24,6 @@ them between runs) and inserts records into the hub's database — run it
 against a hub whose database you can throw away, never production.
 """
 import asyncio
-import json
 import os
 import sys
 
@@ -90,7 +89,7 @@ check("node A outbox fully pushed to hub", unsent == 0, f"{unsent} unsent")
 db_mod._close_db()
 
 # ---------------- Hub-side verification ----------------
-import psycopg
+import psycopg  # noqa: E402 — optional dep imported lazily, only where used
 
 with psycopg.connect(DSN) as conn:
     mem = conn.execute(
@@ -142,7 +141,7 @@ check("LWW update propagated B -> hub -> A", content == "Updated by node B", con
 db_mod._close_db()
 
 # ---------------- Wire-level edge cases ----------------
-import httpx
+import httpx  # noqa: E402 — optional dep imported lazily, only where used
 
 stale = {"node_id": "node-x", "records": [{
     "id": "node-a-mem-1", "content": "STALE", "created_at": now,

@@ -740,6 +740,132 @@ class ConsolidateInput(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# LLM Wiki models (FT-08)
+# ---------------------------------------------------------------------------
+
+
+class WikiWriteInput(BaseModel):
+    """Input for remind_me_wiki_write: create or replace a wiki page (FT-08)."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    title: str = Field(
+        ...,
+        description=(
+            "Page title (e.g. 'Tailscale Setup', 'Bailey Robertson'). The title's "
+            "slug is its identity — keep titles stable so [[wikilinks]] resolve."
+        ),
+        min_length=1,
+        max_length=200,
+    )
+    content: str = Field(
+        ...,
+        description=(
+            "Full markdown body of the page (REPLACES any existing content). "
+            "Open with a one-sentence summary; link related pages with "
+            "[[Page Title]]. A leading '# Title' H1 is added if absent."
+        ),
+        min_length=1,
+        max_length=100000,
+    )
+    log_note: str | None = Field(
+        default=None,
+        description="Optional note recorded in log.md alongside the change (e.g. why).",
+        max_length=500,
+    )
+
+
+class WikiReadInput(BaseModel):
+    """Input for remind_me_wiki_read: fetch one page with its link graph (FT-08)."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    title: str = Field(
+        ...,
+        description="Page title or slug to read (case/punctuation-insensitive).",
+        min_length=1,
+        max_length=200,
+    )
+
+
+class WikiDeleteInput(BaseModel):
+    """Input for remind_me_wiki_delete: remove a wiki page (FT-08)."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    title: str = Field(
+        ...,
+        description="Page title or slug to delete.",
+        min_length=1,
+        max_length=200,
+    )
+
+
+class WikiSearchInput(BaseModel):
+    """Input for remind_me_wiki_search: full-text search wiki pages (FT-08)."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    query: str = Field(
+        ...,
+        description="Search query (FTS5 over page title + content).",
+        min_length=1,
+        max_length=500,
+    )
+    limit: int = Field(default=10, ge=1, le=50, description="Max pages to return.")
+
+
+class WikiListInput(BaseModel):
+    """Input for remind_me_wiki_list: list the wiki's pages (FT-08)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
+
+
+class WikiLoadInput(BaseModel):
+    """Input for remind_me_wiki_load: load the whole wiki into context (FT-08)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    token_budget: int = Field(
+        default=0,
+        ge=0,
+        le=200000,
+        description=(
+            "Estimated-token ceiling (len//4). 0 uses the configured default "
+            "(REMIND_ME_WIKI_LOAD_TOKEN_BUDGET). Pages beyond the budget are listed, "
+            "not included."
+        ),
+    )
+    include_index: bool = Field(
+        default=True, description="Prepend the page catalogue/index."
+    )
+
+
+class WikiCompileInput(BaseModel):
+    """Input for remind_me_wiki_compile: drive the synthesis workflow (FT-08)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    limit: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="Max pending raw memories to surface for synthesis.",
+    )
+    mark_integrated: bool = Field(
+        default=False,
+        description=(
+            "When False (default), return a synthesis brief of pending raw "
+            "memories + the current wiki state + the schema. When True, advance "
+            "the compile watermark past the surfaced batch (call this AFTER you "
+            "have written the pages)."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Vitality report model (Phase 11 Plan 03)
 # ---------------------------------------------------------------------------
 
@@ -784,4 +910,11 @@ __all__ = [
     "ExtractBatchInput",
     "ConsolidateInput",
     "VitalityReportInput",
+    "WikiWriteInput",
+    "WikiReadInput",
+    "WikiDeleteInput",
+    "WikiSearchInput",
+    "WikiListInput",
+    "WikiLoadInput",
+    "WikiCompileInput",
 ]

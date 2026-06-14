@@ -41,7 +41,7 @@ import os
 import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from typing import Any
+from typing import Annotated, Any
 
 import psycopg
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
@@ -450,7 +450,7 @@ def _record_wire_id(rec: dict[str, Any]) -> str:
 
 
 @app.post("/sync/push", dependencies=[Depends(_require_auth)])
-def sync_push(body: dict = Body(...)) -> dict:
+def sync_push(body: Annotated[dict, Body(...)]) -> dict:
     records = body.get("records", [])
     if not isinstance(records, list):
         raise HTTPException(status_code=400, detail="invalid push payload")

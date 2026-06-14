@@ -59,6 +59,21 @@ PID_FILE = MEMORY_DIR / "server.pid"
 MEMORY_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
+# LLM Wiki (FT-08)
+# ---------------------------------------------------------------------------
+
+WIKI_DIR = Path(
+    os.environ.get("REMIND_ME_WIKI_DIR", str(MEMORY_DIR / "wiki"))
+).expanduser()
+"""Root of the LLM Wiki (FT-08). Plain markdown files on disk are the source
+of truth; the database only indexes them for search. Default: ``wiki`` under
+the memory dir. The directory is created lazily on first wiki use."""
+
+WIKI_LOAD_TOKEN_BUDGET = _env_int("REMIND_ME_WIKI_LOAD_TOKEN_BUDGET", 12000)
+"""Default ceiling (estimated tokens, len//4) for ``remind_me_wiki_load`` —
+the whole-wiki-into-context tool. 0 means unlimited."""
+
+# ---------------------------------------------------------------------------
 # Embedding model
 # ---------------------------------------------------------------------------
 
@@ -340,6 +355,8 @@ __all__ = [
     "DB_PATH",
     "IMPORT_LOG",
     "PID_FILE",
+    "WIKI_DIR",
+    "WIKI_LOAD_TOKEN_BUDGET",
     "EMBEDDING_MODEL",
     "EMBEDDING_DIM",
     "EMBEDDING_BACKEND",
