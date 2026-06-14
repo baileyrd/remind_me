@@ -48,6 +48,11 @@ _WIKILINK_RE = re.compile(r"\[\[([^\[\]|]+?)(?:\|([^\[\]]+?))?\]\]")
 _H1_RE = re.compile(r"^\s*#\s+(.+?)\s*$", re.MULTILINE)
 _EPOCH = "1970-01-01T00:00:00+00:00"
 
+# wiki_meta key holding the compile watermark: the created_at of the last raw
+# memory folded into the wiki. Shared with tools.wiki._compile_sync so the
+# "pending compile" count and the compile loop agree on the cutoff.
+COMPILE_WATERMARK_KEY = "last_compile_at"
+
 
 # ---------------------------------------------------------------------------
 # Paths, slugs, titles
@@ -208,6 +213,22 @@ def set_meta(key: str, value: str) -> None:
         (key, value),
     )
     db.commit()
+
+
+def pending_compile_count() -> int:
+    """Count raw memories awaiting wiki synthesis.
+
+    These are non-superseded ``memories`` rows created after the compile
+    watermark — exactly the set ``tools.wiki._compile_sync`` would surface
+    (it caps each brief at its ``limit``; this is the uncapped total). Zero
+    means the wiki is current with the memory store.
+    """
+    watermark = get_meta(COMPILE_WATERMARK_KEY, "") or _EPOCH
+    row = _db._get_db().execute(
+        "SELECT COUNT(*) FROM memories WHERE superseded_by IS NULL AND created_at > ?",
+        (watermark,),
+    ).fetchone()
+    return int(row[0]) if row is not None else 0
 
 
 # ---------------------------------------------------------------------------
@@ -531,6 +552,7 @@ __all__ = [
     "LOG_FILE",
     "SCHEMA_FILE",
     "RESERVED_SLUGS",
+    "COMPILE_WATERMARK_KEY",
     "wiki_dir",
     "slugify",
     "page_path",
@@ -541,6 +563,7 @@ __all__ = [
     "read_schema",
     "get_meta",
     "set_meta",
+    "pending_compile_count",
     "reconcile",
     "rebuild_index",
     "append_log",

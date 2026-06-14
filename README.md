@@ -470,6 +470,7 @@ REMIND_ME_WATCH_DIRS=~/notes:~/Downloads/exports remind-me-mcp
 - **Debounce** — a file whose mtime is younger than `REMIND_ME_WATCH_GRACE` seconds (default 5) is deferred until a later scan observes the same (mtime, size) signature, so partially-written files are never ingested mid-write.
 - **Changed files supersede** — a changed file has a new hash, so it imports fresh; the watcher then marks every memory from the file's previous import as superseded (`superseded_by` = the new import id). Stale chunks drop out of search results (which filter `superseded_by IS NULL`) but remain in the database for audit.
 - **Status** — the `remind_me_watch_status` tool reports watched dirs, scan counters, ingest/skip/supersede counts, and recent errors; `remind_me_server_status` includes a watcher summary too.
+- **Wiki is downstream, not automatic** — the watcher feeds the **memory store**, not the wiki. Synthesis into wiki pages is a separate LLM-driven step (`remind_me_wiki_compile`). So both status tools also report `pending_wiki_compile` — the count of non-superseded memories created since the last compile watermark — as a nudge that newly ingested files are waiting to be folded into the wiki.
 
 ## Entity Knowledge Graph
 

@@ -297,6 +297,45 @@ async def test_compile_mark_with_nothing_pending(db_conn, wiki_dir: Path) -> Non
 
 
 # ---------------------------------------------------------------------------
+# Pending-compile count + status nudge
+# ---------------------------------------------------------------------------
+
+
+def test_pending_compile_count_tracks_watermark(db_conn, memory_factory) -> None:
+    assert wiki.pending_compile_count() == 0
+    memory_factory(content="m1", created_at="2026-01-01T00:00:00+00:00")
+    memory_factory(content="m2", created_at="2026-01-02T00:00:00+00:00")
+    memory_factory(content="m3", created_at="2026-01-03T00:00:00+00:00")
+    # Watermark unset ("never") -> every non-superseded memory is pending.
+    assert wiki.pending_compile_count() == 3
+    # Strictly-greater-than cutoff: a watermark equal to m1 leaves m2 and m3.
+    wiki.set_meta(wiki.COMPILE_WATERMARK_KEY, "2026-01-01T00:00:00+00:00")
+    assert wiki.pending_compile_count() == 2
+    # Past the newest source -> nothing pending.
+    wiki.set_meta(wiki.COMPILE_WATERMARK_KEY, "2026-01-03T00:00:00+00:00")
+    assert wiki.pending_compile_count() == 0
+
+
+def test_pending_compile_count_excludes_superseded(db_conn, memory_factory) -> None:
+    keeper = memory_factory(content="keeper", created_at="2026-02-03T00:00:00+00:00")
+    memory_factory(
+        content="dead",
+        created_at="2026-02-02T00:00:00+00:00",
+        superseded_by=keeper["id"],
+    )
+    # Superseded rows are never surfaced for synthesis, so only the keeper counts.
+    assert wiki.pending_compile_count() == 1
+
+
+async def test_watch_status_tool_reports_pending_compile(db_conn, memory_factory) -> None:
+    from remind_me_mcp.tools.admin import remind_me_watch_status
+
+    memory_factory(content="unsynthesised")
+    payload = json.loads(await remind_me_watch_status())
+    assert payload["pending_wiki_compile"] == 1
+
+
+# ---------------------------------------------------------------------------
 # Tool error/empty paths + resources
 # ---------------------------------------------------------------------------
 

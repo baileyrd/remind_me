@@ -267,12 +267,12 @@ def _compile_sync(params: WikiCompileInput) -> str:
     """Blocking body of remind_me_wiki_compile (runs in a worker thread)."""
     wiki.reconcile()
     db = _pkg._get_db()
-    watermark = wiki.get_meta("last_compile_at", "")
+    watermark = wiki.get_meta(wiki.COMPILE_WATERMARK_KEY, "")
     rows = db.execute(
         """SELECT id, category, content, created_at FROM memories
             WHERE superseded_by IS NULL AND created_at > ?
             ORDER BY created_at ASC LIMIT ?""",
-        (watermark or "1970-01-01T00:00:00+00:00", params.limit),
+        (watermark or wiki._EPOCH, params.limit),
     ).fetchall()
 
     if params.mark_integrated:
@@ -281,7 +281,7 @@ def _compile_sync(params: WikiCompileInput) -> str:
                 {"status": "noop", "reason": "no pending memories to mark", "watermark": watermark}
             )
         new_watermark = rows[-1]["created_at"]
-        wiki.set_meta("last_compile_at", new_watermark)
+        wiki.set_meta(wiki.COMPILE_WATERMARK_KEY, new_watermark)
         wiki.append_log(f"compiled {len(rows)} source(s) — watermark -> {new_watermark}")
         return json.dumps(
             {
