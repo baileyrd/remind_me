@@ -255,6 +255,115 @@ pass the `env` block through `wsl.exe` — inline the variables in the
 
 </details>
 
+## Expose to claude.ai (remote connector)
+
+The hub is deliberately localhost-only, but the same always-on box is the
+right place to also serve the [claude.ai custom connector](../README.md#claudeai-custom-connector-remote-mcp).
+claude.ai connectors are fetched by **Anthropic's servers**, not your
+browser, so they need a public HTTPS endpoint that stays up even when your
+laptops are asleep.
+
+The connector is **not** the hub and does **not** read Postgres. It is a
+normal `remind-me-mcp` process in `--serve-remote` mode serving its own local
+SQLite (`~/.remind-me/memory.db`) over Streamable HTTP. To make that SQLite
+actually hold your memories, run it as one more **sync node** pointed at the
+co-located hub: its lifespan starts the same background sync as every other
+node, pulling the full store from the hub on localhost and pushing writes
+from claude.ai back out to all your machines.
+
+```
+claude.ai ──HTTPS──► Caddy :443 ──► connector node ──sync──► hub :8765 ──► Postgres
+(Anthropic)          (public)       127.0.0.1:8768           127.0.0.1     (same box)
+                                    --serve-remote,
+                                    local SQLite
+```
+
+### 1. Install the package on the host
+
+The hub runs in a container; the connector runs on the host, so install the
+Python package once (the repo is already cloned at `~/remind_me`):
+
+```bash
+cd ~/remind_me
+uv tool install -e .                 # entrypoint → ~/.local/bin/remind-me-mcp
+# optional semantic search: uv tool install -e ".[semantic]"
+```
+
+### 2. Configure it as a sync node + connector
+
+Reuse the hub's `SYNC_SECRET` (from `~/remind-me-hub/hub.env`) and point the
+node at the hub on localhost. Keep the values in an env file, mode 0600:
+
+```bash
+# ~/remind-me-hub/connector.env   (chmod 600)
+REMIND_ME_NODE_ID=server-connector
+REMIND_ME_HUB_URL=http://127.0.0.1:8765
+REMIND_ME_SYNC_SECRET=<the SYNC_SECRET from hub.env>
+REMIND_ME_PEER_BIND=127.0.0.1                        # keep the peer port off the public box
+REMIND_ME_REMOTE_ISSUER=https://memory.example.com   # your public origin (enables OAuth)
+```
+
+`REMIND_ME_NODE_ID` must be unique across your fleet. Setting
+`REMIND_ME_REMOTE_ISSUER` turns on the single-user OAuth 2.1 flow; omit it to
+fall back to the secret-path URL. The connector still binds `127.0.0.1:8768`
+— Caddy does the public exposing.
+
+### 3. Run it under systemd (user service)
+
+The connector is a host process, so it gets a plain user unit (the Quadlet
+units stay for the containerized hub):
+
+```ini
+# ~/.config/systemd/user/remind-me-connector.service
+[Unit]
+Description=Remind Me claude.ai connector (remote MCP, hub sync node)
+After=network-online.target remind-me-hub.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/remind-me-hub/connector.env
+ExecStart=%h/.local/bin/remind-me-mcp --serve-remote
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now remind-me-connector.service
+journalctl --user -u remind-me-connector.service -f   # watch for "Sync started"
+```
+
+Linger is already enabled by `setup.sh install`, so the service survives
+logout and reboot.
+
+### 4. Front it with HTTPS
+
+Only the connector goes public — the hub stays on localhost. Point a real
+domain's A record at the server and let Caddy terminate TLS:
+
+```caddyfile
+# /etc/caddy/Caddyfile
+memory.example.com {
+    reverse_proxy 127.0.0.1:8768
+}
+```
+
+`REMIND_ME_REMOTE_ISSUER` must match this origin exactly. Any HTTPS front
+works — `tailscale funnel 8768` is a zero-config alternative if you'd rather
+not open 443. Then on claude.ai go to **Settings → Connectors → Add custom
+connector**, enter `https://memory.example.com/mcp`, and approve it with the
+owner token (`cat ~/.remind-me/connector_token`). The full connector
+reference — OAuth vs. secret-path, revocation, security caveats — is in the
+[main README](../README.md#claudeai-custom-connector-remote-mcp).
+
+> **Ports:** the hub (`8765`) and the connector's peer server (`8766`,
+> pinned to localhost above) never leave the box; the connector listens on
+> `127.0.0.1:8768`. Only Caddy's `443` is public.
+
 ## Operations
 
 ```bash
