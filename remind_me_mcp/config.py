@@ -104,6 +104,14 @@ EMBED_BATCH_SIZE = _env_int("REMIND_ME_EMBED_BATCH_SIZE", 32)
 """Memories embedded per batched _embed_and_store_rows call (reindex and chat
 import). Larger batches amortise model overhead; smaller ones bound memory."""
 
+EMBED_FORWARD_BATCH = _env_int("REMIND_ME_EMBED_FORWARD_BATCH", 32)
+"""Chunks per ONNX forward pass inside _Embedder.embed(). This is the hard
+ceiling on embedding memory: the model materialises a (batch, seq_len, dim)
+tensor plus transformer activations, so an unbounded batch (e.g. the initial
+bulk hub sync flattening thousands of chunks into one call) can allocate tens
+of GB and OOM the process. Callers may pass any number of texts; embed()
+processes them in slices of this size and concatenates. Keep it small."""
+
 # ---------------------------------------------------------------------------
 # UI / dashboard
 # ---------------------------------------------------------------------------
@@ -363,6 +371,7 @@ __all__ = [
     "OLLAMA_URL",
     "OLLAMA_EMBED_MODEL",
     "EMBED_BATCH_SIZE",
+    "EMBED_FORWARD_BATCH",
     "EMBED_CHUNK_CHARS",
     "EMBED_CHUNK_OVERLAP",
     "EMBED_MAX_CHUNKS",

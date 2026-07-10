@@ -19,6 +19,7 @@ import numpy as np
 from remind_me_mcp.config import (
     EMBED_CHUNK_CHARS,
     EMBED_CHUNK_OVERLAP,
+    EMBED_FORWARD_BATCH,
     EMBED_MAX_CHUNKS,
     EMBEDDING_BACKEND,
     EMBEDDING_DIM,
@@ -197,6 +198,13 @@ class _Embedder:
         applies mean pooling over token embeddings, and L2-normalises the
         result so cosine similarity equals dot product.
 
+        The forward pass is run in slices of ``EMBED_FORWARD_BATCH`` texts and
+        the results concatenated, so peak memory is bounded regardless of how
+        many texts a caller passes. Without this cap, a large batch (e.g. the
+        initial bulk hub sync flattening thousands of chunks into a single
+        call) materialises a ``(batch, seq_len, dim)`` tensor plus transformer
+        activations that can reach tens of GB and OOM the process.
+
         Args:
             texts: List of strings to embed (each truncated to 512 tokens; use
                 chunk_text() upstream to embed longer content as several windows).
@@ -205,6 +213,20 @@ class _Embedder:
             Float32 numpy array of shape (N, dim), L2-normalised.
         """
         self._ensure_loaded()
+        if not texts:
+            return np.empty((0, self.dim), dtype=np.float32)
+        batch = max(1, EMBED_FORWARD_BATCH)
+        if len(texts) <= batch:
+            return self._embed_forward(texts)
+        parts = [self._embed_forward(texts[i : i + batch]) for i in range(0, len(texts), batch)]
+        return np.vstack(parts)
+
+    def _embed_forward(self, texts: list[str]) -> np.ndarray:
+        """Run one ONNX forward pass over ``texts`` and return pooled vectors.
+
+        This is the memory-bounded unit of work; :meth:`embed` slices large
+        inputs into calls of at most ``EMBED_FORWARD_BATCH`` texts.
+        """
         encoded = self._tokenizer.encode_batch(texts)
         input_ids = np.array([e.ids for e in encoded], dtype=np.int64)
         attention_mask = np.array([e.attention_mask for e in encoded], dtype=np.int64)
