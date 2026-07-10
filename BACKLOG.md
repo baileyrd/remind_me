@@ -43,6 +43,7 @@ not from the review).
 | SY-08 | med | done | One canonical UTC ISO timestamp format (triggers vs `_now_iso()` vs hub) | §2 |
 | SY-09 | med | done | Peer server hardening: ThreadingHTTPServer, body/limit caps, JSON error handling, configurable bind, `hmac.compare_digest`, honor `STATIC_PEERS`/`TAILSCALE_SOCKET`, index on `memories(updated_at)` | §2 |
 | SY-10 | med | todo | Tombstone deletes: the outbox has insert/update triggers only, so a local delete never propagates — the record survives on the hub and every other node (and can resurface if edited elsewhere). Needs a delete trigger writing a tombstone record, hub/peer support, and client-side apply | — |
+| SY-11 | med | todo | Batch `_embed_and_store_rows` by `EMBED_BATCH_SIZE` in the sync apply path (parity with reindex/import): the initial bulk hub pull flattens the whole pulled batch into one embed call. PR #15's forward-pass cap (`EMBED_FORWARD_BATCH`) already bounds peak memory; this moves the "no caller flattens the whole store into one call" invariant to the call site (defense in depth) | [#16](https://github.com/baileyrd/remind_me/issues/16) |
 | SE-01 | high | done | Dashboard API: require/generate API key by default; reject non-JSON Content-Type on mutating routes (CSRF) | §3 |
 | SE-02 | high | done | Enforce `IMPORT_ROOTS` in MCP import tool inputs (parity with HTTP API) | §3 |
 | SE-03 | high | done | Fix combined-mode lifespan loss; fix `FastMCP.run()` host/port kwargs | §1.5 |
