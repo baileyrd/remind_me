@@ -579,6 +579,8 @@ Add the sync environment variables to your MCP config:
 
 Sync is enabled automatically when `NODE_ID`, `HUB_URL`, and `SYNC_SECRET` are all set. Each machine needs its own unique `NODE_ID`.
 
+> Moving a node to new hardware? See [docs/MIGRATION.md](docs/MIGRATION.md) — copying `memory.db` carries the old node's sync cursor and will skip older hub records unless you reset it.
+
 #### How It Works
 
 1. Every local write (add, update, delete) is recorded in a `sync_outbox` table
