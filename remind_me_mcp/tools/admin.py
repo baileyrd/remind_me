@@ -17,11 +17,13 @@ from remind_me_mcp import tools as _pkg
 from remind_me_mcp.config import EMBED_BATCH_SIZE
 from remind_me_mcp.exporter import EXPORT_INLINE_MAX, export_memories
 from remind_me_mcp.importer import import_chat_file, import_directory
+from remind_me_mcp.mempalace_import import pull_mempalace
 from remind_me_mcp.models import (
     BulkImportDirInput,
     ChatImportInput,
     ExportInput,
     MemoryStatsInput,
+    MempalaceImportInput,
     ResponseFormat,
 )
 from remind_me_mcp.server import mcp
@@ -106,6 +108,61 @@ async def memory_import_directory(params: BulkImportDirInput) -> str:
         kind=params.kind.value,
     )
     return json.dumps(summary, indent=2)
+
+
+@mcp.tool(
+    name="remind_me_import_mempalace",
+    annotations={
+        "title": "Import Memories from MemPalace",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def memory_import_mempalace(params: MempalaceImportInput) -> str:
+    """Bulk-import memories from a MemPalace ChromaDB store, one page at a time.
+
+    Reads MemPalace's persistent ChromaDB store directly (read-only) rather
+    than one drawer at a time via MemPalace's own MCP tools — the only
+    practical way to pull at real palace scale (tens of thousands of drawers
+    per wing). Requires the optional `mempalace` extra
+    (`pip install remind-me-mcp[mempalace]`).
+
+    Drawers already matching remind_me's own memory frontmatter (id/created/
+    category/source/tags) have those fields restored faithfully; everything
+    else is stored as one memory per drawer, tagged with its wing/room.
+    Already-imported drawers are skipped (tracked by drawer_id), so reruns —
+    including paging through a large wing with limit/offset — are safe.
+
+    Args:
+        params (MempalaceImportInput): wing/room filters, paging (limit/
+            offset), category/tags overrides, and dry_run.
+
+    Returns:
+        str: JSON summary — fetched, already_imported, to_import,
+        native_format, opaque_format, imported, has_more (page again with a
+        higher offset if true).
+    """
+    try:
+        result = await asyncio.to_thread(
+            pull_mempalace,
+            wing=params.wing,
+            room=params.room,
+            limit=params.limit,
+            offset=params.offset,
+            category=params.category,
+            tags=params.tags,
+            dry_run=params.dry_run,
+        )
+        return json.dumps(result, indent=2)
+    except ImportError:
+        return json.dumps({
+            "status": "error",
+            "error": "chromadb not installed — run: uv pip install -e '.[mempalace]'",
+        })
+    except FileNotFoundError as e:
+        return json.dumps({"status": "error", "error": str(e)})
 
 
 @mcp.tool(

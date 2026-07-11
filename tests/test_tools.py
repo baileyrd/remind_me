@@ -556,10 +556,16 @@ async def test_import_directory_empty(db_conn: sqlite3.Connection, tmp_path: Pat
 
 
 async def test_import_directory_concurrent(
-    db_conn: sqlite3.Connection,
+    db_conn_concurrent: sqlite3.Connection,
     tmp_path: Path,
 ) -> None:
-    """Importing a directory with 12 files processes all files correctly via concurrent dispatch."""
+    """Importing a directory with 12 files processes all files correctly via concurrent dispatch.
+
+    Uses db_conn_concurrent (per-thread connections to a shared-cache
+    in-memory DB) rather than db_conn (one connection object shared across
+    threads), since this test genuinely fans out across OS threads via
+    asyncio.to_thread and a single sqlite3.Connection isn't safe for that.
+    """
     # Create 12 distinct JSON chat files
     for i in range(12):
         data = {

@@ -18,6 +18,7 @@ import hashlib
 import json
 import secrets
 import stat
+import sys
 import time
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlparse
@@ -231,7 +232,12 @@ def test_state_file_permissions(oauth_client, tmp_path: Path) -> None:
     _register(oauth_client)
     state_file = tmp_path / "oauth.json"
     assert state_file.is_file()
-    assert stat.S_IMODE(state_file.stat().st_mode) == 0o600
+    if sys.platform != "win32":
+        # POSIX mode bits aren't meaningful on Windows: os.chmod() there only
+        # toggles the read-only DOS attribute, so a real per-owner 0600 isn't
+        # achievable without ACLs. The chmod call itself still runs on every
+        # platform (best-effort); this assertion just can't verify it there.
+        assert stat.S_IMODE(state_file.stat().st_mode) == 0o600
     # And it never stores raw tokens — only hashes (spot-check after a flow).
     info = _register(oauth_client)
     tokens = _obtain_tokens(oauth_client, info)

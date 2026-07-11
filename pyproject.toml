@@ -21,6 +21,9 @@ semantic = [
     "tokenizers>=0.15.0",
     "huggingface-hub>=0.20.0",
 ]
+mempalace = [
+    "chromadb>=0.5.0",
+]
 
 [project.scripts]
 remind-me-mcp = "remind_me_mcp.__main__:main"

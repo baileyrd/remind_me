@@ -8,6 +8,8 @@ handlers synchronously — no async test code is needed.
 
 from __future__ import annotations
 
+import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -383,9 +385,12 @@ def test_api_import_nonexistent_file(client: TestClient) -> None:
     """POST /api/import with a nonexistent file inside allowed roots returns 400 with not-found message.
 
     SEC-02 path guard fires first for paths outside roots, so we use a path
-    inside /tmp (which is in the patched IMPORT_ROOTS) that does not exist.
+    inside the system temp dir (which is in the patched IMPORT_ROOTS, see
+    conftest.py) that does not exist. Built from tempfile.gettempdir() rather
+    than a hardcoded "/tmp" so it resolves inside IMPORT_ROOTS on Windows too.
     """
-    response = client.post("/api/import", json={"file_path": "/tmp/nonexistent_remind_me_test_file.json"})
+    missing = Path(tempfile.gettempdir()) / "nonexistent_remind_me_test_file.json"
+    response = client.post("/api/import", json={"file_path": str(missing)})
     assert response.status_code == 400
     data = response.json()
     assert "not found" in data["error"].lower()
@@ -882,7 +887,10 @@ def test_default_app_generates_and_persists_api_key(db_conn, isolated_key_dir: P
 
     key_file = isolated_key_dir / "api_key"
     assert key_file.is_file(), "API key must be auto-generated and persisted on first run"
-    assert (key_file.stat().st_mode & 0o777) == 0o600, "key file must be private (0600)"
+    if sys.platform != "win32":
+        # POSIX mode bits aren't meaningful on Windows — see test_oauth.py's
+        # test_state_file_permissions for the full rationale.
+        assert (key_file.stat().st_mode & 0o777) == 0o600, "key file must be private (0600)"
     key = key_file.read_text().strip()
     assert len(key) >= 32
 

@@ -28,6 +28,8 @@ Current schema versions:
             tables. The wiki's source of truth is markdown files on disk; these
             tables are a search/index cache only, so there are deliberately NO
             sync outbox triggers (the file layer is what would be synced).
+  11 -> 12: MemPalace importer — mempalace_imports dedup table (drawer_id ->
+            memory_id), mirroring chat_imports for the file-based importer.
 """
 
 from __future__ import annotations
@@ -38,7 +40,7 @@ import json
 import logging
 import sqlite3
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from remind_me_mcp.config import DB_PATH, EMBEDDING_DIM
@@ -227,7 +229,7 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 # Current target schema version.  Increment when adding a new migration step.
-_SCHEMA_VERSION = 11
+_SCHEMA_VERSION = 12
 
 
 
@@ -301,6 +303,11 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         _migrate_v10_to_v11(db)
         db.execute("PRAGMA user_version = 11")
         current_version = 11
+
+    if current_version < 12:
+        _migrate_v11_to_v12(db)
+        db.execute("PRAGMA user_version = 12")
+        current_version = 12
 
     db.commit()
 
@@ -1175,6 +1182,22 @@ def _migrate_v10_to_v11(db: sqlite3.Connection) -> None:
     """)
 
 
+def _migrate_v11_to_v12(db: sqlite3.Connection) -> None:
+    """v11 -> v12: mempalace_imports dedup table for the MemPalace importer.
+
+    Mirrors chat_imports (dedup-by-hash for file imports): tracks which
+    MemPalace drawers have already been pulled in, keyed by drawer_id, so
+    re-running an import is a safe no-op for drawers already stored.
+    """
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS mempalace_imports (
+            drawer_id   TEXT PRIMARY KEY,
+            memory_id   TEXT NOT NULL,
+            imported_at TEXT NOT NULL
+        );
+    """)
+
+
 def _reconcile_sync_enabled_flag(db: sqlite3.Connection) -> None:
     """Align the sync_flags gate with config.SYNC_ENABLED at startup (SY-07).
 
@@ -1329,7 +1352,11 @@ def _embed_and_store_rows(rows: list[tuple[int, str]]) -> int:
             stored += 1
         db.commit()
         return stored
-    except sqlite3.DatabaseError as e:
+    except (sqlite3.DatabaseError, sqlite3.InterfaceError) as e:
+        # InterfaceError is a sibling of DatabaseError in Python's sqlite3
+        # hierarchy (not a subclass), but "bad parameter or other API misuse"
+        # is reachable here too (e.g. a connection used concurrently from
+        # another thread) and is just as self-healing via remind_me_reindex.
         log.warning("Database error storing chunk embeddings: %s", e)
         # PF-05: undo any uncommitted chunk DELETEs/INSERTs, otherwise they
         # would silently ride along with the next unrelated commit on this
@@ -1477,14 +1504,34 @@ def _semantic_search(
 # ---------------------------------------------------------------------------
 
 
+_last_now_lock = threading.Lock()
+_last_now: datetime | None = None
+
+
 def _now_iso() -> str:
-    """Return the current UTC time as an ISO 8601 string.
+    """Return the current UTC time as an ISO 8601 string, strictly monotonic.
+
+    Two calls in immediate succession (e.g. an insert followed by an update
+    a few microseconds later) can otherwise land in the same clock tick and
+    produce an identical string, which is more than a cosmetic issue here:
+    hub sync uses last-write-wins on `updated_at` (see Multi-Machine Sync in
+    the README), so a tie between two same-node writes would make their
+    relative order ambiguous once synced against a concurrent remote write.
+    Nudging forward by a microsecond when the clock hasn't visibly advanced
+    keeps successive calls strictly ordered without lying about real time by
+    more than a tick.
 
     Returns:
         ISO 8601 formatted datetime string with timezone offset, e.g.
         '2024-01-15T12:34:56.789012+00:00'.
     """
-    return datetime.now(UTC).isoformat()
+    global _last_now
+    with _last_now_lock:
+        now = datetime.now(UTC)
+        if _last_now is not None and now <= _last_now:
+            now = _last_now + timedelta(microseconds=1)
+        _last_now = now
+        return now.isoformat()
 
 
 def _make_id(content: str) -> str:

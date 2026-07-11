@@ -74,6 +74,18 @@ WIKI_LOAD_TOKEN_BUDGET = _env_int("REMIND_ME_WIKI_LOAD_TOKEN_BUDGET", 12000)
 the whole-wiki-into-context tool. 0 means unlimited."""
 
 # ---------------------------------------------------------------------------
+# MemPalace importer
+# ---------------------------------------------------------------------------
+
+MEMPALACE_PATH = Path(
+    os.environ.get("REMIND_ME_MEMPALACE_PATH", "~/.mempalace/palace")
+).expanduser()
+"""Path to a MemPalace ChromaDB persistent store, read directly (read-only)
+by remind_me_import_mempalace. Default matches MemPalace's own default
+palace location; only used if the optional ``mempalace`` extra (chromadb)
+is installed."""
+
+# ---------------------------------------------------------------------------
 # Embedding model
 # ---------------------------------------------------------------------------
 
@@ -365,6 +377,7 @@ __all__ = [
     "PID_FILE",
     "WIKI_DIR",
     "WIKI_LOAD_TOKEN_BUDGET",
+    "MEMPALACE_PATH",
     "EMBEDDING_MODEL",
     "EMBEDDING_DIM",
     "EMBEDDING_BACKEND",

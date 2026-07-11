@@ -56,6 +56,30 @@ class PeerHandler(BaseHTTPRequestHandler):
         with contextlib.suppress(BrokenPipeError, ConnectionResetError):
             self.wfile.write(body)
 
+    def _drain_body(self) -> None:
+        """Read and discard a pending request body before an early rejection.
+
+        Closing the connection while the client's already-sent body bytes
+        are still unread in the socket's receive buffer can make the OS send
+        a hard RST instead of a graceful FIN — the client then sees
+        ConnectionResetError (WinError 10053 on Windows) instead of cleanly
+        reading the rejection response, even though it was written fine.
+        Draining first avoids that. Bounded by MAX_BODY_BYTES regardless of
+        the claimed Content-Length, so a request rejected specifically for
+        being oversized can't turn this into an unbounded read.
+        """
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            return
+        remaining = min(length, MAX_BODY_BYTES)
+        with contextlib.suppress(OSError):
+            while remaining > 0:
+                chunk = self.rfile.read(min(remaining, 65536))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+
     def do_GET(self):
         if not self._auth():
             self._send_json(401, {"error": "unauthorized"})
@@ -215,6 +239,7 @@ class PeerHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if not self._auth():
+            self._drain_body()
             self._send_json(401, {"error": "unauthorized"})
             return
 
@@ -228,6 +253,7 @@ class PeerHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "missing request body"})
                 return
             if length > MAX_BODY_BYTES:
+                self._drain_body()
                 self._send_json(413, {"error": "request body too large"})
                 return
 
@@ -257,6 +283,7 @@ class PeerHandler(BaseHTTPRequestHandler):
             })
             return
 
+        self._drain_body()
         self._send_json(404, {"error": "not found"})
 
 

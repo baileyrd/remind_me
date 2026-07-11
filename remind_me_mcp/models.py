@@ -433,6 +433,28 @@ class BulkImportDirInput(BaseModel):
         return str(p)
 
 
+class MempalaceImportInput(BaseModel):
+    """Input for pulling memories from a MemPalace ChromaDB store."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    wing: str = Field(default="", description="Restrict to a MemPalace wing (project), or '' for all")
+    room: str = Field(default="", description="Restrict to a room within the wing, or '' for all")
+    limit: int = Field(
+        default=500,
+        ge=1,
+        le=2000,
+        description="Max drawers to fetch and embed in this call; page through with offset",
+    )
+    offset: int = Field(default=0, ge=0)
+    category: str = Field(
+        default="",
+        description="Category for drawers not already in remind_me's own format (default: 'mempalace_import')",
+    )
+    tags: list[str] = Field(default_factory=list, description="Extra tags added to every imported memory")
+    dry_run: bool = Field(default=False, description="Report what would be imported without writing")
+
+
 class AutoCaptureInput(BaseModel):
     """Input for automatically capturing a full conversation and its summary."""
 

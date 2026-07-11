@@ -232,7 +232,11 @@ def export_memories(
 
     if file_path is not None:
         path = Path(file_path)
-        path.write_text(payload, encoding="utf-8")
+        # write_bytes (not write_text) so no platform newline translation
+        # happens — otherwise \n -> \r\n on Windows would make the on-disk
+        # file bigger than the "bytes" count below, and a JSON/JSONL export
+        # is meant to be byte-identical across platforms for diffing/hashing.
+        path.write_bytes(payload.encode("utf-8"))
         log.info(
             "Exported %d memories (+%d entities, %d links) to %s (%s)",
             n_memories, n_entities, n_links, path, format,

@@ -12,6 +12,7 @@ import hashlib
 import json
 import sqlite3
 import tempfile
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -102,19 +103,77 @@ def db_conn(monkeypatch: pytest.MonkeyPatch) -> sqlite3.Connection:
     import remind_me_mcp.db as _db_mod
     import remind_me_mcp.exporter as _exporter_mod
     import remind_me_mcp.importer as _importer_mod
+    import remind_me_mcp.mempalace_import as _mempalace_mod
     import remind_me_mcp.tools as _tools_mod
     import remind_me_mcp.vitality as _vitality_mod
 
     monkeypatch.setattr(_db_mod, "_get_db", lambda: db)
     monkeypatch.setattr(_api_mod, "_get_db", lambda: db)
-    # tools.py, importer.py, exporter.py, and vitality.py use
-    # `from remind_me_mcp.db import _get_db` which creates separate bindings —
-    # patch those local references directly so tool handlers route through the
-    # test in-memory database.
+    # tools.py, importer.py, exporter.py, vitality.py, and mempalace_import.py
+    # use `from remind_me_mcp.db import _get_db` which creates separate
+    # bindings — patch those local references directly so tool handlers
+    # route through the test in-memory database.
     monkeypatch.setattr(_tools_mod, "_get_db", lambda: db)
     monkeypatch.setattr(_importer_mod, "_get_db", lambda: db)
     monkeypatch.setattr(_exporter_mod, "_get_db", lambda: db)
     monkeypatch.setattr(_vitality_mod, "_get_db", lambda: db)
+    monkeypatch.setattr(_mempalace_mod, "_get_db", lambda: db)
+
+    yield db
+    db.close()
+
+
+@pytest.fixture()
+def db_conn_concurrent(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> sqlite3.Connection:
+    """Like db_conn, but safe for genuine multi-threaded access.
+
+    db_conn hands the *same* sqlite3.Connection object to every caller —
+    fine for single-threaded tests, but SQLite gives no cross-thread
+    execute()/commit() serialization even with check_same_thread=False, so
+    concurrent callers racing on one connection object can hit
+    "sqlite3.InterfaceError: bad parameter or other API misuse". Production
+    _get_db() avoids this by giving each thread its own connection to a
+    WAL-mode file (db.py:90-93) — WAL allows one writer + concurrent readers
+    without blocking. This fixture matches that exactly (real temp file, same
+    journal_mode=WAL + busy_timeout pragmas) rather than using an in-memory
+    database: SQLite's shared-cache in-memory mode was tried first, but it
+    can't use WAL (only real files can), so it allows just one writer for the
+    *whole* database at a time — far more contention-prone than production
+    ever sees, and still flaky under this test's 12-way concurrent fan-out
+    even with a generous busy_timeout.
+    """
+    db_path = tmp_path / "concurrent_test.db"
+
+    def _connect() -> sqlite3.Connection:
+        conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+
+    db = _connect()
+    _ensure_schema(db)
+
+    local = threading.local()
+    local.conn = db
+
+    def _get_test_db() -> sqlite3.Connection:
+        conn = getattr(local, "conn", None)
+        if conn is None:
+            conn = _connect()
+            local.conn = conn
+        return conn
+
+    import remind_me_mcp.api as _api_mod
+    import remind_me_mcp.db as _db_mod
+    import remind_me_mcp.exporter as _exporter_mod
+    import remind_me_mcp.importer as _importer_mod
+    import remind_me_mcp.mempalace_import as _mempalace_mod
+    import remind_me_mcp.tools as _tools_mod
+    import remind_me_mcp.vitality as _vitality_mod
+
+    for mod in (_db_mod, _api_mod, _tools_mod, _importer_mod, _exporter_mod, _vitality_mod, _mempalace_mod):
+        monkeypatch.setattr(mod, "_get_db", _get_test_db)
 
     yield db
     db.close()
@@ -204,19 +263,21 @@ def db_conn_with_vec(monkeypatch: pytest.MonkeyPatch) -> sqlite3.Connection:
     import remind_me_mcp.db as _db_mod
     import remind_me_mcp.exporter as _exporter_mod
     import remind_me_mcp.importer as _importer_mod
+    import remind_me_mcp.mempalace_import as _mempalace_mod
     import remind_me_mcp.tools as _tools_mod
     import remind_me_mcp.vitality as _vitality_mod
 
     monkeypatch.setattr(_db_mod, "_get_db", lambda: db)
     monkeypatch.setattr(_api_mod, "_get_db", lambda: db)
-    # tools.py, importer.py, exporter.py, and vitality.py use
-    # `from remind_me_mcp.db import _get_db` which creates separate bindings —
-    # patch those local references directly so tool handlers route through the
-    # test in-memory database.
+    # tools.py, importer.py, exporter.py, vitality.py, and mempalace_import.py
+    # use `from remind_me_mcp.db import _get_db` which creates separate
+    # bindings — patch those local references directly so tool handlers
+    # route through the test in-memory database.
     monkeypatch.setattr(_tools_mod, "_get_db", lambda: db)
     monkeypatch.setattr(_importer_mod, "_get_db", lambda: db)
     monkeypatch.setattr(_exporter_mod, "_get_db", lambda: db)
     monkeypatch.setattr(_vitality_mod, "_get_db", lambda: db)
+    monkeypatch.setattr(_mempalace_mod, "_get_db", lambda: db)
 
     yield db
     db.close()

@@ -11,6 +11,7 @@ remote-status reporting surfaced through remind_me_server_status.
 from __future__ import annotations
 
 import stat
+import sys
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -49,8 +50,11 @@ def test_token_generated_and_persisted(token_dir: Path) -> None:
     assert token_file.is_file()
     assert token_file.read_text(encoding="utf-8").strip() == token
     assert len(token) >= 32
-    mode = stat.S_IMODE(token_file.stat().st_mode)
-    assert mode == 0o600
+    if sys.platform != "win32":
+        # POSIX mode bits aren't meaningful on Windows — see test_oauth.py's
+        # test_state_file_permissions for the full rationale.
+        mode = stat.S_IMODE(token_file.stat().st_mode)
+        assert mode == 0o600
 
 
 def test_token_reused_across_calls(token_dir: Path) -> None:
