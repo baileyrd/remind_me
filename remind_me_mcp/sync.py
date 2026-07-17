@@ -894,6 +894,11 @@ def start_sync_thread() -> threading.Thread:
         log.info("Sync thread starting")
         while True:
             try:
+                from remind_me_mcp.sidecars import ensure_sidecars
+                ensure_sidecars()
+            except Exception as e:
+                log.warning("Sidecar ensure failed: %s", e)
+            try:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 try:
