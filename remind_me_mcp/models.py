@@ -175,6 +175,16 @@ class MemorySearchInput(BaseModel):
             "section. Does not affect the main ranking."
         ),
     )
+    include_neighbors: bool = Field(
+        default=False,
+        description=(
+            "Opt-in neighbor-aware chunk expansion: after ranking, append up to 5 "
+            "additional non-superseded sibling chunks (same source document, "
+            "adjacent chunk position) for any result that came from an import, "
+            "in a separate related_via_neighbors section. Does not affect the "
+            "main ranking."
+        ),
+    )
 
 
 class FeedbackInput(BaseModel):

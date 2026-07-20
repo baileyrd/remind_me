@@ -229,7 +229,7 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 # Current target schema version.  Increment when adding a new migration step.
-_SCHEMA_VERSION = 12
+_SCHEMA_VERSION = 13
 
 
 
@@ -308,6 +308,11 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         _migrate_v11_to_v12(db)
         db.execute("PRAGMA user_version = 12")
         current_version = 12
+
+    if current_version < 13:
+        _migrate_v12_to_v13(db)
+        db.execute("PRAGMA user_version = 13")
+        current_version = 13
 
     db.commit()
 
@@ -905,6 +910,7 @@ _OUTBOX_PAYLOAD_COLUMNS = (
     "accessed_at", "access_count", "decay_rate", "vitality", "base_weight",
     "status", "memory_type", "source_capture_id",
     "subject", "predicate", "object", "superseded_by",
+    "doc_id", "chunk_index",
 )
 
 # Entity columns mirrored into sync_outbox payloads (FT-04). Memory records
@@ -1195,6 +1201,57 @@ def _migrate_v11_to_v12(db: sqlite3.Connection) -> None:
             memory_id   TEXT NOT NULL,
             imported_at TEXT NOT NULL
         );
+    """)
+
+
+def _migrate_v12_to_v13(db: sqlite3.Connection) -> None:
+    """v12 -> v13: doc_id/chunk_index columns for neighbor-aware chunk retrieval.
+
+    Promotes the per-file import grouping -- previously only reconstructable
+    from ``metadata.import_id``, an unindexed JSON field -- to first-class
+    ``doc_id``/``chunk_index`` columns on ``memories``, so a search hit's
+    sibling chunks from the same source document/message can be looked up
+    directly instead of re-parsing metadata.
+
+    Rides the existing ``memories_outbox_ai``/``_au`` triggers (HY-03): both
+    columns are added to ``_OUTBOX_PAYLOAD_COLUMNS`` and the triggers are
+    dropped and recreated so their baked-in payload SQL picks up the new
+    columns. SQLite defers column resolution inside a trigger body to
+    fire-time rather than CREATE TRIGGER time, so this is safe to run before
+    any row has doc_id/chunk_index populated.
+
+    Args:
+        db: An open SQLite connection.
+    """
+    with contextlib.suppress(sqlite3.OperationalError):
+        db.execute("ALTER TABLE memories ADD COLUMN doc_id TEXT DEFAULT NULL")
+    with contextlib.suppress(sqlite3.OperationalError):
+        db.execute("ALTER TABLE memories ADD COLUMN chunk_index INTEGER DEFAULT NULL")
+
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_memories_doc_chunk ON memories(doc_id, chunk_index)"
+    )
+
+    payload = _outbox_payload_sql("NEW.")
+    db.executescript(f"""
+        DROP TRIGGER IF EXISTS memories_outbox_ai;
+        DROP TRIGGER IF EXISTS memories_outbox_au;
+
+        CREATE TRIGGER IF NOT EXISTS memories_outbox_ai
+        AFTER INSERT ON memories
+        WHEN COALESCE((SELECT value FROM sync_flags WHERE key = 'sync_enabled'), '0') = '1'
+        BEGIN
+            INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+            VALUES (NEW.id, 'insert', {payload}, {_SQL_NOW_ISO});
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS memories_outbox_au
+        AFTER UPDATE ON memories
+        WHEN COALESCE((SELECT value FROM sync_flags WHERE key = 'sync_enabled'), '0') = '1'
+        BEGIN
+            INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+            VALUES (NEW.id, 'update', {payload}, {_SQL_NOW_ISO});
+        END;
     """)
 
 

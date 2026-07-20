@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     import sqlite3
 
 from remind_me_mcp.db import (
+    _SCHEMA_VERSION,
     _ensure_schema,
     _entity_id,
     _link_memory_entity,
@@ -121,7 +122,7 @@ def test_migration_applies_on_existing_pre_v10_db(db_conn: sqlite3.Connection) -
 
     _migrate_schema(db_conn)
 
-    assert db_conn.execute("PRAGMA user_version").fetchone()[0] == 12
+    assert db_conn.execute("PRAGMA user_version").fetchone()[0] == _SCHEMA_VERSION
     tables = {
         r[0]
         for r in db_conn.execute(
@@ -136,7 +137,7 @@ def test_migration_applies_on_existing_pre_v10_db(db_conn: sqlite3.Connection) -
 def test_migration_is_idempotent(db_conn: sqlite3.Connection) -> None:
     _ensure_schema(db_conn)
     _ensure_schema(db_conn)
-    assert db_conn.execute("PRAGMA user_version").fetchone()[0] == 12
+    assert db_conn.execute("PRAGMA user_version").fetchone()[0] == _SCHEMA_VERSION
 
 
 # ---------------------------------------------------------------------------

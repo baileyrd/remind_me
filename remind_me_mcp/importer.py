@@ -659,15 +659,19 @@ def import_chat_file(
             return {"status": "skipped", "reason": "already_imported", "file": path.name, "import_id": existing["import_id"]}
 
         # Chunk and store — collect (mem_id, chunk) pairs so the same IDs are used
-        # for both INSERT and embedding (BUGF-01 fix: prevents ID mismatch)
+        # for both INSERT and embedding (BUGF-01 fix: prevents ID mismatch).
+        # doc_id/chunk_index group every chunk from this file together in
+        # source order, so a search hit's siblings can be looked up directly
+        # (neighbor-aware chunk retrieval) instead of re-parsing metadata.
         stored = 0
-        for mem_id, chunk, section in embed_entries:
+        for chunk_index, (mem_id, chunk, section) in enumerate(embed_entries):
             metadata: dict[str, Any] = {"import_id": import_id, "filename": path.name}
             if section is not None:
                 metadata["section"] = section
             db.execute(
-                """INSERT OR IGNORE INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT OR IGNORE INTO memories
+                   (id, content, category, tags, source, metadata, created_at, updated_at, doc_id, chunk_index)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     mem_id,
                     chunk,
@@ -677,6 +681,8 @@ def import_chat_file(
                     json.dumps(metadata),
                     now,
                     now,
+                    import_id,
+                    chunk_index,
                 ),
             )
             stored += 1

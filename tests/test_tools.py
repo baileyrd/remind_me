@@ -1627,6 +1627,198 @@ async def test_feedback_rejects_invalid_signal() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Neighbor-aware chunk expansion (include_neighbors)
+# ---------------------------------------------------------------------------
+
+
+async def test_neighbors_off_by_default(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    memory_factory(content="zephyr doc seed", doc_id="doc-1", chunk_index=0)
+    memory_factory(content="zephyr doc sibling", doc_id="doc-1", chunk_index=1)
+
+    data = json.loads(await memory_search(MemorySearchInput(
+        query="zephyr doc seed", response_format=ResponseFormat.JSON,
+    )))
+    assert "related_via_neighbors" not in data
+
+
+async def test_neighbors_appends_siblings_without_disturbing_ranking(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    memory_factory(content="zephyr doc seed unique", doc_id="doc-1", chunk_index=1)
+    sibling = memory_factory(content="zephyr doc sibling chunk", doc_id="doc-1", chunk_index=2)
+
+    baseline = json.loads(await memory_search(MemorySearchInput(
+        query="zephyr doc seed unique", response_format=ResponseFormat.JSON,
+    )))
+    data = json.loads(await memory_search(MemorySearchInput(
+        query="zephyr doc seed unique", response_format=ResponseFormat.JSON,
+        include_neighbors=True,
+    )))
+
+    assert [m["id"] for m in data["memories"]] == [
+        m["id"] for m in baseline["memories"]
+    ]
+    related = data["related_via_neighbors"]
+    assert [r["id"] for r in related] == [sibling["id"]]
+    assert related[0]["doc_id"] == "doc-1"
+    assert related[0]["chunk_index"] == 2
+    assert "content_snippet" in related[0]
+
+
+async def test_neighbors_respects_window(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """Only chunk_index +/- 1 (the default window) is included, not further siblings."""
+    memory_factory(content="zephyr window seed", doc_id="doc-2", chunk_index=5)
+    near = memory_factory(content="zephyr window near", doc_id="doc-2", chunk_index=6)
+    memory_factory(content="zephyr window far", doc_id="doc-2", chunk_index=8)
+
+    data = json.loads(await memory_search(MemorySearchInput(
+        query="zephyr window seed", response_format=ResponseFormat.JSON,
+        include_neighbors=True,
+    )))
+    related = data["related_via_neighbors"]
+    assert [r["id"] for r in related] == [near["id"]]
+
+
+async def test_neighbors_ignores_memories_without_doc_id(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """Manually added memories (no doc_id/chunk_index) yield no neighbor expansion."""
+    memory_factory(content="zephyr manual seed memory")
+
+    data = json.loads(await memory_search(MemorySearchInput(
+        query="zephyr manual seed memory", response_format=ResponseFormat.JSON,
+        include_neighbors=True,
+    )))
+    assert data["related_via_neighbors"] == []
+
+
+async def test_neighbors_no_duplicates_with_main_results(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """Siblings already present in the main results are not repeated."""
+    memory_factory(content="zephyr doc alpha", doc_id="doc-3", chunk_index=0)
+    memory_factory(content="zephyr doc beta", doc_id="doc-3", chunk_index=1)
+
+    data = json.loads(await memory_search(MemorySearchInput(
+        query="zephyr doc", response_format=ResponseFormat.JSON,
+        include_neighbors=True,
+    )))
+    main_ids = {m["id"] for m in data["memories"]}
+    assert len(main_ids) == 2
+    assert data["related_via_neighbors"] == []
+
+
+async def test_neighbors_excludes_superseded(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    memory_factory(content="zephyr superseded seed", doc_id="doc-4", chunk_index=1)
+    before = memory_factory(
+        content="zephyr superseded before", doc_id="doc-4", chunk_index=0
+    )
+    memory_factory(
+        content="zephyr superseded after", doc_id="doc-4", chunk_index=2,
+        superseded_by="newer",
+    )
+
+    data = json.loads(await memory_search(MemorySearchInput(
+        query="zephyr superseded seed", response_format=ResponseFormat.JSON,
+        include_neighbors=True,
+    )))
+    related = data["related_via_neighbors"]
+    assert [r["id"] for r in related] == [before["id"]]
+
+
+def test_expand_via_neighbors_respects_cap_across_seeds(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """The cap is shared across all seeds, not applied per-seed (direct unit test
+    of _expand_via_neighbors, since window=1 makes a single seed contribute at
+    most 2 neighbors -- too few to exercise the cap through a full search)."""
+    from remind_me_mcp.tools.search import _expand_via_neighbors
+
+    seed_a = memory_factory(content="cap seed alpha", doc_id="doc-cap-a", chunk_index=0)
+    memory_factory(content="cap neighbor alpha", doc_id="doc-cap-a", chunk_index=1)
+    seed_b = memory_factory(content="cap seed beta", doc_id="doc-cap-b", chunk_index=0)
+    memory_factory(content="cap neighbor beta", doc_id="doc-cap-b", chunk_index=1)
+
+    related = _expand_via_neighbors(db_conn, [seed_a, seed_b], cap=1)
+    assert len(related) == 1
+
+
+def test_expand_via_neighbors_respects_cap_within_single_seed(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """The cap also breaks mid-query when one seed's own window yields more
+    candidates than the cap allows."""
+    from remind_me_mcp.tools.search import _expand_via_neighbors
+
+    seed = memory_factory(content="cap single seed", doc_id="doc-cap-c", chunk_index=0)
+    for i in range(3):
+        memory_factory(
+            content=f"cap single sibling {i}", doc_id="doc-cap-c", chunk_index=1
+        )
+
+    related = _expand_via_neighbors(db_conn, [seed], cap=2)
+    assert len(related) == 2
+
+
+async def test_neighbors_markdown_section(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    memory_factory(content="zephyr markdown seed", doc_id="doc-5", chunk_index=0)
+    sibling = memory_factory(content="zephyr markdown sibling", doc_id="doc-5", chunk_index=1)
+
+    md = await memory_search(MemorySearchInput(
+        query="zephyr markdown seed", include_neighbors=True,
+    ))
+    assert "Related via document neighbors" in md
+    assert sibling["id"] in md
+
+
+async def test_neighbors_not_access_recorded(
+    db_conn: sqlite3.Connection, memory_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Expanded hits are deliberately excluded from PF-02 access recording —
+    document adjacency must not inflate sibling vitality."""
+    import asyncio
+
+    import remind_me_mcp.tools as _tools_mod
+
+    seed = memory_factory(content="zephyr access seed", doc_id="doc-6", chunk_index=0)
+    sibling = memory_factory(content="zephyr access sibling", doc_id="doc-6", chunk_index=1)
+
+    recorded_ids: list[str] = []
+    monkeypatch.setattr(
+        _tools_mod, "record_accesses",
+        lambda ids: recorded_ids.extend(ids) or len(ids),
+    )
+
+    created_tasks: list[asyncio.Task] = []
+    real_create_task = asyncio.create_task
+
+    def capture_task(coro, **kwargs):
+        task = real_create_task(coro, **kwargs)
+        created_tasks.append(task)
+        return task
+
+    monkeypatch.setattr(asyncio, "create_task", capture_task)
+
+    data = json.loads(await memory_search(MemorySearchInput(
+        query="zephyr access seed", response_format=ResponseFormat.JSON,
+        include_neighbors=True,
+    )))
+    assert [r["id"] for r in data["related_via_neighbors"]] == [sibling["id"]]
+    await asyncio.gather(*created_tasks)
+
+    assert seed["id"] in recorded_ids
+    assert sibling["id"] not in recorded_ids
+
+
+# ---------------------------------------------------------------------------
 # remind_me_vitality_report tests (Phase 11 Plan 03)
 # ---------------------------------------------------------------------------
 

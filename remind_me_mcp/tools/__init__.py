@@ -147,6 +147,7 @@ from remind_me_mcp.tools.search import (
     _detect_structured_query,
     _envelope_json,
     _expand_via_entities,
+    _expand_via_neighbors,
     _record_envelope_access,
     _sanitize_fts_query,
     _strip_structured_prefixes,

@@ -734,3 +734,90 @@ def test_import_embeds_in_batches_outside_lock(
         ).fetchone()
         assert row is not None
         assert row["content"] == content
+
+
+# ---------------------------------------------------------------------------
+# doc_id / chunk_index assignment (neighbor-aware chunk retrieval)
+# ---------------------------------------------------------------------------
+
+
+def test_import_chat_assigns_doc_id_and_chunk_index(
+    db_conn: sqlite3.Connection,
+    tmp_path: Path,
+) -> None:
+    """Chat imports get doc_id == import_id and sequential chunk_index per file."""
+    data = {
+        "chat_messages": [
+            {"sender": "assistant", "content": "First unique chat chunk for doc_id test."},
+            {"sender": "assistant", "content": "Second unique chat chunk for doc_id test."},
+            {"sender": "assistant", "content": "Third unique chat chunk for doc_id test."},
+        ]
+    }
+    chat_file = tmp_path / "doc_id_chat.json"
+    chat_file.write_text(json.dumps(data))
+
+    result = import_chat_file(str(chat_file), "test", [], "assistant_messages", 10000)
+    assert result["status"] == "ok"
+    assert result["memories_created"] == 3
+
+    rows = db_conn.execute(
+        "SELECT doc_id, chunk_index, content FROM memories WHERE source = 'chat_import' "
+        "ORDER BY chunk_index"
+    ).fetchall()
+    assert len(rows) == 3
+    assert all(r["doc_id"] == result["import_id"] for r in rows)
+    assert [r["chunk_index"] for r in rows] == [0, 1, 2]
+
+
+def test_import_document_assigns_doc_id_and_chunk_index(
+    db_conn: sqlite3.Connection,
+    tmp_path: Path,
+) -> None:
+    """Document imports get doc_id == import_id and sequential chunk_index per section."""
+    md = (
+        "# Section One\n\nFirst section content for doc_id test.\n\n"
+        "# Section Two\n\nSecond section content for doc_id test.\n"
+    )
+    doc_file = tmp_path / "doc_id_document.md"
+    doc_file.write_text(md)
+
+    result = import_chat_file(
+        str(doc_file), "", [], "assistant_messages", 10000, kind="document"
+    )
+    assert result["status"] == "ok"
+    assert result["memories_created"] == 2
+
+    rows = db_conn.execute(
+        "SELECT doc_id, chunk_index FROM memories WHERE source = 'document_import' "
+        "ORDER BY chunk_index"
+    ).fetchall()
+    assert len(rows) == 2
+    assert all(r["doc_id"] == result["import_id"] for r in rows)
+    assert [r["chunk_index"] for r in rows] == [0, 1]
+
+
+def test_import_different_files_get_different_doc_ids(
+    db_conn: sqlite3.Connection,
+    tmp_path: Path,
+) -> None:
+    """Two separate imported files get distinct doc_id values."""
+    data_a = {"chat_messages": [{"sender": "assistant", "content": "File A unique content."}]}
+    data_b = {"chat_messages": [{"sender": "assistant", "content": "File B unique content."}]}
+    file_a = tmp_path / "doc_id_a.json"
+    file_b = tmp_path / "doc_id_b.json"
+    file_a.write_text(json.dumps(data_a))
+    file_b.write_text(json.dumps(data_b))
+
+    result_a = import_chat_file(str(file_a), "test", [], "assistant_messages", 10000)
+    result_b = import_chat_file(str(file_b), "test", [], "assistant_messages", 10000)
+
+    assert result_a["import_id"] != result_b["import_id"]
+    row_a = db_conn.execute(
+        "SELECT doc_id FROM memories WHERE content = 'File A unique content.'"
+    ).fetchone()
+    row_b = db_conn.execute(
+        "SELECT doc_id FROM memories WHERE content = 'File B unique content.'"
+    ).fetchone()
+    assert row_a["doc_id"] == result_a["import_id"]
+    assert row_b["doc_id"] == result_b["import_id"]
+    assert row_a["doc_id"] != row_b["doc_id"]
