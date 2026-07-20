@@ -225,6 +225,43 @@ class EntityLookupInput(BaseModel):
     )
 
 
+class EntityTraverseInput(BaseModel):
+    """Input for the remind_me_entity_traverse tool: multi-hop entity-relation traversal."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    name: str = Field(
+        ...,
+        description=(
+            "Entity name or alias to start the traversal from "
+            "(case/whitespace-insensitive, e.g. 'Bailey Robertson' or 'Bailey')"
+        ),
+        min_length=1,
+        max_length=200,
+    )
+    hops: int = Field(
+        default=1,
+        ge=1,
+        le=3,
+        description=(
+            "Maximum traversal depth. 1 = direct relations only; 2-3 follow "
+            "relations of relations (e.g. 'who introduced me to the person "
+            "who recommended this tool')."
+        ),
+    )
+    relation: str | None = Field(
+        default=None,
+        description="Optional: only follow edges whose relation label matches exactly",
+        max_length=200,
+    )
+    cap: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="Max number of relation edges to return",
+    )
+
+
 class MemoryListInput(BaseModel):
     """Input for listing memories."""
 
@@ -954,6 +991,7 @@ __all__ = [
     "DecomposeBatchInput",
     "EntityInput",
     "EntityLookupInput",
+    "EntityTraverseInput",
     "MemoryAnnotation",
     "AnnotateInput",
     "ExtractBatchInput",

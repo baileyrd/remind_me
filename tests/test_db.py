@@ -505,9 +505,9 @@ def test_v4_to_v5_indexes_exist(db_conn: sqlite3.Connection) -> None:
 def test_schema_version_is_current(db_conn: sqlite3.Connection) -> None:
     """After migration, _SCHEMA_VERSION and PRAGMA user_version match the latest."""
     from remind_me_mcp.db import _SCHEMA_VERSION
-    assert _SCHEMA_VERSION == 13
+    assert _SCHEMA_VERSION == 14
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 13, f"Expected user_version 13, got {version}"
+    assert version == 14, f"Expected user_version 14, got {version}"
 
 
 def test_v6_to_v7_new_columns_exist(db_conn: sqlite3.Connection) -> None:
@@ -733,3 +733,104 @@ def test_v12_to_v13_migration_from_v12_applies_cleanly(db_conn: sqlite3.Connecti
     assert row is not None
     assert row[0] is None
     assert row[1] is None
+
+
+# ---------------------------------------------------------------------------
+# Migration v13 -> v14 — entity_relations table
+# ---------------------------------------------------------------------------
+
+
+def test_v13_to_v14_table_exists(db_conn: sqlite3.Connection) -> None:
+    """Fresh database has the entity_relations table."""
+    tables = {
+        r[0]
+        for r in db_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    assert "entity_relations" in tables
+
+
+def test_v13_to_v14_columns(db_conn: sqlite3.Connection) -> None:
+    columns = [row[1] for row in db_conn.execute("PRAGMA table_info(entity_relations)").fetchall()]
+    for col in ("id", "subject_entity_id", "relation", "object_entity_id", "created_at", "updated_at", "node_id"):
+        assert col in columns, f"Column {col} missing from entity_relations table"
+
+
+def test_v13_to_v14_indexes_exist(db_conn: sqlite3.Connection) -> None:
+    indexes = {
+        row[0]
+        for row in db_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+        ).fetchall()
+    }
+    assert "idx_entity_relations_subject" in indexes
+    assert "idx_entity_relations_object" in indexes
+    assert "idx_entity_relations_created_at" in indexes
+
+
+def test_v13_to_v14_outbox_trigger_fires_on_insert(db_conn: sqlite3.Connection) -> None:
+    """The entity_relations_outbox_ai trigger records an insert with record_type='entity_relation'."""
+    db_conn.execute(
+        "INSERT OR REPLACE INTO sync_flags (key, value) VALUES ('sync_enabled', '1')"
+    )
+    now = _now_iso()
+    db_conn.execute(
+        """INSERT INTO entity_relations
+           (id, subject_entity_id, relation, object_entity_id, created_at, updated_at, node_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        ("rel-1", "subj-1", "works_with", "obj-1", now, now, "node-a"),
+    )
+    db_conn.commit()
+
+    outbox_row = db_conn.execute(
+        "SELECT payload FROM sync_outbox WHERE memory_id = ? ORDER BY id DESC LIMIT 1",
+        ("rel-1",),
+    ).fetchone()
+    assert outbox_row is not None, "No outbox row found for entity_relations insert"
+    import json
+    payload = json.loads(outbox_row[0])
+    assert payload["record_type"] == "entity_relation"
+    assert payload["subject_entity_id"] == "subj-1"
+    assert payload["relation"] == "works_with"
+    assert payload["object_entity_id"] == "obj-1"
+
+
+def test_v13_to_v14_no_outbox_row_when_sync_disabled(db_conn: sqlite3.Connection) -> None:
+    """The trigger is gated on sync_enabled, like every other outbox trigger (SY-07)."""
+    db_conn.execute(
+        "INSERT OR REPLACE INTO sync_flags (key, value) VALUES ('sync_enabled', '0')"
+    )
+    now = _now_iso()
+    db_conn.execute(
+        """INSERT INTO entity_relations
+           (id, subject_entity_id, relation, object_entity_id, created_at, updated_at, node_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        ("rel-2", "subj-2", "reports_to", "obj-2", now, now, "node-a"),
+    )
+    db_conn.commit()
+
+    outbox_row = db_conn.execute(
+        "SELECT payload FROM sync_outbox WHERE memory_id = ?", ("rel-2",),
+    ).fetchone()
+    assert outbox_row is None
+
+
+def test_v13_to_v14_migration_from_v13_applies_cleanly(db_conn: sqlite3.Connection) -> None:
+    """Simulating an upgrade from a pre-v14 (v13) database applies the migration without error."""
+    db_conn.execute("PRAGMA user_version = 13")
+    db_conn.commit()
+
+    _migrate_schema(db_conn)
+
+    from remind_me_mcp.db import _SCHEMA_VERSION
+    version = db_conn.execute("PRAGMA user_version").fetchone()[0]
+    assert version == _SCHEMA_VERSION
+
+    tables = {
+        r[0]
+        for r in db_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    assert "entity_relations" in tables

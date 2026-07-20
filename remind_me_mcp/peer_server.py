@@ -12,6 +12,9 @@ FT-04 adds two endpoints for the entity graph: ``/sync/pull_entities`` and
 ``/sync/pull_links``. Old peers never call them, and a new peer pulling
 from an old server treats the resulting 404 as "no entity support" —
 backward compatible in both directions.
+
+Phase 3 adds a third: ``/sync/pull_entity_relations``, serving typed
+entity-to-entity edges. Same 404-tolerant backward compatibility.
 """
 from __future__ import annotations
 
@@ -150,6 +153,10 @@ class PeerHandler(BaseHTTPRequestHandler):
             self._pull_links(parse_qs(parsed.query))
             return
 
+        if parsed.path == "/sync/pull_entity_relations":
+            self._pull_entity_relations(parse_qs(parsed.query))
+            return
+
         self._send_json(404, {"error": "not found"})
 
     @staticmethod
@@ -235,6 +242,35 @@ class PeerHandler(BaseHTTPRequestHandler):
             }
             for row in rows
         ]
+        self._send_json(200, {"records": records, "count": len(records)})
+
+    def _pull_entity_relations(self, params: dict) -> None:
+        """Serve entity_relations records newer than the cursor (Phase 3).
+
+        Relations are immutable, like links, so the keyset pages on
+        ``created_at`` -- but unlike links, each row already carries its own
+        real ``id`` (deterministic, from the subject/relation/object triple),
+        so no synthetic wire id is built here.
+        """
+        parsed = self._pull_params(params)
+        if parsed is None:
+            self._send_json(400, {"error": "invalid limit"})
+            return
+        since, since_id, _exclude_node, limit = parsed
+
+        db = _get_db()
+        rows = db.execute("""
+            SELECT r.* FROM entity_relations r
+            WHERE (r.created_at > ? OR (r.created_at = ? AND r.id > ?))
+            ORDER BY r.created_at ASC, r.id ASC
+            LIMIT ?
+        """, (since, since, since_id, limit)).fetchall()
+
+        records = []
+        for row in rows:
+            d = dict(row)
+            d["record_type"] = "entity_relation"
+            records.append(d)
         self._send_json(200, {"records": records, "count": len(records)})
 
     def do_POST(self):

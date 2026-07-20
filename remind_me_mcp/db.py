@@ -229,7 +229,7 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 # Current target schema version.  Increment when adding a new migration step.
-_SCHEMA_VERSION = 13
+_SCHEMA_VERSION = 14
 
 
 
@@ -313,6 +313,11 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         _migrate_v12_to_v13(db)
         db.execute("PRAGMA user_version = 13")
         current_version = 13
+
+    if current_version < 14:
+        _migrate_v13_to_v14(db)
+        db.execute("PRAGMA user_version = 14")
+        current_version = 14
 
     db.commit()
 
@@ -920,6 +925,15 @@ _ENTITY_OUTBOX_COLUMNS = (
     "id", "name", "kind", "aliases", "created_at", "updated_at", "node_id",
 )
 
+# entity_relations columns mirrored into sync_outbox payloads. Relations are
+# immutable (insert-or-ignore, like memory_entities links) but -- unlike
+# links -- already carry a real deterministic id, so no synthetic wire id is
+# needed.
+_ENTITY_RELATION_OUTBOX_COLUMNS = (
+    "id", "subject_entity_id", "relation", "object_entity_id",
+    "created_at", "updated_at", "node_id",
+)
+
 # Canonical UTC ISO-8601 timestamp in SQL, string-comparable with Python's
 # datetime.now(UTC).isoformat(). Replaces the previous datetime('now','utc'),
 # which is documented-incorrect SQLite usage ('now' is already UTC) and
@@ -1251,6 +1265,60 @@ def _migrate_v12_to_v13(db: sqlite3.Connection) -> None:
         BEGIN
             INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
             VALUES (NEW.id, 'update', {payload}, {_SQL_NOW_ISO});
+        END;
+    """)
+
+
+def _migrate_v13_to_v14(db: sqlite3.Connection) -> None:
+    """v13 -> v14: entity_relations -- typed entity-to-entity edges + multi-hop traversal.
+
+    ``entities``/``memory_entities`` (v9->v10) only encode "entity X is
+    mentioned in memory Y" -- a memory<->entity bipartite graph. This adds a
+    genuine entity<->entity typed edge: (subject_entity_id, relation,
+    object_entity_id), e.g. "Bailey --works_with--> Alex". Deterministic id
+    (sha256 of the triple, see :func:`_entity_relation_id`) so the same
+    relation recorded independently on two machines converges to the same
+    row; immutable insert-or-ignore semantics (see
+    :func:`_upsert_entity_relation`), no FKs (same sync-order-tolerance
+    rationale as ``memory_entities`` -- a relation may arrive before either
+    entity does). Outbox trigger mirrors the v9/v10 entity/link triggers
+    (insert-only, since relations never change once recorded), gated on
+    ``sync_enabled``, payload tagged ``record_type='entity_relation'``.
+
+    Args:
+        db: An open SQLite connection.
+    """
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS entity_relations (
+            id                TEXT PRIMARY KEY,
+            subject_entity_id TEXT NOT NULL,
+            relation          TEXT NOT NULL,
+            object_entity_id  TEXT NOT NULL,
+            created_at        TEXT NOT NULL,
+            updated_at        TEXT NOT NULL,
+            node_id           TEXT DEFAULT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_entity_relations_subject
+            ON entity_relations(subject_entity_id);
+        CREATE INDEX IF NOT EXISTS idx_entity_relations_object
+            ON entity_relations(object_entity_id);
+        CREATE INDEX IF NOT EXISTS idx_entity_relations_created_at
+            ON entity_relations(created_at);
+    """)
+
+    relation_payload = _outbox_payload_sql(
+        "NEW.", _ENTITY_RELATION_OUTBOX_COLUMNS, record_type="entity_relation"
+    )
+    db.executescript(f"""
+        DROP TRIGGER IF EXISTS entity_relations_outbox_ai;
+
+        CREATE TRIGGER IF NOT EXISTS entity_relations_outbox_ai
+        AFTER INSERT ON entity_relations
+        WHEN COALESCE((SELECT value FROM sync_flags WHERE key = 'sync_enabled'), '0') = '1'
+        BEGIN
+            INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+            VALUES (NEW.id, 'insert', {relation_payload}, {_SQL_NOW_ISO});
         END;
     """)
 
@@ -1740,6 +1808,68 @@ def _link_memory_entity(
     return cur.rowcount > 0
 
 
+def _entity_relation_id(subject_entity_id: str, relation: str, object_entity_id: str) -> str:
+    """Derive the DETERMINISTIC id for an entity-to-entity relation triple.
+
+    sha256 of ``"subject_id|normalized_relation|object_id"``, truncated to
+    the same 12-hex-char length as :func:`_entity_id`. The relation label is
+    normalized (:func:`_normalize_entity_name`) for the same reason entity
+    names are: so "works_with" and " Works_With " hash to the same edge,
+    and the same triple recorded independently on two machines converges to
+    the same row.
+
+    Args:
+        subject_entity_id: The subject entity's id.
+        relation: The relation label (any casing/whitespace).
+        object_entity_id: The object entity's id.
+
+    Returns:
+        A 12-character hex string.
+    """
+    key = f"{subject_entity_id}|{_normalize_entity_name(relation)}|{object_entity_id}"
+    return hashlib.sha256(key.encode()).hexdigest()[:12]
+
+
+def _upsert_entity_relation(
+    db: sqlite3.Connection,
+    subject_entity_id: str,
+    relation: str,
+    object_entity_id: str,
+    *,
+    node_id: str | None = None,
+    now: str | None = None,
+) -> str:
+    """Insert an entity-to-entity relation if it doesn't already exist.
+
+    Unlike :func:`_upsert_entity` (which merges aliases/kind into an
+    existing row), a relation triple's identity IS its content -- there is
+    nothing to merge, so re-recording the same (subject, relation, object)
+    is a no-op. Mirrors :func:`_link_memory_entity`'s immutable
+    insert-or-ignore semantics. Does NOT commit.
+
+    Args:
+        db: An open SQLite connection.
+        subject_entity_id: The subject entity's id.
+        relation: The relation label (e.g. "works_with", "reports_to").
+        object_entity_id: The object entity's id.
+        node_id: This node's id, stamped on newly created rows.
+        now: Timestamp override (defaults to now).
+
+    Returns:
+        The relation's deterministic id (whether newly created or already
+        existing).
+    """
+    rid = _entity_relation_id(subject_entity_id, relation, object_entity_id)
+    ts = now or _now_iso()
+    db.execute(
+        """INSERT OR IGNORE INTO entity_relations
+           (id, subject_entity_id, relation, object_entity_id, created_at, updated_at, node_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (rid, subject_entity_id, " ".join(relation.split()), object_entity_id, ts, ts, node_id),
+    )
+    return rid
+
+
 def _resolve_entity(db: sqlite3.Connection, query: str) -> dict[str, Any] | None:
     """Resolve a name or alias to its canonical entity row (FT-04 part 2).
 
@@ -1897,6 +2027,8 @@ __all__ = [
     "_entity_id",
     "_upsert_entity",
     "_link_memory_entity",
+    "_entity_relation_id",
+    "_upsert_entity_relation",
     "_resolve_entity",
     "_entity_profile",
     "_row_to_dict",

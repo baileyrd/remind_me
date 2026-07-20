@@ -270,6 +270,7 @@ The stats view replaces the main content area with summary cards, horizontal bar
 |------|-------------|
 | `remind_me_search` | Hybrid search with RRF rank fusion, token budget, dormant exclusion, structured `subject:`/`predicate:`/`entity:` queries, opt-in `expand_entities` graph expansion, and opt-in `include_neighbors` sibling-chunk expansion |
 | `remind_me_entity` | Look up a knowledge-graph entity by name or alias: canonical record, facts, and linked memories |
+| `remind_me_entity_traverse` | Multi-hop traversal of the typed entity-relation graph (1-3 hops, both directions, optional relation filter) — for questions that require chaining relations, not just co-mention |
 | `remind_me_feedback` | Mark a memory helpful/unhelpful for a search result — a signed signal into `base_weight`/vitality (and therefore future ranking), distinct from the always-positive reinforcement of a plain access |
 
 ### CRUD
@@ -334,7 +335,7 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_check_update` | Check if a newer version is available on origin/main |
 | `remind_me_self_update` | Pull latest changes from origin and reinstall the package |
 
-35 tools + 4 resources (`memory://stats`, `memory://categories`, `wiki://schema`, `wiki://index`).
+36 tools + 4 resources (`memory://stats`, `memory://categories`, `wiki://schema`, `wiki://index`).
 
 ### Auto-Capture: Persisting Full Conversations
 
@@ -449,7 +450,7 @@ Use remind_me_import_directory with:
 `remind_me_export_memories` (MCP) and `GET /api/export` (HTTP) dump the memory store to **JSON** (single array) or **JSONL** (one record per line):
 
 - **Complete logical backup** — every column of the memories table is included (id, content, category, tags, source, metadata, timestamps, vitality, superseded_by, …).
-- **Entity graph included by default** — entities and memory-entity links follow the memories as records tagged with a `record_type` discriminator (`entity` / `memory_entity`; memory records carry none — the same wire shape sync uses). Pass `include_graph=false` for a memories-only export.
+- **Entity graph included by default** — entities, memory-entity links, and entity-to-entity relations follow the memories as records tagged with a `record_type` discriminator (`entity` / `memory_entity` / `entity_relation`; memory records carry none — the same wire shape sync uses). Pass `include_graph=false` for a memories-only export.
 - **Embeddings are excluded** — they are derived data; run `remind_me_reindex` after importing on the target machine.
 - **Filters** — optional `category` and `tags` narrow the export (and scope the graph records to the exported memories).
 - **Destination** — small exports (≤200 memories) are returned inline by the MCP tool; pass `file_path` to write to disk. File destinations must be inside `REMIND_ME_EXPORT_ROOTS` (default: your home directory). The HTTP route streams the payload as the response body when no `file_path` is given (`curl .../api/export > backup.json`).
@@ -459,7 +460,7 @@ Use remind_me_import_directory with:
 Each memory record also carries a `role` key, so the export file is directly consumable by `remind_me_import_chat` / `remind_me_import_directory` (the generic `{role, content}` format). But re-import is **lossy for everything except content**:
 
 - The importer **re-chunks** long content and assigns **fresh ids**, category, tags, and source — the original values stay in the export file for manual restoration.
-- Graph records restore on import: entities **upsert** (deterministic ids, alias union-merge), links insert when the referenced memory still exists under its **original id**. Since a chat re-import assigns new memory ids, links only fully restore into a database that still holds the referenced memories — **dangling links are skipped and counted** in the import result.
+- Graph records restore on import: entities **upsert** (deterministic ids, alias union-merge), links insert when the referenced memory still exists under its **original id**. Since a chat re-import assigns new memory ids, links only fully restore into a database that still holds the referenced memories — **dangling links are skipped and counted** in the import result. Relations restore the same way, keyed on their entity endpoints rather than a memory id — a relation only restores when both its subject and object entities exist, and **dangling relations are skipped and counted** too.
 
 ## Watched Folders (Auto-Ingest)
 
@@ -494,9 +495,16 @@ Memories can carry a structured **subject/predicate/object triple** plus links t
 - **`expand_entities=true`** on `remind_me_search` appends up to 5 related memories that share an entity with the results (1-hop graph expansion, in a separate `related_via_entities` section that doesn't affect ranking).
 - **`remind_me_entity`** (or `GET /api/entity?name=`) returns the canonical record, its facts (memories whose SPO subject/object is the entity), and the memories that mention it.
 
+### Typed entity-to-entity relations
+
+`remind_me_entity`/`expand_entities` describe a memory↔entity bipartite graph (entity X is *mentioned in* memory Y). Layered on top of that is a genuine entity↔entity graph: whenever a fact's SPO subject *and* object both resolve to known entities (from that same call's `entities` list, or an earlier annotation), `remind_me_decompose`/`remind_me_annotate` also write a typed **`subject --relation--> object`** edge to `entity_relations` — e.g. `Bailey --works_with--> Alex`. SPO values that don't name a known entity keep working exactly as before: a memory-level triple with no graph edge.
+
+- **`remind_me_entity_traverse`** walks this edge graph breadth-first from a starting entity, up to `hops` (1-3) steps in both directions, with an optional exact-match `relation` filter and a result cap. This answers questions that require chaining relations rather than co-mention — e.g. "who introduced me to the person who recommended this tool" (`Alice --introduced--> Bob`, `Bob --recommended--> tool`).
+- Relation edges have a **deterministic id** (hash of the subject/relation/object triple, same convergence property as entity ids) and are **immutable** — insert-or-ignore, like memory↔entity links, so re-recording the same triple is a no-op.
+
 ### Sync & export
 
-The graph syncs between machines alongside memories: entity and link records travel with `record_type` discriminators through the outbox/hub and the peer endpoints (`/sync/pull_entities`, `/sync/pull_links`). Deterministic ids make concurrent creation converge; aliases union-merge on receipt; links are immutable insert-or-ignore rows, and a link that arrives before its endpoints simply stays invisible until they do. Exports include the graph by default (see [Exporting & Backup](#exporting--backup)).
+The graph syncs between machines alongside memories: entity, link, and relation records travel with `record_type` discriminators through the outbox/hub and the peer endpoints (`/sync/pull_entities`, `/sync/pull_links`, `/sync/pull_entity_relations`). Deterministic ids make concurrent creation converge; aliases union-merge on receipt; links and relations are immutable insert-or-ignore rows, and a record that arrives before its endpoints simply stays invisible until they do. Exports include the graph by default (see [Exporting & Backup](#exporting--backup)).
 
 ## LLM Wiki
 

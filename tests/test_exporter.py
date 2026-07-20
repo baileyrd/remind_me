@@ -23,8 +23,10 @@ from pydantic import ValidationError
 from remind_me_mcp.db import (
     _ensure_schema,
     _entity_id,
+    _entity_relation_id,
     _link_memory_entity,
     _upsert_entity,
+    _upsert_entity_relation,
 )
 from remind_me_mcp.exporter import (
     collect_export_records,
@@ -484,6 +486,131 @@ def test_import_without_graph_records_reports_no_graph_keys(
     assert result["memories_created"] == 1
     assert "entities_restored" not in result
     assert "links_restored" not in result
+
+
+# ---------------------------------------------------------------------------
+# entity_relations export/import (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+def _seed_graph_with_relation(db: sqlite3.Connection, memory_factory) -> tuple[dict, str, str]:
+    """One memory, two entities it mentions, and a relation between them.
+
+    Returns (memory, subject_entity_id, object_entity_id).
+    """
+    mem = memory_factory(content="Bailey works with Alex on remind_me")
+    eid_bailey = _upsert_entity(db, "Bailey Robertson", kind="person")
+    eid_alex = _upsert_entity(db, "Alex", kind="person")
+    _link_memory_entity(db, mem["id"], eid_bailey)
+    _link_memory_entity(db, mem["id"], eid_alex)
+    _upsert_entity_relation(db, eid_bailey, "works_with", eid_alex)
+    db.commit()
+    return mem, eid_bailey, eid_alex
+
+
+def test_relation_records_follow_links_in_export(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    _mem, eid_bailey, eid_alex = _seed_graph_with_relation(db_conn, memory_factory)
+    records = collect_export_records()
+
+    relations = [r for r in records if r.get("record_type") == "entity_relation"]
+    assert len(relations) == 1
+    rel = relations[0]
+    assert rel["subject_entity_id"] == eid_bailey
+    assert rel["relation"] == "works_with"
+    assert rel["object_entity_id"] == eid_alex
+    assert rel["id"] == _entity_relation_id(eid_bailey, "works_with", eid_alex)
+
+
+def test_collect_graph_records_orders_relations_last(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """Entities, then links, then relations -- so a sequential restore sees
+    both a relation's entity endpoints already applied."""
+    _seed_graph_with_relation(db_conn, memory_factory)
+    kinds = [r["record_type"] for r in collect_graph_records()]
+    assert kinds == ["entity", "entity", "memory_entity", "memory_entity", "entity_relation"]
+
+
+def test_filtered_export_scopes_relations_to_scoped_entities(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """A relation is only included when BOTH its entities survive the filter."""
+    _seed_graph_with_relation(db_conn, memory_factory)
+    memory_factory(content="Unrelated dropped memory", category="drop")
+
+    records = collect_export_records(category="general")  # memory_factory default category
+    relations = [r for r in records if r.get("record_type") == "entity_relation"]
+    assert len(relations) == 1  # both endpoints are linked to the scoped memory
+
+
+def test_export_counts_include_relations(db_conn: sqlite3.Connection, memory_factory) -> None:
+    _seed_graph_with_relation(db_conn, memory_factory)
+    result = export_memories(format="json")
+    assert result["relations"] == 1
+
+
+def test_restore_relation_into_db(
+    db_conn: sqlite3.Connection, fresh_db: sqlite3.Connection, memory_factory, tmp_path: Path
+) -> None:
+    """export -> import into a fresh DB restores the relation, because its
+    entities (unlike memory-linked ids) are content-addressed and restored
+    in the same batch -- relations don't depend on memory-id continuity."""
+    _mem, eid_bailey, eid_alex = _seed_graph_with_relation(db_conn, memory_factory)
+    dest = tmp_path / "relation_restore.json"
+    assert export_memories(format="json", file_path=str(dest))["status"] == "ok"
+
+    result = import_chat_file(
+        file_path=str(dest),
+        category="restored",
+        tags=[],
+        extract_mode="assistant_messages",
+        max_length=10000,
+    )
+    assert result["status"] == "ok"
+    assert result["relations_restored"] == 1
+    assert result["relations_skipped_dangling"] == 0
+
+    row = fresh_db.execute(
+        "SELECT subject_entity_id, relation, object_entity_id FROM entity_relations"
+    ).fetchone()
+    assert (row["subject_entity_id"], row["relation"], row["object_entity_id"]) == (
+        eid_bailey, "works_with", eid_alex,
+    )
+
+
+def test_restore_skips_dangling_relation(
+    db_conn: sqlite3.Connection, fresh_db: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """A relation record whose entities are NOT part of the same export batch
+    (so they never get restored) is skipped and counted, not silently dropped."""
+    import json as _json
+
+    dest = tmp_path / "dangling_relation.json"
+    dest.write_text(_json.dumps([
+        {
+            "record_type": "entity_relation",
+            "id": "deadbeefcafe",
+            "subject_entity_id": "missing-subject",
+            "relation": "works_with",
+            "object_entity_id": "missing-object",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+        },
+    ]))
+
+    result = import_chat_file(
+        file_path=str(dest),
+        category="restored",
+        tags=[],
+        extract_mode="assistant_messages",
+        max_length=10000,
+    )
+    assert result["status"] == "ok"
+    assert result["relations_restored"] == 0
+    assert result["relations_skipped_dangling"] == 1
+    assert fresh_db.execute("SELECT COUNT(*) FROM entity_relations").fetchone()[0] == 0
 
 
 async def test_tool_export_include_graph_flag(db_conn: sqlite3.Connection, memory_factory) -> None:

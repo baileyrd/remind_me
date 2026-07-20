@@ -23,6 +23,12 @@ through the entity helpers instead (see importer._restore_graph_records).
 Restore caveat: links reference original memory ids, and a chat re-import
 assigns NEW memory ids, so links only fully restore into a database that still
 holds the referenced memories — dangling links are skipped and counted.
+
+Phase 3: typed entity-to-entity relations (``entity_relations``) are
+included the same way, tagged ``record_type='entity_relation'``. A filtered
+export scopes relations to those whose subject AND object are both among the
+already-scoped entities (the same "only what's reachable from the exported
+memories" rule links follow).
 """
 
 from __future__ import annotations
@@ -50,23 +56,28 @@ EXPORT_INLINE_MAX = 200
 def collect_graph_records(
     memory_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Collect entity-graph rows as export records (FT-06).
+    """Collect entity-graph rows as export records (FT-06, Phase 3).
 
     Entity records mirror the FT-04 sync wire format: every column of the
     ``entities`` table plus ``record_type='entity'`` (aliases deserialized to
     a list). Link records carry ``record_type='memory_entity'`` with
-    memory_id/entity_id/created_at. Entities are emitted before links so a
-    sequential restore can verify link endpoints exist.
+    memory_id/entity_id/created_at. Relation records carry
+    ``record_type='entity_relation'`` with every ``entity_relations`` column.
+    Entities are emitted first so a sequential restore can verify link and
+    relation endpoints exist.
 
     Args:
         memory_ids: When given (a filtered export), only links whose memory_id
-            is in this set are included, and only entities referenced by those
-            links. When None (a full backup), every entity — including ones
-            with no links — and every link is exported.
+            is in this set are included, only entities referenced by those
+            links, and only relations whose subject AND object are both among
+            those entities. When None (a full backup), every entity —
+            including ones with no links — and every link/relation is
+            exported.
 
     Returns:
         List of record dicts: entities ordered by (created_at, id), then
-        links ordered by (created_at, memory_id, entity_id).
+        links ordered by (created_at, memory_id, entity_id), then relations
+        ordered by (created_at, id).
     """
     db = _get_db()
     entities = [
@@ -82,13 +93,25 @@ def collect_graph_records(
                ORDER BY created_at, memory_id, entity_id"""
         ).fetchall()
     ]
+    relations = [
+        _row_to_dict(r)
+        for r in db.execute(
+            "SELECT * FROM entity_relations ORDER BY created_at, id"
+        ).fetchall()
+    ]
     if memory_ids is not None:
         links = [li for li in links if li["memory_id"] in memory_ids]
         linked_eids = {li["entity_id"] for li in links}
         entities = [e for e in entities if e["id"] in linked_eids]
+        relations = [
+            r for r in relations
+            if r["subject_entity_id"] in linked_eids
+            and r["object_entity_id"] in linked_eids
+        ]
     return [
         *({"record_type": "entity", **e} for e in entities),
         *({"record_type": "memory_entity", **li} for li in links),
+        *({"record_type": "entity_relation", **r} for r in relations),
     ]
 
 
@@ -203,16 +226,16 @@ def export_memories(
             larger than this many records — memories plus graph records, the
             cap is about payload size (the caller should retry with a
             file_path instead).
-        include_graph: Append entities/memory_entities records (FT-06,
-            default True).
+        include_graph: Append entities/memory_entities/entity_relations
+            records (FT-06/Phase 3, default True).
 
     Returns:
         A status dict. File write: {'status': 'ok', 'exported': int,
         'format': str, 'file': str, 'bytes': int}. Inline: {'status': 'ok',
         'exported': int, 'format': str, 'content': str}. Over the inline
         limit: {'status': 'error', 'error': str}. 'exported' counts memory
-        records only; with include_graph, 'entities' and 'links' report the
-        graph record counts.
+        records only; with include_graph, 'entities', 'links', and
+        'relations' report the graph record counts.
 
     Raises:
         ValueError: If *format* is unsupported.
@@ -224,11 +247,13 @@ def export_memories(
     payload = render_export(records, format)
     n_entities = sum(1 for r in records if r.get("record_type") == "entity")
     n_links = sum(1 for r in records if r.get("record_type") == "memory_entity")
-    n_memories = len(records) - n_entities - n_links
+    n_relations = sum(1 for r in records if r.get("record_type") == "entity_relation")
+    n_memories = len(records) - n_entities - n_links - n_relations
     counts: dict[str, Any] = {"exported": n_memories}
     if include_graph:
         counts["entities"] = n_entities
         counts["links"] = n_links
+        counts["relations"] = n_relations
 
     if file_path is not None:
         path = Path(file_path)
@@ -238,8 +263,8 @@ def export_memories(
         # is meant to be byte-identical across platforms for diffing/hashing.
         path.write_bytes(payload.encode("utf-8"))
         log.info(
-            "Exported %d memories (+%d entities, %d links) to %s (%s)",
-            n_memories, n_entities, n_links, path, format,
+            "Exported %d memories (+%d entities, %d links, %d relations) to %s (%s)",
+            n_memories, n_entities, n_links, n_relations, path, format,
         )
         return {
             "status": "ok",

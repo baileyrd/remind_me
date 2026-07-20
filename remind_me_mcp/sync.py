@@ -27,6 +27,12 @@ merge, so peers converge). memory_entities links are immutable
 insert-or-ignore rows. Dedicated pull endpoints (/sync/pull_entities,
 /sync/pull_links) keep separate keyset cursors; a 404 from a pre-FT-04
 peer is tolerated.
+
+Phase 3: entity_relations (typed entity-to-entity edges) sync the same way
+as memory_entities links -- immutable insert-or-ignore, record_type
+'entity_relation', its own /sync/pull_entity_relations endpoint and keyset
+cursor. Unlike links, each row already carries its own deterministic id
+(see db._entity_relation_id), so no synthetic wire id is needed.
 """
 from __future__ import annotations
 
@@ -377,6 +383,16 @@ async def _pull_links(client: httpx.AsyncClient, url: str, remote_id: str) -> in
     )
 
 
+async def _pull_entity_relations(client: httpx.AsyncClient, url: str, remote_id: str) -> int:
+    """Pull entity_relations records from a remote (Phase 3); no-op against
+    peers/hubs that predate this feature."""
+    return await _pull_graph_table(
+        client, url, remote_id,
+        path="/sync/pull_entity_relations", cursor_suffix="entity_relations",
+        ts_field="created_at",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Upsert (full-column, per-record isolation — SY-03)
 # ---------------------------------------------------------------------------
@@ -631,6 +647,49 @@ def _upsert_link_one(db: sqlite3.Connection, rec: dict[str, Any]) -> bool:
     return applied
 
 
+def _upsert_entity_relation_one(db: sqlite3.Connection, rec: dict[str, Any]) -> bool:
+    """Validate and apply a single remote entity_relations record (Phase 3).
+
+    Relations are immutable -- insert-or-ignore semantics, no conflict
+    resolution needed, same as :func:`_upsert_link_one`. Unlike links, the
+    record already carries its own real ``id`` (deterministic, from the
+    subject/relation/object triple), so no synthetic wire id is built here.
+
+    Returns:
+        True when a new relation row was inserted, False when it already
+        existed. Raises on malformed input (caller isolates the failure).
+    """
+    missing = [
+        k for k in ("id", "subject_entity_id", "relation", "object_entity_id", "created_at")
+        if not rec.get(k)
+    ]
+    if missing:
+        raise ValueError(f"entity_relation record missing required keys: {missing}")
+    created_at = _canon_ts(rec["created_at"])
+
+    outbox_max = db.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM sync_outbox"
+    ).fetchone()[0]
+    cur = db.execute(
+        """INSERT OR IGNORE INTO entity_relations
+           (id, subject_entity_id, relation, object_entity_id, created_at, updated_at, node_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            str(rec["id"]), str(rec["subject_entity_id"]), str(rec["relation"]),
+            str(rec["object_entity_id"]), created_at,
+            _canon_ts(rec.get("updated_at") or rec["created_at"]),
+            rec.get("node_id"),
+        ),
+    )
+    applied = cur.rowcount > 0
+    if applied:
+        db.execute("""
+            UPDATE sync_outbox SET sent_at = ?
+            WHERE memory_id = ? AND id > ? AND sent_at = ''
+        """, (_now_iso(), str(rec["id"]), outbox_max))
+    return applied
+
+
 def _record_wire_id(rec: dict[str, Any]) -> str:
     """The id the sender matches in processed_ids (links use memory_id|entity_id)."""
     rid = rec.get("id")
@@ -643,7 +702,7 @@ def _upsert_records(db: sqlite3.Connection, records: list[dict[str, Any]]) -> Up
     """Upsert remote records with last-write-wins conflict resolution.
 
     Records are dispatched on their ``record_type`` ('entity' /
-    'memory_entity' / absent = memory, FT-04). Each record is applied
+    'memory_entity' / 'entity_relation' / absent = memory, FT-04/Phase 3). Each record is applied
     independently: a malformed or unknown-kind record is rolled back, logged,
     and counted as failed without poisoning the rest of the batch (defensive
     against newer peers sending kinds this node does not know). Applied
@@ -674,6 +733,8 @@ def _upsert_records(db: sqlite3.Connection, records: list[dict[str, Any]]) -> Up
                 applied = _upsert_entity_one(db, rec)
             elif record_type == "memory_entity":
                 applied = _upsert_link_one(db, rec)
+            elif record_type == "entity_relation":
+                applied = _upsert_entity_relation_one(db, rec)
             else:
                 raise ValueError(f"unknown record_type: {record_type!r}")
             # Commit per record: a later malformed record's rollback must not
@@ -825,6 +886,8 @@ async def _sync_once() -> None:
                 # Entity graph (FT-04) — no-ops against pre-FT-04 remotes.
                 await _pull_entities(client, HUB_URL, "hub")
                 await _pull_links(client, HUB_URL, "hub")
+                # Entity relations (Phase 3) — no-op against older remotes.
+                await _pull_entity_relations(client, HUB_URL, "hub")
                 log.info("Hub sync complete")
             except httpx.ConnectError:
                 log.debug("Hub unreachable, skipping")
@@ -846,6 +909,8 @@ async def _sync_once() -> None:
                 # Entity graph (FT-04) — no-ops against pre-FT-04 peers.
                 await _pull_entities(client, peer["url"], peer["node_id"])
                 await _pull_links(client, peer["url"], peer["node_id"])
+                # Entity relations (Phase 3) — no-op against older peers.
+                await _pull_entity_relations(client, peer["url"], peer["node_id"])
                 log.info("Peer sync complete: %s", peer["node_id"])
             except httpx.ConnectError:
                 log.debug("Peer %s unreachable", peer["node_id"])
