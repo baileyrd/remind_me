@@ -876,6 +876,40 @@ async def test_server_status_no_ui(
 
 
 # ---------------------------------------------------------------------------
+# remind_me_list_connectors tests (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+async def test_list_connectors_reports_builtins() -> None:
+    from remind_me_mcp.tools import remind_me_list_connectors
+
+    data = json.loads(await remind_me_list_connectors())
+    assert {"chat", "document"} <= set(data["connectors"])
+    assert set(data["file_import_kinds"]) == {"chat", "document"}
+
+
+async def test_list_connectors_includes_mempalace_but_not_as_file_import_kind() -> None:
+    """mempalace is registered for discovery (importing mempalace_import.py
+    already happened via tools/admin.py) but isn't a valid file-import kind."""
+    from remind_me_mcp.tools import remind_me_list_connectors
+
+    data = json.loads(await remind_me_list_connectors())
+    assert "mempalace" in data["connectors"]
+    assert "mempalace" not in data["file_import_kinds"]
+
+
+async def test_list_connectors_reflects_third_party_registrations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import remind_me_mcp.importer as _importer_mod
+    from remind_me_mcp.tools import remind_me_list_connectors
+
+    monkeypatch.setitem(_importer_mod._CONNECTORS, "slack", lambda raw, meta: ([], 0))
+    data = json.loads(await remind_me_list_connectors())
+    assert "slack" in data["connectors"]
+
+
+# ---------------------------------------------------------------------------
 # Resource handler tests
 # ---------------------------------------------------------------------------
 

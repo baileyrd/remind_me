@@ -13,6 +13,15 @@ prior remind_me export) have their original id/category/tags/source/created_at
 restored; everything else is stored as one opaque memory per drawer, tagged
 with its wing/room — MemPalace's AAAK dialect is designed to be read as-is,
 so no special decoding is needed.
+
+Phase 4: :func:`_parse_frontmatter` is also registered as a
+:class:`~remind_me_mcp.importer.Connector` under the ``"mempalace"`` kind,
+purely for discovery (``remind_me_list_connectors``) — it documents what
+"parsing a drawer" means in the same vocabulary as the chat/document
+connectors. The real ingestion path (:func:`pull_mempalace`) keeps its own
+bespoke per-drawer dedup/paging loop unchanged: drawers arrive individually
+from a paginated ChromaDB read, not as one raw file, so they never actually
+flow through ``import_chat_file``'s registry dispatch.
 """
 
 from __future__ import annotations
@@ -25,6 +34,7 @@ from typing import Any
 
 from remind_me_mcp.config import EMBED_BATCH_SIZE, MEMPALACE_PATH
 from remind_me_mcp.db import _embed_and_store_rows, _get_db, _make_id, _now_iso
+from remind_me_mcp.importer import register_connector
 
 log = logging.getLogger("remind_me_mcp.mempalace_import")
 
@@ -64,6 +74,25 @@ def _parse_frontmatter(content: str) -> tuple[dict[str, str], str] | None:
         key, _, value = line.partition(":")
         fields[key.strip()] = value.strip()
     return fields, m.group("body")
+
+
+def _mempalace_connector(
+    raw: str, meta: dict[str, Any]
+) -> tuple[list[tuple[str, dict[str, Any]]], int]:
+    """Connector-protocol facade over :func:`_parse_frontmatter` (Phase 4).
+
+    Registered for discovery only -- see the module docstring. A drawer with
+    frontmatter yields its body as one chunk, tagged with the parsed fields;
+    an opaque drawer (no frontmatter) yields its raw content as-is.
+    """
+    parsed = _parse_frontmatter(raw)
+    if parsed is None:
+        return [(raw, {})], 1
+    fields, body = parsed
+    return [(body, dict(fields))], 1
+
+
+register_connector("mempalace", _mempalace_connector)
 
 
 def _open_collection() -> Any:

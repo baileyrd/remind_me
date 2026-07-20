@@ -11,13 +11,16 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
+import remind_me_mcp.importer as _importer_mod
 from remind_me_mcp.importer import (
     _chunk_text,
+    _extract_graph_records,
     _extract_messages_from_json,
     _file_hash,
     _filter_messages,
     _parse_markdown_chat,
     import_chat_file,
+    register_connector,
 )
 
 if TYPE_CHECKING:
@@ -821,3 +824,125 @@ def test_import_different_files_get_different_doc_ids(
     assert row_a["doc_id"] == result_a["import_id"]
     assert row_b["doc_id"] == result_b["import_id"]
     assert row_a["doc_id"] != row_b["doc_id"]
+
+
+# ---------------------------------------------------------------------------
+# Pluggable connectors (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+def test_builtin_connectors_registered() -> None:
+    assert "chat" in _importer_mod._CONNECTORS
+    assert "document" in _importer_mod._CONNECTORS
+
+
+def test_import_kinds_narrower_than_connector_registry() -> None:
+    """IMPORT_KINDS (what import_chat_file accepts) is deliberately not
+    derived from the full _CONNECTORS registry -- a connector can be
+    registered purely for discovery without becoming a valid file-import
+    kind (see mempalace_import.py)."""
+    assert set(_importer_mod.IMPORT_KINDS) == {"auto", "chat", "document"}
+    assert set(_importer_mod.IMPORT_KINDS) <= (set(_importer_mod._CONNECTORS) | {"auto"})
+
+
+def test_register_connector_adds_new_kind() -> None:
+    """A third-party module can register a new connector via the public
+    register_connector() API, without touching importer.py's source."""
+    def fake_connector(raw, meta):
+        return [(raw.upper(), {"source": "fake"})], 1
+
+    assert "fake_source" not in _importer_mod._CONNECTORS
+    try:
+        register_connector("fake_source", fake_connector)
+        assert _importer_mod._CONNECTORS["fake_source"] is fake_connector
+        chunks, raw_entries = _importer_mod._CONNECTORS["fake_source"]("hello", {})
+        assert chunks == [("HELLO", {"source": "fake"})]
+        assert raw_entries == 1
+    finally:
+        del _importer_mod._CONNECTORS["fake_source"]
+
+
+def test_register_connector_last_registration_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Re-registering an existing kind replaces the previous connector."""
+    def connector_a(raw, meta):
+        return [("a", {})], 1
+
+    def connector_b(raw, meta):
+        return [("b", {})], 1
+
+    monkeypatch.setitem(_importer_mod._CONNECTORS, "overridable", connector_a)
+    assert _importer_mod._CONNECTORS["overridable"] is connector_a
+    register_connector("overridable", connector_b)
+    assert _importer_mod._CONNECTORS["overridable"] is connector_b
+
+
+def test_registry_override_drives_real_import_dispatch(
+    db_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Proves the registry -- not a hardcoded branch -- drives
+    import_chat_file's dispatch: swapping the 'chat' connector changes what
+    gets stored, with zero changes to importer.py itself."""
+    def fake_chat_connector(raw, meta):
+        return [("REPLACED CONTENT", {"custom": "yes"})], 1
+
+    monkeypatch.setitem(_importer_mod._CONNECTORS, "chat", fake_chat_connector)
+
+    data = {"chat_messages": [{"sender": "assistant", "content": "original content"}]}
+    chat_file = tmp_path / "override_test.json"
+    chat_file.write_text(json.dumps(data))
+
+    result = import_chat_file(str(chat_file), "test", [], "assistant_messages", 10000)
+    assert result["status"] == "ok"
+    assert result["memories_created"] == 1
+
+    row = db_conn.execute("SELECT content, metadata FROM memories").fetchone()
+    assert row["content"] == "REPLACED CONTENT"
+    assert json.loads(row["metadata"])["custom"] == "yes"
+
+
+def test_chat_connector_raw_entries_counts_messages_not_chunks() -> None:
+    """raw_entries reflects extracted messages, not the post-chunk count --
+    preserves the pre-registry meaning of this stat exactly."""
+    raw = json.dumps({"chat_messages": [{"sender": "assistant", "content": "x" * 50}]})
+    chunks, raw_entries = _importer_mod._CONNECTORS["chat"](
+        raw, {"suffix": ".json", "extract_mode": "assistant_messages", "max_length": 30}
+    )
+    assert raw_entries == 1  # one extracted message
+    assert len(chunks) == 2  # split into 2 chunks by max_length=30
+
+
+def test_document_connector_raw_entries_equals_chunk_count() -> None:
+    """For the document connector, chunking IS the extraction unit, so
+    raw_entries equals the chunk count (unlike the chat connector)."""
+    raw = "# Heading\n\nSome content here.\n\n# Another\n\nMore content."
+    chunks, raw_entries = _importer_mod._CONNECTORS["document"](
+        raw, {"suffix": ".md", "max_length": 10000}
+    )
+    assert raw_entries == len(chunks) == 2
+
+
+def test_extract_graph_records_json() -> None:
+    raw = json.dumps([
+        {"record_type": "entity", "id": "e1", "name": "Foo"},
+        {"role": "assistant", "content": "hi"},
+    ])
+    records = _extract_graph_records(raw, ".json")
+    assert records == [{"record_type": "entity", "id": "e1", "name": "Foo"}]
+
+
+def test_extract_graph_records_jsonl() -> None:
+    raw = "\n".join([
+        json.dumps({"record_type": "memory_entity", "memory_id": "m1", "entity_id": "e1"}),
+        json.dumps({"role": "user", "content": "hi"}),
+        "not json",
+    ])
+    records = _extract_graph_records(raw, ".jsonl")
+    assert records == [{"record_type": "memory_entity", "memory_id": "m1", "entity_id": "e1"}]
+
+
+def test_extract_graph_records_non_json_suffix_returns_empty() -> None:
+    assert _extract_graph_records("whatever", ".md") == []
+
+
+def test_extract_graph_records_json_non_list_returns_empty() -> None:
+    assert _extract_graph_records(json.dumps({"role": "user", "content": "hi"}), ".json") == []

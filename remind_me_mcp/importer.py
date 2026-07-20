@@ -17,6 +17,15 @@ sniffs .md/.markdown/.txt content: files with chat role markers
 (``**User:**`` / ``## Assistant`` …) import as chat, everything else as a
 document.
 
+Phase 4: the two built-in kinds are plain functions registered against a
+``kind`` string via :func:`register_connector` (see :class:`Connector`),
+not a hardcoded if/elif — ``import_chat_file`` resolves the effective kind
+exactly as before, then dispatches through the registry. A third-party
+module can register more connectors (e.g. ``mempalace_import.py`` registers
+one under ``"mempalace"``, purely for discovery) without touching this
+module. Hash dedup, chunk storage, and embedding stay source-agnostic and
+unchanged either way.
+
 FT-06: exports may carry entity-graph records tagged with a ``record_type``
 discriminator ('entity' / 'memory_entity'; absent = memory, mirroring the
 FT-04 sync wire format). Message extraction skips them, and JSON/JSONL chat
@@ -36,7 +45,7 @@ import logging
 import re
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     import sqlite3
@@ -57,7 +66,15 @@ log = logging.getLogger("remind_me_mcp.importer")
 IMPORT_CONCURRENCY = 8
 
 IMPORT_KINDS = ("auto", "chat", "document")
-"""Valid values for the ``kind`` import parameter (FT-02)."""
+"""Valid values for the ``kind`` parameter of :func:`import_chat_file` (FT-02).
+
+Deliberately NOT derived from :data:`_CONNECTORS` (Phase 4): that registry can
+hold connectors -- like ``mempalace`` -- that exist purely for discovery
+(:func:`register_connector`) and are never reachable through this file-based
+import pipeline (no suffix mapping, no compatible chunking contract). This
+tuple is the narrower, load-order-independent set ``import_chat_file`` itself
+validates against.
+"""
 
 DOCUMENT_SOURCE = "document_import"
 """``memories.source`` value for document imports (chat imports use 'chat_import')."""
@@ -65,6 +82,69 @@ DOCUMENT_SOURCE = "document_import"
 DOCUMENT_CATEGORY = "document"
 """Default ``memories.category`` for document imports when the caller passed
 the generic chat default ('chat_import') or an empty category."""
+
+
+# ---------------------------------------------------------------------------
+# Pluggable connectors (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+class Connector(Protocol):
+    """A pluggable source parser: raw file text in, chunked content out.
+
+    Connectors are plain callables (functions or callable objects) matching
+    this signature -- no base class to subclass. The built-in ``chat`` and
+    ``document`` connectors are registered at the bottom of their respective
+    sections below; a third-party module can call :func:`register_connector`
+    to add more without touching :func:`import_chat_file`'s dispatch logic.
+    """
+
+    def __call__(
+        self, raw: str, meta: dict[str, Any]
+    ) -> tuple[list[tuple[str, dict[str, Any]]], int]:
+        """Parse raw file content into (chunk_content, chunk_metadata) pairs.
+
+        Args:
+            raw: The full raw text of the file being imported.
+            meta: Per-import context the connector may need. The built-in
+                connectors read ``suffix``, ``extract_mode``, and
+                ``max_length``.
+
+        Returns:
+            ``(chunks, raw_entry_count)``. Each chunk's metadata dict is
+            merged into the stored memory's metadata (e.g.
+            ``{"section": "..."}`` for document sections -- an empty dict
+            contributes nothing). ``raw_entry_count`` is the number of
+            logical source units found *before* chunking (e.g. extracted
+            chat messages); for connectors where chunking IS the extraction
+            unit (document sections), it equals ``len(chunks)``.
+        """
+        ...
+
+
+_CONNECTORS: dict[str, Connector] = {}
+"""Registry of parsers by import ``kind``. Broader than :data:`IMPORT_KINDS`:
+holds every registered connector, including ones (like ``mempalace``) that
+aren't valid ``import_chat_file`` kinds -- see :func:`register_connector`."""
+
+
+def register_connector(kind: str, connector: Connector) -> None:
+    """Register a parser for an import ``kind``.
+
+    Re-registering an existing ``kind`` replaces the previous connector
+    (last registration wins), so a module can deliberately override a
+    built-in connector if it loads after this one.
+
+    Args:
+        kind: The kind string this connector handles. For a connector meant
+            to be reachable through :func:`import_chat_file`, this must also
+            be a value :data:`IMPORT_KINDS` accepts; connectors registered
+            under other kinds (e.g. a specialized importer's own pipeline)
+            are still discoverable via :data:`_CONNECTORS` but are never
+            dispatched to by ``import_chat_file``.
+        connector: A callable matching the :class:`Connector` signature.
+    """
+    _CONNECTORS[kind] = connector
 
 # Serializes the dedup-check + INSERT transaction when import_chat_file runs
 # concurrently in multiple asyncio.to_thread workers. SQLite connections are
@@ -317,6 +397,65 @@ def _parse_markdown_chat(text: str, extract_mode: str) -> list[str]:
     return _filter_messages(messages, extract_mode)
 
 
+def _chat_connector(
+    raw: str, meta: dict[str, Any]
+) -> tuple[list[tuple[str, dict[str, Any]]], int]:
+    """Built-in ``chat`` connector: wraps the JSON/JSONL/Markdown message
+    extraction + :func:`_chunk_text` chunking, unchanged from the
+    pre-registry implementation.
+
+    The raw entry count is the number of extracted messages/content strings
+    *before* per-message chunking (unlike the document connector, where
+    chunking IS the extraction unit) -- this preserves ``raw_entries``'
+    existing meaning for chat imports exactly.
+    """
+    suffix = meta["suffix"]
+    extract_mode = meta["extract_mode"]
+    max_length = meta["max_length"]
+
+    contents: list[str] = []
+    if suffix == ".json":
+        data = json.loads(raw)
+        # Could be a list of conversations or a single conversation.
+        if (
+            isinstance(data, list) and data and isinstance(data[0], dict)
+            and ("chat_messages" in data[0] or "messages" in data[0])
+        ):
+            for conv in data:
+                msgs = _extract_messages_from_json(conv, extract_mode)
+                contents.extend(_filter_messages(msgs, extract_mode))
+        else:
+            msgs = _extract_messages_from_json(data, extract_mode)
+            contents.extend(_filter_messages(msgs, extract_mode))
+    elif suffix == ".jsonl":
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                log.debug("Skipping malformed JSONL line")
+                continue
+            if isinstance(obj, dict) and "record_type" in obj:
+                continue
+            msgs = _extract_messages_from_json(obj, extract_mode)
+            contents.extend(_filter_messages(msgs, extract_mode))
+    elif suffix in (".md", ".markdown", ".txt"):
+        contents = _parse_markdown_chat(raw, extract_mode)
+
+    parsed: list[tuple[str, dict[str, Any]]] = []
+    for content in contents:
+        if not content.strip():
+            continue
+        for chunk in _chunk_text(content, max_length):
+            parsed.append((chunk, {}))
+    return parsed, len(contents)
+
+
+register_connector("chat", _chat_connector)
+
+
 # ---------------------------------------------------------------------------
 # Document parsing (FT-02)
 # ---------------------------------------------------------------------------
@@ -404,9 +543,72 @@ def _parse_document(text: str, suffix: str, max_length: int) -> list[tuple[str, 
     return pairs
 
 
+def _document_connector(
+    raw: str, meta: dict[str, Any]
+) -> tuple[list[tuple[str, dict[str, Any]]], int]:
+    """Built-in ``document`` connector: wraps :func:`_parse_document` unchanged.
+
+    Document sections are already fully chunked by ``_parse_document``, so
+    the raw entry count equals the chunk count (chunking IS the extraction
+    unit here, unlike the chat connector).
+    """
+    pairs = _parse_document(raw, meta["suffix"], meta["max_length"])
+    parsed = [
+        (content, {"section": section} if section is not None else {})
+        for content, section in pairs
+    ]
+    return parsed, len(parsed)
+
+
+register_connector("document", _document_connector)
+
+
 # ---------------------------------------------------------------------------
 # Entity-graph restore (FT-06)
 # ---------------------------------------------------------------------------
+
+
+def _extract_graph_records(raw: str, suffix: str) -> list[dict[str, Any]]:
+    """Pull FT-06 entity-graph records (``record_type``-tagged) out of a
+    JSON/JSONL export.
+
+    This is deliberately independent of connector dispatch: document files
+    never carry graph records, and ``_extract_messages_from_json`` already
+    skips ``record_type`` items when building chat message content, so
+    extracting them here (once, regardless of which connector runs) changes
+    nothing observable and keeps the :class:`Connector` interface free of
+    graph-record awareness.
+
+    Args:
+        raw: The full raw file text.
+        suffix: Lowercased file extension.
+
+    Returns:
+        List of record dicts carrying a ``record_type`` key; empty for
+        non-JSON/JSONL suffixes or files with no graph records.
+    """
+    if suffix == ".json":
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return [
+                item for item in data
+                if isinstance(item, dict) and "record_type" in item
+            ]
+        return []
+    if suffix == ".jsonl":
+        records: list[dict[str, Any]] = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict) and "record_type" in obj:
+                records.append(obj)
+        return records
+    return []
 
 
 def _restore_graph_records(
@@ -620,70 +822,32 @@ def import_chat_file(
     else:
         effective_kind = kind
 
-    # (content, section_heading) pairs — section is always None for chat.
-    parsed: list[tuple[str, str | None]] = []
-    contents: list[str] = []
-    # Entity-graph records found in JSON/JSONL exports (FT-06) — restored in
-    # phase 3, never parsed as chat messages.
-    graph_records: list[dict[str, Any]] = []
+    # Entity-graph records found in JSON/JSONL exports (FT-06) — restored
+    # below, never parsed as chat messages. Extracted independently of the
+    # connector dispatch (Phase 4): see _extract_graph_records.
+    graph_records = _extract_graph_records(raw, suffix)
+
+    # (chunk_content, chunk_metadata) pairs, via the kind's registered
+    # connector (Phase 4) — chat.effective_kind is always "chat" or
+    # "document" (resolved just above), and both are always registered, so
+    # this lookup cannot miss.
+    connector = _CONNECTORS[effective_kind]
+    parsed, raw_entries = connector(
+        raw, {"suffix": suffix, "extract_mode": extract_mode, "max_length": max_length}
+    )
 
     if effective_kind == "document":
-        parsed = _parse_document(raw, suffix, max_length)
-    elif suffix in (".json",):
-        data = json.loads(raw)
-        if isinstance(data, list):
-            graph_records = [
-                item for item in data
-                if isinstance(item, dict) and "record_type" in item
-            ]
-        # Could be a list of conversations or a single conversation
-        if isinstance(data, list) and data and isinstance(data[0], dict) and ("chat_messages" in data[0] or "messages" in data[0]):
-            # Multiple conversations
-            for conv in data:
-                msgs = _extract_messages_from_json(conv, extract_mode)
-                contents.extend(_filter_messages(msgs, extract_mode))
-        else:
-            msgs = _extract_messages_from_json(data, extract_mode)
-            contents.extend(_filter_messages(msgs, extract_mode))
-    elif suffix in (".jsonl",):
-        for line in raw.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                log.debug("Skipping malformed JSONL line")
-                continue
-            if isinstance(obj, dict) and "record_type" in obj:
-                graph_records.append(obj)
-                continue
-            msgs = _extract_messages_from_json(obj, extract_mode)
-            contents.extend(_filter_messages(msgs, extract_mode))
-    elif suffix in (".md", ".markdown", ".txt"):
-        contents = _parse_markdown_chat(raw, extract_mode)
-
-    if effective_kind == "document":
-        # Documents are already chunked per-section/paragraph by _parse_document.
-        raw_entries = len(parsed)
         source = DOCUMENT_SOURCE
         if category in ("", "chat_import"):
             category = DOCUMENT_CATEGORY
     else:
-        # Chat: chunk each extracted message/content string.
-        for content in contents:
-            if not content.strip():
-                continue
-            for chunk in _chunk_text(content, max_length):
-                parsed.append((chunk, None))
-        raw_entries = len(contents)
         source = "chat_import"
 
     # Pre-compute chunk/embed entries before acquiring the lock
     now = _now_iso()
     import_id = _make_id(file_path)
-    embed_entries: list[tuple[str, str, str | None]] = [
-        (_make_id(chunk), chunk, section) for chunk, section in parsed
+    embed_entries: list[tuple[str, str, dict[str, Any]]] = [
+        (_make_id(chunk), chunk, chunk_meta) for chunk, chunk_meta in parsed
     ]
 
     # --- Phase 3: dedup re-check + INSERTs in one short locked transaction.
@@ -704,10 +868,10 @@ def import_chat_file(
         # source order, so a search hit's siblings can be looked up directly
         # (neighbor-aware chunk retrieval) instead of re-parsing metadata.
         stored = 0
-        for chunk_index, (mem_id, chunk, section) in enumerate(embed_entries):
-            metadata: dict[str, Any] = {"import_id": import_id, "filename": path.name}
-            if section is not None:
-                metadata["section"] = section
+        for chunk_index, (mem_id, chunk, chunk_meta) in enumerate(embed_entries):
+            metadata: dict[str, Any] = {
+                "import_id": import_id, "filename": path.name, **chunk_meta,
+            }
             db.execute(
                 """INSERT OR IGNORE INTO memories
                    (id, content, category, tags, source, metadata, created_at, updated_at, doc_id, chunk_index)
@@ -749,7 +913,7 @@ def import_chat_file(
     # the SAME mem_ids that were INSERTed (BUGF-01); any failure here is
     # healed later by remind_me_reindex. ---
     if embed_entries:
-        chunk_by_id = {mem_id: chunk for mem_id, chunk, _section in embed_entries}
+        chunk_by_id = {mem_id: chunk for mem_id, chunk, _chunk_meta in embed_entries}
         ids = list(chunk_by_id)
         rows_to_embed: list[tuple[int, str]] = []
         # The quick rowid lookups reuse the lock only because tests may share
@@ -856,6 +1020,9 @@ __all__ = [
     "IMPORT_KINDS",
     "DOCUMENT_SOURCE",
     "DOCUMENT_CATEGORY",
+    "Connector",
+    "register_connector",
+    "_CONNECTORS",
     "import_chat_file",
     "import_directory",
     "_chunk_text",
@@ -867,5 +1034,6 @@ __all__ = [
     "_split_markdown_sections",
     "_parse_document",
     "_file_hash",
+    "_extract_graph_records",
     "_restore_graph_records",
 ]

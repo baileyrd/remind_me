@@ -98,3 +98,41 @@ def test_pull_mempalace_dry_run_writes_nothing(db_conn: sqlite3.Connection, fake
     assert result["imported"] == 0
     count = db_conn.execute("SELECT COUNT(*) AS c FROM memories").fetchone()["c"]
     assert count == 0
+
+
+# ---------------------------------------------------------------------------
+# Connector registration (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+def test_mempalace_registered_as_connector() -> None:
+    """Importing this module registers 'mempalace' in the shared registry,
+    purely for discovery -- pull_mempalace never calls through it."""
+    import remind_me_mcp.importer as _importer_mod
+
+    assert "mempalace" in _importer_mod._CONNECTORS
+    assert _importer_mod._CONNECTORS["mempalace"] is _mempalace_mod._mempalace_connector
+
+
+def test_mempalace_connector_native_frontmatter() -> None:
+    chunks, raw_entries = _mempalace_mod._mempalace_connector(NATIVE_CONTENT, {})
+    assert raw_entries == 1
+    assert len(chunks) == 1
+    content, meta = chunks[0]
+    assert content == "Microsoft Project Online migration deadline is September 2026."
+    assert meta["category"] == "fact"
+    assert meta["id"] == "6bb2c33ed386"
+
+
+def test_mempalace_connector_opaque_content() -> None:
+    chunks, raw_entries = _mempalace_mod._mempalace_connector(OPAQUE_CONTENT, {})
+    assert raw_entries == 1
+    assert chunks == [(OPAQUE_CONTENT, {})]
+
+
+def test_mempalace_not_reachable_via_import_chat_file() -> None:
+    """'mempalace' is registered for discovery only -- it's not a valid
+    import_chat_file kind (IMPORT_KINDS stays narrower than _CONNECTORS)."""
+    from remind_me_mcp.importer import IMPORT_KINDS
+
+    assert "mempalace" not in IMPORT_KINDS

@@ -166,6 +166,39 @@ async def memory_import_mempalace(params: MempalaceImportInput) -> str:
 
 
 @mcp.tool(
+    name="remind_me_list_connectors",
+    annotations={
+        "title": "List Import Connectors",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def remind_me_list_connectors() -> str:
+    """List every registered import connector (Phase 4).
+
+    Connectors are pluggable parsers registered by kind string (see
+    `remind_me_mcp.importer.register_connector`). This reports every
+    registration, not just the ones reachable through
+    `remind_me_import_chat`/`remind_me_import_directory` — a connector like
+    `mempalace` is registered purely for discovery and is only actually
+    invoked through its own dedicated tool (`remind_me_import_mempalace`).
+
+    Returns:
+        str: JSON with `connectors` (every registered kind) and
+        `file_import_kinds` (the subset valid for `remind_me_import_chat`'s
+        `kind` parameter, i.e. `IMPORT_KINDS` minus `"auto"`).
+    """
+    from remind_me_mcp.importer import _CONNECTORS, IMPORT_KINDS
+
+    return json.dumps({
+        "connectors": sorted(_CONNECTORS),
+        "file_import_kinds": [k for k in IMPORT_KINDS if k != "auto"],
+    }, indent=2)
+
+
+@mcp.tool(
     name="remind_me_export_memories",
     annotations={
         "title": "Export Memories",
