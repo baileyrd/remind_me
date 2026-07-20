@@ -18,6 +18,7 @@ from remind_me_mcp.models import (
     AutoCaptureInput,
     BulkImportDirInput,
     ChatImportInput,
+    FeedbackInput,
     MemoryAddInput,
     MemoryDeleteInput,
     MemoryListInput,
@@ -37,6 +38,7 @@ from remind_me_mcp.tools import (
     memory_stats,
     memory_update,
     remind_me_auto_capture,
+    remind_me_feedback,
     remind_me_get_capture,
     remind_me_reindex,
     remind_me_server_status,
@@ -1568,6 +1570,63 @@ async def test_search_record_access_called(
 
 
 # ---------------------------------------------------------------------------
+# remind_me_feedback tests
+# ---------------------------------------------------------------------------
+
+
+async def test_feedback_helpful_returns_updated_vitality(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """remind_me_feedback('helpful') returns the memory id, signal, and new vitality."""
+    mem = memory_factory(content="Feedback tool test")
+
+    result = await remind_me_feedback(
+        FeedbackInput(memory_id=mem["id"], signal="helpful")
+    )
+    data = json.loads(result)
+
+    assert data["memory_id"] == mem["id"]
+    assert data["signal"] == "helpful"
+    assert isinstance(data["vitality"], float)
+
+    row = db_conn.execute(
+        "SELECT base_weight FROM memories WHERE id = ?", (mem["id"],)
+    ).fetchone()
+    assert row["base_weight"] > 1.0
+
+
+async def test_feedback_unhelpful_lowers_base_weight(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """remind_me_feedback('unhelpful') lowers the memory's base_weight."""
+    mem = memory_factory(content="Feedback tool unhelpful test")
+
+    await remind_me_feedback(FeedbackInput(memory_id=mem["id"], signal="unhelpful"))
+
+    row = db_conn.execute(
+        "SELECT base_weight FROM memories WHERE id = ?", (mem["id"],)
+    ).fetchone()
+    assert row["base_weight"] < 1.0
+
+
+async def test_feedback_not_found(db_conn: sqlite3.Connection) -> None:
+    """remind_me_feedback returns an error envelope for an unknown memory_id."""
+    result = await remind_me_feedback(
+        FeedbackInput(memory_id="nonexistent-id-xyz", signal="helpful")
+    )
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_feedback_rejects_invalid_signal() -> None:
+    """FeedbackInput only accepts the 'helpful'/'unhelpful' literal values."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        FeedbackInput(memory_id="abc", signal="great")
+
+
+# ---------------------------------------------------------------------------
 # remind_me_vitality_report tests (Phase 11 Plan 03)
 # ---------------------------------------------------------------------------
 
@@ -2514,7 +2573,12 @@ async def test_search_verbose_json_includes_debug_signals(
     assert "keyword_rank" in signals
     assert "recency_rank" in signals
     assert "vitality_rank" in signals
+    assert "idf_rank" in signals
     assert "days_old" in signals
+    # A keyword match should get a real bm25-derived idf_rank, not the
+    # "no FTS hit" default -- confirms _run_fts plumbs bm25(memories_fts)
+    # through to rank_rrf via _bm25_score.
+    assert signals["idf_rank"] is not None
 
 
 async def test_search_verbose_false_no_debug_signals(

@@ -23,6 +23,13 @@ RRF_W_SEMANTIC: float = float(os.environ.get("REMIND_ME_RRF_W_SEMANTIC", "1.0"))
 RRF_W_RECENCY: float = float(os.environ.get("REMIND_ME_RRF_W_RECENCY", "1.0"))
 RRF_W_VITALITY: float = float(os.environ.get("REMIND_ME_RRF_W_VITALITY", "1.0"))
 
+# IDF signal, derived from FTS5's bm25() score (lower = better match). Unlike
+# the four signals above, this defaults to 0 (off) rather than 1 -- it's a new
+# lever layered on top of already-tuned defaults, and flipping it on by
+# default would silently shift existing benchmark numbers. Opt in with
+# REMIND_ME_RRF_W_IDF=1 (or any positive weight).
+RRF_W_IDF: float = float(os.environ.get("REMIND_ME_RRF_W_IDF", "0.0"))
+
 
 # ---------------------------------------------------------------------------
 # Types
@@ -54,31 +61,39 @@ def rank_rrf(
     w_semantic: float | None = None,
     w_recency: float | None = None,
     w_vitality: float | None = None,
+    w_idf: float | None = None,
 ) -> list[dict]:
-    """Fuse keyword, semantic, recency, and vitality ranked lists via Reciprocal Rank Fusion.
+    """Fuse keyword, semantic, recency, vitality, and IDF ranked lists via Reciprocal Rank Fusion.
 
-    Each memory receives four rank signals:
+    Each memory receives five rank signals:
       - keyword_rank: position in *keyword_results* (1-indexed)
       - semantic_rank: position in *semantic_results* (1-indexed)
       - recency_rank: position when all unique memories are sorted by created_at DESC
       - vitality_rank: position when all unique memories are sorted by vitality DESC
         (higher vitality = better rank). Memories without a ``vitality`` key default to 1.0.
+      - idf_rank: position when all unique memories are sorted by FTS5 ``bm25()``
+        score ascending (lower = better match). Memories with no ``_bm25_score``
+        (semantic-only hits, no FTS match) sort last. Off by default (see
+        ``RRF_W_IDF``) -- keyword_rank already reflects FTS5 relevance order,
+        so this only matters once a caller opts in with a positive weight.
 
-    The RRF score is ``sum(weight / (k + rank))`` across all four signals.
+    The RRF score is ``sum(weight / (k + rank))`` across all five signals.
     Memories absent from a list receive a penalty rank of ``len(list) + 1``.
 
     Args:
         keyword_results: Memories ranked by keyword/FTS relevance (best first).
         semantic_results: Memories ranked by semantic similarity (best first).
         k: RRF smoothing constant. Defaults to module-level ``RRF_K``.
-        w_keyword, w_semantic, w_recency, w_vitality: Per-signal weights. Each
-            defaults to its module-level ``RRF_W_*`` constant. Set a weight to 0
-            to drop that signal (e.g. recency/vitality for a retrieval profile).
+        w_keyword, w_semantic, w_recency, w_vitality, w_idf: Per-signal weights.
+            Each defaults to its module-level ``RRF_W_*`` constant. Set a weight
+            to 0 to drop that signal (e.g. recency/vitality for a retrieval
+            profile). ``w_idf`` defaults to 0 (off).
 
     Returns:
         De-duplicated list of memory dicts sorted by RRF score descending,
         each augmented with ``_rrf_score``, ``_keyword_rank``,
-        ``_semantic_rank``, ``_recency_rank``, and ``_vitality_rank`` keys.
+        ``_semantic_rank``, ``_recency_rank``, ``_vitality_rank``, and
+        ``_idf_rank`` keys.
     """
     if k is None:
         k = RRF_K
@@ -90,6 +105,8 @@ def rank_rrf(
         w_recency = RRF_W_RECENCY
     if w_vitality is None:
         w_vitality = RRF_W_VITALITY
+    if w_idf is None:
+        w_idf = RRF_W_IDF
 
     # Collect unique memories by id, preserving dict contents. A memory hit by
     # both tiers merges the second occurrence's keys (e.g. semantic_distance)
@@ -139,19 +156,32 @@ def rank_rrf(
         mem["id"]: i + 1 for i, mem in enumerate(vitality_sorted)
     }
 
-    # Compute RRF scores (4 signals)
+    # IDF ranking: sort all unique memories by bm25() score ASCENDING (lower =
+    # better match). Memories with no FTS hit (semantic-only) have no
+    # _bm25_score and sort last, via the +inf default.
+    idf_sorted = sorted(
+        seen.values(),
+        key=lambda m: m["_bm25_score"] if m.get("_bm25_score") is not None else float("inf"),
+    )
+    idf_rank: dict[str, int] = {
+        mem["id"]: i + 1 for i, mem in enumerate(idf_sorted)
+    }
+
+    # Compute RRF scores (5 signals)
     results: list[dict] = []
     for mid, mem in seen.items():
         kr = keyword_rank.get(mid, kw_penalty)
         sr = semantic_rank.get(mid, sem_penalty)
         rr = recency_rank[mid]
         vr = vitality_rank[mid]
+        ir = idf_rank[mid]
 
         score = (
             w_keyword / (k + kr)
             + w_semantic / (k + sr)
             + w_recency / (k + rr)
             + w_vitality / (k + vr)
+            + w_idf / (k + ir)
         )
 
         mem["_rrf_score"] = score
@@ -159,6 +189,7 @@ def rank_rrf(
         mem["_semantic_rank"] = sr
         mem["_recency_rank"] = rr
         mem["_vitality_rank"] = vr
+        mem["_idf_rank"] = ir
         results.append(mem)
 
     # Sort by RRF score descending (stable sort preserves insertion order for ties)
@@ -265,6 +296,7 @@ def build_debug_signals(memory: dict) -> dict:
         "keyword_rank": memory.get("_keyword_rank"),
         "recency_rank": memory.get("_recency_rank"),
         "vitality_rank": memory.get("_vitality_rank"),
+        "idf_rank": memory.get("_idf_rank"),
         "rrf_score": memory.get("_rrf_score"),
         "rerank_score": memory.get("_rerank_score"),
         "search_method": memory.get("_search_method"),

@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -164,7 +164,7 @@ class MemorySearchInput(BaseModel):
     )
     verbose: bool = Field(
         default=False,
-        description="Include debug ranking signals (semantic_rank, keyword_rank, recency_rank, vitality_rank, days_old) per result",
+        description="Include debug ranking signals (semantic_rank, keyword_rank, recency_rank, vitality_rank, idf_rank, days_old) per result",
     )
     expand_entities: bool = Field(
         default=False,
@@ -174,6 +174,22 @@ class MemorySearchInput(BaseModel):
             "entity with the returned results, in a separate related_via_entities "
             "section. Does not affect the main ranking."
         ),
+    )
+
+
+class FeedbackInput(BaseModel):
+    """Input for the remind_me_feedback tool: mark a search result helpful/unhelpful."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    memory_id: str = Field(..., description="ID of the memory to give feedback on", min_length=1)
+    signal: Literal["helpful", "unhelpful"] = Field(
+        ..., description="Whether the memory was helpful or unhelpful for the query it was retrieved for"
+    )
+    query: str | None = Field(
+        default=None,
+        description="Optional: the search query this feedback relates to (for future audit/reporting)",
+        max_length=500,
     )
 
 
@@ -908,6 +924,7 @@ __all__ = [
     "ResponseFormat",
     "MemoryAddInput",
     "MemorySearchInput",
+    "FeedbackInput",
     "MemoryListInput",
     "MemoryUpdateInput",
     "MemoryDeleteInput",
