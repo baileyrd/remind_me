@@ -316,6 +316,102 @@ def _fmt_expansion_md(related: list[dict[str, Any]]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Neighbor-aware chunk expansion (opt-in via include_neighbors)
+# ---------------------------------------------------------------------------
+
+# Maximum number of extra memories appended by neighbor expansion. Kept small
+# for the same reason as _ENTITY_EXPANSION_CAP: expansions sit OUTSIDE the
+# token-budget envelope, so the cap (plus the 300-char snippets) is what
+# bounds their response cost.
+_NEIGHBOR_EXPANSION_CAP = 5
+
+# How many chunk positions on either side of a seed to include.
+_NEIGHBOR_WINDOW = 1
+
+
+def _expand_via_neighbors(
+    db: sqlite3.Connection,
+    memories: list[dict],
+    window: int = _NEIGHBOR_WINDOW,
+    cap: int = _NEIGHBOR_EXPANSION_CAP,
+) -> list[dict[str, Any]]:
+    """Collect up to *cap* sibling chunks (same doc_id, adjacent chunk_index).
+
+    Only seed memories produced by an import carry a doc_id/chunk_index
+    (manually added memories and other single-row sources have neither, so
+    they are skipped). For each such seed, fetches sibling rows from the
+    same source document within +/- *window* chunk positions, excluding the
+    seeds themselves and superseded rows.
+
+    Access recording (PF-02): like _expand_via_entities, expanded hits are
+    deliberately NOT recorded -- they are a discovery aid surfaced by
+    document adjacency, not direct matches for the user's query.
+
+    Args:
+        db: An open SQLite connection.
+        memories: The main ranked results (the seeds).
+        window: How many chunk positions on either side to include.
+        cap: Maximum number of expansion items to return.
+
+    Returns:
+        List of {id, content_snippet, category, created_at, doc_id,
+        chunk_index} dicts; empty when no seed carries a doc_id.
+    """
+    seed_ids = {m["id"] for m in memories}
+    expanded: dict[str, dict[str, Any]] = {}
+
+    for m in memories:
+        if len(expanded) >= cap:
+            break
+        doc_id = m.get("doc_id")
+        chunk_index = m.get("chunk_index")
+        if doc_id is None or chunk_index is None:
+            continue
+
+        rows = db.execute(
+            """SELECT id, substr(content, 1, 300) AS content_snippet,
+                      category, created_at, doc_id, chunk_index
+               FROM memories
+               WHERE doc_id = ?
+                 AND chunk_index BETWEEN ? AND ?
+                 AND superseded_by IS NULL
+               ORDER BY chunk_index""",
+            (doc_id, chunk_index - window, chunk_index + window),
+        ).fetchall()
+
+        for r in rows:
+            if r["id"] in seed_ids or r["id"] in expanded:
+                continue
+            if len(expanded) >= cap:
+                break
+            expanded[r["id"]] = {
+                "id": r["id"],
+                "content_snippet": r["content_snippet"],
+                "category": r["category"],
+                "created_at": r["created_at"],
+                "doc_id": r["doc_id"],
+                "chunk_index": r["chunk_index"],
+            }
+
+    return list(expanded.values())
+
+
+def _fmt_neighbor_expansion_md(related: list[dict[str, Any]]) -> str:
+    """Render the related_via_neighbors section for markdown responses."""
+    lines = [
+        f"**Related via document neighbors** (adjacent chunks, max {_NEIGHBOR_EXPANSION_CAP}):"
+    ]
+    for item in related:
+        snippet = " ".join(str(item["content_snippet"]).split())
+        if len(snippet) > 120:
+            snippet = snippet[:120] + "…"
+        lines.append(
+            f"- `{item['id']}` {snippet} _(doc: {item['doc_id']}, chunk: {item['chunk_index']})_"
+        )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Tool handler
 # ---------------------------------------------------------------------------
 
@@ -409,13 +505,19 @@ async def memory_search(params: MemorySearchInput) -> str:
             if params.expand_entities:
                 related = _expand_via_entities(db, envelope["memories"])
 
+            # Opt-in neighbor-aware chunk expansion (expanded hits are not
+            # access-recorded — see _expand_via_neighbors).
+            related_neighbors: list[dict[str, Any]] = []
+            if params.include_neighbors:
+                related_neighbors = _expand_via_neighbors(db, envelope["memories"])
+
             if params.response_format == ResponseFormat.JSON:
-                extra: dict[str, Any] | None = (
-                    {"related_via_entities": related}
-                    if params.expand_entities
-                    else None
-                )
-                return _envelope_json(envelope, extra=extra)
+                extra: dict[str, Any] = {}
+                if params.expand_entities:
+                    extra["related_via_entities"] = related
+                if params.include_neighbors:
+                    extra["related_via_neighbors"] = related_neighbors
+                return _envelope_json(envelope, extra=extra or None)
 
             if not envelope["memories"]:
                 return "_No memories found._"
@@ -428,6 +530,8 @@ async def memory_search(params: MemorySearchInput) -> str:
                 parts.append("")
             if related:
                 parts.append(_fmt_expansion_md(related))
+            if related_neighbors:
+                parts.append(_fmt_neighbor_expansion_md(related_neighbors))
             return _maybe_update_notice("\n---\n".join(parts))
 
         # Structured query detected but no results -- fall through to normal search
@@ -588,6 +692,12 @@ async def memory_search(params: MemorySearchInput) -> str:
     if params.expand_entities:
         related = _expand_via_entities(db, envelope["memories"])
 
+    # --- Opt-in neighbor-aware chunk expansion (expanded hits are not
+    # access-recorded — see _expand_via_neighbors) ---
+    related_neighbors = []  # also annotated in the structured-path branch above
+    if params.include_neighbors:
+        related_neighbors = _expand_via_neighbors(db, envelope["memories"])
+
     # --- Attach debug signals if verbose ---
     if params.verbose:
         for m in envelope["memories"]:
@@ -604,6 +714,8 @@ async def memory_search(params: MemorySearchInput) -> str:
         }
         if params.expand_entities:
             extra["related_via_entities"] = related
+        if params.include_neighbors:
+            extra["related_via_neighbors"] = related_neighbors
         return _envelope_json(envelope, extra=extra)
 
     if not envelope["memories"]:
@@ -649,6 +761,8 @@ async def memory_search(params: MemorySearchInput) -> str:
 
     if related:
         parts.append(_fmt_expansion_md(related))
+    if related_neighbors:
+        parts.append(_fmt_neighbor_expansion_md(related_neighbors))
 
     # Always append tier breakdown summary line
     parts.append(

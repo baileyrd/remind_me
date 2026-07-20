@@ -505,9 +505,9 @@ def test_v4_to_v5_indexes_exist(db_conn: sqlite3.Connection) -> None:
 def test_schema_version_is_current(db_conn: sqlite3.Connection) -> None:
     """After migration, _SCHEMA_VERSION and PRAGMA user_version match the latest."""
     from remind_me_mcp.db import _SCHEMA_VERSION
-    assert _SCHEMA_VERSION == 12
+    assert _SCHEMA_VERSION == 13
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 12, f"Expected user_version 12, got {version}"
+    assert version == 13, f"Expected user_version 13, got {version}"
 
 
 def test_v6_to_v7_new_columns_exist(db_conn: sqlite3.Connection) -> None:
@@ -633,3 +633,103 @@ def test_v6_to_v7_outbox_triggers_include_new_columns(db_conn: sqlite3.Connectio
     assert payload["subject"] == "Alice"
     assert payload["predicate"] == "likes"
     assert payload["object"] == "Python"
+
+
+# ---------------------------------------------------------------------------
+# Migration v12 -> v13 — doc_id/chunk_index columns
+# ---------------------------------------------------------------------------
+
+
+def test_v12_to_v13_new_columns_exist(db_conn: sqlite3.Connection) -> None:
+    """Fresh database has doc_id and chunk_index columns from v12->v13."""
+    columns = [row[1] for row in db_conn.execute("PRAGMA table_info(memories)").fetchall()]
+    for col in ("doc_id", "chunk_index"):
+        assert col in columns, f"Column {col} missing from memories table"
+
+
+def test_v12_to_v13_columns_default_null(db_conn: sqlite3.Connection) -> None:
+    """New columns default to NULL for existing memories."""
+    now = _now_iso()
+    mem_id = _make_id("v13-defaults-test")
+    db_conn.execute(
+        """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (mem_id, "V13 defaults test", "general", "[]", "manual", "{}", now, now),
+    )
+    db_conn.commit()
+    row = db_conn.execute(
+        "SELECT doc_id, chunk_index FROM memories WHERE id = ?", (mem_id,),
+    ).fetchone()
+    assert row is not None
+    assert row[0] is None, f"Expected doc_id=NULL, got {row[0]}"
+    assert row[1] is None, f"Expected chunk_index=NULL, got {row[1]}"
+
+
+def test_v12_to_v13_doc_chunk_index_exists(db_conn: sqlite3.Connection) -> None:
+    """Index idx_memories_doc_chunk exists on (doc_id, chunk_index)."""
+    indexes = [
+        row[0]
+        for row in db_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+        ).fetchall()
+    ]
+    assert "idx_memories_doc_chunk" in indexes, "idx_memories_doc_chunk index is missing"
+
+
+def test_v12_to_v13_outbox_triggers_include_new_columns(db_conn: sqlite3.Connection) -> None:
+    """Outbox triggers include doc_id, chunk_index in the JSON payload."""
+    # Since v9 the outbox triggers only fire while sync is enabled (SY-07).
+    db_conn.execute(
+        "INSERT OR REPLACE INTO sync_flags (key, value) VALUES ('sync_enabled', '1')"
+    )
+    now = _now_iso()
+    mem_id = _make_id("v13-outbox-test")
+    db_conn.execute(
+        """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at,
+                                 doc_id, chunk_index)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (mem_id, "Outbox test", "general", "[]", "manual", "{}", now, now, "doc-abc", 2),
+    )
+    db_conn.commit()
+
+    outbox_row = db_conn.execute(
+        "SELECT payload FROM sync_outbox WHERE memory_id = ? ORDER BY id DESC LIMIT 1",
+        (mem_id,),
+    ).fetchone()
+    assert outbox_row is not None, "No outbox row found for insert"
+    import json
+    payload = json.loads(outbox_row[0])
+    assert "doc_id" in payload, "doc_id missing from outbox payload"
+    assert "chunk_index" in payload, "chunk_index missing from outbox payload"
+    assert payload["doc_id"] == "doc-abc"
+    assert payload["chunk_index"] == 2
+
+
+def test_v12_to_v13_migration_from_v12_applies_cleanly(db_conn: sqlite3.Connection) -> None:
+    """Simulating an upgrade from a pre-v13 (v12) database applies the migration without error."""
+    now = _now_iso()
+    mem_id = _make_id("v13-upgrade-test")
+    db_conn.execute(
+        """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (mem_id, "Upgrade test", "general", "[]", "manual", "{}", now, now),
+    )
+    db_conn.commit()
+
+    # Force user_version back to 12 to simulate a database that hasn't seen
+    # the v13 migration yet, then re-run migrations.
+    db_conn.execute("PRAGMA user_version = 12")
+    db_conn.commit()
+
+    _migrate_schema(db_conn)
+
+    from remind_me_mcp.db import _SCHEMA_VERSION
+    version = db_conn.execute("PRAGMA user_version").fetchone()[0]
+    assert version == _SCHEMA_VERSION
+
+    row = db_conn.execute(
+        "SELECT doc_id, chunk_index FROM memories WHERE id = ?", (mem_id,),
+    ).fetchone()
+    assert row is not None
+    assert row[0] is None
+    assert row[1] is None
