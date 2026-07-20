@@ -634,9 +634,10 @@ def _build_api_app() -> Starlette:
 
         Query parameters: ``format`` (json|jsonl, default json), ``category``,
         ``tags`` (comma-separated, memory must have ALL), ``file_path``, and
-        ``include_graph`` (default true — entities and memory-entity links
-        follow the memories as record_type-tagged records, FT-06; pass
-        false/0/no for a memories-only export). Without ``file_path`` the
+        ``include_graph`` (default true — entities, memory-entity links, and
+        entity-to-entity relations follow the memories as record_type-tagged
+        records, FT-06/Phase 3; pass false/0/no for a memories-only export).
+        Without ``file_path`` the
         export payload is returned as the response body
         (``curl .../api/export > backup.json``); with it, the export is
         written server-side to a path inside EXPORT_ROOTS and a JSON summary

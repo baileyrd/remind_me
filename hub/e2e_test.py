@@ -72,12 +72,15 @@ db.execute(
 eid = db_mod._entity_id("Bailey Robertson")
 db_mod._upsert_entity(db, "Bailey Robertson", kind="person", aliases=["bailey"])
 db_mod._link_memory_entity(db, "node-a-mem-1", eid)
+eid2 = db_mod._entity_id("remind_me")
+db_mod._upsert_entity(db, "remind_me", kind="project")
+rel_id = db_mod._upsert_entity_relation(db, eid, "maintains", eid2)
 db.commit()
 
 outbox = db.execute(
     "SELECT COUNT(*) c FROM sync_outbox WHERE sent_at = ''"
 ).fetchone()["c"]
-check("node A outbox captured writes", outbox >= 3, f"{outbox} rows")
+check("node A outbox captured writes", outbox >= 5, f"{outbox} rows")
 
 asyncio.run(sync_mod._sync_once())
 
@@ -107,6 +110,14 @@ with psycopg.connect(DSN) as conn:
     lnk = conn.execute("SELECT memory_id, entity_id FROM memory_entities").fetchall()
     check("hub stored memory-entity link",
           len(lnk) == 1 and lnk[0][0] == "node-a-mem-1")
+    rel = conn.execute(
+        "SELECT id, subject_entity_id, relation, object_entity_id "
+        "FROM entity_relations"
+    ).fetchall()
+    check("hub stored entity relation",
+          len(rel) == 1 and rel[0][0] == rel_id
+          and rel[0][1] == eid and rel[0][2] == "maintains" and rel[0][3] == eid2,
+          str(rel))
 
 # ---------------- Node B: fresh node converges ----------------
 db_mod, sync_mod, db = make_node("node-b", "/tmp/node-b")
@@ -120,6 +131,13 @@ check("node B pulled entity", len(ents) == 1 and ents[0]["kind"] == "person")
 links = db.execute("SELECT memory_id, entity_id FROM memory_entities").fetchall()
 check("node B pulled link",
       len(links) == 1 and links[0]["memory_id"] == "node-a-mem-1")
+rels = db.execute(
+    "SELECT id, subject_entity_id, relation, object_entity_id FROM entity_relations"
+).fetchall()
+check("node B pulled entity relation",
+      len(rels) == 1 and rels[0]["id"] == rel_id
+      and rels[0]["relation"] == "maintains",
+      str([dict(r) for r in rels]))
 
 # ---------------- LWW: node B updates, node A sees it ----------------
 # Mirrors remind_me_update: content + updated_at change, node_id does NOT.

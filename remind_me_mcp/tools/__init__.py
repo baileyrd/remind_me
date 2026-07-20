@@ -55,6 +55,7 @@ from remind_me_mcp.db import (
     _row_to_dict,
     _semantic_search,
     _upsert_entity,
+    _upsert_entity_relation,
 )
 from remind_me_mcp.formatting import _fmt_memories, _fmt_memory_md
 from remind_me_mcp.importer import import_chat_file, import_directory
@@ -68,6 +69,7 @@ from remind_me_mcp.models import (
     DecomposeInput,
     EntityInput,
     EntityLookupInput,
+    EntityTraverseInput,
     ExportInput,
     ExtractBatchInput,
     FeedbackInput,
@@ -134,7 +136,11 @@ from remind_me_mcp.tools.crud import (
     memory_list,
     memory_update,
 )
-from remind_me_mcp.tools.entity import remind_me_entity
+from remind_me_mcp.tools.entity import (
+    _expand_via_entity_relations,
+    remind_me_entity,
+    remind_me_entity_traverse,
+)
 from remind_me_mcp.tools.lifecycle import (
     remind_me_consolidate,
     remind_me_reclassify,
@@ -208,6 +214,7 @@ __all__ = [
     "remind_me_extract_batch",
     "remind_me_annotate",
     "remind_me_entity",
+    "remind_me_entity_traverse",
     "remind_me_consolidate",
     "wiki_write",
     "wiki_read",

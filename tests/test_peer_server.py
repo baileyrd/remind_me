@@ -524,15 +524,79 @@ def test_pull_links_keyset_cursor(
 def test_pull_entity_endpoints_require_auth(peer_url: str) -> None:
     assert httpx.get(f"{peer_url}/sync/pull_entities").status_code == 401
     assert httpx.get(f"{peer_url}/sync/pull_links").status_code == 401
+    assert httpx.get(f"{peer_url}/sync/pull_entity_relations").status_code == 401
+
+
+def test_pull_entity_relations_returns_tagged_records(
+    peer_url: str, peer_db: sqlite3.Connection
+) -> None:
+    from remind_me_mcp.db import _entity_relation_id
+
+    now = _now_iso()
+    rid = _entity_relation_id("subj-1", "works_with", "obj-1")
+    peer_db.execute(
+        """INSERT INTO entity_relations
+           (id, subject_entity_id, relation, object_entity_id, created_at, updated_at, node_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (rid, "subj-1", "works_with", "obj-1", now, now, "local-node"),
+    )
+    peer_db.commit()
+
+    resp = httpx.get(f"{peer_url}/sync/pull_entity_relations", headers=AUTH)
+    assert resp.status_code == 200
+    records = resp.json()["records"]
+    assert records == [{
+        "id": rid,
+        "subject_entity_id": "subj-1",
+        "relation": "works_with",
+        "object_entity_id": "obj-1",
+        "created_at": now,
+        "updated_at": now,
+        "node_id": "local-node",
+        "record_type": "entity_relation",
+    }]
+
+
+def test_pull_entity_relations_keyset_cursor(
+    peer_url: str, peer_db: sqlite3.Connection
+) -> None:
+    from remind_me_mcp.db import _entity_relation_id
+
+    ts = "2026-01-01T00:00:00+00:00"
+    peer_db.executemany(
+        """INSERT INTO entity_relations
+           (id, subject_entity_id, relation, object_entity_id, created_at, updated_at, node_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        [
+            (_entity_relation_id("s1", "r1", "o1"), "s1", "r1", "o1", ts, ts, None),
+            (_entity_relation_id("s2", "r2", "o2"), "s2", "r2", "o2", ts, ts, None),
+        ],
+    )
+    peer_db.commit()
+    first_id = _entity_relation_id("s1", "r1", "o1")
+    second_id = _entity_relation_id("s2", "r2", "o2")
+    # Cursor sits right after whichever id sorts first — only the other remains.
+    ordered = sorted([first_id, second_id])
+    resp = httpx.get(
+        f"{peer_url}/sync/pull_entity_relations",
+        params={"since": ts, "since_id": ordered[0]},
+        headers=AUTH,
+    )
+    ids = [r["id"] for r in resp.json()["records"]]
+    assert ids == [ordered[1]]
 
 
 def test_push_entity_and_link_records(
     peer_url: str, peer_db: sqlite3.Connection
 ) -> None:
-    """The push endpoint applies mixed memory/entity/link batches and
-    reports composite link ids in processed_ids."""
+    """The push endpoint applies mixed memory/entity/link/entity_relation
+    batches and reports composite link ids in processed_ids."""
+    from remind_me_mcp.db import _entity_relation_id
+
     now = _now_iso()
     eid = _entity_id("Pushed Entity")
+    eid2 = _entity_id("Other Entity")
+    rid = _entity_relation_id(eid, "relates_to", eid2)
     records = [
         make_record("mem-x", "memory body"),
         {
@@ -552,6 +616,16 @@ def test_push_entity_and_link_records(
             "entity_id": eid,
             "created_at": now,
         },
+        {
+            "record_type": "entity_relation",
+            "id": rid,
+            "subject_entity_id": eid,
+            "relation": "relates_to",
+            "object_entity_id": eid2,
+            "created_at": now,
+            "updated_at": now,
+            "node_id": "other-node",
+        },
     ]
     resp = httpx.post(
         f"{peer_url}/sync/push",
@@ -560,8 +634,13 @@ def test_push_entity_and_link_records(
     )
     assert resp.status_code == 200
     body = resp.json()
-    assert body["accepted"] == 3
-    assert set(body["processed_ids"]) == {"mem-x", eid, f"mem-x|{eid}"}
+    assert body["accepted"] == 4
+    assert set(body["processed_ids"]) == {"mem-x", eid, f"mem-x|{eid}", rid}
+    row = peer_db.execute(
+        "SELECT * FROM entity_relations WHERE id = ?", (rid,)
+    ).fetchone()
+    assert row["subject_entity_id"] == eid
+    assert row["object_entity_id"] == eid2
 
     ent = peer_db.execute("SELECT * FROM entities WHERE id = ?", (eid,)).fetchone()
     assert ent["kind"] == "tool"

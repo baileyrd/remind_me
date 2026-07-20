@@ -49,6 +49,7 @@ from remind_me_mcp.db import (
     _make_id,
     _now_iso,
     _upsert_entity,
+    _upsert_entity_relation,
 )
 
 log = logging.getLogger("remind_me_mcp.importer")
@@ -411,7 +412,7 @@ def _parse_document(text: str, suffix: str, max_length: int) -> list[tuple[str, 
 def _restore_graph_records(
     db: sqlite3.Connection, records: list[dict[str, Any]]
 ) -> dict[str, int]:
-    """Restore exported entity-graph records into the database (FT-06).
+    """Restore exported entity-graph records into the database (FT-06, Phase 3).
 
     Entities are applied first, through :func:`_upsert_entity` — the same
     union-merge semantics as sync: aliases dedup-merge into any existing row,
@@ -420,7 +421,11 @@ def _restore_graph_records(
     links reference original memory ids, and a fresh-DB chat re-import assigns
     NEW memory ids, so a link is restorable only when the referenced memory
     was kept with its original id (same DB, or a synced one). Dangling links
-    are skipped and counted — restore is honest, not magic.
+    are skipped and counted — restore is honest, not magic. Relations are
+    restored last, the same way: insert-or-ignore, only when BOTH the
+    subject and object entities exist (they always do for entities restored
+    just above in this same call, but a relation's endpoints may also
+    reference entities absent from this particular export batch).
 
     Timestamps are assigned fresh, matching the lossy chat re-import semantics
     for memories (the originals remain in the export file). Malformed records
@@ -433,10 +438,15 @@ def _restore_graph_records(
 
     Returns:
         Counts: {'entities_restored': int, 'links_restored': int,
-        'links_skipped_dangling': int}. 'links_restored' counts newly
-        inserted rows only (already-present links are no-ops).
+        'links_skipped_dangling': int, 'relations_restored': int,
+        'relations_skipped_dangling': int}. 'links_restored'/
+        'relations_restored' count newly inserted rows only (already-present
+        rows are no-ops).
     """
-    counts = {"entities_restored": 0, "links_restored": 0, "links_skipped_dangling": 0}
+    counts = {
+        "entities_restored": 0, "links_restored": 0, "links_skipped_dangling": 0,
+        "relations_restored": 0, "relations_skipped_dangling": 0,
+    }
 
     # Entities first so link endpoint checks see freshly restored rows.
     for rec in records:
@@ -482,6 +492,35 @@ def _restore_graph_records(
         if _link_memory_entity(db, str(memory_id), str(entity_id)):
             counts["links_restored"] += 1
 
+    for rec in records:
+        if rec.get("record_type") != "entity_relation":
+            continue
+        subject_id, relation, object_id = (
+            rec.get("subject_entity_id"), rec.get("relation"), rec.get("object_entity_id")
+        )
+        if not subject_id or not relation or not object_id:
+            log.warning(
+                "Skipping relation record missing subject/relation/object: %r", rec
+            )
+            continue
+        subject_row = db.execute(
+            "SELECT 1 FROM entities WHERE id = ?", (str(subject_id),)
+        ).fetchone()
+        object_row = db.execute(
+            "SELECT 1 FROM entities WHERE id = ?", (str(object_id),)
+        ).fetchone()
+        if subject_row is None or object_row is None:
+            counts["relations_skipped_dangling"] += 1
+            continue
+        before = db.execute(
+            "SELECT COUNT(*) FROM entity_relations WHERE subject_entity_id = ? "
+            "AND relation = ? AND object_entity_id = ?",
+            (str(subject_id), str(relation), str(object_id)),
+        ).fetchone()[0]
+        _upsert_entity_relation(db, str(subject_id), str(relation), str(object_id))
+        if before == 0:
+            counts["relations_restored"] += 1
+
     return counts
 
 
@@ -525,8 +564,9 @@ def import_chat_file(
     Returns:
         A status dict. On success: {'status': 'ok', 'import_id': str,
         'kind': str, 'memories_created': int, 'raw_entries': int, 'file': str};
-        when the file carried entity-graph records (FT-06 exports), also
-        'entities_restored', 'links_restored', and 'links_skipped_dangling'.
+        when the file carried entity-graph records (FT-06/Phase 3 exports),
+        also 'entities_restored', 'links_restored', 'links_skipped_dangling',
+        'relations_restored', and 'relations_skipped_dangling'.
         On skip: {'status': 'skipped', 'reason': str, 'file': str,
         'import_id': str}. On unsupported format/kind: {'status': 'error',
         'reason': str, 'file': str}.

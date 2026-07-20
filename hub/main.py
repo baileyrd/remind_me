@@ -13,11 +13,13 @@ implementation:
 - GET  /sync/pull_entities  — entity records (record_type='entity')
 - GET  /sync/pull_links     — memory_entities link records
                               (record_type='memory_entity', synthetic id)
+- GET  /sync/pull_entity_relations — entity_relations records
+                              (record_type='entity_relation', real id)
 - GET  /health              — unauthenticated liveness probe
 
 Push records dispatch on record_type: absent = memory, 'entity' upserts
-with LWW except aliases (always union-merged), 'memory_entity' is an
-immutable insert-or-ignore link.
+with LWW except aliases (always union-merged), 'memory_entity' and
+'entity_relation' are immutable insert-or-ignore edges.
 
 Timestamps are stored as canonical UTC ISO-8601 TEXT with COLLATE "C" so
 string comparison is a correct ordering — exactly the convention the
@@ -136,12 +138,25 @@ CREATE TABLE IF NOT EXISTS memory_entities (
     PRIMARY KEY (memory_id, entity_id)
 );
 
+CREATE TABLE IF NOT EXISTS entity_relations (
+    id                TEXT COLLATE "C" PRIMARY KEY,
+    subject_entity_id TEXT COLLATE "C" NOT NULL,
+    relation          TEXT NOT NULL,
+    object_entity_id  TEXT COLLATE "C" NOT NULL,
+    created_at        TEXT COLLATE "C" NOT NULL,
+    updated_at        TEXT COLLATE "C" NOT NULL,
+    node_id           TEXT,
+    origin_node       TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_memories_updated_at_id
     ON memories (updated_at, id);
 CREATE INDEX IF NOT EXISTS idx_entities_updated_at_id
     ON entities (updated_at, id);
 CREATE INDEX IF NOT EXISTS idx_links_created_at
     ON memory_entities (created_at);
+CREATE INDEX IF NOT EXISTS idx_entity_relations_created_at_id
+    ON entity_relations (created_at, id);
 """
 
 # Convert a TIMESTAMPTZ column to the canonical TEXT form. Trailing
@@ -441,6 +456,38 @@ def _upsert_link(conn: psycopg.Connection, rec: dict[str, Any]) -> bool:
     return cur.rowcount > 0
 
 
+def _upsert_entity_relation(
+    conn: psycopg.Connection, rec: dict[str, Any], origin: str | None
+) -> bool:
+    """Apply one entity_relations record (immutable, insert-or-ignore).
+
+    Mirrors remind_me_mcp.sync._upsert_entity_relation_one / _upsert_link --
+    relations never change once recorded, so there is no LWW conflict to
+    resolve, and the record already carries its own real id (deterministic,
+    from the subject/relation/object triple) rather than a synthetic one.
+    """
+    missing = [
+        k for k in ("id", "subject_entity_id", "relation", "object_entity_id", "created_at")
+        if not rec.get(k)
+    ]
+    if missing:
+        raise ValueError(f"entity_relation record missing required keys: {missing}")
+    created_at = _canon_ts(rec["created_at"])
+    updated_at = _canon_ts(rec.get("updated_at") or rec["created_at"])
+    cur = conn.execute(
+        "INSERT INTO entity_relations "
+        "(id, subject_entity_id, relation, object_entity_id, created_at, "
+        "updated_at, node_id, origin_node) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+        (
+            str(rec["id"]), str(rec["subject_entity_id"]), str(rec["relation"]),
+            str(rec["object_entity_id"]), created_at, updated_at,
+            rec.get("node_id"), origin,
+        ),
+    )
+    return cur.rowcount > 0
+
+
 def _record_wire_id(rec: dict[str, Any]) -> str:
     """The id the sender matches in processed_ids (links use memory_id|entity_id)."""
     rid = rec.get("id")
@@ -476,6 +523,8 @@ def sync_push(body: Annotated[dict, Body(...)]) -> dict:
                         ok = _upsert_entity(conn, rec, origin)
                     elif record_type == "memory_entity":
                         ok = _upsert_link(conn, rec)
+                    elif record_type == "entity_relation":
+                        ok = _upsert_entity_relation(conn, rec, origin)
                     else:
                         raise ValueError(f"unknown record_type: {record_type!r}")
             except Exception as e:
@@ -509,6 +558,9 @@ _MEMORY_WIRE_COLUMNS = (
     'subject, predicate, "object", superseded_by'
 )
 _ENTITY_WIRE_COLUMNS = "id, name, kind, aliases, created_at, updated_at, node_id"
+_ENTITY_RELATION_WIRE_COLUMNS = (
+    "id, subject_entity_id, relation, object_entity_id, created_at, updated_at, node_id"
+)
 
 
 @app.get("/sync/pull", dependencies=[Depends(_require_auth)])
@@ -594,4 +646,24 @@ def sync_pull_links(
         }
         for row in rows
     ]
+    return {"records": records, "count": len(records)}
+
+
+@app.get("/sync/pull_entity_relations", dependencies=[Depends(_require_auth)])
+def sync_pull_entity_relations(
+    since: str = _EPOCH,
+    since_id: str = "",
+    limit: int = Query(default=MAX_PULL_LIMIT),
+) -> dict:
+    """Relations are immutable: keyset on (created_at, id), like links --
+    but each row already carries its own real id, so no synthetic key."""
+    where = "(created_at > %s OR (created_at = %s AND id > %s))"
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT {_ENTITY_RELATION_WIRE_COLUMNS} FROM entity_relations "
+            f"WHERE {where} ORDER BY created_at ASC, id ASC LIMIT %s",
+            (since, since, since_id, _clamp_limit(limit)),
+        ).fetchall()
+
+    records = [{**row, "record_type": "entity_relation"} for row in rows]
     return {"records": records, "count": len(records)}

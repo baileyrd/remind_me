@@ -27,9 +27,10 @@ from remind_me_mcp.db import (
     _link_memory_entity,
     _resolve_entity,
     _upsert_entity,
+    _upsert_entity_relation,
 )
 from remind_me_mcp.models import MemorySearchInput, ResponseFormat
-from remind_me_mcp.tools import memory_search, remind_me_entity
+from remind_me_mcp.tools import memory_search, remind_me_entity, remind_me_entity_traverse
 
 
 def _mention(
@@ -532,3 +533,130 @@ async def test_expansion_not_access_recorded(
 
     assert seed["id"] in recorded_ids
     assert neighbor["id"] not in recorded_ids
+
+
+# ---------------------------------------------------------------------------
+# remind_me_entity_traverse tool (Phase 3 -- multi-hop relation traversal)
+# ---------------------------------------------------------------------------
+
+
+async def test_traverse_direct_relation(db_conn: sqlite3.Connection) -> None:
+    from remind_me_mcp.models import EntityTraverseInput
+
+    a = _upsert_entity(db_conn, "Alice", "person")
+    b = _upsert_entity(db_conn, "Bob", "person")
+    _upsert_entity_relation(db_conn, a, "works_with", b)
+    db_conn.commit()
+
+    result = json.loads(await remind_me_entity_traverse(EntityTraverseInput(name="Alice")))
+
+    assert result["found"] is True
+    assert result["entity"]["name"] == "Alice"
+    assert len(result["edges"]) == 1
+    edge = result["edges"][0]
+    assert edge["subject_name"] == "Alice"
+    assert edge["relation"] == "works_with"
+    assert edge["object_name"] == "Bob"
+    assert edge["hop"] == 1
+    names = {e["name"] for e in result["entities"]}
+    assert names == {"Alice", "Bob"}
+
+
+async def test_traverse_follows_both_directions(db_conn: sqlite3.Connection) -> None:
+    from remind_me_mcp.models import EntityTraverseInput
+
+    a = _upsert_entity(db_conn, "Alice", "person")
+    b = _upsert_entity(db_conn, "Bob", "person")
+    _upsert_entity_relation(db_conn, a, "works_with", b)
+    db_conn.commit()
+
+    # Traversing from Bob (the object) still finds the Alice->Bob edge.
+    result = json.loads(await remind_me_entity_traverse(EntityTraverseInput(name="Bob")))
+    assert len(result["edges"]) == 1
+    assert result["edges"][0]["subject_name"] == "Alice"
+    assert result["edges"][0]["object_name"] == "Bob"
+
+
+async def test_traverse_multi_hop(db_conn: sqlite3.Connection) -> None:
+    from remind_me_mcp.models import EntityTraverseInput
+
+    a = _upsert_entity(db_conn, "Alice", "person")
+    b = _upsert_entity(db_conn, "Bob", "person")
+    c = _upsert_entity(db_conn, "Carol", "person")
+    _upsert_entity_relation(db_conn, a, "introduced", b)
+    _upsert_entity_relation(db_conn, b, "recommended", c)
+    db_conn.commit()
+
+    hop1 = json.loads(await remind_me_entity_traverse(
+        EntityTraverseInput(name="Alice", hops=1)
+    ))
+    assert len(hop1["edges"]) == 1
+    assert {e["hop"] for e in hop1["edges"]} == {1}
+
+    hop2 = json.loads(await remind_me_entity_traverse(
+        EntityTraverseInput(name="Alice", hops=2)
+    ))
+    assert len(hop2["edges"]) == 2
+    assert {e["hop"] for e in hop2["edges"]} == {1, 2}
+    names = {e["name"] for e in hop2["entities"]}
+    assert names == {"Alice", "Bob", "Carol"}
+
+
+async def test_traverse_relation_filter(db_conn: sqlite3.Connection) -> None:
+    from remind_me_mcp.models import EntityTraverseInput
+
+    a = _upsert_entity(db_conn, "Alice", "person")
+    b = _upsert_entity(db_conn, "Bob", "person")
+    c = _upsert_entity(db_conn, "Carol", "person")
+    _upsert_entity_relation(db_conn, a, "works_with", b)
+    _upsert_entity_relation(db_conn, a, "reports_to", c)
+    db_conn.commit()
+
+    result = json.loads(await remind_me_entity_traverse(
+        EntityTraverseInput(name="Alice", relation="works_with")
+    ))
+    assert len(result["edges"]) == 1
+    assert result["edges"][0]["object_name"] == "Bob"
+
+
+async def test_traverse_respects_cap(db_conn: sqlite3.Connection) -> None:
+    from remind_me_mcp.models import EntityTraverseInput
+
+    a = _upsert_entity(db_conn, "Alice", "person")
+    for i in range(5):
+        nbr = _upsert_entity(db_conn, f"Neighbor {i}", "person")
+        _upsert_entity_relation(db_conn, a, "knows", nbr)
+    db_conn.commit()
+
+    result = json.loads(await remind_me_entity_traverse(
+        EntityTraverseInput(name="Alice", cap=2)
+    ))
+    assert len(result["edges"]) == 2
+
+
+async def test_traverse_not_found(db_conn: sqlite3.Connection) -> None:
+    from remind_me_mcp.models import EntityTraverseInput
+
+    result = json.loads(await remind_me_entity_traverse(EntityTraverseInput(name="Ghost")))
+    assert result["found"] is False
+    assert "message" in result
+
+
+async def test_traverse_cycle_terminates(db_conn: sqlite3.Connection) -> None:
+    """A -> B -> A cycle doesn't loop forever and doesn't duplicate edges."""
+    from remind_me_mcp.models import EntityTraverseInput
+
+    a = _upsert_entity(db_conn, "Alice", "person")
+    b = _upsert_entity(db_conn, "Bob", "person")
+    _upsert_entity_relation(db_conn, a, "knows", b)
+    _upsert_entity_relation(db_conn, b, "knows", a)
+    db_conn.commit()
+
+    result = json.loads(await remind_me_entity_traverse(
+        EntityTraverseInput(name="Alice", hops=3)
+    ))
+    # Both edges are distinct triples (different subject/object order) so
+    # both are found once each, with no runaway duplication.
+    assert len(result["edges"]) == 2
+    names = {e["name"] for e in result["entities"]}
+    assert names == {"Alice", "Bob"}

@@ -1554,3 +1554,147 @@ async def test_sync_once_syncs_healthy_peer(
     assert "/health" in paths
     assert "/sync/push" in paths
     assert "/sync/pull" in paths
+
+
+# ---------------------------------------------------------------------------
+# Entity relation sync (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+def make_entity_relation_record(
+    subject_entity_id: str, relation: str, object_entity_id: str, **overrides: Any
+) -> dict:
+    """Build a wire-format entity_relation record like a Phase-3 peer would send."""
+    from remind_me_mcp.db import _entity_relation_id
+
+    now = _now_iso()
+    rec = {
+        "record_type": "entity_relation",
+        "id": _entity_relation_id(subject_entity_id, relation, object_entity_id),
+        "subject_entity_id": subject_entity_id,
+        "relation": relation,
+        "object_entity_id": object_entity_id,
+        "created_at": now,
+        "updated_at": now,
+        "node_id": "remote-node",
+    }
+    rec.update(overrides)
+    return rec
+
+
+def insert_entity_relation(
+    db: sqlite3.Connection,
+    subject_entity_id: str,
+    relation: str,
+    object_entity_id: str,
+) -> str:
+    """Insert an entity_relations row through SQL so the outbox trigger fires."""
+    from remind_me_mcp.db import _entity_relation_id
+
+    now = _now_iso()
+    rid = _entity_relation_id(subject_entity_id, relation, object_entity_id)
+    db.execute(
+        """INSERT INTO entity_relations
+           (id, subject_entity_id, relation, object_entity_id, created_at, updated_at, node_id)
+           VALUES (?, ?, ?, ?, ?, ?, 'local-node')""",
+        (rid, subject_entity_id, relation, object_entity_id, now, now),
+    )
+    db.commit()
+    return rid
+
+
+async def test_push_outbox_sends_entity_relation_records(
+    sync_db: sqlite3.Connection,
+) -> None:
+    rid = insert_entity_relation(sync_db, "subj-1", "works_with", "obj-1")
+
+    recorder = RequestRecorder()
+    async with mock_client(recorder) as client:
+        await sync._push_outbox(client, "http://peer", "peer-x")
+
+    records = json.loads(recorder.requests[0].content)["records"]
+    by_type = {r.get("record_type", "memory"): r for r in records}
+    assert by_type["entity_relation"]["id"] == rid
+    assert by_type["entity_relation"]["subject_entity_id"] == "subj-1"
+    assert by_type["entity_relation"]["relation"] == "works_with"
+    assert by_type["entity_relation"]["object_entity_id"] == "obj-1"
+
+
+def test_upsert_entity_relation_record_inserts(sync_db: sqlite3.Connection) -> None:
+    rec = make_entity_relation_record("subj-1", "works_with", "obj-1")
+    result = sync._upsert_records(sync_db, [rec])
+    assert result.applied == 1
+    assert result.processed_ids == [rec["id"]]
+    row = sync_db.execute(
+        "SELECT * FROM entity_relations WHERE id = ?", (rec["id"],)
+    ).fetchone()
+    assert row["subject_entity_id"] == "subj-1"
+    assert row["relation"] == "works_with"
+    assert row["object_entity_id"] == "obj-1"
+
+
+def test_upsert_entity_relation_insert_or_ignore(sync_db: sqlite3.Connection) -> None:
+    rec = make_entity_relation_record("subj-1", "works_with", "obj-1")
+    first = sync._upsert_records(sync_db, [rec])
+    assert first.applied == 1
+    again = sync._upsert_records(sync_db, [rec])
+    assert again.applied == 0
+    assert again.processed_ids == [rec["id"]]
+    assert sync_db.execute(
+        "SELECT COUNT(*) FROM entity_relations"
+    ).fetchone()[0] == 1
+
+
+def test_upsert_entity_relation_suppresses_echo_outbox_rows(
+    sync_db: sqlite3.Connection,
+) -> None:
+    rec = make_entity_relation_record("subj-9", "knows", "obj-9")
+    sync._upsert_records(sync_db, [rec])
+    rows = sync_db.execute(
+        "SELECT sent_at FROM sync_outbox WHERE memory_id = ?", (rec["id"],)
+    ).fetchall()
+    assert rows
+    assert all(r["sent_at"] != "" for r in rows)
+
+
+def test_upsert_entity_relation_malformed_is_isolated(sync_db: sqlite3.Connection) -> None:
+    """A record missing required keys is skipped without poisoning the batch."""
+    bad = {"record_type": "entity_relation", "id": "r1"}  # missing subject/relation/object
+    good = make_entity_relation_record("subj-ok", "knows", "obj-ok")
+    result = sync._upsert_records(sync_db, [bad, good])
+    assert result.applied == 1
+    assert result.failed == 1
+    assert result.processed_ids == [good["id"]]
+
+
+async def test_pull_entity_relations_upserts_and_advances_cursor(
+    sync_db: sqlite3.Connection,
+) -> None:
+    rec = make_entity_relation_record(
+        "subj-1", "works_with", "obj-1", created_at="2026-05-01T00:00:00+00:00"
+    )
+    recorder = RequestRecorder(
+        responses={"/sync/pull_entity_relations": {"records": [rec], "count": 1}}
+    )
+    async with mock_client(recorder) as client:
+        count = await sync._pull_entity_relations(client, "http://peer", "peer-x")
+    assert count == 1
+    assert sync_db.execute(
+        "SELECT COUNT(*) FROM entity_relations WHERE id = ?", (rec["id"],)
+    ).fetchone()[0] == 1
+    # Cursor stored under its own remote key, separate from entities/links.
+    log_row = sync_db.execute(
+        "SELECT last_pull, last_pull_id FROM sync_log WHERE remote_id = 'peer-x#entity_relations'"
+    ).fetchone()
+    assert log_row["last_pull"] == "2026-05-01T00:00:00+00:00"
+    assert log_row["last_pull_id"] == rec["id"]
+
+
+async def test_pull_entity_relations_tolerates_old_peer(
+    sync_db: sqlite3.Connection,
+) -> None:
+    """An old peer/hub 404s the endpoint; the pull is a silent no-op."""
+    recorder = RequestRecorder()  # 404s everything but the legacy endpoints
+    async with mock_client(recorder) as client:
+        assert await sync._pull_entity_relations(client, "http://old-peer", "old") == 0
+    assert sync_db.execute("SELECT COUNT(*) FROM sync_log").fetchone()[0] == 0

@@ -22,11 +22,13 @@ from remind_me_mcp.db import (
     _SCHEMA_VERSION,
     _ensure_schema,
     _entity_id,
+    _entity_relation_id,
     _link_memory_entity,
     _migrate_schema,
     _normalize_entity_name,
     _now_iso,
     _upsert_entity,
+    _upsert_entity_relation,
 )
 
 # ---------------------------------------------------------------------------
@@ -209,6 +211,79 @@ def test_link_memory_entity_insert_or_ignore(db_conn: sqlite3.Connection) -> Non
 
 
 # ---------------------------------------------------------------------------
+# _entity_relation_id / _upsert_entity_relation helpers
+# ---------------------------------------------------------------------------
+
+
+def test_entity_relation_id_is_deterministic() -> None:
+    """Same triple -> same id, regardless of relation-label casing/whitespace."""
+    a = _entity_relation_id("subj-1", "works_with", "obj-1")
+    b = _entity_relation_id("subj-1", "  Works_With ", "obj-1")
+    assert a == b
+    assert len(a) == 12
+    int(a, 16)  # hex string
+
+
+def test_entity_relation_id_differs_by_subject_relation_or_object() -> None:
+    base = _entity_relation_id("subj-1", "works_with", "obj-1")
+    assert base != _entity_relation_id("subj-2", "works_with", "obj-1")
+    assert base != _entity_relation_id("subj-1", "reports_to", "obj-1")
+    assert base != _entity_relation_id("subj-1", "works_with", "obj-2")
+
+
+def test_upsert_entity_relation_creates_row(db_conn: sqlite3.Connection) -> None:
+    subj = _upsert_entity(db_conn, "Bailey")
+    obj = _upsert_entity(db_conn, "Alex")
+    rid = _upsert_entity_relation(db_conn, subj, "works_with", obj, node_id="n1")
+    db_conn.commit()
+
+    row = db_conn.execute("SELECT * FROM entity_relations WHERE id = ?", (rid,)).fetchone()
+    assert rid == _entity_relation_id(subj, "works_with", obj)
+    assert row["subject_entity_id"] == subj
+    assert row["relation"] == "works_with"
+    assert row["object_entity_id"] == obj
+    assert row["node_id"] == "n1"
+
+
+def test_upsert_entity_relation_insert_or_ignore(db_conn: sqlite3.Connection) -> None:
+    """Re-recording the same triple is a no-op — no duplicate row, same id."""
+    subj = _upsert_entity(db_conn, "Bailey")
+    obj = _upsert_entity(db_conn, "Alex")
+    rid1 = _upsert_entity_relation(db_conn, subj, "works_with", obj)
+    rid2 = _upsert_entity_relation(db_conn, subj, "works_with", obj)
+    db_conn.commit()
+
+    assert rid1 == rid2
+    count = db_conn.execute(
+        "SELECT COUNT(*) FROM entity_relations WHERE id = ?", (rid1,)
+    ).fetchone()[0]
+    assert count == 1
+
+
+def test_upsert_entity_relation_distinguishes_direction(db_conn: sqlite3.Connection) -> None:
+    """Subject and object are not interchangeable -- A->B is a different edge than B->A."""
+    a = _upsert_entity(db_conn, "Bailey")
+    b = _upsert_entity(db_conn, "Alex")
+    rid_ab = _upsert_entity_relation(db_conn, a, "works_with", b)
+    rid_ba = _upsert_entity_relation(db_conn, b, "works_with", a)
+    db_conn.commit()
+
+    assert rid_ab != rid_ba
+    assert db_conn.execute("SELECT COUNT(*) FROM entity_relations").fetchone()[0] == 2
+
+
+def test_upsert_entity_relation_strips_relation_whitespace(db_conn: sqlite3.Connection) -> None:
+    subj = _upsert_entity(db_conn, "Bailey")
+    obj = _upsert_entity(db_conn, "Alex")
+    rid = _upsert_entity_relation(db_conn, subj, "  works_with  ", obj)
+    db_conn.commit()
+    row = db_conn.execute(
+        "SELECT relation FROM entity_relations WHERE id = ?", (rid,)
+    ).fetchone()
+    assert row["relation"] == "works_with"
+
+
+# ---------------------------------------------------------------------------
 # Decompose write path
 # ---------------------------------------------------------------------------
 
@@ -265,6 +340,50 @@ async def test_decompose_writes_spo_and_entities(
         "SELECT subject FROM memories WHERE id = ?", (result["fact_ids"][1],)
     ).fetchone()
     assert plain["subject"] is None
+
+    # "dark mode" isn't in the fact's entities list, so it never resolves to
+    # a known entity -- no relation edge is written (best-effort, Phase 3).
+    assert result["relations_linked"] == 0
+    assert db_conn.execute("SELECT COUNT(*) FROM entity_relations").fetchone()[0] == 0
+
+
+async def test_decompose_links_entity_relation_when_both_sides_resolve(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """Phase 3: an SPO triple whose subject AND object both name known
+    entities also writes a typed entity_relations edge."""
+    from remind_me_mcp.models import AtomicFact, DecomposeInput, EntityInput
+    from remind_me_mcp.tools import remind_me_decompose
+
+    memory_factory(
+        content="Talked about who works with whom",
+        category="dialog",
+        capture_id="cap_ft04_rel",
+    )
+    params = DecomposeInput(
+        capture_id="cap_ft04_rel",
+        facts=[
+            AtomicFact(
+                content="Bailey works with Alex",
+                subject="Bailey",
+                predicate="works_with",
+                object="Alex",
+                entities=[
+                    EntityInput(name="Bailey", kind="person"),
+                    EntityInput(name="Alex", kind="person"),
+                ],
+            ),
+        ],
+    )
+    result = json.loads(await remind_me_decompose(params))
+    assert result["relations_linked"] == 1
+
+    row = db_conn.execute(
+        "SELECT subject_entity_id, relation, object_entity_id FROM entity_relations"
+    ).fetchone()
+    assert row["subject_entity_id"] == _entity_id("Bailey")
+    assert row["relation"] == "works_with"
+    assert row["object_entity_id"] == _entity_id("Alex")
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +471,9 @@ async def test_annotate_applies_spo_and_entities(
     assert result["annotated"] == 1
     assert result["errors"] == []
     assert result["results"][0]["entities_linked"] == 2
+    # Phase 3: subject "Bailey" and object "Portland" both name entities just
+    # upserted above, so a typed entity_relations edge is also written.
+    assert result["results"][0]["relation_linked"] is True
 
     row = db_conn.execute(
         "SELECT subject, predicate, object, updated_at FROM memories WHERE id = ?",
@@ -365,6 +487,12 @@ async def test_annotate_applies_spo_and_entities(
     assert db_conn.execute(
         "SELECT COUNT(*) FROM memory_entities WHERE memory_id = ?", (mem["id"],)
     ).fetchone()[0] == 2
+    rel = db_conn.execute(
+        "SELECT subject_entity_id, relation, object_entity_id FROM entity_relations"
+    ).fetchone()
+    assert rel["subject_entity_id"] == _entity_id("Bailey")
+    assert rel["relation"] == "lives in"
+    assert rel["object_entity_id"] == _entity_id("Portland")
 
 
 async def test_annotate_missing_memory_reports_error(
@@ -401,6 +529,39 @@ async def test_annotate_partial_fields_leave_others_untouched(
     assert (row["subject"], row["predicate"], row["object"]) == (
         "OldSubject", "OldPred", "NewObj",
     )
+
+
+async def test_annotate_partial_update_links_relation_from_current_triple(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """A second, partial annotate call (only predicate changes) still links a
+    relation using the memory's CURRENT subject/object, not just this call's
+    (possibly omitted) fields -- Phase 3."""
+    from remind_me_mcp.models import AnnotateInput, EntityInput, MemoryAnnotation
+    from remind_me_mcp.tools import remind_me_annotate
+
+    mem = memory_factory(content="Bailey knows Alex")
+    await remind_me_annotate(AnnotateInput(annotations=[
+        MemoryAnnotation(
+            memory_id=mem["id"], subject="Bailey", predicate="knows", object="Alex",
+            entities=[EntityInput(name="Bailey"), EntityInput(name="Alex")],
+        ),
+    ]))
+    assert db_conn.execute("SELECT COUNT(*) FROM entity_relations").fetchone()[0] == 1
+
+    # Second call only changes predicate; subject/object are omitted.
+    result = json.loads(await remind_me_annotate(AnnotateInput(annotations=[
+        MemoryAnnotation(memory_id=mem["id"], predicate="works_with"),
+    ])))
+    assert result["results"][0]["relation_linked"] is True
+
+    row = db_conn.execute(
+        "SELECT subject_entity_id, relation, object_entity_id FROM entity_relations "
+        "ORDER BY created_at"
+    ).fetchall()
+    assert len(row) == 2  # the old "knows" edge stays; a new "works_with" edge is added
+    relations = {r["relation"] for r in row}
+    assert relations == {"knows", "works_with"}
 
 
 # ---------------------------------------------------------------------------

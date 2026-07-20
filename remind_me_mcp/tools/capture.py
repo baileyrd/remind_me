@@ -54,6 +54,44 @@ def _apply_entity_mentions(
     return linked
 
 
+def _maybe_link_entity_relation(
+    db, subject: str | None, predicate: str | None, obj: str | None, now: str
+) -> bool:
+    """Best-effort link a typed entity-to-entity relation from an SPO triple (Phase 3).
+
+    A memory's SPO triple is free text -- writing it doesn't imply the
+    subject/object name known entities. This only records a relation edge
+    when BOTH resolve to entities that already exist (typically because the
+    same call's ``entities`` list -- via :func:`_apply_entity_mentions`,
+    called just before this -- or an earlier annotation already upserted
+    them). Facts whose subject/object don't name a known entity keep working
+    exactly as before this feature existed: a memory-level triple with no
+    graph edge.
+
+    Args:
+        db: An open SQLite connection.
+        subject: The fact's SPO subject text, if any.
+        predicate: The fact's SPO predicate text (the relation label), if any.
+        obj: The fact's SPO object text, if any.
+        now: Timestamp for the relation row. Does NOT commit.
+
+    Returns:
+        True if a relation edge was written (or already existed) because both
+        sides resolved; False if the triple is incomplete or either side
+        doesn't name a known entity.
+    """
+    if not subject or not predicate or not obj:
+        return False
+    subj_entity = _pkg._resolve_entity(db, subject)
+    obj_entity = _pkg._resolve_entity(db, obj)
+    if subj_entity is None or obj_entity is None:
+        return False
+    _pkg._upsert_entity_relation(
+        db, subj_entity["id"], predicate, obj_entity["id"], node_id=NODE_ID, now=now
+    )
+    return True
+
+
 @mcp.tool(
     name="remind_me_auto_capture",
     annotations={
@@ -296,6 +334,7 @@ async def remind_me_decompose(params: DecomposeInput) -> str:
 
     fact_ids: list[str] = []
     entities_linked = 0
+    relations_linked = 0
 
     for fact in params.facts:
         fact_id = _make_id(fact.content)
@@ -347,6 +386,11 @@ async def remind_me_decompose(params: DecomposeInput) -> str:
         # FT-04: upsert mentioned entities and link them to this fact.
         entities_linked += _apply_entity_mentions(db, fact_id, fact.entities, now)
 
+        # Typed entity-to-entity relation, when the SPO subject/object both
+        # name known entities (Phase 3).
+        if _maybe_link_entity_relation(db, fact.subject, fact.predicate, fact.object, now):
+            relations_linked += 1
+
         # Fire-and-forget embed (reference held in _background_tasks, PF-04)
         _pkg._spawn_task(asyncio.to_thread(_pkg._embed_and_store, fact_id, fact.content))
 
@@ -357,6 +401,7 @@ async def remind_me_decompose(params: DecomposeInput) -> str:
         "fact_ids": fact_ids,
         "capture_id": params.capture_id,
         "parent_tags_inherited": parent_tags,
+        "relations_linked": relations_linked,
         "entities_linked": entities_linked,
     }
     return json.dumps(result)
@@ -573,7 +618,24 @@ async def remind_me_annotate(params: AnnotateInput) -> str:
         )
 
         linked = _apply_entity_mentions(db, ann.memory_id, ann.entities, now)
-        results.append({"memory_id": ann.memory_id, "entities_linked": linked})
+
+        # Typed entity-to-entity relation (Phase 3). subject/predicate/object
+        # are each optionally omitted (left unchanged) on this call, so
+        # re-read the memory's full current triple rather than relying only
+        # on this annotation's possibly-partial fields.
+        current = db.execute(
+            "SELECT subject, predicate, object FROM memories WHERE id = ?",
+            (ann.memory_id,),
+        ).fetchone()
+        relation_linked = _maybe_link_entity_relation(
+            db, current["subject"], current["predicate"], current["object"], now
+        )
+
+        results.append({
+            "memory_id": ann.memory_id,
+            "entities_linked": linked,
+            "relation_linked": relation_linked,
+        })
 
     db.commit()
 
