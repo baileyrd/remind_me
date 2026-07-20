@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 from datetime import UTC, datetime
+from typing import Literal
 
 from remind_me_mcp.db import _get_db, _now_iso
 
@@ -49,6 +50,15 @@ DECAY_RATES: dict[str, float] = {
     "unclassified": 0.10,
 }
 """Mapping of memory_type to default decay rate. Lower values persist longer."""
+
+FEEDBACK_MAGNITUDE: float = 0.15
+"""Default fractional adjustment applied to base_weight per feedback signal."""
+
+BASE_WEIGHT_MAX: float = 3.0
+"""Ceiling applied to base_weight after positive ("helpful") feedback."""
+
+BASE_WEIGHT_MIN: float = 0.1
+"""Floor applied to base_weight after negative ("unhelpful") feedback."""
 
 
 # ---------------------------------------------------------------------------
@@ -269,14 +279,77 @@ def record_access(memory_id: str) -> float | None:
     return new_vitality
 
 
+def record_feedback(
+    memory_id: str,
+    signal: Literal["helpful", "unhelpful"],
+    magnitude: float = FEEDBACK_MAGNITUDE,
+) -> float | None:
+    """Record helpful/unhelpful feedback on a memory, adjusting its base_weight.
+
+    Unlike :func:`record_access` (an unsigned, always-positive reinforcement
+    signal derived from ``access_count``), feedback is a *signed* adjustment
+    to ``base_weight`` -- the multiplicative importance term in
+    :func:`compute_vitality`. ``access_count`` is deliberately untouched: it
+    feeds ``sqrt(access_count + 1)`` and has no sensible "negative access"
+    interpretation, so it cannot represent unhelpful feedback.
+
+    Args:
+        memory_id: The text primary key of the memory to record feedback for.
+        signal: "helpful" scales base_weight up (capped at BASE_WEIGHT_MAX);
+            "unhelpful" scales it down (floored at BASE_WEIGHT_MIN).
+        magnitude: Fractional adjustment applied to base_weight (0-1).
+
+    Returns:
+        The new vitality value, or None if the memory was not found.
+    """
+    db = _get_db()
+
+    row = db.execute(
+        "SELECT access_count, decay_rate, base_weight FROM memories WHERE id = ?",
+        (memory_id,),
+    ).fetchone()
+
+    if row is None:
+        return None
+
+    if signal == "helpful":
+        new_base_weight = min(BASE_WEIGHT_MAX, row["base_weight"] * (1 + magnitude))
+    else:
+        new_base_weight = max(BASE_WEIGHT_MIN, row["base_weight"] * (1 - magnitude))
+
+    # Snapshot recompute, same convention as record_access: days_since=0.
+    # accessed_at/access_count are untouched -- feedback is not an access.
+    effective_rate = get_effective_decay_rate(row["decay_rate"], row["access_count"])
+    new_vitality = compute_vitality(
+        base_weight=new_base_weight,
+        access_count=row["access_count"],
+        decay_rate=effective_rate,
+        days_since_last_access=0.0,
+    )
+    new_status = "dormant" if is_dormant(new_vitality) else "active"
+
+    db.execute(
+        """UPDATE memories
+           SET base_weight = ?, vitality = ?, status = ?
+           WHERE id = ?""",
+        (new_base_weight, new_vitality, new_status, memory_id),
+    )
+    db.commit()
+
+    return new_vitality
+
+
 # ---------------------------------------------------------------------------
 # Exports
 # ---------------------------------------------------------------------------
 
 __all__ = [
+    "BASE_WEIGHT_MAX",
+    "BASE_WEIGHT_MIN",
     "BRIDGE_MULTIPLIER",
     "BRIDGE_THRESHOLD",
     "DECAY_RATES",
+    "FEEDBACK_MAGNITUDE",
     "VITALITY_FLOOR",
     "compute_vitality",
     "effective_vitality",
@@ -284,4 +357,5 @@ __all__ = [
     "is_dormant",
     "record_access",
     "record_accesses",
+    "record_feedback",
 ]

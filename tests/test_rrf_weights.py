@@ -52,6 +52,26 @@ def test_weights_default_to_module_constants(monkeypatch):
     assert ranked[0]["id"] == "A"
 
 
+def test_idf_weight_defaults_to_zero_module_constant():
+    """REMIND_ME_RRF_W_IDF is opt-in: the module constant defaults to 0.0,
+    unlike the other four RRF_W_* constants which default to 1.0."""
+    assert retr.RRF_W_IDF == 0.0
+
+
+def test_idf_weight_module_constant_overridable(monkeypatch):
+    keyword, semantic = _case()
+    a, b, _c = keyword
+    a["_bm25_score"] = -1.0  # weak match
+    b["_bm25_score"] = -9.0  # strong match
+    monkeypatch.setattr(retr, "RRF_W_IDF", 5.0)
+    monkeypatch.setattr(retr, "RRF_W_RECENCY", 0.0)
+    monkeypatch.setattr(retr, "RRF_W_VITALITY", 0.0)
+    ranked = retr.rank_rrf(keyword, semantic)  # no explicit weights -> uses module constants
+    # B has the stronger bm25 match, and a heavily-weighted IDF signal now
+    # dominates over the tied keyword/semantic ranks.
+    assert ranked[0]["id"] == "B"
+
+
 async def test_rrf_comparison_runs_and_restores_state():
     """The before_after 'rrf' comparison runs and leaves module weights unchanged."""
     items = make_dataset(4)

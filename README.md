@@ -33,10 +33,11 @@ Persistent, searchable memory that works across **Claude.ai**, **Claude Code**, 
 **Search & retrieval**
 - **Full-text search** via SQLite FTS5 — fast, offline, no external services
 - **Hybrid semantic search** — FTS5 keyword matching + vector similarity via `sqlite-vec` and a local ONNX embedding model
-- **RRF rank fusion** — Reciprocal Rank Fusion merges keyword, semantic, recency, and vitality signals for best-match retrieval
+- **RRF rank fusion** — Reciprocal Rank Fusion merges keyword, semantic, recency, vitality, and an opt-in IDF signal for best-match retrieval
 - **Structured queries** — `subject:`, `predicate:`, and `entity:"..."` filters route straight to indexed lookups; opt-in 1-hop graph expansion surfaces related memories
 - **Token budget** — search results are trimmed to fit within an 800-token default cap (configurable), preventing context overflow
 - **Search transparency** — debug signals, tier breakdown, and dormant exclusion counts in search results
+- **Search feedback** — `remind_me_feedback` records a helpful/unhelpful signal on a memory, adjusting its `base_weight` (and therefore vitality and future ranking) up or down
 
 **Sync, backup & access**
 - **Distributed sync** — offline-first with outbox pattern, Postgres hub, and peer-to-peer sync over Tailscale; the entity graph syncs too
@@ -268,6 +269,7 @@ The stats view replaces the main content area with summary cards, horizontal bar
 |------|-------------|
 | `remind_me_search` | Hybrid search with RRF rank fusion, token budget, dormant exclusion, structured `subject:`/`predicate:`/`entity:` queries, and opt-in `expand_entities` graph expansion |
 | `remind_me_entity` | Look up a knowledge-graph entity by name or alias: canonical record, facts, and linked memories |
+| `remind_me_feedback` | Mark a memory helpful/unhelpful for a search result — a signed signal into `base_weight`/vitality (and therefore future ranking), distinct from the always-positive reinforcement of a plain access |
 
 ### CRUD
 
@@ -331,7 +333,7 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_check_update` | Check if a newer version is available on origin/main |
 | `remind_me_self_update` | Pull latest changes from origin and reinstall the package |
 
-34 tools + 4 resources (`memory://stats`, `memory://categories`, `wiki://schema`, `wiki://index`).
+35 tools + 4 resources (`memory://stats`, `memory://categories`, `wiki://schema`, `wiki://index`).
 
 ### Auto-Capture: Persisting Full Conversations
 
@@ -870,6 +872,7 @@ An unresolvable `entity:` filter returns an empty result with a message (no sile
 | `REMIND_ME_RRF_W_SEMANTIC` | `1.0` | RRF weight for the semantic (vector) signal |
 | `REMIND_ME_RRF_W_RECENCY` | `1.0` | RRF weight for the recency signal (set `0` for a pure-retrieval profile) |
 | `REMIND_ME_RRF_W_VITALITY` | `1.0` | RRF weight for the vitality signal (set `0` for a pure-retrieval profile) |
+| `REMIND_ME_RRF_W_IDF` | `0.0` | RRF weight for the IDF signal (derived from FTS5's `bm25()` score). Off by default — set a positive value to opt in |
 | `REMIND_ME_RERANK` | *(unset)* | Set to `onnx` to rerank the top search candidates with a cross-encoder |
 | `REMIND_ME_RERANK_MODEL` | `cross-encoder/ms-marco-MiniLM-L6-v2` | HuggingFace cross-encoder repo (must ship `onnx/model.onnx`) |
 | `REMIND_ME_RERANK_TOP_K` | `20` | How many top RRF candidates the reranker rescores |
@@ -986,9 +989,9 @@ The server uses:
 - **SQLite FTS5** for keyword full-text search (inverted index, boolean queries)
 - **sqlite-vec** for semantic vector search (cosine similarity on embeddings)
 - **all-MiniLM-L6-v2** via ONNX Runtime for local embedding generation (~80MB model, no API keys)
-- **RRF rank fusion** (k=60) — merges keyword, semantic, recency, and vitality signals without score normalization
+- **RRF rank fusion** (k=60) — merges keyword, semantic, recency, vitality, and an opt-in IDF signal without score normalization
 - **Token budget** — search results are trimmed to an 800-token default cap to prevent LLM context overflow
-- **ACT-R vitality model** — cognitive-science decay with per-category rates, access reinforcement, and bridge protection
+- **ACT-R vitality model** — cognitive-science decay with per-category rates, access reinforcement, signed helpful/unhelpful feedback, and bridge protection
 - **Structured triples** — subject/predicate/object columns with indexed query routing
 - **Entity knowledge graph** — `entities` and `memory_entities` tables with deterministic name-derived ids, alias union-merge, and 1-hop search expansion
 - **Union-Find clustering** — transitive semantic similarity grouping for vault consolidation

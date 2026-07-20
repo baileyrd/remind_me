@@ -70,6 +70,7 @@ from remind_me_mcp.models import (
     EntityLookupInput,
     ExportInput,
     ExtractBatchInput,
+    FeedbackInput,
     MemoryAddInput,
     MemoryDeleteInput,
     MemoryListInput,
@@ -151,6 +152,7 @@ from remind_me_mcp.tools.search import (
     _strip_structured_prefixes,
     _structured_lookup,
     memory_search,
+    remind_me_feedback,
 )
 from remind_me_mcp.tools.wiki import (
     resource_wiki_index,
@@ -171,6 +173,7 @@ from remind_me_mcp.vitality import (
     get_effective_decay_rate,
     is_dormant,
     record_accesses,
+    record_feedback,
 )
 
 # ---------------------------------------------------------------------------
@@ -180,6 +183,7 @@ from remind_me_mcp.vitality import (
 __all__ = [
     "memory_add",
     "memory_search",
+    "remind_me_feedback",
     "memory_list",
     "memory_get",
     "memory_update",

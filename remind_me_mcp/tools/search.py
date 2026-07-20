@@ -17,7 +17,7 @@ from typing import Any
 from remind_me_mcp import tools as _pkg
 from remind_me_mcp.db import _normalize_entity_name, _resolve_entity, _row_to_dict
 from remind_me_mcp.formatting import _fmt_memory_md
-from remind_me_mcp.models import MemorySearchInput, ResponseFormat
+from remind_me_mcp.models import FeedbackInput, MemorySearchInput, ResponseFormat
 from remind_me_mcp.reranker import RERANK_TOP_K
 from remind_me_mcp.retrieval import (
     apply_token_budget,
@@ -466,7 +466,7 @@ async def memory_search(params: MemorySearchInput) -> str:
             bindings.append(tag)
         bindings.append(fetch_limit)
         rows = db.execute(
-            f"""SELECT m.* FROM memories m
+            f"""SELECT m.*, bm25(memories_fts) AS _bm25_score FROM memories m
                JOIN memories_fts fts ON m.rowid = fts.rowid
                WHERE memories_fts MATCH ?
                AND m.superseded_by IS NULL{conditions}
@@ -642,6 +642,7 @@ async def memory_search(params: MemorySearchInput) -> str:
                 f"sem={signals.get('semantic_rank', '?')} "
                 f"rec={signals.get('recency_rank', '?')} "
                 f"vit={signals.get('vitality_rank', '?')} "
+                f"idf={signals.get('idf_rank', '?')} "
                 f"| {signals.get('days_old', '?')} days old_"
             )
         parts.append("")  # blank line separator
@@ -658,3 +659,44 @@ async def memory_search(params: MemorySearchInput) -> str:
     )
 
     return _maybe_update_notice("\n---\n".join(parts))
+
+
+# ---------------------------------------------------------------------------
+# Search feedback (helpful/unhelpful signal into vitality/ranking)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool(
+    name="remind_me_feedback",
+    annotations={
+        "title": "Record Search Feedback",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def remind_me_feedback(params: FeedbackInput) -> str:
+    """Mark a memory as helpful or unhelpful for a search result.
+
+    Unlike plain access recording (which happens automatically and is always
+    positive), this is a signed signal: "helpful" nudges the memory's
+    base_weight up, "unhelpful" nudges it down, and both are reflected in
+    vitality (and therefore future RRF ranking) immediately.
+
+    Args:
+        params (FeedbackInput): The memory id, signal, and optional query context.
+
+    Returns:
+        str: JSON with the memory id and its updated vitality, or an error message.
+    """
+    new_vitality = _pkg.record_feedback(params.memory_id, params.signal)
+    if new_vitality is None:
+        return json.dumps({"error": f"Memory not found: {params.memory_id}"})
+    return json.dumps(
+        {
+            "memory_id": params.memory_id,
+            "signal": params.signal,
+            "vitality": new_vitality,
+        }
+    )

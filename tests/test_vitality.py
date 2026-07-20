@@ -14,14 +14,18 @@ import pytest
 
 from remind_me_mcp.db import _make_id, _now_iso
 from remind_me_mcp.vitality import (
+    BASE_WEIGHT_MAX,
+    BASE_WEIGHT_MIN,
     BRIDGE_THRESHOLD,
     DECAY_RATES,
+    FEEDBACK_MAGNITUDE,
     VITALITY_FLOOR,
     compute_vitality,
     get_effective_decay_rate,
     is_dormant,
     record_access,
     record_accesses,
+    record_feedback,
 )
 
 if TYPE_CHECKING:
@@ -383,3 +387,100 @@ def test_record_accesses_applies_bridge_protection(db_conn: sqlite3.Connection) 
         "SELECT access_count FROM memories WHERE id = ?", (mem_id,)
     ).fetchone()
     assert row["access_count"] == BRIDGE_THRESHOLD
+
+
+# ---------------------------------------------------------------------------
+# record_feedback — signed base_weight adjustment
+# ---------------------------------------------------------------------------
+
+
+def test_record_feedback_helpful_increases_base_weight(db_conn: sqlite3.Connection) -> None:
+    """A 'helpful' signal multiplies base_weight up by (1 + magnitude)."""
+    mem_id = _insert_access_row(db_conn, "feedback-helpful-test")
+
+    result = record_feedback(mem_id, "helpful")
+    assert result is not None
+    assert isinstance(result, float)
+
+    row = db_conn.execute(
+        "SELECT base_weight FROM memories WHERE id = ?", (mem_id,)
+    ).fetchone()
+    assert row["base_weight"] == pytest.approx(1.0 * (1 + FEEDBACK_MAGNITUDE))
+
+
+def test_record_feedback_unhelpful_decreases_base_weight(db_conn: sqlite3.Connection) -> None:
+    """An 'unhelpful' signal multiplies base_weight down by (1 - magnitude)."""
+    mem_id = _insert_access_row(db_conn, "feedback-unhelpful-test")
+
+    record_feedback(mem_id, "unhelpful")
+
+    row = db_conn.execute(
+        "SELECT base_weight FROM memories WHERE id = ?", (mem_id,)
+    ).fetchone()
+    assert row["base_weight"] == pytest.approx(1.0 * (1 - FEEDBACK_MAGNITUDE))
+
+
+def test_record_feedback_helpful_is_capped_at_max(db_conn: sqlite3.Connection) -> None:
+    """Repeated 'helpful' signals never push base_weight above BASE_WEIGHT_MAX."""
+    mem_id = _insert_access_row(db_conn, "feedback-cap-test")
+    db_conn.execute(
+        "UPDATE memories SET base_weight = ? WHERE id = ?", (BASE_WEIGHT_MAX, mem_id)
+    )
+    db_conn.commit()
+
+    record_feedback(mem_id, "helpful")
+
+    row = db_conn.execute(
+        "SELECT base_weight FROM memories WHERE id = ?", (mem_id,)
+    ).fetchone()
+    assert row["base_weight"] == BASE_WEIGHT_MAX
+
+
+def test_record_feedback_unhelpful_is_floored_at_min(db_conn: sqlite3.Connection) -> None:
+    """Repeated 'unhelpful' signals never push base_weight below BASE_WEIGHT_MIN."""
+    mem_id = _insert_access_row(db_conn, "feedback-floor-test")
+    db_conn.execute(
+        "UPDATE memories SET base_weight = ? WHERE id = ?", (BASE_WEIGHT_MIN, mem_id)
+    )
+    db_conn.commit()
+
+    record_feedback(mem_id, "unhelpful")
+
+    row = db_conn.execute(
+        "SELECT base_weight FROM memories WHERE id = ?", (mem_id,)
+    ).fetchone()
+    assert row["base_weight"] == BASE_WEIGHT_MIN
+
+
+def test_record_feedback_does_not_touch_access_count(db_conn: sqlite3.Connection) -> None:
+    """Feedback is not an access: access_count and accessed_at are untouched."""
+    mem_id = _insert_access_row(db_conn, "feedback-no-access-test", access_count=3)
+    before = db_conn.execute(
+        "SELECT access_count, accessed_at FROM memories WHERE id = ?", (mem_id,)
+    ).fetchone()
+
+    record_feedback(mem_id, "helpful")
+
+    after = db_conn.execute(
+        "SELECT access_count, accessed_at FROM memories WHERE id = ?", (mem_id,)
+    ).fetchone()
+    assert after["access_count"] == before["access_count"]
+    assert after["accessed_at"] == before["accessed_at"]
+
+
+def test_record_feedback_updates_vitality_and_status(db_conn: sqlite3.Connection) -> None:
+    """record_feedback recomputes vitality/status from the new base_weight."""
+    mem_id = _insert_access_row(db_conn, "feedback-vitality-test")
+
+    result = record_feedback(mem_id, "unhelpful")
+
+    row = db_conn.execute(
+        "SELECT vitality, status FROM memories WHERE id = ?", (mem_id,)
+    ).fetchone()
+    assert row["vitality"] == pytest.approx(result)
+    assert row["status"] in ("active", "dormant")
+
+
+def test_record_feedback_not_found(db_conn: sqlite3.Connection) -> None:
+    """record_feedback returns None for a non-existent memory_id."""
+    assert record_feedback("nonexistent-id-xyz", "helpful") is None

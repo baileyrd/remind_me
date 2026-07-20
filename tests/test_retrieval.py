@@ -390,6 +390,81 @@ class TestRankRRFVitality:
         assert ranks["A"] < ranks["B"]
 
 
+class TestRankRRFIdf:
+    """Tests for the 5th (opt-in) RRF signal: IDF ranking via bm25() score."""
+
+    def test_idf_rank_assigned(self):
+        """rank_rrf assigns _idf_rank to each result."""
+        from remind_me_mcp.retrieval import rank_rrf
+
+        a = _mem("A", created_at=_ts(0), _bm25_score=-5.0)
+        b = _mem("B", created_at=_ts(0), _bm25_score=-2.0)
+
+        result = rank_rrf([a, b], [a, b], k=60)
+
+        for m in result:
+            assert "_idf_rank" in m, f"Missing _idf_rank on {m['id']}"
+
+    def test_lower_bm25_score_gets_better_rank(self):
+        """bm25() is lower-is-better; a lower score should get a better (lower) idf_rank."""
+        from remind_me_mcp.retrieval import rank_rrf
+
+        strong_match = _mem("STRONG", created_at=_ts(0), _bm25_score=-8.0)
+        weak_match = _mem("WEAK", created_at=_ts(0), _bm25_score=-1.0)
+
+        result = rank_rrf([strong_match, weak_match], [strong_match, weak_match], k=60)
+
+        ranks = {m["id"]: m["_idf_rank"] for m in result}
+        assert ranks["STRONG"] < ranks["WEAK"]
+
+    def test_missing_bm25_score_sorts_last(self):
+        """Semantic-only hits (no _bm25_score) get the worst idf_rank."""
+        from remind_me_mcp.retrieval import rank_rrf
+
+        has_score = _mem("SCORED", created_at=_ts(0), _bm25_score=-3.0)
+        no_score = _mem("UNSCORED", created_at=_ts(0))  # semantic-only, no FTS hit
+
+        result = rank_rrf([has_score], [has_score, no_score], k=60)
+
+        ranks = {m["id"]: m["_idf_rank"] for m in result}
+        assert ranks["SCORED"] < ranks["UNSCORED"]
+
+    def test_idf_weight_defaults_to_zero(self):
+        """With the default (opt-in-off) w_idf, differing bm25 scores don't move the RRF score."""
+        from remind_me_mcp.retrieval import rank_rrf
+
+        strong_match = _mem("STRONG", created_at=_ts(0), _bm25_score=-8.0)
+        weak_match = _mem("WEAK", created_at=_ts(0), _bm25_score=-1.0)
+
+        # Crossed keyword/semantic order so kw+sem contributions tie exactly;
+        # recency/vitality disabled so only idf could break the tie.
+        result = rank_rrf(
+            [strong_match, weak_match],
+            [weak_match, strong_match],
+            k=60,
+            w_recency=0.0,
+            w_vitality=0.0,
+        )
+        scores = {m["id"]: m["_rrf_score"] for m in result}
+
+        # Despite differing bm25, scores tie because w_idf defaults to 0.
+        assert scores["STRONG"] == scores["WEAK"]
+
+    def test_idf_weight_override_favors_stronger_match(self):
+        """A positive w_idf makes the stronger bm25 match score higher."""
+        from remind_me_mcp.retrieval import rank_rrf
+
+        strong_match = _mem("STRONG", created_at=_ts(0), _bm25_score=-8.0)
+        weak_match = _mem("WEAK", created_at=_ts(0), _bm25_score=-1.0)
+
+        result = rank_rrf(
+            [strong_match, weak_match], [strong_match, weak_match], k=60, w_idf=1.0
+        )
+        scores = {m["id"]: m["_rrf_score"] for m in result}
+
+        assert scores["STRONG"] > scores["WEAK"]
+
+
 # ---------------------------------------------------------------------------
 # build_debug_signals
 # ---------------------------------------------------------------------------
@@ -430,7 +505,7 @@ class TestBuildDebugSignals:
         assert signals["days_old"] == 10
 
     def test_returns_correct_keys(self):
-        """build_debug_signals returns dict with exactly the 8 expected keys."""
+        """build_debug_signals returns dict with exactly the 9 expected keys."""
         from remind_me_mcp.retrieval import build_debug_signals
 
         mem = _mem("A", created_at=_ts(0))
@@ -438,12 +513,13 @@ class TestBuildDebugSignals:
         mem["_semantic_rank"] = 1
         mem["_recency_rank"] = 1
         mem["_vitality_rank"] = 1
+        mem["_idf_rank"] = 1
 
         signals = build_debug_signals(mem)
 
         assert set(signals.keys()) == {
             "semantic_rank", "keyword_rank", "recency_rank", "vitality_rank",
-            "rrf_score", "rerank_score", "search_method", "days_old",
+            "idf_rank", "rrf_score", "rerank_score", "search_method", "days_old",
         }
 
     def test_exposes_score_and_method_signals(self):
