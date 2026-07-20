@@ -326,6 +326,7 @@ The stats view replaces the main content area with summary cards, horizontal bar
 |------|-------------|
 | `remind_me_import_chat` | Import a single chat export or document file (`kind`: auto/chat/document) |
 | `remind_me_import_directory` | Bulk import all exports/documents from a directory |
+| `remind_me_list_connectors` | List every registered import connector (built-in and third-party) and which are valid `remind_me_import_chat` kinds |
 | `remind_me_export_memories` | Export memories (+ entity graph by default) to JSON/JSONL, inline or to a file inside the export roots |
 | `remind_me_stats` | View statistics: counts, categories, recent activity |
 | `remind_me_reindex` | Build vector embeddings for any memories missing them |
@@ -335,7 +336,7 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_check_update` | Check if a newer version is available on origin/main |
 | `remind_me_self_update` | Pull latest changes from origin and reinstall the package |
 
-36 tools + 4 resources (`memory://stats`, `memory://categories`, `wiki://schema`, `wiki://index`).
+37 tools + 4 resources (`memory://stats`, `memory://categories`, `wiki://schema`, `wiki://index`).
 
 ### Auto-Capture: Persisting Full Conversations
 
@@ -416,6 +417,10 @@ The import tools (`remind_me_import_chat`, `remind_me_import_directory`, `POST /
 Document imports chunk Markdown per-section (the heading context is kept with each chunk and stored in metadata) and plain text per-paragraph. They get `source: document_import` and default to category `document`.
 
 Imports are restricted to paths inside `REMIND_ME_IMPORT_ROOTS` (default: your home directory) — enforced by both the MCP tools and the HTTP API.
+
+### Pluggable Connectors
+
+The `chat` and `document` kinds are plain parser functions registered by kind string in `remind_me_mcp/importer.py` (`register_connector(kind, connector)`), not a hardcoded dispatch — `remind_me_import_chat`/`remind_me_import_directory` resolve the effective kind exactly as before, then look it up in the registry. A third-party module can register more connectors without touching `importer.py`; `remind_me_mcp/mempalace_import.py` does this for its own `_parse_frontmatter` step, registered under `"mempalace"` purely for discovery (its real ingestion path, `remind_me_import_mempalace`, keeps its own bespoke per-drawer dedup/paging loop — MemPalace drawers arrive individually from a paginated ChromaDB read, not as one raw file). Call `remind_me_list_connectors` to see every registered connector and which are valid `remind_me_import_chat` kinds.
 
 ### Claude Export Format
 
@@ -1009,6 +1014,7 @@ The server uses:
 - **Entity knowledge graph** — `entities` and `memory_entities` tables with deterministic name-derived ids, alias union-merge, and 1-hop search expansion
 - **Union-Find clustering** — transitive semantic similarity grouping for vault consolidation
 - **Section-aware document chunking** — Markdown imports split per heading section, plain text per paragraph
+- **Pluggable connectors** — `chat`/`document` (and third-party kinds like `mempalace`) are parser functions registered by kind string, not a hardcoded dispatch — `remind_me_list_connectors` reports the registry
 - **Neighbor-aware chunk retrieval** — every import-produced chunk carries a `doc_id`/`chunk_index`; opt-in search expansion surfaces adjacent chunks from the same source document
 - **Polling folder watcher** — mtime/size scans with a debounce grace window and changed-file supersession (no inotify dependency)
 - **Outbox-based sync** — local writes (memories, entities, links) are captured in `sync_outbox`, pushed to hub/peers in background
