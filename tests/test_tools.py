@@ -2891,6 +2891,139 @@ async def test_search_verbose_false_no_debug_signals(
     assert "debug_signals" not in mem
 
 
+async def test_search_strategy_defaults_to_auto(db_conn: sqlite3.Connection) -> None:
+    await memory_add(MemoryAddInput(content="Strategy default test memory"))
+
+    params = MemorySearchInput(
+        query="Strategy default test",
+        response_format=ResponseFormat.JSON,
+        verbose=True,
+    )
+    result = await memory_search(params)
+    data = json.loads(result)
+
+    signals = data["memories"][0]["debug_signals"]
+    assert signals["strategy"] == "auto"
+
+
+async def test_search_auto_strategy_picks_keyword_favored_for_short_query(
+    db_conn: sqlite3.Connection,
+) -> None:
+    """A short (<=2 word) query auto-routes to the keyword_favored profile."""
+    from remind_me_mcp.retrieval import resolve_strategy_weights
+
+    await memory_add(MemoryAddInput(content="tailscale vpn config"))
+
+    params = MemorySearchInput(
+        query="tailscale",
+        response_format=ResponseFormat.JSON,
+        verbose=True,
+    )
+    result = await memory_search(params)
+    data = json.loads(result)
+
+    signals = data["memories"][0]["debug_signals"]
+    assert signals["weights_used"] == resolve_strategy_weights("keyword_favored")
+
+
+async def test_search_auto_strategy_picks_semantic_favored_for_question(
+    db_conn: sqlite3.Connection, mock_embedder
+) -> None:
+    """Semantic favoring only makes sense when a semantic tier is actually
+    available — has_semantic gates the heuristic (see
+    test_search_auto_strategy_prefers_keyword_when_no_embedder)."""
+    from remind_me_mcp.retrieval import resolve_strategy_weights
+
+    await memory_add(MemoryAddInput(content="The VPN was configured with split tunneling."))
+
+    params = MemorySearchInput(
+        query="how was the vpn configured for split tunneling access?",
+        response_format=ResponseFormat.JSON,
+        verbose=True,
+    )
+    result = await memory_search(params)
+    data = json.loads(result)
+
+    signals = data["memories"][0]["debug_signals"]
+    assert signals["weights_used"] == resolve_strategy_weights("semantic_favored")
+
+
+async def test_search_auto_strategy_prefers_keyword_when_no_embedder(
+    db_conn: sqlite3.Connection,
+) -> None:
+    """Without a semantic tier available, auto-routing always favors keyword
+    — a semantic weight would be meaningless with no semantic results to
+    weight, regardless of how question-shaped the query looks."""
+    from remind_me_mcp.retrieval import resolve_strategy_weights
+
+    await memory_add(MemoryAddInput(content="The VPN was configured with split tunneling."))
+
+    params = MemorySearchInput(
+        query="how was the vpn configured for split tunneling access?",
+        response_format=ResponseFormat.JSON,
+        verbose=True,
+    )
+    result = await memory_search(params)
+    data = json.loads(result)
+
+    signals = data["memories"][0]["debug_signals"]
+    assert signals["weights_used"] == resolve_strategy_weights("keyword_favored")
+
+
+async def test_search_explicit_strategy_overrides_auto_routing(
+    db_conn: sqlite3.Connection,
+) -> None:
+    """An explicit strategy pins its preset regardless of query shape."""
+    from remind_me_mcp.models import RetrievalStrategy
+    from remind_me_mcp.retrieval import resolve_strategy_weights
+
+    await memory_add(MemoryAddInput(content="short pin test memory"))
+
+    # This query shape would normally auto-route to keyword_favored (<=2
+    # words), but an explicit strategy overrides the heuristic.
+    params = MemorySearchInput(
+        query="pin",
+        response_format=ResponseFormat.JSON,
+        verbose=True,
+        strategy=RetrievalStrategy.SEMANTIC_FAVORED,
+    )
+    result = await memory_search(params)
+    data = json.loads(result)
+
+    signals = data["memories"][0]["debug_signals"]
+    assert signals["strategy"] == "semantic_favored"
+    assert signals["weights_used"] == resolve_strategy_weights("semantic_favored")
+
+
+async def test_search_balanced_strategy_matches_default_ranking(
+    db_conn: sqlite3.Connection,
+) -> None:
+    """The 'balanced' preset (all weights None) ranks identically to omitting strategy."""
+    from remind_me_mcp.models import RetrievalStrategy
+
+    await memory_add(MemoryAddInput(content="Balanced ranking parity test memory"))
+
+    default_result = await memory_search(
+        MemorySearchInput(query="Balanced ranking parity", response_format=ResponseFormat.JSON)
+    )
+    balanced_result = await memory_search(
+        MemorySearchInput(
+            query="Balanced ranking parity",
+            response_format=ResponseFormat.JSON,
+            strategy=RetrievalStrategy.BALANCED,
+        )
+    )
+
+    default_ids = [m["id"] for m in json.loads(default_result)["memories"]]
+    balanced_ids = [m["id"] for m in json.loads(balanced_result)["memories"]]
+    assert default_ids == balanced_ids
+
+
+async def test_search_invalid_strategy_rejected() -> None:
+    with pytest.raises(ValueError):
+        MemorySearchInput(query="q", strategy="not-a-real-strategy")
+
+
 async def test_search_json_always_includes_tier_breakdown(
     db_conn: sqlite3.Connection,
 ) -> None:

@@ -17,13 +17,20 @@ from typing import Any
 from remind_me_mcp import tools as _pkg
 from remind_me_mcp.db import _normalize_entity_name, _resolve_entity, _row_to_dict
 from remind_me_mcp.formatting import _fmt_memory_md
-from remind_me_mcp.models import FeedbackInput, MemorySearchInput, ResponseFormat
+from remind_me_mcp.models import (
+    FeedbackInput,
+    MemorySearchInput,
+    ResponseFormat,
+    RetrievalStrategy,
+)
 from remind_me_mcp.reranker import RERANK_TOP_K
 from remind_me_mcp.retrieval import (
     apply_token_budget,
     build_debug_signals,
+    choose_rrf_weights,
     compute_tier_breakdown,
     rank_rrf,
+    resolve_strategy_weights,
 )
 from remind_me_mcp.server import mcp
 from remind_me_mcp.tools._shared import _maybe_update_notice, _public_memory, log
@@ -660,8 +667,14 @@ async def memory_search(params: MemorySearchInput) -> str:
             m for m in filtered_sem if m["vitality"] >= params.min_vitality
         ]
 
-    # --- RRF ranking ---
-    ranked = rank_rrf(filtered_fts, filtered_sem)
+    # --- RRF ranking (Phase 6: strategy selects the weight profile) ---
+    if params.strategy == RetrievalStrategy.AUTO:
+        weights = choose_rrf_weights(
+            params.query, structured=False, has_semantic=sem_available
+        )
+    else:
+        weights = resolve_strategy_weights(params.strategy.value)
+    ranked = rank_rrf(filtered_fts, filtered_sem, **weights)
 
     # Mark hybrid results (appeared in both FTS and semantic)
     for m in ranked:
@@ -698,10 +711,13 @@ async def memory_search(params: MemorySearchInput) -> str:
     if params.include_neighbors:
         related_neighbors = _expand_via_neighbors(db, envelope["memories"])
 
-    # --- Attach debug signals if verbose ---
+    # --- Attach debug signals if verbose (Phase 6: includes the resolved
+    # strategy/weight profile actually used for this search) ---
     if params.verbose:
         for m in envelope["memories"]:
-            m["debug_signals"] = build_debug_signals(m)
+            m["debug_signals"] = build_debug_signals(
+                m, strategy=params.strategy.value, weights=weights
+            )
 
     # --- Compute tier breakdown (always) ---
     tier_breakdown = compute_tier_breakdown(envelope["memories"])
@@ -755,7 +771,8 @@ async def memory_search(params: MemorySearchInput) -> str:
                 f"rec={signals.get('recency_rank', '?')} "
                 f"vit={signals.get('vitality_rank', '?')} "
                 f"idf={signals.get('idf_rank', '?')} "
-                f"| {signals.get('days_old', '?')} days old_"
+                f"| {signals.get('days_old', '?')} days old "
+                f"| strategy={signals.get('strategy', '?')}_"
             )
         parts.append("")  # blank line separator
 
