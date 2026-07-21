@@ -24,6 +24,7 @@ import atexit
 import logging
 import signal
 import sys
+from typing import TYPE_CHECKING
 
 import remind_me_mcp.tools  # noqa: F401 — ensure tools are registered before mcp.run()
 from remind_me_mcp.api import _build_api_app
@@ -46,12 +47,15 @@ from remind_me_mcp.pid import (
 )
 from remind_me_mcp.server import mcp
 
+if TYPE_CHECKING:
+    from starlette.applications import Starlette
+
 log = logging.getLogger("remind_me_mcp.__main__")
 
 __all__ = ["main"]
 
 
-def _build_combined_app():
+def _build_combined_app() -> tuple[Starlette, str]:
     """Build the combined Starlette app: dashboard API at / and MCP HTTP at /mcp.
 
     SE-03 fixes:
@@ -64,6 +68,16 @@ def _build_combined_app():
         (the shared BearerAuthMiddleware from api.py, SE-05, gating only
         /mcp paths) instead of re-instantiating Starlette around the MCP
         routes, which discarded the lifespan again.
+
+    Auth is always on (config.resolve_mcp_http_secret() auto-generates and
+    persists a secret when REMIND_ME_MCP_HTTP_SECRET is unset, mirroring the
+    remote connector's resolve_connector_token — there is no way to run
+    combined mode with an open /mcp, since widening --ui-host to serve the
+    dashboard remotely would otherwise silently expose the full MCP tool-call
+    surface unauthenticated on the same host:port).
+
+    Returns:
+        (app, secret) — the secret is returned so the caller can log it.
     """
     from contextlib import asynccontextmanager
 
@@ -71,8 +85,10 @@ def _build_combined_app():
     from starlette.middleware import Middleware
     from starlette.routing import Mount
 
+    from remind_me_mcp import config as cfg
     from remind_me_mcp.api import BearerAuthMiddleware
-    from remind_me_mcp.config import MCP_HTTP_SECRET
+
+    secret = cfg.resolve_mcp_http_secret()
 
     dashboard_app = _build_api_app()
     # The MCP app serves its endpoint at settings.streamable_http_path
@@ -86,16 +102,11 @@ def _build_combined_app():
         async with mcp_http_app.router.lifespan_context(mcp_http_app):
             yield
 
-    # Gate the MCP endpoint with bearer auth when a secret is configured
-    # (shared middleware, SE-05); dashboard paths keep their own auth from
-    # _build_api_app.
-    middleware = (
-        [Middleware(BearerAuthMiddleware, secret=MCP_HTTP_SECRET, protect_prefix="/mcp")]
-        if MCP_HTTP_SECRET
-        else []
-    )
+    # Gate the MCP endpoint with bearer auth (shared middleware, SE-05);
+    # dashboard paths keep their own auth from _build_api_app.
+    middleware = [Middleware(BearerAuthMiddleware, secret=secret, protect_prefix="/mcp")]
 
-    return Starlette(
+    app = Starlette(
         routes=[
             *mcp_http_app.routes,
             Mount("/", app=dashboard_app),
@@ -103,20 +114,27 @@ def _build_combined_app():
         middleware=middleware,
         lifespan=_combined_lifespan,
     )
+    return app, secret
 
 
 def _run_combined(args) -> None:
     """Run dashboard API and MCP HTTP transport on the same Uvicorn instance."""
     import uvicorn
 
-    combined = _build_combined_app()
+    from remind_me_mcp import config as cfg
+    from remind_me_mcp.remote import redact_token
+
+    combined, secret = _build_combined_app()
 
     log.info(
-        "Combined server starting — dashboard: http://%s:%d  MCP HTTP: http://%s:%d/mcp",
+        "Combined server starting — dashboard: http://%s:%d  MCP HTTP: "
+        "http://%s:%d/mcp (bearer secret required: %s, full secret at %s)",
         args.ui_host,
         args.ui_port,
         args.ui_host,
         args.ui_port,
+        redact_token(secret),
+        cfg.MCP_HTTP_SECRET_FILE,
     )
     uvicorn.run(combined, host=args.ui_host, port=args.ui_port)
 

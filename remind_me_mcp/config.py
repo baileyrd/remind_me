@@ -135,7 +135,70 @@ UI_PORT = _env_int("REMIND_ME_MCP_UI_PORT", 5199)
 SERVE_MCP: bool = os.environ.get("REMIND_ME_MCP_SERVE_HTTP", "").lower() in ("true", "1", "yes")
 MCP_HTTP_PORT: int = _env_int("REMIND_ME_MCP_HTTP_PORT", 8767)
 MCP_HTTP_HOST: str = os.environ.get("REMIND_ME_MCP_HTTP_HOST", "127.0.0.1")
+
 MCP_HTTP_SECRET: str | None = os.environ.get("REMIND_ME_MCP_HTTP_SECRET") or None
+"""Bearer token gating /mcp in combined mode (--serve-mcp --serve-ui), from
+the REMIND_ME_MCP_HTTP_SECRET env var.
+
+When unset, a secret is auto-generated on first use and persisted under
+MEMORY_DIR (see resolve_mcp_http_secret) -- mirroring resolve_connector_token,
+not resolve_api_key: there is no 'disabled' opt-out, since /mcp is the full
+MCP tool-call surface (read/write memory access, including destructive tools
+and remind_me_self_update), at least as sensitive as the remote connector.
+Standalone MCP HTTP mode (--serve-mcp without --serve-ui) is unaffected by
+this and stays unauthenticated by design, relying on its localhost-only
+default bind -- same posture as the peer/webhook servers."""
+
+MCP_HTTP_SECRET_FILE = MEMORY_DIR / "mcp_http_secret"
+"""Location of the auto-generated combined-mode MCP secret (0600 perms).
+Delete the file to rotate: a fresh secret is generated on next resolution."""
+
+
+def resolve_mcp_http_secret() -> str:
+    """Return the effective combined-mode /mcp bearer secret.
+
+    Resolution order mirrors :func:`resolve_connector_token`:
+      1. ``REMIND_ME_MCP_HTTP_SECRET`` env var — always wins when set.
+      2. The secret persisted at ``MEMORY_DIR/mcp_http_secret``.
+      3. First use: generate a new secret, persist it with 0600 permissions,
+         and log it once (the only time the full secret is logged).
+
+    If the secret file can be neither read nor written, an ephemeral secret
+    is generated for this process (and logged) so /mcp never falls open.
+
+    Reads module attributes at call time so tests can monkeypatch
+    ``MCP_HTTP_SECRET`` / ``MEMORY_DIR``.
+    """
+    if MCP_HTTP_SECRET is not None:
+        return MCP_HTTP_SECRET.strip()
+    secret_file = MEMORY_DIR / "mcp_http_secret"
+    try:
+        if secret_file.is_file():
+            existing = secret_file.read_text(encoding="utf-8").strip()
+            if existing:
+                return existing
+        secret = secrets.token_urlsafe(32)
+        secret_file.touch(mode=0o600, exist_ok=True)
+        secret_file.chmod(0o600)
+        secret_file.write_text(secret + "\n", encoding="utf-8")
+        log.info(
+            "Generated combined-mode MCP bearer secret — stored at %s. "
+            "Clients must send 'Authorization: Bearer <secret>' to reach "
+            "/mcp: %s",
+            secret_file,
+            secret,
+        )
+        return secret
+    except OSError as exc:
+        secret = secrets.token_urlsafe(32)
+        log.warning(
+            "Could not persist MCP HTTP secret at %s (%s); using an "
+            "ephemeral secret for this run: %s",
+            secret_file,
+            exc,
+            secret,
+        )
+        return secret
 
 # ---------------------------------------------------------------------------
 # Security
@@ -411,6 +474,8 @@ __all__ = [
     "MCP_HTTP_PORT",
     "MCP_HTTP_HOST",
     "MCP_HTTP_SECRET",
+    "MCP_HTTP_SECRET_FILE",
+    "resolve_mcp_http_secret",
     "API_KEY",
     "API_KEY_FILE",
     "resolve_api_key",

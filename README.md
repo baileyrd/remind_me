@@ -929,7 +929,7 @@ This is a deterministic heuristic, not an LLM planner call — no extra latency 
 | `REMIND_ME_MCP_SERVE_HTTP` | `false` | Run MCP server over Streamable HTTP transport |
 | `REMIND_ME_MCP_HTTP_PORT` | `8767` | Port for the MCP HTTP transport |
 | `REMIND_ME_MCP_HTTP_HOST` | `127.0.0.1` | Host to bind the MCP HTTP transport |
-| `REMIND_ME_MCP_HTTP_SECRET` | *(unset)* | Bearer token for MCP HTTP transport authentication |
+| `REMIND_ME_MCP_HTTP_SECRET` | *(auto-generated)* | Bearer token gating `/mcp` in combined mode (`--serve-mcp --serve-ui`). When unset, generated on first use and stored at `~/.remind-me/mcp_http_secret` (0600) — delete the file to rotate. Standalone `--serve-mcp` (without `--serve-ui`) is unaffected and stays unauthenticated by design, relying on its localhost-only default bind |
 | `REMIND_ME_REMOTE_MCP` | `false` | Run the remote MCP connector (Streamable HTTP behind a secret URL path) for claude.ai custom connectors |
 | `REMIND_ME_REMOTE_PORT` | `8768` | Port for the remote MCP connector |
 | `REMIND_ME_REMOTE_HOST` | `127.0.0.1` | Host to bind the remote MCP connector (keep localhost; let the tunnel do the exposing) |
