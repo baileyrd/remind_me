@@ -19,8 +19,16 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from remind_me_mcp.config import DB_PATH, is_in_export_roots, is_in_import_roots, resolve_api_key
+from remind_me_mcp import ann_index
+from remind_me_mcp.config import (
+    DB_PATH,
+    SYNC_ENABLED,
+    is_in_export_roots,
+    is_in_import_roots,
+    resolve_api_key,
+)
 from remind_me_mcp.db import (
+    _delete_chunks,
     _embed_and_store,
     _entity_profile,
     _get_db,
@@ -272,16 +280,20 @@ def _build_api_app() -> Starlette:
 
         def _work() -> JSONResponse:
             db = _get_db()
-            total = db.execute("SELECT COUNT(*) as cnt FROM memories").fetchone()["cnt"]
+            total = db.execute(
+                "SELECT COUNT(*) as cnt FROM memories WHERE deleted_at IS NULL"
+            ).fetchone()["cnt"]
             categories = db.execute(
-                "SELECT category, COUNT(*) as cnt FROM memories GROUP BY category ORDER BY cnt DESC"
+                "SELECT category, COUNT(*) as cnt FROM memories "
+                "WHERE deleted_at IS NULL GROUP BY category ORDER BY cnt DESC"
             ).fetchall()
             sources = db.execute(
-                "SELECT source, COUNT(*) as cnt FROM memories GROUP BY source ORDER BY cnt DESC"
+                "SELECT source, COUNT(*) as cnt FROM memories "
+                "WHERE deleted_at IS NULL GROUP BY source ORDER BY cnt DESC"
             ).fetchall()
             imports = db.execute("SELECT COUNT(*) as cnt FROM chat_imports").fetchone()["cnt"]
             all_tags: dict[str, int] = {}
-            for row in db.execute("SELECT tags FROM memories").fetchall():
+            for row in db.execute("SELECT tags FROM memories WHERE deleted_at IS NULL").fetchall():
                 try:
                     for t in json.loads(row["tags"]):
                         all_tags[t] = all_tags.get(t, 0) + 1
@@ -302,7 +314,7 @@ def _build_api_app() -> Starlette:
     async def api_list(request: Request) -> JSONResponse:
         """List memories with optional category, source, and tag filters."""
         params = request.query_params
-        conditions: list[str] = []
+        conditions: list[str] = ["m.deleted_at IS NULL"]
         bindings: list[Any] = []
 
         if cat := params.get("category"):
@@ -322,7 +334,7 @@ def _build_api_app() -> Starlette:
                 )
                 bindings.append(tag)
 
-        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        where = f"WHERE {' AND '.join(conditions)}"
         try:
             limit = min(_int_param(params, "limit", 50), 200)
             offset = max(_int_param(params, "offset", 0), 0)
@@ -355,9 +367,11 @@ def _build_api_app() -> Starlette:
         ``entity:"Full Name"``) token in ``q`` filters results to memories
         linked to the resolved entity via memory_entities OR whose structured
         subject/object equals the entity's canonical name. The entity path
-        excludes superseded memories (DI-02). With no free text remaining,
-        matching memories are listed newest-first instead of FTS-ranked; an
-        unknown entity yields an empty result with a message.
+        excludes superseded memories (DI-02). Soft-deleted memories
+        (deleted_at set, gap #11) are always excluded regardless of the
+        entity path. With no free text remaining, matching memories are
+        listed newest-first instead of FTS-ranked; an unknown entity yields
+        an empty result with a message.
         """
         import sqlite3 as _sqlite3
 
@@ -380,8 +394,10 @@ def _build_api_app() -> Starlette:
             query = " ".join(_ENTITY_QUERY_PATTERN.sub("", raw_query).split())
 
         # Category/tag predicates go into the SQL so they apply before LIMIT
-        # (DI-03; same pattern as api_list's DATA-02 fix).
-        conditions = ""
+        # (DI-03; same pattern as api_list's DATA-02 fix). deleted_at IS NULL
+        # is unconditional -- a soft-deleted memory must never resurface here,
+        # unlike superseded_by (only excluded on the entity-scoped path below).
+        conditions = " AND m.deleted_at IS NULL"
         bindings: list[Any] = []
         if cat := params.get("category"):
             conditions += " AND m.category = ?"
@@ -569,7 +585,9 @@ def _build_api_app() -> Starlette:
 
         def _work() -> JSONResponse:
             db = _get_db()
-            row = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+            row = db.execute(
+                "SELECT * FROM memories WHERE id = ? AND deleted_at IS NULL", (memory_id,)
+            ).fetchone()
             if not row:
                 return _json_err("Not found", 404)
             return _json_ok(_row_to_dict(row))
@@ -638,7 +656,9 @@ def _build_api_app() -> Starlette:
 
         def _work() -> JSONResponse:
             db = _get_db()
-            row = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+            row = db.execute(
+                "SELECT * FROM memories WHERE id = ? AND deleted_at IS NULL", (memory_id,)
+            ).fetchone()
             if not row:
                 return _json_err("Not found", 404)
 
@@ -652,15 +672,44 @@ def _build_api_app() -> Starlette:
         return await asyncio.to_thread(_work)
 
     async def api_delete(request: Request) -> JSONResponse:
-        """Permanently delete a memory by its ID."""
+        """Delete a memory by its ID.
+
+        When sync is configured (config.SYNC_ENABLED), this is a soft delete:
+        the row is tombstoned (deleted_at set) rather than removed, so the
+        deletion propagates to other devices via the normal sync path (gap
+        #11) instead of silently resurrecting there on the next pull. On a
+        node with sync disabled, this is a plain, immediate delete exactly
+        as before. Mirrors remind_me_delete's MCP-tool behavior exactly.
+        """
+        import sqlite3 as _sqlite3
+
         memory_id = request.path_params["memory_id"]
 
         def _work() -> JSONResponse:
+            import contextlib
+
             db = _get_db()
-            result = db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
-            db.commit()
-            if result.rowcount == 0:
+            row = db.execute(
+                "SELECT rowid FROM memories WHERE id = ? AND deleted_at IS NULL",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
                 return _json_err("Not found", 404)
+            removed_vec_rowids: list[int] = []
+            with contextlib.suppress(_sqlite3.OperationalError):
+                removed_vec_rowids = _delete_chunks(db, row[0])
+            db.execute("DELETE FROM memory_entities WHERE memory_id = ?", (memory_id,))
+            if SYNC_ENABLED:
+                now = _now_iso()
+                db.execute(
+                    "UPDATE memories SET deleted_at = ?, updated_at = ? WHERE id = ?",
+                    (now, now, memory_id),
+                )
+            else:
+                db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+            db.commit()
+            for vec_rowid in removed_vec_rowids:
+                ann_index.remove_vector(db, vec_rowid)
             return _json_ok({"deleted": memory_id})
 
         return await asyncio.to_thread(_work)

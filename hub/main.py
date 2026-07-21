@@ -119,6 +119,7 @@ CREATE TABLE IF NOT EXISTS memories (
     predicate         TEXT,
     "object"          TEXT,
     superseded_by     TEXT,
+    deleted_at        TEXT COLLATE "C",
     origin_node       TEXT
 );
 
@@ -184,6 +185,7 @@ _NEW_MEMORY_COLUMNS = (
     ('predicate', 'TEXT'),
     ('"object"', 'TEXT'),
     ('superseded_by', 'TEXT'),
+    ('deleted_at', 'TEXT COLLATE "C"'),
     ('origin_node', 'TEXT'),
 )
 
@@ -319,9 +321,9 @@ INSERT INTO memories
      created_at, updated_at, capture_id, node_id, client,
      accessed_at, access_count, decay_rate, vitality, base_weight,
      status, memory_type, source_capture_id,
-     subject, predicate, "object", superseded_by, origin_node)
+     subject, predicate, "object", superseded_by, deleted_at, origin_node)
 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 ON CONFLICT (id) DO UPDATE SET
     content           = EXCLUDED.content,
     category          = EXCLUDED.category,
@@ -344,6 +346,7 @@ ON CONFLICT (id) DO UPDATE SET
     predicate         = EXCLUDED.predicate,
     "object"          = EXCLUDED."object",
     superseded_by     = EXCLUDED.superseded_by,
+    deleted_at        = EXCLUDED.deleted_at,
     origin_node       = EXCLUDED.origin_node
 WHERE EXCLUDED.updated_at > memories.updated_at
 """
@@ -365,6 +368,7 @@ def _upsert_memory(
         accessed_at = _canon_ts(rec.get("accessed_at"))
     except ValueError:
         accessed_at = created_at
+    deleted_at = _canon_ts(rec["deleted_at"]) if rec.get("deleted_at") else None
 
     cur = conn.execute(_MEMORY_UPSERT, (
         str(rec["id"]),
@@ -390,6 +394,7 @@ def _upsert_memory(
         rec.get("predicate"),
         rec.get("object"),
         rec.get("superseded_by"),
+        deleted_at,
         origin,
     ))
     return cur.rowcount > 0
@@ -573,7 +578,7 @@ _MEMORY_WIRE_COLUMNS = (
     'id, content, category, tags, source, metadata, created_at, updated_at, '
     'capture_id, node_id, client, accessed_at, access_count, decay_rate, '
     'vitality, base_weight, status, memory_type, source_capture_id, '
-    'subject, predicate, "object", superseded_by'
+    'subject, predicate, "object", superseded_by, deleted_at'
 )
 _ENTITY_WIRE_COLUMNS = "id, name, kind, aliases, created_at, updated_at, node_id"
 _ENTITY_RELATION_WIRE_COLUMNS = (

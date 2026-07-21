@@ -308,6 +308,7 @@ async def remind_me_consolidate(params: ConsolidateInput) -> str:
         JOIN memories_vec mv ON mv.rowid = vc.vec_rowid
         WHERE m.status = 'active'
           AND m.superseded_by IS NULL
+          AND m.deleted_at IS NULL
     """
     query_params: list[Any] = []
 

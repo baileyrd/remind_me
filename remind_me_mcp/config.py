@@ -537,6 +537,16 @@ IP, or 127.0.0.1 to disable remote access) to narrow exposure. Every
 request requires the SYNC_SECRET bearer token regardless of bind address."""
 OUTBOX_RETENTION_DAYS = _env_int("REMIND_ME_OUTBOX_RETENTION_DAYS", 30)
 """Sync outbox rows older than this many days are pruned each sync cycle."""
+TOMBSTONE_RETENTION_DAYS = _env_int("REMIND_ME_TOMBSTONE_RETENTION_DAYS", 180)
+"""A deleted memory (deleted_at set) is only hard-deleted this many days
+after the delete, purely time-based like OUTBOX_RETENTION_DAYS (no per-peer
+acknowledgment tracking — this is a single-owner, LWW sync model, not a
+general-purpose replicated database). Deliberately generous and longer than
+OUTBOX_RETENTION_DAYS: hard-deleting a tombstone too early risks a genuinely
+offline device later pushing a stale copy of the "deleted" memory and
+resurrecting it, which is a worse failure mode than a slower-to-compact
+tombstone table. Only ever runs while sync is enabled (config.SYNC_ENABLED)
+— a single, never-synced device just hard-deletes immediately instead."""
 SYNC_ENABLED = bool(NODE_ID and HUB_URL and SYNC_SECRET)
 STATIC_PEERS: list[dict] = json.loads(
     os.environ.get("REMIND_ME_STATIC_PEERS", "[]")

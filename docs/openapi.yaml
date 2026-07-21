@@ -760,6 +760,15 @@ components:
         chunk_index:
           type: integer
           nullable: true
+        deleted_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            Tombstone timestamp (gap #11). Always null on a memory returned
+            by any of these routes — a deleted memory is excluded from every
+            read path — documented here only because it's a real column on
+            the underlying row, mirroring superseded_by's treatment above.
 
     WikiPageSummary:
       type: object

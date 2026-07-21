@@ -225,7 +225,8 @@ def pending_compile_count() -> int:
     """
     watermark = get_meta(COMPILE_WATERMARK_KEY, "") or _EPOCH
     row = _db._get_db().execute(
-        "SELECT COUNT(*) FROM memories WHERE superseded_by IS NULL AND created_at > ?",
+        "SELECT COUNT(*) FROM memories "
+        "WHERE superseded_by IS NULL AND deleted_at IS NULL AND created_at > ?",
         (watermark,),
     ).fetchone()
     return int(row[0]) if row is not None else 0

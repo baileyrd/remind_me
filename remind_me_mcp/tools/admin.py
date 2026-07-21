@@ -341,16 +341,21 @@ async def memory_stats(params: MemoryStatsInput) -> str:
     from remind_me_mcp.config import DB_PATH
 
     db = _pkg._get_db()
-    total = db.execute("SELECT COUNT(*) as cnt FROM memories").fetchone()["cnt"]
+    total = db.execute(
+        "SELECT COUNT(*) as cnt FROM memories WHERE deleted_at IS NULL"
+    ).fetchone()["cnt"]
     categories = db.execute(
-        "SELECT category, COUNT(*) as cnt FROM memories GROUP BY category ORDER BY cnt DESC"
+        "SELECT category, COUNT(*) as cnt FROM memories "
+        "WHERE deleted_at IS NULL GROUP BY category ORDER BY cnt DESC"
     ).fetchall()
     sources = db.execute(
-        "SELECT source, COUNT(*) as cnt FROM memories GROUP BY source ORDER BY cnt DESC"
+        "SELECT source, COUNT(*) as cnt FROM memories "
+        "WHERE deleted_at IS NULL GROUP BY source ORDER BY cnt DESC"
     ).fetchall()
     imports = db.execute("SELECT COUNT(*) as cnt FROM chat_imports").fetchone()["cnt"]
     recent = db.execute(
-        "SELECT id, category, substr(content, 1, 80) as preview, created_at FROM memories ORDER BY created_at DESC LIMIT 5"
+        "SELECT id, category, substr(content, 1, 80) as preview, created_at FROM memories "
+        "WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 5"
     ).fetchall()
 
     try:
@@ -436,8 +441,12 @@ async def remind_me_reindex() -> str:
         log.debug("Chunk tables not available for pruning: %s", e)
 
     # Find memories without chunk embeddings (a memory is "embedded" once it owns
-    # at least one row in vec_chunks).
-    all_rows = db.execute("SELECT id, rowid, content FROM memories").fetchall()
+    # at least one row in vec_chunks). Tombstoned memories (gap #11) are
+    # skipped -- no point spending embed compute on something search will
+    # never surface anyway.
+    all_rows = db.execute(
+        "SELECT id, rowid, content FROM memories WHERE deleted_at IS NULL"
+    ).fetchall()
     embedded_rowids = set()
     try:
         embedded_rowids = {
@@ -508,7 +517,9 @@ async def remind_me_server_status() -> str:
     embedder = await asyncio.to_thread(_get_embedder)
     if embedder is not None:
         db = _pkg._get_db()
-        total_mems = db.execute("SELECT COUNT(*) as cnt FROM memories").fetchone()["cnt"]
+        total_mems = db.execute(
+            "SELECT COUNT(*) as cnt FROM memories WHERE deleted_at IS NULL"
+        ).fetchone()["cnt"]
         try:
             total_vecs = db.execute(
                 "SELECT COUNT(DISTINCT memory_rowid) as cnt FROM vec_chunks"
@@ -878,7 +889,9 @@ async def resource_stats() -> str:
     from remind_me_mcp.config import DB_PATH
 
     db = _pkg._get_db()
-    total = db.execute("SELECT COUNT(*) as cnt FROM memories").fetchone()["cnt"]
+    total = db.execute(
+        "SELECT COUNT(*) as cnt FROM memories WHERE deleted_at IS NULL"
+    ).fetchone()["cnt"]
     return json.dumps({"total_memories": total, "db_path": str(DB_PATH)})
 
 
@@ -886,5 +899,8 @@ async def resource_stats() -> str:
 async def resource_categories() -> str:
     """List all memory categories with counts."""
     db = _pkg._get_db()
-    rows = db.execute("SELECT category, COUNT(*) as cnt FROM memories GROUP BY category ORDER BY cnt DESC").fetchall()
+    rows = db.execute(
+        "SELECT category, COUNT(*) as cnt FROM memories "
+        "WHERE deleted_at IS NULL GROUP BY category ORDER BY cnt DESC"
+    ).fetchall()
     return json.dumps({r["category"]: r["cnt"] for r in rows}, indent=2)

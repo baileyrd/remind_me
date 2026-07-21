@@ -41,6 +41,7 @@ NORMALIZED_CATEGORY = "normalized"
 # normalized (no existing memory points back at it via normalized_from).
 _UNNORMALIZED_WHERE = """
     m.superseded_by IS NULL
+    AND m.deleted_at IS NULL
     AND m.source IN ('document_import', 'chat_import')
     AND NOT EXISTS (
         SELECT 1 FROM memories n WHERE json_extract(n.metadata, '$.normalized_from') = m.id

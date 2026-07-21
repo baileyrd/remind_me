@@ -33,6 +33,16 @@ as memory_entities links -- immutable insert-or-ignore, record_type
 'entity_relation', its own /sync/pull_entity_relations endpoint and keyset
 cursor. Unlike links, each row already carries its own deterministic id
 (see db._entity_relation_id), so no synthetic wire id is needed.
+
+Gap #11: deletion propagates via a deleted_at tombstone column, not a hard
+DELETE (which produced no outbox row at all, so a memory deleted on one
+device silently resurrected on the next pull elsewhere). A soft-delete is
+just another UPDATE, so it rides the existing memories_outbox_au trigger and
+LWW-on-updated_at conflict resolution unchanged -- no new operation type or
+wire format needed. _upsert_records skips embedding a tombstoned incoming
+record and cleans up its chunk vectors instead. _compact_tombstones hard-
+deletes old-enough tombstones each cycle (config.TOMBSTONE_RETENTION_DAYS),
+same time-based-only approach as _prune_outbox.
 """
 from __future__ import annotations
 
@@ -50,7 +60,7 @@ if TYPE_CHECKING:
 
 import httpx
 
-from remind_me_mcp import config
+from remind_me_mcp import ann_index, config
 from remind_me_mcp.config import (
     HUB_URL,
     NODE_ID,
@@ -59,7 +69,7 @@ from remind_me_mcp.config import (
     SYNC_INTERVAL,
     SYNC_SECRET,
 )
-from remind_me_mcp.db import _embed_and_store_rows, _get_db, _now_iso
+from remind_me_mcp.db import _delete_chunks, _embed_and_store_rows, _get_db, _now_iso
 from remind_me_mcp.telemetry import maybe_span
 
 log = logging.getLogger("remind_me_mcp.sync")
@@ -462,8 +472,8 @@ def _upsert_one(db: sqlite3.Connection, rec: dict[str, Any]) -> int | None:
              created_at, updated_at, capture_id, node_id, client,
              accessed_at, access_count, decay_rate, vitality, base_weight,
              status, memory_type, source_capture_id,
-             subject, predicate, object, superseded_by)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             subject, predicate, object, superseded_by, deleted_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             content           = excluded.content,
             category          = excluded.category,
@@ -485,7 +495,8 @@ def _upsert_one(db: sqlite3.Connection, rec: dict[str, Any]) -> int | None:
             subject           = excluded.subject,
             predicate         = excluded.predicate,
             object            = excluded.object,
-            superseded_by     = excluded.superseded_by
+            superseded_by     = excluded.superseded_by,
+            deleted_at        = excluded.deleted_at
         WHERE excluded.updated_at > memories.updated_at
         RETURNING rowid
     """, (
@@ -512,6 +523,7 @@ def _upsert_one(db: sqlite3.Connection, rec: dict[str, Any]) -> int | None:
         rec.get("predicate"),
         rec.get("object"),
         rec.get("superseded_by"),
+        rec.get("deleted_at"),
     ))
 
     applied = result.fetchone()
@@ -710,6 +722,13 @@ def _upsert_records(db: sqlite3.Connection, records: list[dict[str, Any]]) -> Up
     memory records are embedded for semantic search after commit (SY-06) —
     best-effort, silently skipped when no embedder is available.
 
+    A memory record whose ``deleted_at`` is set (a tombstone, gap #11) is
+    never embedded — instead any chunk vectors it already has locally are
+    removed, mirroring what ``remind_me_delete`` does for a local delete.
+    The row itself stays (with ``deleted_at`` applied via the normal LWW
+    upsert above), since it's the tombstone that needs to keep propagating
+    to other nodes; only its now-pointless derived embeddings are cleaned up.
+
     Args:
         db: An open SQLite connection.
         records: Wire-format records from a hub or peer.
@@ -720,6 +739,7 @@ def _upsert_records(db: sqlite3.Connection, records: list[dict[str, Any]]) -> Up
     """
     result = UpsertResult()
     embed_rows: list[tuple[int, str]] = []
+    tombstoned_rowids: list[int] = []
 
     for rec in records:
         try:
@@ -750,13 +770,25 @@ def _upsert_records(db: sqlite3.Connection, records: list[dict[str, Any]]) -> Up
         if applied:
             result.applied += 1
         if rowid is not None:
-            embed_rows.append((rowid, str(rec.get("content") or "")))
+            if rec.get("deleted_at"):
+                tombstoned_rowids.append(rowid)
+            else:
+                embed_rows.append((rowid, str(rec.get("content") or "")))
 
     if embed_rows:
         try:
             _embed_and_store_rows(embed_rows)
         except Exception as e:
             log.debug("Embedding pulled records failed (non-fatal): %s", e)
+
+    for rowid in tombstoned_rowids:
+        try:
+            removed = _delete_chunks(db, rowid)
+            db.commit()
+            for vec_rowid in removed:
+                ann_index.remove_vector(db, vec_rowid)
+        except Exception as e:
+            log.debug("Cleaning up a remotely-tombstoned memory's chunks failed (non-fatal): %s", e)
 
     return result
 
@@ -790,6 +822,53 @@ def _prune_outbox(db: sqlite3.Connection) -> int:
     if removed:
         log.debug("Pruned %d outbox rows", removed)
     return removed
+
+
+# ---------------------------------------------------------------------------
+# Tombstone compaction (gap #11)
+# ---------------------------------------------------------------------------
+
+
+def _compact_tombstones(db: sqlite3.Connection) -> int:
+    """Hard-delete memories tombstoned longer than TOMBSTONE_RETENTION_DAYS ago.
+
+    Purely time-based, like :func:`_prune_outbox` — no per-peer acknowledgment
+    tracking (this is a single-owner, LWW sync model, not a general-purpose
+    replicated database; see config.TOMBSTONE_RETENTION_DAYS for the tradeoff
+    this accepts). Chunk vectors, the ANN index entry, and entity mention
+    links are cleaned up the same way :func:`remind_me_mcp.tools.crud.memory_delete`
+    does for a fresh local delete — a compacted tombstone is a real delete,
+    just a deferred one.
+
+    Only ever called from the sync loop (config.SYNC_ENABLED), so a node that
+    never syncs never compacts — see memory_delete's hard-delete fast path
+    for that case instead.
+
+    Returns:
+        The number of tombstoned memories hard-deleted.
+    """
+    cutoff = (
+        datetime.now(UTC) - timedelta(days=config.TOMBSTONE_RETENTION_DAYS)
+    ).isoformat()
+    rows = db.execute(
+        "SELECT id, rowid FROM memories WHERE deleted_at IS NOT NULL AND deleted_at < ?",
+        (cutoff,),
+    ).fetchall()
+    if not rows:
+        return 0
+
+    removed_vec_rowids: list[int] = []
+    for row in rows:
+        removed_vec_rowids.extend(_delete_chunks(db, row["rowid"]))
+        db.execute("DELETE FROM memory_entities WHERE memory_id = ?", (row["id"],))
+        db.execute("DELETE FROM memories WHERE id = ?", (row["id"],))
+    db.commit()
+    # ANN mutations only after the commit succeeds — see db._delete_chunks.
+    for vec_rowid in removed_vec_rowids:
+        ann_index.remove_vector(db, vec_rowid)
+
+    log.debug("Compacted %d tombstoned memories", len(rows))
+    return len(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -926,6 +1005,11 @@ async def _sync_once() -> None:
             _prune_outbox(_get_db())
         except Exception as e:
             log.warning("Outbox prune failed: %s", e)
+
+        try:
+            _compact_tombstones(_get_db())
+        except Exception as e:
+            log.warning("Tombstone compaction failed: %s", e)
 
 
 async def sync_loop() -> None:

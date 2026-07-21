@@ -369,7 +369,7 @@ def memory_factory(db_conn: sqlite3.Connection):
         # Update v5/v6/v13 schema columns if provided (status, vitality, memory_type, source_capture_id, etc.)
         v5_cols = {
             k: defaults[k]
-            for k in ("status", "vitality", "memory_type", "decay_rate", "base_weight", "access_count", "accessed_at", "source_capture_id", "capture_id", "subject", "predicate", "object", "superseded_by", "doc_id", "chunk_index")
+            for k in ("status", "vitality", "memory_type", "decay_rate", "base_weight", "access_count", "accessed_at", "source_capture_id", "capture_id", "subject", "predicate", "object", "superseded_by", "doc_id", "chunk_index", "deleted_at")
             if k in defaults
         }
         if v5_cols:

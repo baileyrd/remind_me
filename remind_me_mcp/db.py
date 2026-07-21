@@ -34,6 +34,9 @@ Current schema versions:
             (dbs_source, external_id) rather than a single id column since
             that's dbs's own item identity; also stores content_hash so a
             rerun can tell an edited item from an unchanged one.
+  15 -> 16: deleted_at tombstone column (gap #11) so deletion propagates over
+            sync — a soft-delete UPDATE rides the existing memories_outbox_au
+            trigger instead of a hard DELETE producing no outbox row at all.
 """
 
 from __future__ import annotations
@@ -255,7 +258,7 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 # Current target schema version.  Increment when adding a new migration step.
-_SCHEMA_VERSION = 15
+_SCHEMA_VERSION = 16
 
 
 
@@ -349,6 +352,11 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         _migrate_v14_to_v15(db)
         db.execute("PRAGMA user_version = 15")
         current_version = 15
+
+    if current_version < 16:
+        _migrate_v15_to_v16(db)
+        db.execute("PRAGMA user_version = 16")
+        current_version = 16
 
     db.commit()
 
@@ -946,7 +954,7 @@ _OUTBOX_PAYLOAD_COLUMNS = (
     "accessed_at", "access_count", "decay_rate", "vitality", "base_weight",
     "status", "memory_type", "source_capture_id",
     "subject", "predicate", "object", "superseded_by",
-    "doc_id", "chunk_index",
+    "doc_id", "chunk_index", "deleted_at",
 )
 
 # Entity columns mirrored into sync_outbox payloads (FT-04). Memory records
@@ -1376,6 +1384,69 @@ def _migrate_v14_to_v15(db: sqlite3.Connection) -> None:
     """)
 
 
+def _migrate_v15_to_v16(db: sqlite3.Connection) -> None:
+    """v15 -> v16: deleted_at tombstone column for delete/sync propagation (gap #11).
+
+    Deletion previously had no sync representation at all: ``memory_delete``
+    hard-DELETEd the row, which produces no ``sync_outbox`` entry (the
+    triggers only fire on INSERT/UPDATE), so a memory deleted on one device
+    silently resurrected on the next pull from another. This adds a
+    ``deleted_at`` tombstone column instead: "deleting" a memory becomes an
+    UPDATE (setting ``deleted_at``/``updated_at``), which rides the
+    *existing* ``memories_outbox_au`` trigger for free once the column is
+    added to ``_OUTBOX_PAYLOAD_COLUMNS`` -- no new outbox operation type or
+    trigger is needed, and LWW conflict resolution (compare ``updated_at``)
+    already applies to a tombstone exactly like any other update.
+
+    Every normal read path (search, list, get, entity profile, ...) is
+    updated elsewhere to filter ``deleted_at IS NULL``, same as the existing
+    ``superseded_by IS NULL`` convention -- the row stays in the database
+    (so the tombstone itself can propagate) but is invisible to normal use.
+    Sync's pull/push wire paths and ``exporter.py``'s full-backup export
+    deliberately do NOT filter it, since they need to carry tombstones
+    across nodes / preserve them in a restorable backup.
+
+    A separate periodic compaction pass (``sync._compact_tombstones``) hard-
+    deletes tombstones once they're old enough that every reachable peer/hub
+    has almost certainly already observed them, so the table doesn't grow
+    forever.
+
+    Rides the existing ``memories_outbox_ai``/``_au`` triggers (HY-03), same
+    pattern as v12->v13's doc_id/chunk_index addition.
+
+    Args:
+        db: An open SQLite connection.
+    """
+    with contextlib.suppress(sqlite3.OperationalError):
+        db.execute("ALTER TABLE memories ADD COLUMN deleted_at TEXT DEFAULT NULL")
+
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_memories_deleted_at ON memories(deleted_at)"
+    )
+
+    payload = _outbox_payload_sql("NEW.")
+    db.executescript(f"""
+        DROP TRIGGER IF EXISTS memories_outbox_ai;
+        DROP TRIGGER IF EXISTS memories_outbox_au;
+
+        CREATE TRIGGER IF NOT EXISTS memories_outbox_ai
+        AFTER INSERT ON memories
+        WHEN COALESCE((SELECT value FROM sync_flags WHERE key = 'sync_enabled'), '0') = '1'
+        BEGIN
+            INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+            VALUES (NEW.id, 'insert', {payload}, {_SQL_NOW_ISO});
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS memories_outbox_au
+        AFTER UPDATE ON memories
+        WHEN COALESCE((SELECT value FROM sync_flags WHERE key = 'sync_enabled'), '0') = '1'
+        BEGIN
+            INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+            VALUES (NEW.id, 'update', {payload}, {_SQL_NOW_ISO});
+        END;
+    """)
+
+
 def _reconcile_sync_enabled_flag(db: sqlite3.Connection) -> None:
     """Align the sync_flags gate with config.SYNC_ENABLED at startup (SY-07).
 
@@ -1705,7 +1776,8 @@ def _hydrate_ann_hits(
     m_placeholders = ",".join("?" * len(memory_rowids))
     rows = db.execute(
         f"""SELECT m.*, m.rowid AS _ann_rowid FROM memories m
-           WHERE m.rowid IN ({m_placeholders}) AND m.superseded_by IS NULL{conditions}""",
+           WHERE m.rowid IN ({m_placeholders}) AND m.superseded_by IS NULL
+           AND m.deleted_at IS NULL{conditions}""",
         [*memory_rowids, *bindings],
     ).fetchall()
 
@@ -1797,7 +1869,8 @@ def _semantic_search(
                JOIN memories m ON m.rowid = vc.memory_rowid
                WHERE mv.embedding MATCH ?
                AND mv.k = ?
-               AND m.superseded_by IS NULL{conditions}
+               AND m.superseded_by IS NULL
+               AND m.deleted_at IS NULL{conditions}
                GROUP BY m.rowid
                ORDER BY distance""",
             bindings,
@@ -2138,7 +2211,7 @@ def _entity_profile(
     fact_rows = db.execute(
         """SELECT id, content, subject, predicate, object, category, created_at
            FROM memories
-           WHERE superseded_by IS NULL
+           WHERE superseded_by IS NULL AND deleted_at IS NULL
              AND (lower(subject) = ? OR lower(object) = ?)
            ORDER BY created_at DESC
            LIMIT ?""",
@@ -2150,7 +2223,7 @@ def _entity_profile(
                   m.category, m.created_at
            FROM memory_entities me
            JOIN memories m ON m.id = me.memory_id
-           WHERE me.entity_id = ? AND m.superseded_by IS NULL
+           WHERE me.entity_id = ? AND m.superseded_by IS NULL AND m.deleted_at IS NULL
            ORDER BY m.created_at DESC
            LIMIT ?""",
         (ent["id"], limit),
@@ -2159,7 +2232,7 @@ def _entity_profile(
         """SELECT COUNT(*) AS cnt
            FROM memory_entities me
            JOIN memories m ON m.id = me.memory_id
-           WHERE me.entity_id = ? AND m.superseded_by IS NULL""",
+           WHERE me.entity_id = ? AND m.superseded_by IS NULL AND m.deleted_at IS NULL""",
         (ent["id"],),
     ).fetchone()["cnt"]
 
