@@ -15,12 +15,14 @@ import sqlite3
 
 from remind_me_mcp import tools as _pkg
 from remind_me_mcp.config import EMBED_BATCH_SIZE
+from remind_me_mcp.dbs_import import pull_dbs
 from remind_me_mcp.exporter import EXPORT_INLINE_MAX, export_memories
 from remind_me_mcp.importer import import_chat_file, import_directory
 from remind_me_mcp.mempalace_import import pull_mempalace
 from remind_me_mcp.models import (
     BulkImportDirInput,
     ChatImportInput,
+    DbsImportInput,
     ExportInput,
     MemoryStatsInput,
     MempalaceImportInput,
@@ -161,6 +163,58 @@ async def memory_import_mempalace(params: MempalaceImportInput) -> str:
             "status": "error",
             "error": "chromadb not installed — run: uv pip install -e '.[mempalace]'",
         })
+    except FileNotFoundError as e:
+        return json.dumps({"status": "error", "error": str(e)})
+
+
+@mcp.tool(
+    name="remind_me_import_dbs",
+    annotations={
+        "title": "Import Memories from dbs",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def memory_import_dbs(params: DbsImportInput) -> str:
+    """Bulk-import memories from a dbs (daily-backup-system) SQLite store.
+
+    Reads dbs's items/sources tables directly (read-only) rather than going
+    through dbs's own export files — each live item becomes a memory with
+    dbs's source and tags preserved as first-class knowledge-graph entities
+    (linked via the memory-entity graph), not flattened into note prose.
+
+    Already-imported items are skipped when unchanged (tracked by
+    (dbs source, external_id) plus a content hash), so reruns — including
+    paging through a large database with limit/offset — are safe. An item
+    whose content changed since its last import gets a fresh memory, with
+    the previous one marked superseded, so edits are picked up too (unlike
+    the file-export pipeline, which can only see items by their original
+    creation date).
+
+    Args:
+        params (DbsImportInput): Path to the dbs SQLite database, optional
+            source/item_type filters, paging (limit/offset), extra tags, and
+            dry_run.
+
+    Returns:
+        str: JSON summary — fetched, already_imported, to_import, created,
+        updated, imported (created + updated), has_more (page again with a
+        higher offset if true).
+    """
+    try:
+        result = await asyncio.to_thread(
+            pull_dbs,
+            db_path=params.db_path,
+            source=params.source,
+            item_type=params.item_type,
+            limit=params.limit,
+            offset=params.offset,
+            tags=params.tags,
+            dry_run=params.dry_run,
+        )
+        return json.dumps(result, indent=2)
     except FileNotFoundError as e:
         return json.dumps({"status": "error", "error": str(e)})
 

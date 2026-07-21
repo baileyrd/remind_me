@@ -101,6 +101,7 @@ def db_conn(monkeypatch: pytest.MonkeyPatch) -> sqlite3.Connection:
 
     import remind_me_mcp.api as _api_mod
     import remind_me_mcp.db as _db_mod
+    import remind_me_mcp.dbs_import as _dbs_mod
     import remind_me_mcp.exporter as _exporter_mod
     import remind_me_mcp.importer as _importer_mod
     import remind_me_mcp.mempalace_import as _mempalace_mod
@@ -109,15 +110,16 @@ def db_conn(monkeypatch: pytest.MonkeyPatch) -> sqlite3.Connection:
 
     monkeypatch.setattr(_db_mod, "_get_db", lambda: db)
     monkeypatch.setattr(_api_mod, "_get_db", lambda: db)
-    # tools.py, importer.py, exporter.py, vitality.py, and mempalace_import.py
-    # use `from remind_me_mcp.db import _get_db` which creates separate
-    # bindings — patch those local references directly so tool handlers
-    # route through the test in-memory database.
+    # tools.py, importer.py, exporter.py, vitality.py, mempalace_import.py, and
+    # dbs_import.py use `from remind_me_mcp.db import _get_db` which creates
+    # separate bindings — patch those local references directly so tool
+    # handlers route through the test in-memory database.
     monkeypatch.setattr(_tools_mod, "_get_db", lambda: db)
     monkeypatch.setattr(_importer_mod, "_get_db", lambda: db)
     monkeypatch.setattr(_exporter_mod, "_get_db", lambda: db)
     monkeypatch.setattr(_vitality_mod, "_get_db", lambda: db)
     monkeypatch.setattr(_mempalace_mod, "_get_db", lambda: db)
+    monkeypatch.setattr(_dbs_mod, "_get_db", lambda: db)
 
     yield db
     db.close()
@@ -166,13 +168,17 @@ def db_conn_concurrent(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> sqlit
 
     import remind_me_mcp.api as _api_mod
     import remind_me_mcp.db as _db_mod
+    import remind_me_mcp.dbs_import as _dbs_mod
     import remind_me_mcp.exporter as _exporter_mod
     import remind_me_mcp.importer as _importer_mod
     import remind_me_mcp.mempalace_import as _mempalace_mod
     import remind_me_mcp.tools as _tools_mod
     import remind_me_mcp.vitality as _vitality_mod
 
-    for mod in (_db_mod, _api_mod, _tools_mod, _importer_mod, _exporter_mod, _vitality_mod, _mempalace_mod):
+    for mod in (
+        _db_mod, _api_mod, _tools_mod, _importer_mod, _exporter_mod,
+        _vitality_mod, _mempalace_mod, _dbs_mod,
+    ):
         monkeypatch.setattr(mod, "_get_db", _get_test_db)
 
     yield db
@@ -261,6 +267,7 @@ def db_conn_with_vec(monkeypatch: pytest.MonkeyPatch) -> sqlite3.Connection:
 
     import remind_me_mcp.api as _api_mod
     import remind_me_mcp.db as _db_mod
+    import remind_me_mcp.dbs_import as _dbs_mod
     import remind_me_mcp.exporter as _exporter_mod
     import remind_me_mcp.importer as _importer_mod
     import remind_me_mcp.mempalace_import as _mempalace_mod
@@ -269,15 +276,16 @@ def db_conn_with_vec(monkeypatch: pytest.MonkeyPatch) -> sqlite3.Connection:
 
     monkeypatch.setattr(_db_mod, "_get_db", lambda: db)
     monkeypatch.setattr(_api_mod, "_get_db", lambda: db)
-    # tools.py, importer.py, exporter.py, vitality.py, and mempalace_import.py
-    # use `from remind_me_mcp.db import _get_db` which creates separate
-    # bindings — patch those local references directly so tool handlers
-    # route through the test in-memory database.
+    # tools.py, importer.py, exporter.py, vitality.py, mempalace_import.py, and
+    # dbs_import.py use `from remind_me_mcp.db import _get_db` which creates
+    # separate bindings — patch those local references directly so tool
+    # handlers route through the test in-memory database.
     monkeypatch.setattr(_tools_mod, "_get_db", lambda: db)
     monkeypatch.setattr(_importer_mod, "_get_db", lambda: db)
     monkeypatch.setattr(_exporter_mod, "_get_db", lambda: db)
     monkeypatch.setattr(_vitality_mod, "_get_db", lambda: db)
     monkeypatch.setattr(_mempalace_mod, "_get_db", lambda: db)
+    monkeypatch.setattr(_dbs_mod, "_get_db", lambda: db)
 
     yield db
     db.close()
