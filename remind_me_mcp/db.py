@@ -37,6 +37,11 @@ Current schema versions:
   15 -> 16: deleted_at tombstone column (gap #11) so deletion propagates over
             sync — a soft-delete UPDATE rides the existing memories_outbox_au
             trigger instead of a hard DELETE producing no outbox row at all.
+  17 -> 18: embedding_meta table (issue #18) recording which embedding
+            model/dimension/backend the stored vectors were actually computed
+            with, so a changed EMBEDDING_MODEL/EMBEDDING_DIM/EMBEDDING_BACKEND
+            can be detected at startup and stale vectors cleared instead of
+            silently serving garbage nearest-neighbor results.
 """
 
 from __future__ import annotations
@@ -51,7 +56,14 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from remind_me_mcp import ann_index
-from remind_me_mcp.config import ANN_MIN_CHUNKS, DB_PATH, EMBED_BATCH_SIZE, EMBEDDING_DIM
+from remind_me_mcp.config import (
+    ANN_MIN_CHUNKS,
+    DB_PATH,
+    EMBED_BATCH_SIZE,
+    EMBEDDING_BACKEND,
+    EMBEDDING_DIM,
+    EMBEDDING_MODEL,
+)
 from remind_me_mcp.embeddings import _get_embedder, chunk_text
 
 # Over-fetch factor for chunked KNN: a single memory may own several chunk
@@ -258,7 +270,7 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 # Current target schema version.  Increment when adding a new migration step.
-_SCHEMA_VERSION = 17
+_SCHEMA_VERSION = 18
 
 
 
@@ -401,11 +413,20 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         db.execute("PRAGMA user_version = 17")
         current_version = 17
 
+    if current_version < 18:
+        _migrate_v17_to_v18(db)
+        db.execute("PRAGMA user_version = 18")
+        current_version = 18
+
     db.commit()
 
     # Align the sync_flags gate (and outbox contents) with the current
     # SYNC_ENABLED configuration on every startup.
     _reconcile_sync_enabled_flag(db)
+
+    # Detect an embedding-model/dimension change and clear now-invalid
+    # vectors (issue #18) on every startup.
+    _reconcile_embedding_meta(db)
 
 
 def _migrate_v0_to_v1(db: sqlite3.Connection) -> None:
@@ -1533,6 +1554,158 @@ def _migrate_v16_to_v17(db: sqlite3.Connection) -> None:
     """)
 
 
+def _migrate_v17_to_v18(db: sqlite3.Connection) -> None:
+    """v17 -> v18: embedding_meta table for embedding-model versioning (issue #18).
+
+    Records which embedding model/dimension/backend the vectors currently
+    stored in ``memories_vec``/``vec_chunks`` were actually computed with --
+    written by :func:`_mark_embedding_meta_current` after a batch of vectors
+    is (re-)written, not merely inferred from the running config, so a
+    mismatch check stays accurate even mid-reindex.
+
+    No sync outbox trigger: this describes which model produced *this
+    node's* local vectors (vectors themselves are never synced -- see
+    sync.py's ``_embed_and_store_rows`` call after pull), not something
+    meaningful to replicate to a peer that might run a different backend.
+
+    Args:
+        db: An open SQLite connection.
+    """
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS embedding_meta (
+            key        TEXT PRIMARY KEY,
+            value      TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+    """)
+
+
+def embedding_mismatch_info(db: sqlite3.Connection) -> dict[str, str] | None:
+    """Read-only check: do the stored vectors' model/dim/backend differ from
+    the currently configured ``EMBEDDING_MODEL``/``EMBEDDING_DIM``/
+    ``EMBEDDING_BACKEND`` (issue #18)?
+
+    Returns None when nothing is recorded yet (a fresh store, or one that
+    predates this feature -- nothing to compare against) or when the
+    recorded values match. Otherwise returns the stored vs. current values
+    for display (:func:`remind_me_mcp.tools.admin.remind_me_server_status`)
+    or action (:func:`_reconcile_embedding_meta`).
+
+    Args:
+        db: An open SQLite connection.
+    """
+    try:
+        rows = db.execute("SELECT key, value FROM embedding_meta").fetchall()
+    except sqlite3.OperationalError:
+        return None  # pre-v18 database; migrations haven't run yet
+    stored = {r[0]: r[1] for r in rows}
+    if not stored:
+        return None
+    if (
+        stored.get("model") == EMBEDDING_MODEL
+        and stored.get("dim") == str(EMBEDDING_DIM)
+        and stored.get("backend") == EMBEDDING_BACKEND
+    ):
+        return None
+    return {
+        "stored_model": stored.get("model", "?"),
+        "stored_dim": stored.get("dim", "?"),
+        "stored_backend": stored.get("backend", "?"),
+        "current_model": EMBEDDING_MODEL,
+        "current_dim": str(EMBEDDING_DIM),
+        "current_backend": EMBEDDING_BACKEND,
+    }
+
+
+def _reconcile_embedding_meta(db: sqlite3.Connection) -> None:
+    """Clear stale vectors when the embedding model/dimension has changed (issue #18).
+
+    Existing vectors computed by a different model (or a different
+    dimension) are not just outdated -- they're actively wrong: KNN against
+    them would silently return garbage nearest-neighbor results rather than
+    erroring. ``memories_vec``/``vec_chunks`` are cleared entirely (and
+    ``memories_vec`` recreated at the new dimension if it changed) so every
+    memory falls through to the existing "missing embeddings" path that
+    ``remind_me_reindex`` and ``remind_me_server_status`` already surface --
+    this is the "clear, actionable warning" the issue asks for, reusing
+    machinery that already exists rather than adding a parallel one.
+
+    Deliberately does NOT update ``embedding_meta`` here -- that only
+    happens once vectors are actually rewritten
+    (:func:`_mark_embedding_meta_current`), so the mismatch stays flagged
+    across every connection/startup until a real reindex happens, not just
+    the one connection that first detected it.
+
+    An automatic background re-embed (spawning a reindex thread at startup)
+    was considered and rejected: it would run unconditionally on every
+    server start with a pending mismatch, including inside tests and quick
+    CLI invocations, for a potentially expensive operation the existing
+    ``remind_me_reindex`` tool already does deliberately, on request.
+
+    Args:
+        db: An open SQLite connection with row_factory=sqlite3.Row set.
+    """
+    info = embedding_mismatch_info(db)
+    if info is None:
+        return
+
+    log.warning(
+        "Embedding model changed (%s/%s dim=%s -> %s/%s dim=%s); clearing "
+        "stale vectors. Run remind_me_reindex to rebuild them.",
+        info["stored_backend"],
+        info["stored_model"],
+        info["stored_dim"],
+        info["current_backend"],
+        info["current_model"],
+        info["current_dim"],
+    )
+
+    with contextlib.suppress(sqlite3.OperationalError):
+        db.execute("DELETE FROM vec_chunks")
+    with contextlib.suppress(sqlite3.OperationalError):
+        db.execute("DROP TABLE IF EXISTS memories_vec")
+    try:
+        db.execute(
+            f"CREATE VIRTUAL TABLE memories_vec USING vec0(embedding float[{EMBEDDING_DIM}])"
+        )
+    except sqlite3.OperationalError as e:
+        log.debug("sqlite-vec not available while recreating memories_vec: %s", e)
+    db.commit()
+
+    ann_index.invalidate_index(db)
+
+
+def _mark_embedding_meta_current(db: sqlite3.Connection) -> None:
+    """Record that stored vectors now match the configured embedding model (issue #18).
+
+    Called after a batch of vectors is successfully (re-)written
+    (:func:`_embed_and_store_batch`). Safe to call repeatedly/mid-reindex:
+    any vector present at all was written under the current config (a
+    mismatch clears every old vector first via
+    :func:`_reconcile_embedding_meta`), so marking "current" as soon as any
+    batch succeeds is accurate, not just once a full reindex finishes.
+
+    Best-effort -- a failure here is bookkeeping only and must never surface
+    as an embedding failure to the caller.
+
+    Args:
+        db: An open SQLite connection.
+    """
+    now = _now_iso()
+    with contextlib.suppress(sqlite3.Error):
+        for key, value in (
+            ("model", EMBEDDING_MODEL),
+            ("dim", str(EMBEDDING_DIM)),
+            ("backend", EMBEDDING_BACKEND),
+        ):
+            db.execute(
+                "INSERT INTO embedding_meta (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                (key, value, now),
+            )
+        db.commit()
+
+
 def _reconcile_sync_enabled_flag(db: sqlite3.Connection) -> None:
     """Align the sync_flags gate with config.SYNC_ENABLED at startup (SY-07).
 
@@ -1740,6 +1913,8 @@ def _embed_and_store_batch(embedder: Any, rows: list[tuple[int, str]]) -> int:
             ann_index.remove_vector(db, vec_rowid)
         for vec_rowid, vec_bytes in added_vecs:
             ann_index.add_vector(db, vec_rowid, vec_bytes)
+        if stored:
+            _mark_embedding_meta_current(db)
         return stored
     except (sqlite3.DatabaseError, sqlite3.InterfaceError) as e:
         # InterfaceError is a sibling of DatabaseError in Python's sqlite3

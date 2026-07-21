@@ -940,6 +940,35 @@ async def test_server_status_reports_backup_count_after_backup(
     assert "**Backups:** 1 at" in result
 
 
+async def test_server_status_no_embedding_mismatch_by_default(
+    db_conn: sqlite3.Connection, mock_embedder
+) -> None:
+    """No embedding_meta recorded yet -- no mismatch warning."""
+    result = await remind_me_server_status()
+
+    assert "Embedding model changed" not in result
+
+
+async def test_server_status_reports_embedding_mismatch(
+    db_conn: sqlite3.Connection, mock_embedder
+) -> None:
+    from remind_me_mcp.db import _now_iso
+
+    now = _now_iso()
+    for key, value in (("model", "old-model"), ("dim", "768"), ("backend", "ollama")):
+        db_conn.execute(
+            "INSERT INTO embedding_meta (key, value, updated_at) VALUES (?, ?, ?)",
+            (key, value, now),
+        )
+    db_conn.commit()
+
+    result = await remind_me_server_status()
+
+    assert "Embedding model changed" in result
+    assert "old-model" in result
+    assert "remind_me_reindex" in result
+
+
 async def test_server_status_no_ui(
     db_conn: sqlite3.Connection,
     monkeypatch: pytest.MonkeyPatch,

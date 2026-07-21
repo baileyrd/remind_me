@@ -573,7 +573,21 @@ async def remind_me_server_status() -> str:
             total_vecs = 0
         lines.append(f"\n**Semantic search:** ✓ Enabled ({EMBEDDING_MODEL})")
         lines.append(f"**Embeddings:** {total_vecs}/{total_mems} memories indexed")
-        if total_vecs < total_mems:
+
+        # Embedding-model versioning (issue #18): stale vectors from a prior
+        # model/dimension are cleared automatically at startup, which is why
+        # this shows up as "missing embeddings" below -- flag the root cause
+        # explicitly so it doesn't read as a plain never-embedded backlog.
+        mismatch = _pkg.embedding_mismatch_info(db)
+        if mismatch is not None:
+            lines.append(
+                f"_⚠ Embedding model changed ({mismatch['stored_backend']}/"
+                f"{mismatch['stored_model']} dim={mismatch['stored_dim']} → "
+                f"{mismatch['current_backend']}/{mismatch['current_model']} "
+                f"dim={mismatch['current_dim']}); stale vectors were cleared. "
+                f"Run `remind_me_reindex` to rebuild them._"
+            )
+        elif total_vecs < total_mems:
             lines.append(f"_Run `remind_me_reindex` to embed the remaining {total_mems - total_vecs} memories._")
 
         # Gap #10: optional ANN index — brute-force sqlite-vec scan otherwise.

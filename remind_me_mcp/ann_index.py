@@ -33,6 +33,7 @@ thing regardless of which path served the query.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import threading
@@ -240,6 +241,27 @@ def status() -> dict[str, Any]:
     }
 
 
+def invalidate_index(db: sqlite3.Connection) -> None:
+    """Discard the in-memory index and its persisted file, then rebuild from `db`.
+
+    Used when the embedding model/dimension changes (issue #18): existing
+    vectors — and any on-disk index built from them — are no longer valid
+    for the newly configured model, so both must be dropped rather than
+    silently kept around until a stale-size check happens to catch it.
+    `db` is typically empty of vectors right after the caller clears
+    `memories_vec`, so this mostly resets state to "correctly-dimensioned
+    and empty" rather than eagerly repopulating; `rebuild_index` doesn't
+    hurt either way since it just reads whatever's in `memories_vec`.
+    """
+    global _index, _index_failed
+    with _lock:
+        _index = None
+        _index_failed = False
+    with contextlib.suppress(OSError):
+        _index_path().unlink(missing_ok=True)
+    rebuild_index(db)
+
+
 def reset_for_tests() -> None:
     """Clear all cached state. Test-only — production code never needs this."""
     global _index, _index_failed
@@ -252,6 +274,7 @@ __all__ = [
     "get_index",
     "add_vector",
     "remove_vector",
+    "invalidate_index",
     "search",
     "save_index",
     "rebuild_index",
