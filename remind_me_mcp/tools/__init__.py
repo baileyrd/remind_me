@@ -183,6 +183,7 @@ from remind_me_mcp.tools.wiki import (
 from remind_me_mcp.updater import pop_update_notice
 from remind_me_mcp.vitality import (
     DECAY_RATES,
+    apply_feedback_adjustment,
     compute_vitality,
     effective_vitality,
     get_effective_decay_rate,

@@ -258,7 +258,7 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 # Current target schema version.  Increment when adding a new migration step.
-_SCHEMA_VERSION = 16
+_SCHEMA_VERSION = 17
 
 
 
@@ -357,6 +357,11 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         _migrate_v15_to_v16(db)
         db.execute("PRAGMA user_version = 16")
         current_version = 16
+
+    if current_version < 17:
+        _migrate_v16_to_v17(db)
+        db.execute("PRAGMA user_version = 17")
+        current_version = 17
 
     db.commit()
 
@@ -1444,6 +1449,49 @@ def _migrate_v15_to_v16(db: sqlite3.Connection) -> None:
             INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
             VALUES (NEW.id, 'update', {payload}, {_SQL_NOW_ISO});
         END;
+    """)
+
+
+def _migrate_v16_to_v17(db: sqlite3.Connection) -> None:
+    """v16 -> v17: memory_feedback table for query-contextual feedback (gap #6).
+
+    ``record_feedback`` previously always mutated ``base_weight`` globally --
+    a memory marked unhelpful for one query got demoted for *every* future
+    query, even though ``FeedbackInput`` already carried a ``query`` field
+    that was silently discarded. This adds a table to log each feedback
+    event with its query context: ``query_tokens`` is a normalized,
+    space-joined token set (lowercased, deduplicated) used for a coarse
+    Jaccard-similarity comparison against a future query at ranking time
+    (``vitality.apply_feedback_adjustment``) -- no embedder dependency, so
+    this works identically whether or not semantic search is configured.
+
+    When feedback is given *with* a query, ``record_feedback`` now logs a
+    row here instead of touching ``base_weight`` (query-contextual only);
+    without a query, the original global mutation is unchanged, preserving
+    exact backward compatibility for any caller that doesn't supply one.
+
+    No sync outbox trigger: purely local bookkeeping, same as
+    ``dbs_imports``/``mempalace_imports`` -- feedback given on one device
+    doesn't (yet) propagate to others. An explicit, flagged scope decision,
+    not an oversight: full cross-device sync would need its own outbox
+    triggers, a ``sync.py`` dispatch branch, and hub route parity (the same
+    lift ``entity_relations`` required), disproportionate to this gap.
+
+    Args:
+        db: An open SQLite connection.
+    """
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS memory_feedback (
+            id           TEXT PRIMARY KEY,
+            memory_id    TEXT NOT NULL,
+            query        TEXT NOT NULL,
+            query_tokens TEXT NOT NULL,
+            signal       TEXT NOT NULL CHECK (signal IN ('helpful', 'unhelpful')),
+            magnitude    REAL NOT NULL,
+            created_at   TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_feedback_memory_id
+            ON memory_feedback(memory_id);
     """)
 
 

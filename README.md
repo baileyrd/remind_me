@@ -41,7 +41,7 @@ Persistent, searchable memory that works across **Claude.ai**, **Claude Code**, 
 - **Neighbor-aware chunk retrieval** — opt-in expansion surfaces a result's adjacent chunks from the same source document, so context split apart by chunking isn't lost
 - **Token budget** — search results are trimmed to fit within an 800-token default cap (configurable), preventing context overflow
 - **Search transparency** — debug signals, tier breakdown, and dormant exclusion counts in search results
-- **Search feedback** — `remind_me_feedback` records a helpful/unhelpful signal on a memory, adjusting its `base_weight` (and therefore vitality and future ranking) up or down
+- **Search feedback** — `remind_me_feedback` records a helpful/unhelpful signal on a memory. Without a `query`, adjusts `base_weight` (and therefore vitality and future ranking) globally; with a `query`, the signal is query-contextual instead — it only nudges future searches with a similar query, so demoting a memory for one question doesn't punish it for an unrelated one
 
 **Sync, backup & access**
 - **Distributed sync** — offline-first with outbox pattern, Postgres hub, and peer-to-peer sync over Tailscale; the entity graph syncs too
@@ -283,7 +283,7 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_search` | Hybrid search with RRF rank fusion, auto-routed or pinned ranking `strategy`, token budget, dormant exclusion, structured `subject:`/`predicate:`/`entity:` queries, opt-in `expand_entities` graph expansion, and opt-in `include_neighbors` sibling-chunk expansion |
 | `remind_me_entity` | Look up a knowledge-graph entity by name or alias: canonical record, facts, and linked memories |
 | `remind_me_entity_traverse` | Multi-hop traversal of the typed entity-relation graph (1-3 hops, both directions, optional relation filter) — for questions that require chaining relations, not just co-mention |
-| `remind_me_feedback` | Mark a memory helpful/unhelpful for a search result — a signed signal into `base_weight`/vitality (and therefore future ranking), distinct from the always-positive reinforcement of a plain access |
+| `remind_me_feedback` | Mark a memory helpful/unhelpful for a search result — a signed signal, distinct from the always-positive reinforcement of a plain access. Without `query`: global `base_weight`/vitality adjustment. With `query`: query-contextual instead — only applies to future searches with a similar query |
 
 ### CRUD
 
@@ -975,6 +975,14 @@ This is a deterministic heuristic, not an LLM planner call — no extra latency 
 
 On top of the profile above, a query containing a temporal expression ("before I moved", "last summer", "when I lived in Seattle", a bare year like "2019") additionally boosts `w_recency` by 1.5x — recency-weighted ranking for questions that are asking to place a fact in time, regardless of whether the query is also short/keyword-shaped or long/semantic-shaped. Always active under `strategy="auto"`; no separate toggle.
 
+### Query-Contextual Feedback
+
+`remind_me_feedback` (`memory_id`, `signal`, optional `query`) has two modes:
+
+- **No `query`** — the original global signal: "helpful"/"unhelpful" adjusts the memory's `base_weight` up or down immediately, affecting every future search.
+- **With `query`** — query-contextual instead: a memory can be a poor match for "what's my favorite editor" but a perfect match for "what IDE did I mention last year," and global demotion would punish the second case for the first's feedback. The event is logged (memory, query, signal, magnitude) rather than touching `base_weight`; at ranking time, a future search's query is compared against every stored feedback query for that memory using Jaccard token-overlap similarity (coarse clustering, no embedder dependency), and matches above a threshold nudge that memory's RRF score up or down by up to 40%, before reranking. A memory with no matching feedback is completely unaffected — this only ever adds signal, never removes a candidate.
+- Feedback logs are per-node local bookkeeping (like the dbs/MemPalace import dedup tables) and aren't synced across devices — an explicit scope decision, not an oversight.
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -1191,6 +1199,12 @@ remind_me is local-first, single-user, and MCP-native by design — some capabil
 ## Changelog
 
 See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for a per-version feature breakdown with PR references; this section summarizes the same history phase-by-phase.
+
+### 1.10.0 — 2026-07-21
+
+Closes the biggest gap in the feedback loop flagged in the application capability review: `record_feedback` always adjusted `base_weight` globally, discarding `FeedbackInput`'s `query` field entirely — a memory marked unhelpful for one query got demoted for *every* future query, even a completely unrelated one.
+
+- **Query-contextual feedback** — `remind_me_feedback` now has two modes. Without `query`: the original global `base_weight` adjustment, unchanged. With `query`: the event is logged (memory, query, signal, magnitude) to a new `memory_feedback` table instead of touching `base_weight`; at ranking time, a future query is compared against stored feedback queries via Jaccard token-overlap similarity, and matches above a threshold nudge that memory's RRF score up or down (capped at ±40%) before reranking. Purely local bookkeeping, not synced across devices — same scope as the dbs/MemPalace import dedup tables.
 
 ### 1.9.0 — 2026-07-21
 

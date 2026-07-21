@@ -18,13 +18,18 @@ from remind_me_mcp.vitality import (
     BASE_WEIGHT_MIN,
     BRIDGE_THRESHOLD,
     DECAY_RATES,
+    FEEDBACK_ADJUSTMENT_CAP,
     FEEDBACK_MAGNITUDE,
+    FEEDBACK_SIMILARITY_THRESHOLD,
     VITALITY_FLOOR,
+    apply_feedback_adjustment,
     compute_vitality,
+    contextual_feedback_adjustment,
     get_effective_decay_rate,
     is_dormant,
     record_access,
     record_accesses,
+    record_contextual_feedback,
     record_feedback,
 )
 
@@ -484,3 +489,249 @@ def test_record_feedback_updates_vitality_and_status(db_conn: sqlite3.Connection
 def test_record_feedback_not_found(db_conn: sqlite3.Connection) -> None:
     """record_feedback returns None for a non-existent memory_id."""
     assert record_feedback("nonexistent-id-xyz", "helpful") is None
+
+
+# ---------------------------------------------------------------------------
+# record_feedback(query=...) — query-contextual mode (issue #54)
+# ---------------------------------------------------------------------------
+
+
+def test_record_feedback_with_query_does_not_touch_base_weight(db_conn: sqlite3.Connection) -> None:
+    """Feedback with a query is contextual-only -- base_weight is untouched."""
+    mem_id = _insert_access_row(db_conn, "feedback-contextual-test")
+
+    record_feedback(mem_id, "unhelpful", query="what's my favorite editor")
+
+    row = db_conn.execute(
+        "SELECT base_weight FROM memories WHERE id = ?", (mem_id,)
+    ).fetchone()
+    assert row["base_weight"] == 1.0
+
+
+def test_record_feedback_with_query_returns_current_vitality(db_conn: sqlite3.Connection) -> None:
+    """Since base_weight is unchanged, the returned vitality equals the stored value."""
+    mem_id = _insert_access_row(db_conn, "feedback-contextual-vitality-test")
+    stored = db_conn.execute(
+        "SELECT vitality FROM memories WHERE id = ?", (mem_id,)
+    ).fetchone()["vitality"]
+
+    result = record_feedback(mem_id, "helpful", query="some query")
+
+    assert result == pytest.approx(stored)
+
+
+def test_record_feedback_with_query_logs_a_row(db_conn: sqlite3.Connection) -> None:
+    mem_id = _insert_access_row(db_conn, "feedback-contextual-logs-test")
+
+    record_feedback(mem_id, "helpful", query="what IDE did I mention last year")
+
+    rows = db_conn.execute(
+        "SELECT memory_id, query, signal, magnitude FROM memory_feedback WHERE memory_id = ?",
+        (mem_id,),
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["query"] == "what IDE did I mention last year"
+    assert rows[0]["signal"] == "helpful"
+    assert rows[0]["magnitude"] == pytest.approx(FEEDBACK_MAGNITUDE)
+
+
+def test_record_feedback_with_query_not_found(db_conn: sqlite3.Connection) -> None:
+    assert record_feedback("nonexistent-id-xyz", "helpful", query="anything") is None
+
+
+def test_record_feedback_without_query_is_unchanged(db_conn: sqlite3.Connection) -> None:
+    """Regression guard: omitting query preserves the exact pre-#54 global mutation."""
+    mem_id = _insert_access_row(db_conn, "feedback-backcompat-test")
+
+    record_feedback(mem_id, "helpful")
+
+    row = db_conn.execute(
+        "SELECT base_weight FROM memories WHERE id = ?", (mem_id,)
+    ).fetchone()
+    assert row["base_weight"] == pytest.approx(1.0 * (1 + FEEDBACK_MAGNITUDE))
+    assert db_conn.execute("SELECT COUNT(*) AS n FROM memory_feedback").fetchone()["n"] == 0
+
+
+# ---------------------------------------------------------------------------
+# _tokenize_query / _jaccard (internal helpers, exercised via public API)
+# ---------------------------------------------------------------------------
+
+
+def test_tokenize_and_jaccard_identical_queries_similarity_one() -> None:
+    from remind_me_mcp.vitality import _jaccard, _tokenize_query
+
+    a = _tokenize_query("what IDE did I mention last year?")
+    b = _tokenize_query("What IDE did I mention last year?")
+    assert _jaccard(a, b) == pytest.approx(1.0)
+
+
+def test_tokenize_and_jaccard_disjoint_queries_similarity_zero() -> None:
+    from remind_me_mcp.vitality import _jaccard, _tokenize_query
+
+    a = _tokenize_query("favorite pizza toppings")
+    b = _tokenize_query("vpn configuration settings")
+    assert _jaccard(a, b) == 0.0
+
+
+def test_jaccard_empty_sets_similarity_zero() -> None:
+    from remind_me_mcp.vitality import _jaccard
+
+    assert _jaccard(set(), {"a"}) == 0.0
+    assert _jaccard(set(), set()) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# record_contextual_feedback / contextual_feedback_adjustment (issue #54)
+# ---------------------------------------------------------------------------
+
+
+def test_record_contextual_feedback_inserts_row(db_conn: sqlite3.Connection) -> None:
+    mem_id = _insert_access_row(db_conn, "contextual-insert-test")
+
+    feedback_id = record_contextual_feedback(db_conn, mem_id, "what IDE did I use", "helpful")
+
+    row = db_conn.execute(
+        "SELECT id, memory_id, query, signal FROM memory_feedback WHERE id = ?",
+        (feedback_id,),
+    ).fetchone()
+    assert row["memory_id"] == mem_id
+    assert row["query"] == "what IDE did I use"
+    assert row["signal"] == "helpful"
+
+
+def test_contextual_feedback_adjustment_no_feedback_is_zero(db_conn: sqlite3.Connection) -> None:
+    mem_id = _insert_access_row(db_conn, "no-feedback-test")
+    assert contextual_feedback_adjustment(db_conn, mem_id, "any query") == 0.0
+
+
+def test_contextual_feedback_adjustment_similar_query_applies(db_conn: sqlite3.Connection) -> None:
+    """The headline case: feedback on a similar query counts."""
+    mem_id = _insert_access_row(db_conn, "similar-query-test")
+    record_contextual_feedback(db_conn, mem_id, "what IDE did I use last year", "helpful")
+
+    adjustment = contextual_feedback_adjustment(db_conn, mem_id, "what IDE did I use last year")
+    assert adjustment > 0.0
+
+
+def test_contextual_feedback_adjustment_unrelated_query_does_not_apply(db_conn: sqlite3.Connection) -> None:
+    """The headline case from the issue: unhelpful for one query must not
+    demote a completely unrelated one."""
+    mem_id = _insert_access_row(db_conn, "unrelated-query-test")
+    record_contextual_feedback(db_conn, mem_id, "what's my favorite editor", "unhelpful")
+
+    adjustment = contextual_feedback_adjustment(db_conn, mem_id, "what IDE did I mention last year")
+    assert adjustment == 0.0
+
+
+def test_contextual_feedback_adjustment_unhelpful_is_negative(db_conn: sqlite3.Connection) -> None:
+    mem_id = _insert_access_row(db_conn, "negative-adjustment-test")
+    record_contextual_feedback(db_conn, mem_id, "vpn configuration settings", "unhelpful")
+
+    adjustment = contextual_feedback_adjustment(db_conn, mem_id, "vpn configuration settings")
+    assert adjustment < 0.0
+
+
+def test_contextual_feedback_adjustment_is_clamped(db_conn: sqlite3.Connection) -> None:
+    """Many strong 'helpful' signals never push the adjustment past the cap."""
+    mem_id = _insert_access_row(db_conn, "clamped-adjustment-test")
+    for _ in range(20):
+        record_contextual_feedback(
+            db_conn, mem_id, "vpn configuration settings", "helpful", magnitude=1.0
+        )
+
+    adjustment = contextual_feedback_adjustment(db_conn, mem_id, "vpn configuration settings")
+    assert adjustment == pytest.approx(FEEDBACK_ADJUSTMENT_CAP)
+
+
+def test_contextual_feedback_adjustment_threshold_boundary(db_conn: sqlite3.Connection) -> None:
+    """A query with overlap just below FEEDBACK_SIMILARITY_THRESHOLD contributes nothing."""
+    from remind_me_mcp.vitality import _jaccard, _tokenize_query
+
+    mem_id = _insert_access_row(db_conn, "threshold-boundary-test")
+    record_contextual_feedback(db_conn, mem_id, "alpha beta gamma delta", "helpful")
+
+    # Construct a query sharing exactly one of four tokens -- similarity 1/7 < 0.3.
+    weak_query = "alpha epsilon zeta eta"
+    sim = _jaccard(_tokenize_query("alpha beta gamma delta"), _tokenize_query(weak_query))
+    assert sim < FEEDBACK_SIMILARITY_THRESHOLD
+
+    assert contextual_feedback_adjustment(db_conn, mem_id, weak_query) == 0.0
+
+
+def test_contextual_feedback_adjustment_missing_memory_is_zero(db_conn: sqlite3.Connection) -> None:
+    assert contextual_feedback_adjustment(db_conn, "no-such-memory", "any query") == 0.0
+
+
+# ---------------------------------------------------------------------------
+# apply_feedback_adjustment (issue #54) -- the ranking-time integration point
+# ---------------------------------------------------------------------------
+
+
+def test_apply_feedback_adjustment_noop_without_feedback(db_conn: sqlite3.Connection) -> None:
+    memories = [{"id": "A", "_rrf_score": 0.5}, {"id": "B", "_rrf_score": 0.3}]
+    result = apply_feedback_adjustment("some query", memories)
+    assert [m["_rrf_score"] for m in result] == [0.5, 0.3]
+    assert "_feedback_adjustment" not in result[0]
+
+
+def test_apply_feedback_adjustment_empty_memories_returns_empty() -> None:
+    assert apply_feedback_adjustment("some query", []) == []
+
+
+def test_apply_feedback_adjustment_empty_query_is_noop(db_conn: sqlite3.Connection) -> None:
+    memories = [{"id": "A", "_rrf_score": 0.5}]
+    assert apply_feedback_adjustment("", memories) == memories
+
+
+def test_apply_feedback_adjustment_boosts_helpful_match(db_conn: sqlite3.Connection) -> None:
+    mem_id = _insert_access_row(db_conn, "apply-boost-test")
+    record_contextual_feedback(db_conn, mem_id, "vpn configuration settings", "helpful")
+
+    memories = [{"id": mem_id, "_rrf_score": 0.5}]
+    result = apply_feedback_adjustment("vpn configuration settings", memories)
+
+    assert result[0]["_rrf_score"] > 0.5
+    assert result[0]["_feedback_adjustment"] > 0.0
+
+
+def test_apply_feedback_adjustment_demotes_unhelpful_match(db_conn: sqlite3.Connection) -> None:
+    mem_id = _insert_access_row(db_conn, "apply-demote-test")
+    record_contextual_feedback(db_conn, mem_id, "vpn configuration settings", "unhelpful")
+
+    memories = [{"id": mem_id, "_rrf_score": 0.5}]
+    result = apply_feedback_adjustment("vpn configuration settings", memories)
+
+    assert result[0]["_rrf_score"] < 0.5
+
+
+def test_apply_feedback_adjustment_resorts_by_adjusted_score(db_conn: sqlite3.Connection) -> None:
+    """A lower-ranked memory with strong helpful feedback can overtake a
+    higher-ranked one with no feedback."""
+    helped = _insert_access_row(db_conn, "resort-helped-test")
+    plain = _insert_access_row(db_conn, "resort-plain-test")
+    for _ in range(10):
+        record_contextual_feedback(
+            db_conn, helped, "vpn configuration settings", "helpful", magnitude=1.0
+        )
+
+    memories = [
+        {"id": plain, "_rrf_score": 0.6},
+        {"id": helped, "_rrf_score": 0.5},
+    ]
+    result = apply_feedback_adjustment("vpn configuration settings", memories)
+
+    # helped's score is boosted by up to FEEDBACK_ADJUSTMENT_CAP (40%):
+    # 0.5 * 1.4 = 0.7 > plain's untouched 0.6.
+    assert [m["id"] for m in result] == [helped, plain]
+
+
+def test_apply_feedback_adjustment_ignores_dissimilar_query(db_conn: sqlite3.Connection) -> None:
+    """The issue's headline case, exercised through the full pipeline function."""
+    mem_id = _insert_access_row(db_conn, "apply-dissimilar-test")
+    record_contextual_feedback(db_conn, mem_id, "what's my favorite editor", "unhelpful")
+
+    memories = [{"id": mem_id, "_rrf_score": 0.5}]
+    result = apply_feedback_adjustment("what IDE did I mention last year", memories)
+
+    assert result[0]["_rrf_score"] == 0.5
+    assert "_feedback_adjustment" not in result[0]

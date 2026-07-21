@@ -283,6 +283,12 @@ async def memory_delete(params: MemoryDeleteInput) -> str:
     db.execute(
         "DELETE FROM memory_entities WHERE memory_id = ?", (params.memory_id,)
     )
+    # Query-contextual feedback (gap #6) is meaningless once the memory it's
+    # about is gone — a tombstoned memory is excluded from every read path
+    # anyway, so there's nothing left for stored feedback to adjust.
+    db.execute(
+        "DELETE FROM memory_feedback WHERE memory_id = ?", (params.memory_id,)
+    )
     if SYNC_ENABLED:
         now = _now_iso()
         db.execute(

@@ -823,6 +823,27 @@ class TestBuildDebugSignals:
         assert signals["recency_score"] == 0.4
         assert signals["vitality_score"] == 0.2
 
+    def test_feedback_adjustment_omitted_by_default(self):
+        """Issue #54: no new keys unless the memory actually carries a
+        _feedback_adjustment (i.e. matching feedback was found)."""
+        from remind_me_mcp.retrieval import build_debug_signals
+
+        mem = _mem("A", created_at=_ts(0))
+
+        signals = build_debug_signals(mem)
+
+        assert "feedback_adjustment" not in signals
+
+    def test_feedback_adjustment_included_when_present(self):
+        from remind_me_mcp.retrieval import build_debug_signals
+
+        mem = _mem("A", created_at=_ts(0))
+        mem["_feedback_adjustment"] = 0.25
+
+        signals = build_debug_signals(mem)
+
+        assert signals["feedback_adjustment"] == 0.25
+
 
 # ---------------------------------------------------------------------------
 # choose_rrf_weights / resolve_strategy_weights (Phase 6: auto-routing)

@@ -691,6 +691,12 @@ async def memory_search(params: MemorySearchInput) -> str:
         if mid in fts_ids and mid in sem_ids:
             m["_search_method"] = "hybrid"
 
+    # --- Query-contextual feedback adjustment (gap #6) ---
+    # Nudges _rrf_score by any similar-query feedback before reranking, so
+    # the cross-encoder (when enabled) still has final say over the head --
+    # this only perturbs the RRF order feeding into it.
+    ranked = _pkg.apply_feedback_adjustment(params.query, ranked)
+
     # --- Optional cross-encoder rerank of the top candidates (lever D) ---
     # Rerank a pool larger than the response limit so the cross-encoder can
     # promote candidates beyond the head, THEN truncate (DI-07).
@@ -820,17 +826,25 @@ async def remind_me_feedback(params: FeedbackInput) -> str:
     """Mark a memory as helpful or unhelpful for a search result.
 
     Unlike plain access recording (which happens automatically and is always
-    positive), this is a signed signal: "helpful" nudges the memory's
-    base_weight up, "unhelpful" nudges it down, and both are reflected in
-    vitality (and therefore future RRF ranking) immediately.
+    positive), this is a signed signal. Two modes, selected by whether
+    ``query`` is given (gap #6 -- query-contextual feedback):
+
+    - Without ``query``: "helpful" nudges the memory's base_weight up,
+      "unhelpful" nudges it down, globally -- reflected in vitality (and
+      therefore future RRF ranking) immediately, for every future search.
+    - With ``query``: the feedback only applies to future searches whose
+      query is similar to this one (a memory can be a poor match for one
+      question but a great match for another) -- base_weight/vitality are
+      unchanged; the memory's current vitality is returned as-is.
 
     Args:
         params (FeedbackInput): The memory id, signal, and optional query context.
 
     Returns:
-        str: JSON with the memory id and its updated vitality, or an error message.
+        str: JSON with the memory id and its (updated, if global) vitality,
+            or an error message.
     """
-    new_vitality = _pkg.record_feedback(params.memory_id, params.signal)
+    new_vitality = _pkg.record_feedback(params.memory_id, params.signal, query=params.query)
     if new_vitality is None:
         return json.dumps({"error": f"Memory not found: {params.memory_id}"})
     return json.dumps(
