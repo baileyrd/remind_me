@@ -379,7 +379,7 @@ def test_run_combined_mounts_mcp_and_dashboard(monkeypatch: pytest.MonkeyPatch) 
     import remind_me_mcp.config as cfg
 
     uvicorn_calls: list[dict] = []
-    monkeypatch.setattr(cfg, "MCP_HTTP_SECRET", None)
+    monkeypatch.setattr(cfg, "MCP_HTTP_SECRET", "s3cret")
     monkeypatch.setattr(uvicorn, "run", lambda app, **kw: uvicorn_calls.append({"app": app, **kw}))
 
     args = argparse.Namespace(ui_host="127.0.0.1", ui_port=5199)
@@ -412,6 +412,117 @@ def test_run_combined_bearer_auth_rejects_unauthorized(monkeypatch: pytest.Monke
 
 
 # ---------------------------------------------------------------------------
+# SEC-04: combined mode's /mcp must never be reachable without a secret,
+# even when REMIND_ME_MCP_HTTP_SECRET is unset (previously: an empty
+# middleware list, so the entire MCP tool-call surface was open by default
+# whenever both --serve-mcp and --serve-ui were passed).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def isolated_mcp_secret_dir(monkeypatch: pytest.MonkeyPatch, tmp_path) -> Any:
+    """Point MEMORY_DIR at a fresh per-test dir and clear any env secret."""
+    import remind_me_mcp.config as cfg
+
+    monkeypatch.setattr(cfg, "MCP_HTTP_SECRET", None)
+    monkeypatch.setattr(cfg, "MEMORY_DIR", tmp_path)
+    return tmp_path
+
+
+def test_unset_secret_still_requires_auth(
+    monkeypatch: pytest.MonkeyPatch, isolated_mcp_secret_dir: Any
+) -> None:
+    """With REMIND_ME_MCP_HTTP_SECRET unset, a secret is still auto-generated
+    and /mcp still rejects unauthenticated requests -- the whole point of
+    the fix: there is no way to end up with an open /mcp in combined mode."""
+    from starlette.testclient import TestClient
+
+    import remind_me_mcp.config as cfg
+
+    monkeypatch.setattr(cfg, "API_KEY", "disabled")
+    monkeypatch.setattr(cfg, "AUTO_UPDATE_CHECK", False)
+    monkeypatch.setattr(main_mod.mcp, "_session_manager", None)
+
+    app, secret = main_mod._build_combined_app()
+    assert secret  # a real secret was generated, not None/empty
+    with TestClient(app, base_url="http://127.0.0.1:5199", raise_server_exceptions=False) as client:
+        assert client.post("/mcp", json=_MCP_INITIALIZE, headers=_MCP_HEADERS).status_code == 401
+        r = client.post(
+            "/mcp",
+            json=_MCP_INITIALIZE,
+            headers={**_MCP_HEADERS, "Authorization": f"Bearer {secret}"},
+        )
+        assert r.status_code == 200, r.text
+
+
+def test_secret_generated_and_persisted(isolated_mcp_secret_dir: Any) -> None:
+    """First resolution generates a high-entropy secret and persists it (0600)."""
+    import stat
+    import sys
+
+    from remind_me_mcp.config import resolve_mcp_http_secret
+
+    secret = resolve_mcp_http_secret()
+
+    secret_file = isolated_mcp_secret_dir / "mcp_http_secret"
+    assert secret_file.is_file()
+    assert secret_file.read_text(encoding="utf-8").strip() == secret
+    assert len(secret) >= 32
+    if sys.platform != "win32":
+        assert stat.S_IMODE(secret_file.stat().st_mode) == 0o600
+
+
+def test_secret_reused_across_calls(isolated_mcp_secret_dir: Any) -> None:
+    """Subsequent resolutions return the persisted secret, not a fresh one."""
+    from remind_me_mcp.config import resolve_mcp_http_secret
+
+    first = resolve_mcp_http_secret()
+    second = resolve_mcp_http_secret()
+    assert first == second
+
+
+def test_secret_rotation_by_deleting_file(isolated_mcp_secret_dir: Any) -> None:
+    """Deleting the secret file rotates the credential on next resolution."""
+    from remind_me_mcp.config import resolve_mcp_http_secret
+
+    first = resolve_mcp_http_secret()
+    (isolated_mcp_secret_dir / "mcp_http_secret").unlink()
+    second = resolve_mcp_http_secret()
+    assert first != second
+
+
+def test_env_secret_wins_over_secret_file(
+    isolated_mcp_secret_dir: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REMIND_ME_MCP_HTTP_SECRET overrides the persisted secret and writes no file."""
+    import remind_me_mcp.config as cfg
+    from remind_me_mcp.config import resolve_mcp_http_secret
+
+    monkeypatch.setattr(cfg, "MCP_HTTP_SECRET", "  env-secret  ")
+    assert resolve_mcp_http_secret() == "env-secret"
+    assert not (isolated_mcp_secret_dir / "mcp_http_secret").exists()
+
+
+def test_ephemeral_secret_when_unwritable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unwritable MEMORY_DIR yields an ephemeral secret -- /mcp never falls open."""
+    import remind_me_mcp.config as cfg
+    from remind_me_mcp.config import resolve_mcp_http_secret
+
+    blocker = tmp_path / "not_a_dir"
+    blocker.write_text("file, not a directory")
+    monkeypatch.setattr(cfg, "MCP_HTTP_SECRET", None)
+    monkeypatch.setattr(cfg, "MEMORY_DIR", blocker)
+
+    with caplog.at_level("WARNING", logger="remind_me_mcp.config"):
+        secret = resolve_mcp_http_secret()
+
+    assert secret
+    assert "ephemeral" in caplog.text
+
+
+# ---------------------------------------------------------------------------
 # SE-03: combined mode must run the MCP app's lifespan
 # ---------------------------------------------------------------------------
 
@@ -431,12 +542,13 @@ _MCP_HEADERS = {"Accept": "application/json, text/event-stream"}
 
 @pytest.fixture()
 def _combined_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Prepare an isolated combined-app build: no MCP secret, dashboard auth
-    off, startup git-fetch disabled (SE-06), and a fresh StreamableHTTP
-    session manager (its .run() is once-only per instance)."""
+    """Prepare an isolated combined-app build: a fixed known MCP secret
+    (auth is always on for combined mode, SEC-04), dashboard auth off,
+    startup git-fetch disabled (SE-06), and a fresh StreamableHTTP session
+    manager (its .run() is once-only per instance)."""
     import remind_me_mcp.config as cfg
 
-    monkeypatch.setattr(cfg, "MCP_HTTP_SECRET", None)
+    monkeypatch.setattr(cfg, "MCP_HTTP_SECRET", "se03-test-secret")
     monkeypatch.setattr(cfg, "API_KEY", "disabled")
     monkeypatch.setattr(cfg, "AUTO_UPDATE_CHECK", False)
     monkeypatch.setattr(main_mod.mcp, "_session_manager", None)
@@ -452,11 +564,15 @@ def test_combined_app_lifespan_starts_mcp_session_manager(
     the DB and starts sync never ran)."""
     from starlette.testclient import TestClient
 
-    app = main_mod._build_combined_app()
+    app, secret = main_mod._build_combined_app()
     # TestClient as context manager runs the lifespan; base_url must be a
     # localhost host to satisfy the SDK's DNS-rebinding protection.
     with TestClient(app, base_url="http://127.0.0.1:5199") as client:
-        r = client.post("/mcp", json=_MCP_INITIALIZE, headers=_MCP_HEADERS)
+        r = client.post(
+            "/mcp",
+            json=_MCP_INITIALIZE,
+            headers={**_MCP_HEADERS, "Authorization": f"Bearer {secret}"},
+        )
         assert r.status_code == 200, r.text
         assert "protocolVersion" in r.text
 
@@ -470,7 +586,7 @@ def test_combined_app_serves_mcp_at_exact_mcp_path(
 ) -> None:
     """SE-03: the MCP endpoint lives at /mcp exactly (not /mcp/mcp as the old
     nested-mount layout produced)."""
-    app = main_mod._build_combined_app()
+    app, _secret = main_mod._build_combined_app()
     route_paths = {route.path for route in app.routes}
     assert "/mcp" in route_paths
     assert "/mcp/mcp" not in route_paths
@@ -487,7 +603,8 @@ def test_combined_app_accepts_valid_mcp_token_with_lifespan(
 
     monkeypatch.setattr(cfg, "MCP_HTTP_SECRET", "s3cret")
 
-    app = main_mod._build_combined_app()
+    app, secret = main_mod._build_combined_app()
+    assert secret == "s3cret"
     with TestClient(app, base_url="http://127.0.0.1:5199", raise_server_exceptions=False) as client:
         # Wrong/missing token -> 401 from the shared middleware
         assert client.post("/mcp", json=_MCP_INITIALIZE, headers=_MCP_HEADERS).status_code == 401
