@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from typing import TYPE_CHECKING
 
 import pytest
 
 import remind_me_mcp.dbs_import as _dbs_mod
-from remind_me_mcp.dbs_import import pull_dbs
+from remind_me_mcp.dbs_import import _dbs_memory_id, pull_dbs
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -218,6 +219,100 @@ def test_pull_dbs_source_and_item_type_filters(db_conn: sqlite3.Connection, tmp_
 def test_pull_dbs_missing_db_raises_file_not_found(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         pull_dbs(db_path=str(tmp_path / "does-not-exist.sqlite3"))
+
+
+def test_pull_dbs_locked_db_raises_database_error(tmp_path: Path) -> None:
+    """A file that exists but isn't a valid SQLite database (simulating a
+    dbs process holding it in a state this can't read) raises DatabaseError
+    -- not FileNotFoundError, and not an uncaught crash."""
+    bogus = tmp_path / "not-a-real-db.sqlite3"
+    bogus.write_bytes(b"this is not a sqlite file")
+    with pytest.raises(sqlite3.DatabaseError):
+        pull_dbs(db_path=str(bogus))
+
+
+# ---------------------------------------------------------------------------
+# Deterministic memory ids (SEC-10)
+# ---------------------------------------------------------------------------
+
+
+def test_dbs_memory_id_is_deterministic() -> None:
+    """Same (source, external_id, content_hash) always yields the same id --
+    unlike db._make_id, which salts with the wall-clock timestamp."""
+    first = _dbs_memory_id("raindrop", "42", "h1")
+    second = _dbs_memory_id("raindrop", "42", "h1")
+    assert first == second
+
+
+def test_dbs_memory_id_changes_with_content_hash() -> None:
+    """An edited item (different content_hash) gets a different id --
+    this is what drives the supersession path."""
+    original = _dbs_memory_id("raindrop", "42", "h1")
+    edited = _dbs_memory_id("raindrop", "42", "h1-v2")
+    assert original != edited
+
+
+def test_dbs_memory_id_changes_with_identity() -> None:
+    """Different (source, external_id) never collides even with the same
+    content_hash."""
+    a = _dbs_memory_id("raindrop", "42", "h1")
+    b = _dbs_memory_id("reddit", "42", "h1")
+    c = _dbs_memory_id("raindrop", "43", "h1")
+    assert len({a, b, c}) == 3
+
+
+def test_pull_dbs_concurrent_calls_do_not_duplicate(
+    db_conn_concurrent: sqlite3.Connection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two overlapping pull_dbs calls over the same never-before-imported
+    item must not both create a memory (SEC-10): previously, the
+    tracked-state read ran outside _import_lock and _make_id salted with
+    the wall-clock timestamp, so two racing calls could each decide "not
+    yet imported," each mint a different id, and both writes would
+    succeed -- a permanent orphan duplicate that dbs_imports' (dbs_source,
+    external_id) row (last-writer-wins) never caught. Uses
+    db_conn_concurrent (per-thread connections to a shared WAL-mode file)
+    since this genuinely fans out across OS threads.
+    """
+    monkeypatch.setattr(_dbs_mod, "_embed_and_store_rows", lambda rows: 0)
+
+    db_path = tmp_path / "dbs.sqlite3"
+    _make_dbs_db(
+        db_path,
+        [
+            {
+                "source": "raindrop",
+                "external_id": "1",
+                "title": "Cool Article",
+                "content_hash": "h1",
+            },
+        ],
+    )
+
+    barrier = threading.Barrier(2)
+    results: list[dict] = []
+    results_lock = threading.Lock()
+
+    def call_pull() -> None:
+        barrier.wait(timeout=5)
+        result = pull_dbs(db_path=str(db_path))
+        with results_lock:
+            results.append(result)
+
+    threads = [threading.Thread(target=call_pull) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert len(results) == 2
+    assert sum(r["created"] for r in results) == 1
+    assert sum(r["already_imported"] for r in results) == 1
+
+    count = db_conn_concurrent.execute("SELECT COUNT(*) AS c FROM memories").fetchone()["c"]
+    assert count == 1
+    tracked_rows = db_conn_concurrent.execute("SELECT COUNT(*) AS c FROM dbs_imports").fetchone()["c"]
+    assert tracked_rows == 1
 
 
 # ---------------------------------------------------------------------------

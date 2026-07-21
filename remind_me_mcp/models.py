@@ -566,6 +566,26 @@ class DbsImportInput(BaseModel):
     tags: list[str] = Field(default_factory=list, description="Extra tags added to every imported memory")
     dry_run: bool = Field(default=False, description="Report what would be imported without writing")
 
+    @field_validator("db_path")
+    @classmethod
+    def validate_db_path(cls, v: str) -> str:
+        """Validate import-root containment and existence (SE-02).
+
+        Mirrors ChatImportInput.validate_path/BulkImportDirInput.validate_dir
+        -- db_path is a caller-supplied filesystem path like any other import
+        source, so it gets the same containment check (the SDK's own
+        _open_dbs_db only checked existence, letting a caller point this at
+        any readable file anywhere on disk). The containment check runs
+        first so a path outside IMPORT_ROOTS is rejected without leaking
+        whether it exists.
+        """
+        p = Path(v).expanduser().resolve()
+        if not is_in_import_roots(p):
+            raise ValueError(f"Path not in allowed import roots: {p}")
+        if not p.exists():
+            raise ValueError(f"File not found: {p}")
+        return str(p)
+
 
 class AutoCaptureInput(BaseModel):
     """Input for automatically capturing a full conversation and its summary."""

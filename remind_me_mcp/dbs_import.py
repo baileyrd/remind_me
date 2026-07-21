@@ -5,10 +5,12 @@ dbs (https://github.com/baileyrd/daily-backup-system) archives a user's data
 from many external sources (Reddit, YouTube, Raindrop, GitHub stars, ...)
 into one SQLite database with a uniform ``items``/``sources`` schema. This
 module opens that database directly, read-only, and imports each live item
-as a memory — preserving dbs's source/tags/kind as first-class
-knowledge-graph entities (FT-04) instead of collapsing them into note prose,
-which is what the file-export pipeline (``dbs export-notes`` + the folder
-watcher) has to do instead. This is "option 3" of the dbs/remind_me
+as a memory — preserving dbs's source/tags as first-class knowledge-graph
+entities (FT-04) instead of collapsing them into note prose, which is what
+the file-export pipeline (``dbs export-notes`` + the folder watcher) has to
+do instead. (``item_kind`` becomes the memory's category/metadata, not an
+entity — there's no established "kind" entity type elsewhere in this
+codebase's entity graph to reuse.) This is "option 3" of the dbs/remind_me
 integration review — see
 docs/dbs-integration-review-2026-07-21.md.
 
@@ -37,6 +39,7 @@ bespoke per-item dedup loop and never actually flows through
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sqlite3
@@ -49,7 +52,6 @@ from remind_me_mcp.db import (
     _embed_and_store_rows,
     _get_db,
     _link_memory_entity,
-    _make_id,
     _now_iso,
     _upsert_entity,
 )
@@ -76,14 +78,40 @@ register_connector("dbs", _dbs_connector)
 def _open_dbs_db(db_path: str) -> sqlite3.Connection:
     """Open a dbs SQLite database read-only.
 
-    Raises FileNotFoundError if no database exists at the given path.
+    Raises FileNotFoundError if no database exists at the given path, or
+    sqlite3.DatabaseError if it exists but isn't a valid SQLite file (the
+    file signature is checked immediately below via a real read, since
+    sqlite3.connect() itself doesn't validate anything until first use).
     """
     path = Path(db_path).expanduser()
     if not path.exists():
         raise FileNotFoundError(f"No dbs database found at {path}")
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+    except sqlite3.DatabaseError:
+        conn.close()
+        raise
     return conn
+
+
+def _dbs_memory_id(dbs_source: str, external_id: str, content_hash: str) -> str:
+    """Deterministic memory id for one dbs item version (SEC-10).
+
+    Unlike _make_id (content + wall-clock timestamp, deliberately NOT
+    deterministic -- see its docstring -- so remind_me_add can store the
+    same content again as a distinct memory), this is a pure hash of
+    (dbs_source, external_id, content_hash): two concurrent or retried
+    pull_dbs calls processing the same item version always compute the
+    SAME id, so INSERT OR IGNORE correctly collapses them into one row
+    instead of leaving an orphan duplicate that dbs_imports' (dbs_source,
+    external_id) uniqueness never catches (that table only tracks the id
+    of whichever call wrote *last*). A genuine content edit changes
+    content_hash, which changes the id, which is exactly what's supposed
+    to trigger the supersession path below.
+    """
+    return hashlib.sha256(f"dbs:{dbs_source}:{external_id}:{content_hash}".encode()).hexdigest()[:12]
 
 
 def _memory_content(title: str | None, body: str | None, url: str | None, external_id: str) -> str:
@@ -142,61 +170,72 @@ def pull_dbs(
 
     fetched = len(rows)
     db = _get_db()
-
-    tracked: dict[tuple[str, str], sqlite3.Row] = {}
-    if rows:
-        by_source: dict[str, list[str]] = {}
-        for row in rows:
-            by_source.setdefault(row["source_name"], []).append(row["external_id"])
-        for src, ext_ids in by_source.items():
-            placeholders = ",".join("?" for _ in ext_ids)
-            for tr in db.execute(
-                f"""SELECT dbs_source, external_id, memory_id, content_hash
-                    FROM dbs_imports
-                    WHERE dbs_source = ? AND external_id IN ({placeholders})""",
-                (src, *ext_ids),
-            ).fetchall():
-                tracked[(tr["dbs_source"], tr["external_id"])] = tr
-
-    already = 0
-    to_import: list[sqlite3.Row] = []
-    for row in rows:
-        key = (row["source_name"], row["external_id"])
-        prior = tracked.get(key)
-        if prior is not None and prior["content_hash"] == row["content_hash"]:
-            already += 1
-        else:
-            to_import.append(row)
-
-    result: dict[str, Any] = {
-        "source": source or None,
-        "item_type": item_type or None,
-        "fetched": fetched,
-        "already_imported": already,
-        "to_import": len(to_import),
-        "offset": offset,
-        "limit": limit,
-        "has_more": fetched == limit,
-    }
-    if dry_run:
-        result["created"] = 0
-        result["updated"] = 0
-        result["imported"] = 0
-        return result
-
     extra_tags = tags or []
     now = _now_iso()
     created = 0
     updated = 0
     embed_entries: list[tuple[str, str]] = []
 
+    # SEC-10: the tracked-state lookup and the created/updated writes below
+    # share one lock acquisition. Splitting them (read outside, write
+    # inside) let two concurrent/retried calls both read "not yet
+    # imported" for the same item before either had written it -- with
+    # _make_id's wall-clock-salted ids, each call minted a *different* id
+    # and both inserts succeeded, leaving a permanent orphan duplicate that
+    # dbs_imports' (dbs_source, external_id) row (last-writer-wins) never
+    # caught. _dbs_memory_id's determinism closes half of that (duplicate
+    # calls now compute the identical id, so INSERT OR IGNORE collapses
+    # them); locking the read+decide+write as one unit closes the other
+    # half (an accurate already_imported/to_import count and no wasted
+    # duplicate work).
     with _import_lock:
+        tracked: dict[tuple[str, str], sqlite3.Row] = {}
+        if rows:
+            by_source: dict[str, list[str]] = {}
+            for row in rows:
+                by_source.setdefault(row["source_name"], []).append(row["external_id"])
+            for src, ext_ids in by_source.items():
+                placeholders = ",".join("?" for _ in ext_ids)
+                for tr in db.execute(
+                    f"""SELECT dbs_source, external_id, memory_id, content_hash
+                        FROM dbs_imports
+                        WHERE dbs_source = ? AND external_id IN ({placeholders})""",
+                    (src, *ext_ids),
+                ).fetchall():
+                    tracked[(tr["dbs_source"], tr["external_id"])] = tr
+
+        already = 0
+        to_import: list[sqlite3.Row] = []
+        for row in rows:
+            key = (row["source_name"], row["external_id"])
+            prior = tracked.get(key)
+            if prior is not None and prior["content_hash"] == row["content_hash"]:
+                already += 1
+            else:
+                to_import.append(row)
+
+        result: dict[str, Any] = {
+            "source": source or None,
+            "item_type": item_type or None,
+            "fetched": fetched,
+            "already_imported": already,
+            "to_import": len(to_import),
+            "offset": offset,
+            "limit": limit,
+            "has_more": fetched == limit,
+        }
+        if dry_run:
+            result["created"] = 0
+            result["updated"] = 0
+            result["imported"] = 0
+            return result
+
         for row in to_import:
             key = (row["source_name"], row["external_id"])
             prior = tracked.get(key)
             item_tags = [t for t in json.loads(row["tags_json"] or "[]") if t] + extra_tags
             content = _memory_content(row["title"], row["body"], row["url"], row["external_id"])
-            mem_id = _make_id(content)
+            mem_id = _dbs_memory_id(row["source_name"], row["external_id"], row["content_hash"])
             metadata = {
                 "dbs_source": row["source_name"],
                 "dbs_external_id": row["external_id"],
