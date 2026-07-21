@@ -959,6 +959,7 @@ This is a deterministic heuristic, not an LLM planner call — no extra latency 
 | `REMIND_ME_OTEL_ENDPOINT` | *(unset)* | OTLP/HTTP collector endpoint (e.g. `http://localhost:4318/v1/traces`). Unset uses the OTLP exporter's own default |
 | `REMIND_ME_OTEL_SERVICE_NAME` | `remind-me-mcp` | `service.name` resource attribute reported to the collector |
 | `REMIND_ME_AUTO_UPDATE_CHECK` | `true` | Set to `false` to skip the background `git fetch` update check at server startup (the manual check/update tools keep working) |
+| `REMIND_ME_UPDATE_EXPECTED_ORIGIN` | *(unset)* | Optional trust pin for `remind_me_self_update`: when set, refuses to `git pull`/`pip install` unless the local `origin` remote's URL matches exactly — a repointed remote (compromise, a stray `git remote set-url`) is refused instead of silently trusted |
 | `REMIND_ME_RRF_K` | `60` | Smoothing constant for Reciprocal Rank Fusion scoring |
 | `REMIND_ME_RRF_W_KEYWORD` | `1.0` | RRF weight for the keyword (FTS5) signal |
 | `REMIND_ME_RRF_W_SEMANTIC` | `1.0` | RRF weight for the semantic (vector) signal |

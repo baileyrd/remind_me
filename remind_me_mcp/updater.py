@@ -33,6 +33,7 @@ class UpdateStatus:
     commits_behind: int
     commit_messages: list[str] = field(default_factory=list)
     repo_path: str = ""
+    origin_url: str = ""
     error: str | None = None
 
 
@@ -46,8 +47,10 @@ class UpdateResult:
     previous_version: str = ""
     new_version: str = ""
     pip_output: str = ""
+    origin_url: str = ""
     error: str | None = None
     restart_required: bool = False
+    rolled_back: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -55,17 +58,45 @@ class UpdateResult:
 # ---------------------------------------------------------------------------
 
 
-def _find_repo_root() -> Path | None:
-    """Locate the git repository root from the package's installed location.
+_PACKAGE_NAME = "remind-me-mcp"
 
-    Walks upward from this file's directory looking for a ``.git`` directory.
+
+def _is_remind_me_repo_root(candidate: Path) -> bool:
+    """Return True when *candidate* looks like this package's own repo root.
+
+    Checks ``pyproject.toml``'s ``[project].name`` rather than trusting any
+    ``.git`` directory found by walking upward -- a non-editable install
+    placed inside an unrelated git-tracked directory (e.g. a venv nested in
+    a user's own project repo) would otherwise cause self-update to
+    ``git pull``/``pip install -e .`` against the wrong repository entirely.
+    """
+    pyproject = candidate / "pyproject.toml"
+    if not pyproject.is_file():
+        return False
+    try:
+        import tomllib
+
+        with pyproject.open("rb") as f:
+            data = tomllib.load(f)
+        return data.get("project", {}).get("name") == _PACKAGE_NAME
+    except (OSError, ValueError):
+        return False
+
+
+def _find_repo_root() -> Path | None:
+    """Locate this package's git repository root from its installed location.
+
+    Walks upward from this file's directory looking for a ``.git`` directory
+    whose sibling ``pyproject.toml`` identifies as this package (SEC-05) --
+    the first ``.git`` found isn't necessarily the right one.
 
     Returns:
-        Path to the repo root, or None if not inside a git repository.
+        Path to the repo root, or None if not inside this package's git
+        repository.
     """
     current = Path(__file__).resolve().parent
     for parent in (current, *current.parents):
-        if (parent / ".git").is_dir():
+        if (parent / ".git").is_dir() and _is_remind_me_repo_root(parent):
             return parent
     return None
 
@@ -92,6 +123,27 @@ def _run_git(*args: str, repo_path: Path) -> subprocess.CompletedProcess[str]:
         timeout=60,
         check=True,
     )
+
+
+def _get_origin_url(repo_path: Path) -> str:
+    """Return the ``origin`` remote's URL, or "" if it can't be read.
+
+    Reading this is purely local (no network) -- ``git config --get`` reads
+    ``.git/config`` directly, unlike ``git remote get-url`` which behaves
+    the same but is documented as network-safe either way. Best-effort: an
+    unreadable/missing origin must never break a status check.
+    """
+    try:
+        return subprocess.run(
+            ["git", "config", "--get", "remote.origin.url"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        ).stdout.strip()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
 
 
 def _run_pip(*args: str) -> subprocess.CompletedProcess[str]:
@@ -159,6 +211,8 @@ def check_for_update() -> UpdateStatus:
             error="Not installed from a git repository.",
         )
 
+    origin_url = _get_origin_url(repo)
+
     try:
         _run_git("fetch", "origin", "--quiet", repo_path=repo)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
@@ -169,6 +223,7 @@ def check_for_update() -> UpdateStatus:
             update_available=False,
             commits_behind=0,
             repo_path=str(repo),
+            origin_url=origin_url,
             error=f"Failed to fetch from origin: {exc}",
         )
 
@@ -187,6 +242,7 @@ def check_for_update() -> UpdateStatus:
             update_available=False,
             commits_behind=0,
             repo_path=str(repo),
+            origin_url=origin_url,
             error=f"Failed to read commit info: {exc}",
         )
 
@@ -198,6 +254,7 @@ def check_for_update() -> UpdateStatus:
             update_available=False,
             commits_behind=0,
             repo_path=str(repo),
+            origin_url=origin_url,
         )
 
     # Count commits behind
@@ -228,6 +285,7 @@ def check_for_update() -> UpdateStatus:
         commits_behind=commits_behind,
         commit_messages=commit_messages,
         repo_path=str(repo),
+        origin_url=origin_url,
     )
 
 
@@ -235,7 +293,10 @@ def perform_update(force: bool = False) -> UpdateResult:
     """Pull the latest changes and reinstall the package.
 
     Checks for a dirty working tree (uncommitted changes) before pulling.
-    If ``force`` is True, skips the dirty-tree check.
+    If ``force`` is True, skips the dirty-tree check. If
+    ``config.UPDATE_EXPECTED_ORIGIN`` is set, refuses to proceed unless the
+    local ``origin`` remote matches it exactly (SEC-05) -- opt-in, since
+    there's no single correct origin for every fork of this package.
 
     Args:
         force: If True, proceed even with uncommitted changes.
@@ -243,7 +304,7 @@ def perform_update(force: bool = False) -> UpdateResult:
     Returns:
         UpdateResult describing what happened.
     """
-    from remind_me_mcp import __version__
+    from remind_me_mcp import __version__, config
 
     repo = _find_repo_root()
     if repo is None:
@@ -253,6 +314,21 @@ def perform_update(force: bool = False) -> UpdateResult:
         )
 
     previous_version = __version__
+    origin_url = _get_origin_url(repo)
+
+    expected_origin = config.UPDATE_EXPECTED_ORIGIN
+    if expected_origin and origin_url != expected_origin:
+        return UpdateResult(
+            success=False,
+            previous_version=previous_version,
+            origin_url=origin_url,
+            error=(
+                f"Refusing to update: origin is {origin_url!r}, expected "
+                f"{expected_origin!r} (REMIND_ME_UPDATE_EXPECTED_ORIGIN). "
+                "If this remote change is intentional, update the env var "
+                "to match."
+            ),
+        )
 
     # Get current commit
     try:
@@ -273,6 +349,7 @@ def perform_update(force: bool = False) -> UpdateResult:
                     success=False,
                     previous_commit=previous_commit,
                     previous_version=previous_version,
+                    origin_url=origin_url,
                     error=(
                         "Working tree has uncommitted changes. "
                         "Commit or stash them first, or use force=True to override."
@@ -283,6 +360,7 @@ def perform_update(force: bool = False) -> UpdateResult:
                 success=False,
                 previous_commit=previous_commit,
                 previous_version=previous_version,
+                origin_url=origin_url,
                 error=f"Failed to check working tree status: {exc}",
             )
 
@@ -294,6 +372,7 @@ def perform_update(force: bool = False) -> UpdateResult:
             success=False,
             previous_commit=previous_commit,
             previous_version=previous_version,
+            origin_url=origin_url,
             error=f"git pull failed: {exc.stderr.strip() or exc.stdout.strip()}",
         )
     except subprocess.TimeoutExpired:
@@ -301,6 +380,7 @@ def perform_update(force: bool = False) -> UpdateResult:
             success=False,
             previous_commit=previous_commit,
             previous_version=previous_version,
+            origin_url=origin_url,
             error="git pull timed out.",
         )
 
@@ -308,19 +388,37 @@ def perform_update(force: bool = False) -> UpdateResult:
     try:
         pip_result = _run_pip("install", "-e", str(repo))
         pip_output = pip_result.stdout.strip()
-    except subprocess.CalledProcessError as exc:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        # The source tree already advanced past previous_commit at this
+        # point -- left as-is, the checked-out code and installed package
+        # metadata/dependencies would silently diverge (SEC-06). Since the
+        # dirty-tree check above already guarantees nothing uncommitted
+        # exists to lose, resetting back to previous_commit is safe and
+        # restores a fully consistent state.
+        rolled_back = _rollback(repo, previous_commit)
+        if isinstance(exc, subprocess.TimeoutExpired):
+            reason = "pip install timed out."
+        else:
+            reason = f"pip install failed: {exc.stderr.strip() or exc.stdout.strip()}"
         return UpdateResult(
             success=False,
             previous_commit=previous_commit,
             previous_version=previous_version,
-            error=f"pip install failed: {exc.stderr.strip() or exc.stdout.strip()}",
-        )
-    except subprocess.TimeoutExpired:
-        return UpdateResult(
-            success=False,
-            previous_commit=previous_commit,
-            previous_version=previous_version,
-            error="pip install timed out.",
+            origin_url=origin_url,
+            rolled_back=rolled_back,
+            error=(
+                f"{reason} "
+                + (
+                    f"Rolled the source tree back to {previous_commit} -- "
+                    "nothing changed overall."
+                    if rolled_back
+                    else "Automatic rollback ALSO failed -- the source tree "
+                    f"is now ahead of the installed package (still at "
+                    f"{previous_commit}'s dependencies/metadata). Run "
+                    f"'git reset --hard {previous_commit}' manually, then "
+                    "reinstall."
+                )
+            ),
         )
 
     # Get new commit
@@ -347,8 +445,26 @@ def perform_update(force: bool = False) -> UpdateResult:
         previous_version=previous_version,
         new_version=new_version,
         pip_output=pip_output,
+        origin_url=origin_url,
         restart_required=True,
     )
+
+
+def _rollback(repo: Path, previous_commit: str) -> bool:
+    """Best-effort ``git reset --hard`` back to *previous_commit*.
+
+    Only ever called after a successful ``git pull`` followed by a failed
+    ``pip install``, to restore a consistent state (SEC-06). Returns False
+    (never raises) if the reset itself fails -- the caller must surface
+    that so the operator knows manual recovery is needed.
+    """
+    if previous_commit in ("", "unknown"):
+        return False
+    try:
+        _run_git("reset", "--hard", previous_commit, repo_path=repo)
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return False
 
 
 # ---------------------------------------------------------------------------

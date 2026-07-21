@@ -738,6 +738,8 @@ async def remind_me_check_update() -> str:
 
     if status.repo_path:
         lines.append(f"\n_Repository: `{status.repo_path}`_")
+    if status.origin_url:
+        lines.append(f"_Origin: `{status.origin_url}`_")
 
     return "\n".join(lines)
 
@@ -778,6 +780,8 @@ async def remind_me_self_update(force: bool = False) -> str:
     lines = ["## Update Successful\n"]
     lines.append(f"**Previous:** `{result.previous_version}` (commit `{result.previous_commit}`)")
     lines.append(f"**Updated to:** `{result.new_version}` (commit `{result.new_commit}`)")
+    if result.origin_url:
+        lines.append(f"**Origin:** `{result.origin_url}`")
 
     if result.restart_required:
         lines.append(
