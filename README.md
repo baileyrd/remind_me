@@ -203,6 +203,7 @@ to run an open localhost API (not recommended). Mutating requests must send
 - **Add memories** — modal form with content editor, color-coded category picker, and tag input
 - **Edit & delete** — inline controls on every memory card with confirmation dialogs
 - **Expand/collapse** — long memories truncate at 200 characters with a click to expand
+- **Browse the Wiki** — read-only view of the LLM Wiki (FT-08): searchable page catalogue in the sidebar, rendered page body with clickable `[[Wikilinks]]`, and a backlinks/links panel for cross-page navigation; a pending-compile badge flags raw memories not yet folded in
 - **Live data** — the dashboard reads and writes your real SQLite database; changes appear immediately
 
 ### REST API
@@ -222,8 +223,13 @@ The dashboard is powered by a REST API you can also use directly:
 | `POST` | `/api/import` | Import a chat/document file or directory (JSON body: `{file_path, kind, extract_mode, category, tags, max_length}`; paths must be inside `REMIND_ME_IMPORT_ROOTS`) |
 | `GET` | `/api/export?format=&category=&tags=&file_path=&include_graph=` | Export memories (+ entity graph by default) as JSON/JSONL — streamed as the response body, or written server-side when `file_path` (inside `REMIND_ME_EXPORT_ROOTS`) is given |
 | `GET` | `/api/entity?name=&limit=` | Look up a knowledge-graph entity by name or alias (404 if unknown) |
+| `GET` | `/api/wiki` | List every LLM Wiki page (slug, title, summary, updated_at) |
+| `GET` | `/api/wiki/search?q=&limit=` | Full-text search the wiki (title + body), distinct from `/api/memories/search` |
+| `GET` | `/api/wiki/load?token_budget=&include_index=` | Concatenate the whole wiki into one blob (the core LLM-Wiki move) |
+| `GET` | `/api/wiki/status` | Page count + pending-compile count, for a dashboard badge |
+| `GET` | `/api/wiki/{slug}` | Read a single page by title or slug, with its links and backlinks (404 if unknown) |
 
-All `/api/*` routes require the bearer token described above (`GET /health` does not).
+All `/api/*` routes require the bearer token described above (`GET /health` does not). The wiki surface is read-only — writing stays an MCP-tool-only, LLM-curated action (see `SCHEMA.md`).
 
 A full [OpenAPI 3.0 spec](docs/openapi.yaml) covers every route above (request/response schemas, error shapes, auth) — feed it to `openapi-generator`, `openapi-typescript`, or similar to generate a typed client in any language, rather than remind_me maintaining hand-written SDKs itself.
 
@@ -1148,6 +1154,13 @@ remind_me is local-first, single-user, and MCP-native by design — some capabil
 ## Changelog
 
 See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for a per-version feature breakdown with PR references; this section summarizes the same history phase-by-phase.
+
+### 1.2.0 — 2026-07-21
+
+Gives the LLM Wiki (FT-08) a user-facing surface — previously Claude could read and write it via MCP tools, but the human owner had no way to browse it at all.
+
+- **Wiki REST API.** Five read-only routes under `/api/wiki/*` (list, read-by-slug, search, load, status), mirroring the existing `remind_me_wiki_*` MCP tool read paths. Read-only by design — writing remains an MCP-tool-only, LLM-curated action.
+- **Wiki dashboard view.** A new "Wiki" tab with a searchable page catalogue, rendered page body (clickable `[[Wikilinks]]`), and a links/backlinks panel, plus a pending-compile badge.
 
 ### 1.1.0 — 2026-07-21
 

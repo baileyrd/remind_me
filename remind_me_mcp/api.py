@@ -471,6 +471,98 @@ def _build_api_app() -> Starlette:
 
         return await asyncio.to_thread(_work)
 
+    # -- LLM Wiki (FT-08) — read-only REST surface --------------------------
+    #
+    # The wiki tools (remind_me_wiki_*) are the only user-facing capability
+    # with no REST/dashboard surface at all: Claude can write and browse it,
+    # but the human owner has had no way to see it outside the MCP tools.
+    # This mirrors the read paths (list/read/search/load) exactly — writing
+    # remains an MCP-tool-only, LLM-curated action (see SCHEMA.md's "you are
+    # the disciplined maintainer" framing), so there is no POST/PUT/DELETE
+    # here by design, not by omission.
+
+    async def api_wiki_pages(request: Request) -> JSONResponse:
+        """List every wiki page with its one-line summary (the catalogue)."""
+        from remind_me_mcp import wiki
+
+        def _work() -> JSONResponse:
+            pages = wiki.list_pages()
+            return _json_ok({"count": len(pages), "pages": pages})
+
+        return await asyncio.to_thread(_work)
+
+    async def api_wiki_status(request: Request) -> JSONResponse:
+        """Small aggregate for a dashboard badge: page count + pending-compile count."""
+        from remind_me_mcp import wiki
+
+        def _work() -> JSONResponse:
+            return _json_ok({
+                "pages": len(wiki.list_pages()),
+                "pending_compile": wiki.pending_compile_count(),
+            })
+
+        return await asyncio.to_thread(_work)
+
+    async def api_wiki_search(request: Request) -> JSONResponse:
+        """Full-text search wiki pages (title + body) — distinct from /api/memories/search."""
+        from remind_me_mcp import wiki
+
+        params = request.query_params
+        query = (params.get("q") or "").strip()
+        if not query:
+            return _json_err("Missing 'q' parameter")
+        try:
+            limit = min(_int_param(params, "limit", 10), 50)
+        except ValueError as e:
+            return _json_err(str(e))
+
+        def _work() -> JSONResponse:
+            results = wiki.search_pages(query, limit)
+            return _json_ok({"count": len(results), "results": results})
+
+        return await asyncio.to_thread(_work)
+
+    async def api_wiki_load(request: Request) -> JSONResponse:
+        """Load the whole wiki as one concatenated blob (the core LLM-Wiki move).
+
+        Query params mirror remind_me_wiki_load: ``token_budget`` (unset uses
+        config.WIKI_LOAD_TOKEN_BUDGET, ``0`` means unlimited) and
+        ``include_index`` (default true).
+        """
+        from remind_me_mcp import wiki
+
+        params = request.query_params
+        raw_budget = params.get("token_budget")
+        if raw_budget is None or raw_budget == "":
+            budget = None
+        else:
+            try:
+                budget = int(raw_budget)
+            except ValueError:
+                return _json_err(
+                    f"Invalid integer for query parameter 'token_budget': {raw_budget!r}"
+                )
+        include_index = params.get("include_index", "true").lower() not in ("false", "0", "no")
+
+        def _work() -> JSONResponse:
+            return _json_ok(wiki.load_wiki(budget, include_index))
+
+        return await asyncio.to_thread(_work)
+
+    async def api_wiki_page(request: Request) -> JSONResponse:
+        """Read a single wiki page by title or slug, with links and backlinks."""
+        from remind_me_mcp import wiki
+
+        slug = request.path_params["slug"]
+
+        def _work() -> JSONResponse:
+            page = wiki.read_page(slug)
+            if page is None:
+                return _json_err(f"Wiki page not found: {slug!r}", 404)
+            return _json_ok(page)
+
+        return await asyncio.to_thread(_work)
+
     async def api_get(request: Request) -> JSONResponse:
         """Retrieve a single memory by its ID."""
         memory_id = request.path_params["memory_id"]
@@ -713,6 +805,15 @@ def _build_api_app() -> Starlette:
         Route("/api/import", api_import, methods=["POST"]),
         Route("/api/export", api_export, methods=["GET"]),
         Route("/api/entity", api_entity, methods=["GET"]),
+        # Literal sub-paths must precede /api/wiki/{slug} — Starlette matches
+        # routes in registration order, so "search"/"load"/"status" would
+        # otherwise be swallowed as a slug (mirrors /api/memories/search's
+        # placement ahead of /api/memories/{memory_id} above).
+        Route("/api/wiki", api_wiki_pages, methods=["GET"]),
+        Route("/api/wiki/search", api_wiki_search, methods=["GET"]),
+        Route("/api/wiki/load", api_wiki_load, methods=["GET"]),
+        Route("/api/wiki/status", api_wiki_status, methods=["GET"]),
+        Route("/api/wiki/{slug}", api_wiki_page, methods=["GET"]),
     ]
 
     # SE-01: auth is on by default — resolve_api_key() auto-generates and

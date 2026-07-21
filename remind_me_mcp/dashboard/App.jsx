@@ -113,6 +113,46 @@ function useMemoryStore() {
   return { memories, stats, loading, refresh, search, add, update, remove };
 }
 
+function useWikiStore() {
+  const [pages, setPages] = useState([]);
+  const [status, setStatus] = useState({ pages: 0, pending_compile: 0 });
+  const [current, setCurrent] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await api("/wiki");
+      setPages(data.pages || []);
+    } catch (e) { console.error("wiki pages:", e); }
+    try {
+      const s = await api("/wiki/status");
+      setStatus(s);
+    } catch (e) { console.error("wiki status:", e); }
+    setLoading(false);
+  }, []);
+
+  const openPage = useCallback(async (slug) => {
+    setLoading(true);
+    try {
+      const data = await api("/wiki/" + encodeURIComponent(slug));
+      setCurrent(data.error ? null : data);
+    } catch (e) { console.error("wiki page:", e); setCurrent(null); }
+    setLoading(false);
+  }, []);
+
+  const search = useCallback(async (query) => {
+    try {
+      const data = await api("/wiki/search?" + new URLSearchParams({ q: query, limit: "20" }));
+      return data.results || [];
+    } catch (e) { console.error("wiki search:", e); return []; }
+  }, []);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  return { pages, status, current, setCurrent, loading, refresh, openPage, search };
+}
+
 // --- Icons ---
 const Icons = {
   Search: () => React.createElement("svg", {width:16,height:16,viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:2,strokeLinecap:"round"}, React.createElement("circle",{cx:11,cy:11,r:8}), React.createElement("path",{d:"m21 21-4.35-4.35"})),
@@ -127,6 +167,8 @@ const Icons = {
   Tag: () => React.createElement("svg", {width:12,height:12,viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:2,strokeLinecap:"round"}, React.createElement("path",{d:"M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"}), React.createElement("line",{x1:7,y1:7,x2:7.01,y2:7})),
   Check: () => React.createElement("svg", {width:14,height:14,viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:2.5,strokeLinecap:"round"}, React.createElement("polyline",{points:"20 6 9 17 4 12"})),
   Database: () => React.createElement("svg", {width:16,height:16,viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:2,strokeLinecap:"round"}, React.createElement("ellipse",{cx:12,cy:5,rx:9,ry:3}), React.createElement("path",{d:"M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"}), React.createElement("path",{d:"M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"})),
+  Book: () => React.createElement("svg", {width:16,height:16,viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:2,strokeLinecap:"round"}, React.createElement("path",{d:"M4 19.5A2.5 2.5 0 0 1 6.5 17H20"}), React.createElement("path",{d:"M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"})),
+  Link: () => React.createElement("svg", {width:12,height:12,viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:2,strokeLinecap:"round"}, React.createElement("path",{d:"M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"}), React.createElement("path",{d:"M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"})),
   Loader: () => React.createElement("svg", {width:16,height:16,viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:2,strokeLinecap:"round",style:{animation:"spin 1s linear infinite"}}, React.createElement("path",{d:"M21 12a9 9 0 1 1-6.219-8.56"})),
 };
 
@@ -207,6 +249,61 @@ function BarChart({data, colorMap}) {
           )
         )
       )
+    )
+  );
+}
+
+// --- Wiki ---
+// Lightweight rendering, not a full markdown parser: headings by leading
+// '#' count, and [[Wikilink]] / [[Wikilink|alias]] spans made clickable so
+// the cross-linking the wiki schema calls "the point" is actually navigable
+// from the dashboard. Body text otherwise renders as-is (monospace,
+// matching the rest of the app's raw-content aesthetic).
+const WIKILINK_RE = /\[\[([^\[\]|]+?)(?:\|([^\[\]]+?))?\]\]/g;
+
+function slugifyTitle(title) {
+  return (title || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "untitled";
+}
+
+function renderWikiLine(line, i, onNavigate) {
+  const heading = line.match(/^(#{1,3})\s+(.*)$/);
+  if (heading) {
+    const size = heading[1].length === 1 ? 22 : heading[1].length === 2 ? 17 : 14;
+    return React.createElement("div", {key:i, style:{fontSize:size,fontWeight:700,fontFamily:sans,letterSpacing:"-0.01em",margin:i===0?"0 0 10px":"18px 0 8px"}}, heading[2]);
+  }
+  const parts = [];
+  let last = 0, m, idx = 0;
+  WIKILINK_RE.lastIndex = 0;
+  while ((m = WIKILINK_RE.exec(line))) {
+    if (m.index > last) parts.push(React.createElement("span",{key:idx++}, line.slice(last, m.index)));
+    const target = m[1].trim();
+    const label = (m[2] || target).trim();
+    parts.push(React.createElement("button",{
+      key:idx++, onClick:() => onNavigate(slugifyTitle(target)),
+      style:{background:"none",border:"none",padding:0,color:theme.accent,fontFamily:mono,fontWeight:600,cursor:"pointer",textDecoration:"underline",textUnderlineOffset:2,fontSize:"inherit"},
+    }, label));
+    last = m.index + m[0].length;
+  }
+  if (last < line.length) parts.push(React.createElement("span",{key:idx++}, line.slice(last)));
+  if (parts.length === 0) return React.createElement("div",{key:i,style:{minHeight:8}});
+  return React.createElement("div", {key:i, style:{marginBottom:2}}, parts);
+}
+
+function WikiPageBody({content, onNavigate}) {
+  return React.createElement("div", {style:{fontFamily:mono,fontSize:14,color:theme.text,lineHeight:1.7}},
+    content.split("\n").map((line, i) => renderWikiLine(line, i, onNavigate))
+  );
+}
+
+function WikiLinkList({label, items, onNavigate}) {
+  if (!items || !items.length) return null;
+  return React.createElement("div", {style:{marginTop:16}},
+    React.createElement("div",{style:labelSt}, label),
+    React.createElement("div",{style:{display:"flex",flexWrap:"wrap",gap:6}},
+      items.map(it => React.createElement("button",{
+        key:it.slug, onClick:() => onNavigate(it.slug),
+        style:{display:"flex",alignItems:"center",gap:4,padding:"4px 10px",borderRadius:12,border:"1px solid "+theme.border,background:theme.surface,color:theme.textSecondary,fontSize:12,fontFamily:mono,cursor:"pointer"},
+      }, React.createElement(Icons.Link), it.title))
     )
   );
 }
@@ -388,6 +485,7 @@ function ImportForm({onComplete, onCancel}) {
 
 function App() {
   const store = useMemoryStore();
+  const wikiStore = useWikiStore();
   const [view, setView] = useState("browse");
   const [searchQuery, setSearchQuery] = useState("");
   const [filterCategory, setFilterCategory] = useState("");
@@ -397,8 +495,11 @@ function App() {
   const [editMemory, setEditMemory] = useState(null);
   const [deleteConfirm, setDeleteConfirm] = useState(null);
   const [expandedIds, setExpandedIds] = useState(new Set());
+  const [wikiQuery, setWikiQuery] = useState("");
+  const [wikiSearchResults, setWikiSearchResults] = useState(null);
   const searchRef = useRef(null);
   const debounceRef = useRef(null);
+  const wikiDebounceRef = useRef(null);
 
   useEffect(() => {
     const h = e => { if ((e.metaKey||e.ctrlKey)&&e.key==="k") { e.preventDefault(); searchRef.current?.focus(); } };
@@ -418,11 +519,25 @@ function App() {
     }, 250);
   }, [searchQuery, filterCategory, filterTags]);
 
+  // Debounced wiki search — a filter over the page list, mirroring the
+  // Browse search box; null means "show every page" (no query typed).
+  useEffect(() => {
+    clearTimeout(wikiDebounceRef.current);
+    wikiDebounceRef.current = setTimeout(async () => {
+      if (wikiQuery.trim()) {
+        setWikiSearchResults(await wikiStore.search(wikiQuery));
+      } else {
+        setWikiSearchResults(null);
+      }
+    }, 250);
+  }, [wikiQuery]);
+
   const handleAdd = async data => { await store.add(data); setShowAddModal(false); };
   const handleEdit = async data => { if (editMemory) { await store.update(editMemory.id, data); setEditMemory(null); } };
   const handleDelete = async id => { await store.remove(id); setDeleteConfirm(null); };
   const toggleExpand = id => setExpandedIds(prev => { const n=new Set(prev); n.has(id)?n.delete(id):n.add(id); return n; });
   const handleTagClick = tag => { if (!filterTags.includes(tag)) setFilterTags([...filterTags, tag]); };
+  const handleWikiNavigate = slug => { wikiStore.openPage(slug); setWikiQuery(""); setWikiSearchResults(null); };
 
   const stats = store.stats;
   const allCategories = Object.keys(stats.categories||{});
@@ -442,7 +557,9 @@ function App() {
       React.createElement("div",{style:{display:"flex",alignItems:"center",gap:8}},
         store.loading && React.createElement("span",{style:{color:theme.textMuted}}, React.createElement(Icons.Loader)),
         React.createElement("div",{style:{display:"flex",background:theme.surface,borderRadius:6,border:"1px solid "+theme.border,overflow:"hidden"}},
-          [["browse","Browse"],["stats","Stats"]].map(([v,l])=>React.createElement("button",{key:v,onClick:()=>setView(v),style:{padding:"6px 14px",border:"none",fontSize:12,fontFamily:mono,fontWeight:500,cursor:"pointer",background:view===v?theme.accent:"transparent",color:view===v?"#fff":theme.textSecondary,transition:"all 0.15s"}},l))
+          [["browse","Browse"],["stats","Stats"],["wiki","Wiki"]].map(([v,l])=>React.createElement("button",{key:v,onClick:()=>setView(v),style:{padding:"6px 14px",border:"none",fontSize:12,fontFamily:mono,fontWeight:500,cursor:"pointer",background:view===v?theme.accent:"transparent",color:view===v?"#fff":theme.textSecondary,transition:"all 0.15s"}},
+            l, v==="wiki" && wikiStore.status.pending_compile>0 && React.createElement("span",{style:{marginLeft:6,padding:"1px 6px",borderRadius:8,background:view===v?"rgba(255,255,255,0.25)":theme.warningSubtle,color:view===v?"#fff":theme.warning,fontSize:10,fontWeight:700}}, wikiStore.status.pending_compile)
+          ))
         ),
         React.createElement("button",{onClick:()=>setShowImportModal(true),style:{display:"flex",alignItems:"center",gap:6,padding:"8px 14px",borderRadius:6,border:"1px solid "+theme.border,background:"transparent",color:theme.textSecondary,fontSize:13,fontWeight:500,fontFamily:mono,cursor:"pointer",transition:"all 0.15s"},onMouseEnter:e=>{e.currentTarget.style.borderColor=theme.accent;e.currentTarget.style.color=theme.text},onMouseLeave:e=>{e.currentTarget.style.borderColor=theme.border;e.currentTarget.style.color=theme.textSecondary}}, React.createElement(Icons.Upload), " Import"),
         React.createElement("button",{onClick:()=>setShowAddModal(true),style:{display:"flex",alignItems:"center",gap:6,padding:"8px 14px",borderRadius:6,border:"none",background:theme.accent,color:"#fff",fontSize:13,fontWeight:600,fontFamily:mono,cursor:"pointer"}}, React.createElement(Icons.Plus), " Add")
@@ -465,6 +582,26 @@ function App() {
           React.createElement("div",{style:{display:"flex",flexWrap:"wrap",gap:4}},
             allTags.slice(0,15).map(t=>React.createElement(TagPill,{key:t,tag:t,onClick:()=>handleTagClick(t)}))
           )
+        )
+      ),
+      view==="wiki" && React.createElement("aside",{style:{width:240,borderRight:"1px solid "+theme.border,padding:"20px 16px",flexShrink:0,position:"sticky",top:69,height:"calc(100vh - 69px)",overflowY:"auto"}},
+        React.createElement("div",{style:{position:"relative",marginBottom:16}},
+          React.createElement("div",{style:{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",color:theme.textMuted}}, React.createElement(Icons.Search)),
+          React.createElement("input",{value:wikiQuery,onChange:e=>setWikiQuery(e.target.value),placeholder:"Search wiki…",style:{...inputSt,paddingLeft:32,fontSize:13,padding:"7px 10px 7px 32px"}})
+        ),
+        wikiStore.status.pending_compile>0 && React.createElement("div",{style:{padding:"6px 10px",borderRadius:5,background:theme.warningSubtle,color:theme.warning,fontSize:11,fontFamily:mono,marginBottom:14}},
+          wikiStore.status.pending_compile+" raw "+(wikiStore.status.pending_compile===1?"memory":"memories")+" not yet compiled"
+        ),
+        React.createElement("div",{style:{...labelSt,marginBottom:10}}, (wikiSearchResults?wikiSearchResults.length:wikiStore.pages.length)+" page(s)"),
+        React.createElement("div",{style:{display:"flex",flexDirection:"column",gap:2}},
+          (wikiSearchResults || wikiStore.pages).map(p=>React.createElement("button",{
+            key:p.slug, onClick:()=>handleWikiNavigate(p.slug),
+            style:{display:"block",width:"100%",textAlign:"left",padding:"7px 10px",borderRadius:5,border:"none",background:wikiStore.current&&wikiStore.current.slug===p.slug?theme.accentSubtle:"transparent",color:wikiStore.current&&wikiStore.current.slug===p.slug?theme.accent:theme.textSecondary,fontSize:13,fontFamily:sans,cursor:"pointer",fontWeight:wikiStore.current&&wikiStore.current.slug===p.slug?600:400},
+          },
+            React.createElement("div",null, p.title),
+            p.summary && React.createElement("div",{style:{fontSize:11,color:theme.textMuted,fontFamily:sans,marginTop:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}, p.snippet ? React.createElement("span",{dangerouslySetInnerHTML:{__html:p.snippet.replace(/\[/g,"<b>").replace(/\]/g,"</b>")}}) : p.summary)
+          )),
+          !wikiStore.loading && (wikiSearchResults||wikiStore.pages).length===0 && React.createElement("div",{style:{fontSize:12,color:theme.textMuted,fontFamily:sans,padding:"8px 10px"}}, wikiQuery ? "No matches." : "The wiki is empty. Ask Claude to run remind_me_wiki_compile.")
         )
       ),
       // Main
@@ -492,6 +629,23 @@ function App() {
             )
           )
         ) :
+        view==="wiki" ?
+        // Wiki view
+        (wikiStore.current ? React.createElement("div",null,
+          React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:12}},
+            React.createElement("span",{style:{fontSize:11,color:theme.textMuted,fontFamily:mono}}, "Updated "+(wikiStore.current.updated_at||"").replace("T"," ").slice(0,16)),
+            React.createElement("button",{onClick:()=>wikiStore.setCurrent(null),style:{background:"none",border:"none",color:theme.textSecondary,fontSize:12,fontFamily:mono,cursor:"pointer",display:"flex",alignItems:"center",gap:4}}, React.createElement(Icons.X), " Close")
+          ),
+          React.createElement("div",{style:{background:theme.surface,border:"1px solid "+theme.border,borderRadius:8,padding:"20px 24px"}},
+            React.createElement(WikiPageBody,{content:wikiStore.current.content, onNavigate:handleWikiNavigate}),
+            React.createElement(WikiLinkList,{label:"Links",items:wikiStore.current.links,onNavigate:handleWikiNavigate}),
+            React.createElement(WikiLinkList,{label:"Backlinks",items:wikiStore.current.backlinks,onNavigate:handleWikiNavigate})
+          )
+        ) : React.createElement("div",{style:{textAlign:"center",padding:"80px 20px",color:theme.textMuted}},
+          React.createElement("div",{style:{color:theme.textMuted,marginBottom:12,display:"flex",justifyContent:"center"}}, React.createElement(Icons.Book)),
+          React.createElement("div",{style:{fontSize:15,marginBottom:6}}, wikiStore.pages.length===0 ? "The wiki is empty" : "Select a page"),
+          React.createElement("div",{style:{fontSize:13}}, wikiStore.pages.length===0 ? "Ask Claude to run remind_me_wiki_compile to synthesise one from your memories." : "Pick a page from the list on the left.")
+        )) :
         // Stats view
         React.createElement("div",null,
           React.createElement("h2",{style:{fontFamily:sans,fontWeight:700,fontSize:22,marginBottom:20,letterSpacing:"-0.02em"}},"Memory Statistics"),

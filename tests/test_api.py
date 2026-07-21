@@ -1523,3 +1523,175 @@ def test_api_search_entity_unresolved_returns_empty_with_message(
     assert data["count"] == 0
     assert data["memories"] == []
     assert "No entity found" in data["message"]
+
+
+# ---------------------------------------------------------------------------
+# Wiki (FT-08) — read-only REST surface
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def wiki_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point config.WIKI_DIR at a fresh temp directory (mirrors test_wiki.py)."""
+    import remind_me_mcp.config as _cfg
+
+    d = tmp_path / "wiki"
+    monkeypatch.setattr(_cfg, "WIKI_DIR", d)
+    return d
+
+
+def test_api_wiki_pages_empty(client: TestClient, db_conn, wiki_dir: Path) -> None:
+    r = client.get("/api/wiki")
+    assert r.status_code == 200
+    assert r.json() == {"count": 0, "pages": []}
+
+
+def test_api_wiki_pages_lists_catalogue(client: TestClient, db_conn, wiki_dir: Path) -> None:
+    from remind_me_mcp import wiki
+
+    wiki.write_page("Tailscale", "A mesh VPN built on WireGuard.")
+    wiki.write_page("Postgres", "A relational database.")
+
+    r = client.get("/api/wiki")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["count"] == 2
+    titles = {p["title"] for p in data["pages"]}
+    assert titles == {"Tailscale", "Postgres"}
+    # Sorted title, case-insensitive, matching wiki.list_pages().
+    assert [p["title"] for p in data["pages"]] == ["Postgres", "Tailscale"]
+
+
+def test_api_wiki_page_read_with_links_and_backlinks(
+    client: TestClient, db_conn, wiki_dir: Path
+) -> None:
+    from remind_me_mcp import wiki
+
+    wiki.write_page("Networking", "Overview. See [[Tailscale]] for the VPN.")
+    wiki.write_page("Tailscale", "A mesh VPN. Part of [[Networking]].")
+
+    r = client.get("/api/wiki/tailscale")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["title"] == "Tailscale"
+    assert data["slug"] == "tailscale"
+    assert "A mesh VPN" in data["content"]
+    assert [ln["title"] for ln in data["links"]] == ["Networking"]
+    assert [bl["title"] for bl in data["backlinks"]] == ["Networking"]
+
+
+def test_api_wiki_page_accepts_title_not_just_slug(
+    client: TestClient, db_conn, wiki_dir: Path
+) -> None:
+    """The path segment is resolved the same way as remind_me_wiki_read: any
+    casing/punctuation variant of the title slugifies to the same page."""
+    from remind_me_mcp import wiki
+
+    wiki.write_page("VLAN Setup", "Notes.")
+    r = client.get("/api/wiki/VLAN%20Setup")
+    assert r.status_code == 200
+    assert r.json()["slug"] == "vlan-setup"
+
+
+def test_api_wiki_page_not_found(client: TestClient, db_conn, wiki_dir: Path) -> None:
+    r = client.get("/api/wiki/does-not-exist")
+    assert r.status_code == 404
+    assert "not found" in r.json()["error"].lower()
+
+
+def test_api_wiki_search_finds_match(client: TestClient, db_conn, wiki_dir: Path) -> None:
+    from remind_me_mcp import wiki
+
+    wiki.write_page("Tailscale", "A mesh VPN built on WireGuard.")
+    wiki.write_page("Postgres", "A relational database.")
+
+    r = client.get("/api/wiki/search", params={"q": "WireGuard"})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["count"] == 1
+    assert data["results"][0]["title"] == "Tailscale"
+
+
+def test_api_wiki_search_no_query(client: TestClient, wiki_dir: Path) -> None:
+    r = client.get("/api/wiki/search")
+    assert r.status_code == 400
+    assert "Missing 'q'" in r.json()["error"]
+
+
+def test_api_wiki_search_no_results(client: TestClient, db_conn, wiki_dir: Path) -> None:
+    from remind_me_mcp import wiki
+
+    wiki.write_page("Tailscale", "A mesh VPN.")
+    r = client.get("/api/wiki/search", params={"q": "nonexistentxyz"})
+    assert r.status_code == 200
+    assert r.json() == {"count": 0, "results": []}
+
+
+def test_api_wiki_load_concatenates_pages(client: TestClient, db_conn, wiki_dir: Path) -> None:
+    from remind_me_mcp import wiki
+
+    wiki.write_page("A", "First page body.")
+    wiki.write_page("B", "Second page body.")
+
+    r = client.get("/api/wiki/load")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["pages_included"] == 2
+    assert data["pages_omitted"] == 0
+    assert "First page body." in data["content"]
+    assert "Second page body." in data["content"]
+
+
+def test_api_wiki_load_respects_token_budget(client: TestClient, db_conn, wiki_dir: Path) -> None:
+    from remind_me_mcp import wiki
+
+    wiki.write_page("Page One", "x" * 400)
+    wiki.write_page("Page Two", "y" * 400)
+
+    r = client.get("/api/wiki/load", params={"token_budget": 120, "include_index": "false"})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["pages_included"] == 1
+    assert data["pages_omitted"] == 1
+
+
+def test_api_wiki_load_zero_budget_is_unlimited(
+    client: TestClient, db_conn, wiki_dir: Path
+) -> None:
+    from remind_me_mcp import wiki
+
+    wiki.write_page("Page One", "x" * 400)
+    wiki.write_page("Page Two", "y" * 400)
+
+    r = client.get("/api/wiki/load", params={"token_budget": 0})
+    assert r.status_code == 200
+    assert r.json()["pages_omitted"] == 0
+
+
+def test_api_wiki_load_invalid_token_budget(client: TestClient, wiki_dir: Path) -> None:
+    r = client.get("/api/wiki/load", params={"token_budget": "abc"})
+    assert r.status_code == 400
+
+
+def test_api_wiki_status_reports_pages_and_pending_compile(
+    client: TestClient, db_conn, wiki_dir: Path, memory_factory
+) -> None:
+    from remind_me_mcp import wiki
+
+    wiki.write_page("Tailscale", "A mesh VPN.")
+    memory_factory(content="A raw memory not yet folded into the wiki")
+
+    r = client.get("/api/wiki/status")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["pages"] == 1
+    assert data["pending_compile"] == 1
+
+
+def test_api_wiki_endpoints_require_auth(client_with_auth: TestClient, wiki_dir: Path) -> None:
+    """SE-01: the wiki routes are gated by the same /api/ bearer middleware."""
+    assert client_with_auth.get("/api/wiki").status_code == 401
+    assert client_with_auth.get("/api/wiki/search", params={"q": "x"}).status_code == 401
+    assert client_with_auth.get("/api/wiki/load").status_code == 401
+    assert client_with_auth.get("/api/wiki/status").status_code == 401
+    assert client_with_auth.get("/api/wiki/some-page").status_code == 401
