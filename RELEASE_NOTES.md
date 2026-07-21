@@ -1,5 +1,16 @@
 # Release Notes
 
+## v1.16.0 — 2026-07-21
+
+Closes a silent-degradation gap flagged in the application capability review: changing `REMIND_ME_EMBEDDING_MODEL`/`REMIND_ME_EMBEDDING_DIM`/`REMIND_ME_EMBEDDING_BACKEND` required a manual `remind_me_reindex`, and there was no stored record of which model actually produced the vectors currently in the store — a forgotten reindex after a model change meant KNN silently ran against vectors from a different model's embedding space, producing garbage nearest-neighbor results with no error at all.
+
+### New Features
+
+- **Embedding-model versioning** — a new `embedding_meta` table (local-only, not synced — vectors themselves are never synced either) records the model/dimension/backend that produced the vectors currently stored in `memories_vec`/`vec_chunks`, written after every successful (re-)embed rather than merely inferred from the running config.
+- **Automatic stale-vector clearing** — every startup compares the recorded model/dim/backend against the current config. On a mismatch, `memories_vec`/`vec_chunks` (and the on-disk ANN index, if present) are cleared automatically, and `memories_vec` is recreated at the new dimension if it changed — every memory then falls through to the existing "missing embeddings" path `remind_me_reindex`/`remind_me_server_status` already handle, rather than silently continuing to serve dimension- or model-mismatched results.
+- **`remind_me_server_status`** now reports an explicit "Embedding model changed" warning (old vs. new model/dim/backend) distinct from the generic "some memories aren't embedded yet" message, so the cause is clear at a glance.
+- Deliberately scoped to detect-and-clear-and-warn rather than an automatic background re-embed at startup — an unconditional background reindex thread on every server start with a pending mismatch would run inside tests and quick CLI invocations too, for a potentially expensive operation the existing `remind_me_reindex` tool already does deliberately, on request.
+
 ## v1.15.0 — 2026-07-21
 
 Closes a data-safety gap flagged in the application capability review: there was no backup command anywhere in the app, and schema migrations ran with no snapshot or safety net — a failed or buggy migration against the single SQLite file holding someone's entire memory store had no way back short of a manual file copy the user had to remember to make themselves.

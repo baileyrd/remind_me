@@ -57,6 +57,7 @@ from remind_me_mcp.db import (
     _supersede_contradicting_facts,
     _upsert_entity,
     _upsert_entity_relation,
+    embedding_mismatch_info,
 )
 from remind_me_mcp.formatting import _fmt_memories, _fmt_memory_md
 from remind_me_mcp.importer import import_chat_file, import_directory

@@ -443,6 +443,10 @@ Or ask Claude: "Reindex my memories for semantic search."
 
 This only generates embeddings for memories that don't have them yet — existing embeddings are preserved.
 
+### Changing the Embedding Model
+
+Switching `REMIND_ME_EMBEDDING_MODEL`, `REMIND_ME_EMBEDDING_DIM`, or `REMIND_ME_EMBEDDING_BACKEND` no longer requires remembering to manually reindex. The server records which model/dimension/backend produced the vectors currently stored, and detects a mismatch automatically at startup: stale vectors (and the on-disk ANN index, if built) are cleared so search never silently serves results from the wrong embedding space, and every memory falls through to the normal "missing embeddings" path — run `remind_me_reindex` to rebuild them under the new model.
+
 ### Checking Status
 
 Use `remind_me_server_status` to see how many memories have embeddings and whether the model is loaded.
@@ -1227,6 +1231,14 @@ remind_me is local-first, single-user, and MCP-native by design — some capabil
 ## Changelog
 
 See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for a per-version feature breakdown with PR references; this section summarizes the same history phase-by-phase.
+
+### 1.16.0 — 2026-07-21
+
+Closes a silent-degradation gap flagged in the application capability review: changing the embedding model/dimension/backend required remembering a manual `remind_me_reindex`, and there was no stored record of which model produced the vectors currently in the store — a forgotten reindex meant KNN silently ran against a different model's embedding space with no error at all.
+
+- **Embedding-model versioning** — a new local-only `embedding_meta` table records the model/dimension/backend that actually produced the currently stored vectors, updated after every successful (re-)embed.
+- **Automatic stale-vector clearing** — every startup compares recorded vs. configured model/dim/backend; on a mismatch, `memories_vec`/`vec_chunks` (and the on-disk ANN index) are cleared automatically and `memories_vec` recreated at the new dimension if needed, so every memory falls through to the existing missing-embeddings path instead of silently serving wrong-model results.
+- `remind_me_server_status` surfaces an explicit "Embedding model changed" warning distinct from the generic missing-embeddings message.
 
 ### 1.15.0 — 2026-07-21
 
