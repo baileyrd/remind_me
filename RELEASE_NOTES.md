@@ -1,5 +1,15 @@
 # Release Notes
 
+## v1.15.0 — 2026-07-21
+
+Closes a data-safety gap flagged in the application capability review: there was no backup command anywhere in the app, and schema migrations ran with no snapshot or safety net — a failed or buggy migration against the single SQLite file holding someone's entire memory store had no way back short of a manual file copy the user had to remember to make themselves.
+
+### New Features
+
+- **`remind_me_backup` MCP tool** — creates an on-demand backup using SQLite's WAL-safe `Connection.backup()` API (not a raw file copy, which could read a torn or partially-checkpointed page while the WAL is mid-write). Backups are written under `MEMORY_DIR/backups/`; `remind_me_server_status` now reports the current backup count and the most recent backup's timestamp.
+- **Pre-migration snapshot guard** — `_migrate_schema()` now snapshots the database before running any pending migration, so a migration that fails outright, or completes but is semantically wrong, can be rolled back by restoring the snapshot. Skipped for a brand-new, empty database (nothing to protect yet); snapshot failure (e.g. disk full) is logged and never blocks the migration itself.
+- **Automatic retention** — only the most recent `REMIND_ME_BACKUP_RETENTION_COUNT` backups (default 10, covering both manual and pre-migration snapshots) are kept; older ones are pruned after each new backup.
+
 ## v1.14.0 — 2026-07-21
 
 Closes a dashboard-usability gap flagged in the application capability review: `api_search` (and, before this, the general listing routes) returned a flat, capped list with no `offset`/`total`/`has_more` fields, so a dashboard or external client had no way to page through results beyond the cap. Separately, there was no bulk delete/tag/reclassify REST endpoint despite the equivalent batch MCP tools already existing.

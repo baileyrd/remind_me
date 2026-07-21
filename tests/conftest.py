@@ -65,6 +65,7 @@ def tmp_memory_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
     # Patch direct imports in sibling modules
     import remind_me_mcp.api as _api_mod
+    import remind_me_mcp.backup as _backup_mod
     import remind_me_mcp.db as _db_mod
     import remind_me_mcp.pid as _pid_mod
     import remind_me_mcp.server as _srv_mod
@@ -74,10 +75,22 @@ def tmp_memory_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     mp.setattr(_pid_mod, "DB_PATH", tmp_db)
     mp.setattr(_pid_mod, "PID_FILE", tmp_pid)
     mp.setattr(_srv_mod, "DB_PATH", tmp_db)
+    mp.setattr(_backup_mod, "BACKUP_DIR", tmp_dir / "backups")
 
     yield tmp_dir
 
     mp.undo()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_backup_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Give every test its own BACKUP_DIR (function-scoped, unlike the
+    session-scoped tmp_memory_dir fixture above), so backup.py and
+    pre-migration-snapshot tests never see files left behind by another test.
+    """
+    import remind_me_mcp.backup as _backup_mod
+
+    monkeypatch.setattr(_backup_mod, "BACKUP_DIR", tmp_path / "backups")
 
 
 # ---------------------------------------------------------------------------
