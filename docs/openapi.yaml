@@ -1,0 +1,611 @@
+openapi: 3.0.3
+info:
+  title: Remind Me — Dashboard REST API
+  version: "1.0.0"
+  description: |
+    The `GET /api/*` REST surface served by `remind_me_mcp/api.py` (the
+    dashboard's HTTP backend) — the same operations available as MCP tools,
+    exposed over plain HTTP so any language/tool can talk to a running
+    remind_me instance without an MCP client.
+
+    Published so client SDKs can be generated for free from this spec
+    instead of remind_me maintaining hand-written TS/Rust/etc. SDKs itself
+    (see the "Client SDKs" note in the main README) — feed this file to
+    `openapi-generator`, `openapi-typescript`, or similar.
+
+    This spec is maintained by hand alongside `api.py`; if you add or change
+    a route there, update this file in the same change.
+  license:
+    name: MIT
+
+servers:
+  - url: http://127.0.0.1:5199
+    description: Default local dashboard server (`remind-me-mcp --serve-ui`)
+
+security:
+  - bearerAuth: []
+
+paths:
+  /health:
+    get:
+      operationId: health
+      summary: Liveness probe
+      description: Unauthenticated. Reveals no data — used by pid.py's health check.
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+  /api/stats:
+    get:
+      operationId: getStats
+      summary: Aggregate statistics about the memory store
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total:
+                    type: integer
+                  imports:
+                    type: integer
+                  categories:
+                    type: object
+                    additionalProperties:
+                      type: integer
+                  sources:
+                    type: object
+                    additionalProperties:
+                      type: integer
+                  tags:
+                    type: object
+                    additionalProperties:
+                      type: integer
+                    description: Tag name -> count, sorted descending by count.
+                  db_path:
+                    type: string
+                  db_size_mb:
+                    type: number
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/memories:
+    get:
+      operationId: listMemories
+      summary: List memories with optional filters and pagination
+      parameters:
+        - $ref: "#/components/parameters/Category"
+        - name: source
+          in: query
+          schema:
+            type: string
+        - $ref: "#/components/parameters/Tags"
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+            maximum: 200
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+            minimum: 0
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total:
+                    type: integer
+                  count:
+                    type: integer
+                  offset:
+                    type: integer
+                  has_more:
+                    type: boolean
+                  memories:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Memory"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      operationId: addMemory
+      summary: Create a new memory
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content:
+                  type: string
+                  minLength: 1
+                category:
+                  type: string
+                  default: general
+                tags:
+                  type: array
+                  items:
+                    type: string
+                  default: []
+                source:
+                  type: string
+                  default: manual
+                metadata:
+                  type: object
+                  default: {}
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Memory"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+
+  /api/memories/search:
+    get:
+      operationId: searchMemories
+      summary: "Full-text search (FTS5), with an entity: token extension"
+      description: |
+        `q` may embed an `entity:NAME` or `entity:"Full Name"` token, which
+        filters to memories linked to that resolved entity (or whose
+        structured subject/object matches it) in addition to any remaining
+        free-text FTS5 query. An `entity:`-only query (no text left) lists
+        matching memories newest-first instead of FTS-ranking them.
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+            maximum: 200
+        - $ref: "#/components/parameters/Category"
+        - $ref: "#/components/parameters/Tags"
+      responses:
+        "200":
+          description: OK. If an `entity:` token doesn't resolve, count is 0 and `message` explains why.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: integer
+                  memories:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Memory"
+                  message:
+                    type: string
+        "400":
+          description: Missing `q`, invalid `limit`, or malformed FTS5 query syntax.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/memories/{memory_id}:
+    parameters:
+      - name: memory_id
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getMemory
+      summary: Retrieve a single memory by id
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Memory"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      operationId: updateMemoryPut
+      summary: Update fields on an existing memory (see PATCH)
+      requestBody:
+        $ref: "#/components/requestBodies/MemoryUpdate"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Memory"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+    patch:
+      operationId: updateMemoryPatch
+      summary: Update fields on an existing memory
+      description: |
+        Only fields present (and non-null) in the body are changed. `content`
+        triggers re-embedding. Identical behavior to PUT on this endpoint —
+        both are accepted as a partial update, there is no separate
+        full-replace semantic.
+      requestBody:
+        $ref: "#/components/requestBodies/MemoryUpdate"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Memory"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+    delete:
+      operationId: deleteMemory
+      summary: Permanently delete a memory
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:
+                    type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/entity:
+    get:
+      operationId: getEntity
+      summary: Look up a knowledge-graph entity by name or alias
+      description: |
+        Deterministic-id resolution on the canonical name first, then a
+        case-insensitive name/alias scan (mirrors the `remind_me_entity` MCP
+        tool). Superseded memories are excluded; dangling sync links are
+        invisible.
+      parameters:
+        - name: name
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          description: Max facts and max linked memories returned.
+          schema:
+            type: integer
+            default: 20
+            maximum: 100
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entity:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      name:
+                        type: string
+                      kind:
+                        type: string
+                        nullable: true
+                      aliases:
+                        type: array
+                        items:
+                          type: string
+                  facts:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Memory"
+                  memories:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Memory"
+                  total_linked_memories:
+                    type: integer
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: No entity found matching `name`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/import:
+    post:
+      operationId: importFile
+      summary: Import a chat export or document file (or directory) into the memory store
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [file_path]
+              properties:
+                file_path:
+                  type: string
+                  description: Absolute path, must lie inside REMIND_ME_IMPORT_ROOTS. A directory imports recursively.
+                category:
+                  type: string
+                  default: chat_import
+                tags:
+                  type: array
+                  items:
+                    type: string
+                  default: []
+                extract_mode:
+                  type: string
+                  default: assistant_messages
+                  enum: [assistant_messages, user_messages, all_messages, conversations, summaries]
+                max_length:
+                  type: integer
+                  default: 10000
+                kind:
+                  type: string
+                  default: auto
+                  enum: [auto, chat, document]
+      responses:
+        "200":
+          description: |
+            Import result (single file) or bulk-import summary (directory) —
+            shape depends on the target; see importer.py.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+
+  /api/export:
+    get:
+      operationId: exportMemories
+      summary: Export memories to JSON or JSONL
+      description: |
+        Without `file_path`, the export payload is the raw response body
+        (`curl .../api/export > backup.json`). With `file_path`, the export
+        is written server-side inside `REMIND_ME_EXPORT_ROOTS` and a JSON
+        summary is returned instead. Embedding vectors are never included
+        (rebuild with `remind_me_reindex` / `POST /api/import` + reindex);
+        records round-trip back in through `POST /api/import`, including the
+        entity graph when `include_graph=true` (the default).
+      parameters:
+        - name: format
+          in: query
+          schema:
+            type: string
+            default: json
+            enum: [json, jsonl]
+        - $ref: "#/components/parameters/Category"
+        - $ref: "#/components/parameters/Tags"
+        - name: file_path
+          in: query
+          schema:
+            type: string
+        - name: include_graph
+          in: query
+          schema:
+            type: boolean
+            default: true
+      responses:
+        "200":
+          description: |
+            Without `file_path`: the raw export (`application/json` or
+            `application/x-ndjson` depending on `format`). With `file_path`:
+            a JSON write summary.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+            application/x-ndjson:
+              schema:
+                type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          description: Server-side write failed (e.g. disk error).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        `REMIND_ME_API_KEY`, or an auto-generated key persisted at
+        `~/.remind-me/api_key` (0600) on first run. Every `/api/*` route
+        requires it unless `REMIND_ME_API_KEY=disabled` is set. `/` and
+        `/health` are always unauthenticated.
+
+  parameters:
+    Category:
+      name: category
+      in: query
+      schema:
+        type: string
+    Tags:
+      name: tags
+      in: query
+      description: Comma-separated; a memory must have ALL listed tags.
+      schema:
+        type: string
+
+  requestBodies:
+    MemoryUpdate:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            description: All fields optional; only present, non-null fields are changed. At least one must be given.
+            properties:
+              content:
+                type: string
+              category:
+                type: string
+              source:
+                type: string
+              tags:
+                type: array
+                items:
+                  type: string
+              metadata:
+                type: object
+
+  responses:
+    BadRequest:
+      description: Invalid request (bad JSON, missing/invalid field, malformed query param).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Missing or incorrect bearer token.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: Unauthorized
+    NotFound:
+      description: No memory with that id.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    UnsupportedMediaType:
+      description: "POST/PUT/PATCH under /api/ requires Content-Type: application/json."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+      required: [error]
+
+    Memory:
+      type: object
+      description: |
+        Every column of the `memories` table (`_row_to_dict` output) — `tags`
+        and `metadata` are JSON-decoded. Additional lifecycle/graph columns
+        exist beyond the ones listed here (schema evolves via migrations);
+        treat this as the stable core, not an exhaustive/closed set.
+      additionalProperties: true
+      properties:
+        id:
+          type: string
+        content:
+          type: string
+        category:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        source:
+          type: string
+        metadata:
+          type: object
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        vitality:
+          type: number
+        status:
+          type: string
+        memory_type:
+          type: string
+          nullable: true
+        subject:
+          type: string
+          nullable: true
+        predicate:
+          type: string
+          nullable: true
+        object:
+          type: string
+          nullable: true
+        superseded_by:
+          type: string
+          nullable: true
+        doc_id:
+          type: string
+          nullable: true
+        chunk_index:
+          type: integer
+          nullable: true

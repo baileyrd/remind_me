@@ -1,0 +1,41 @@
+# fly.toml — Remind Me sync hub, deployed as a Fly.io app.
+#
+# Postgres is a separate managed Fly app (Fly Postgres), attached via
+# `fly postgres attach` — that's what supplies the DATABASE_URL secret
+# below, so it isn't set in this file. SYNC_SECRET is a plain secret you
+# generate yourself.
+#
+# Quick start (run from the hub/ directory, one level up from this file,
+# so the Containerfile's build context matches — it does `COPY main.py .`
+# with no path prefix):
+#
+#   fly postgres create --name remind-me-db
+#   fly apps create remind-me-hub
+#   fly postgres attach remind-me-db -a remind-me-hub   # sets DATABASE_URL
+#   fly secrets set SYNC_SECRET=$(openssl rand -hex 32) -a remind-me-hub
+#   fly deploy --config deploy/fly.toml --dockerfile Containerfile
+#
+# No [[services]]/http_service block below on purpose: the hub is reached
+# over Fly's private 6PN network (WireGuard peer, or a Tailscale-to-Fly
+# bridge) at remind-me-hub.internal:8765, not the public internet — same
+# "SYNC_SECRET is the only thing standing between the internet and your
+# memory database, so don't expose this publicly" posture as the quadlet
+# and docker-compose templates. Add your own [[services]] block only if you
+# specifically want a public HTTPS endpoint, and put real TLS + rate
+# limiting in front of it if you do.
+
+app = "remind-me-hub"
+primary_region = "iad" # change to your nearest Fly region
+
+[build]
+  dockerfile = "Containerfile"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+# Check health from a WireGuard peer (`fly wireguard create`, or the
+# Tailscale-to-Fly bridge) since there's no public endpoint here:
+#   curl http://remind-me-hub.internal:8765/health
+# `fly status`/`fly machine status` also report whether the Machine itself
+# is running, independent of application-level health.

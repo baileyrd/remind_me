@@ -225,6 +225,8 @@ The dashboard is powered by a REST API you can also use directly:
 
 All `/api/*` routes require the bearer token described above (`GET /health` does not).
 
+A full [OpenAPI 3.0 spec](docs/openapi.yaml) covers every route above (request/response schemas, error shapes, auth) — feed it to `openapi-generator`, `openapi-typescript`, or similar to generate a typed client in any language, rather than remind_me maintaining hand-written SDKs itself.
+
 ### Instance Detection
 
 The server tracks running instances via a PID file (`~/.remind-me/server.pid`):
@@ -1101,3 +1103,14 @@ The server uses:
 - **Self-contained HTML** — the dashboard is served as a single inline page with no build step
 - **Graceful degradation** — semantic search, vitality scoring, and distributed sync are all optional; core functionality works with just FTS5 and local storage
 - **Optional OTEL instrumentation** — a single `maybe_span()` no-op context manager wraps tool calls, sync cycles, and watcher scans; zero-cost and zero-dependency unless `REMIND_ME_OTEL_ENABLED=1` and the `otel` extra are both set, exporting to any OTLP/HTTP collector (no bundled collector — that would conflict with the zero-ops, local-first design)
+- **Storage-interface Protocols** (`storage_interfaces.py`) — the entity-graph and vector-search operations `db.py` implements, documented as `typing.Protocol`s and mypy-verified against the real functions; prep/documentation only, not a second backend (see "Design Scope" below)
+
+## Design Scope
+
+remind_me is local-first, single-user, and MCP-native by design — some capabilities other memory/knowledge systems offer are deliberately out of scope rather than missing, because building them would work against that center. Documented here so the reasoning doesn't have to be reconstructed from a GitHub issue thread:
+
+- **Pluggable vector/graph storage backends (Neo4j, Qdrant, etc.)** — not planned. remind_me stores everything in one SQLite file (+ `sqlite-vec` for vectors) so it stays zero-ops: no second service to run, back up, or lose sync with. `storage_interfaces.py` documents the storage operations as `Protocol`s (mypy-verified against the real SQLite implementation) purely so the seam is legible if this ever changes — it ships no second backend and implies no near-term plan to build one.
+- **Multimodal ingestion (images, audio)** — deferred entirely. Ingestion, chunking, embedding, FTS5, and the wiki are all text-native end to end; images would need a second embedding pipeline, binary storage, and a UI story, none of which serve the text-first "personal memory for Claude clients" center. Revisit only if a concrete use case emerges.
+- **Multi-tenant / cross-agent isolation** — deferred. remind_me is explicitly single-owner by design: one OAuth owner token, one SQLite file per node. Multi-tenancy is an architecture change orthogonal to "personal memory," not a gap in the current design — worth revisiting only if the project's scope deliberately shifts toward shared/team memory infrastructure.
+- **Client SDKs beyond MCP** — no hand-written TS/Rust/etc. SDKs (maintenance surface disproportionate to a single-user local tool whose real client is Claude via MCP). Instead, the existing `GET /api/*` REST surface is published as an [OpenAPI 3.0 spec](docs/openapi.yaml) so any language can generate a thin client for free.
+- **Cloud/managed & serverless hosting** — no managed hosting product. The per-user SQLite node is designed to stay local; the one component that's natural to host centrally (the sync hub) already had a Podman quadlet deploy path, and now also has [Docker Compose, Fly.io, and Railway templates](hub/deploy/) — deliberately still self-hosted, not a one-click managed service.
