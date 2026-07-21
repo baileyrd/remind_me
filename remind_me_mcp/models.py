@@ -872,6 +872,16 @@ class NormalizationEntry(BaseModel):
         description="Optional reference ids/urls/paths supporting this normalization",
         max_length=20,
     )
+    entities: list[EntityInput] = Field(
+        default_factory=list,
+        description=(
+            "Entities this distillation mentions (FT-04 knowledge graph). The raw "
+            "imported memory is never entity-linked automatically, so pass entities "
+            "here to make the normalized memory reachable via remind_me_entity/"
+            "remind_me_entity_traverse."
+        ),
+        max_length=20,
+    )
 
 
 class NormalizeApplyInput(BaseModel):

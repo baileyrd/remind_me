@@ -9,7 +9,10 @@ does for atomic-fact extraction (no in-server LLM dependency, consistent
 with the project's zero-ops design). ``remind_me_normalize_apply`` then
 writes each distillation as a new memory, non-destructively linked back to
 the raw row via a ``normalized_from`` metadata pointer — the same
-dialog/summary linking idiom ``remind_me_auto_capture`` uses.
+dialog/summary linking idiom ``remind_me_auto_capture`` uses. The normalized
+memory inherits its source's ``doc_id``/``chunk_index`` (so neighbor-aware
+retrieval still finds it) and accepts its own ``entities`` list (FT-04),
+since the raw import is never entity-linked automatically.
 
 Patchable shared state and cross-module helpers are looked up through the
 ``remind_me_mcp.tools`` package namespace (``_pkg.<name>``) at call time so
@@ -135,10 +138,13 @@ async def remind_me_normalize_apply(params: NormalizeApplyInput) -> str:
     its own right. The link is metadata-only (normalized_from), the same
     non-destructive idiom remind_me_auto_capture uses for dialog/summary
     pairs, so remind_me_normalize_batch skips an already-normalized raw row
-    on the next call (once ANY normalization points back at it).
+    on the next call (once ANY normalization points back at it). The new
+    memory inherits the raw row's doc_id/chunk_index (so include_neighbors
+    still finds it) and links any entities passed in the entry (so it's
+    reachable via remind_me_entity/remind_me_entity_traverse).
 
     Args:
-        params: A batch of {memory_id, question, summary, resolution?, refs?}.
+        params: A batch of {memory_id, question, summary, resolution?, refs?, entities?}.
 
     Returns:
         JSON string with per-entry results and any errors.
@@ -151,7 +157,7 @@ async def remind_me_normalize_apply(params: NormalizeApplyInput) -> str:
 
     for entry in params.normalizations:
         raw_row = db.execute(
-            "SELECT tags FROM memories WHERE id = ?", (entry.memory_id,)
+            "SELECT tags, doc_id, chunk_index FROM memories WHERE id = ?", (entry.memory_id,)
         ).fetchone()
         if raw_row is None:
             errors.append({"memory_id": entry.memory_id, "error": "memory not found"})
@@ -182,8 +188,9 @@ async def remind_me_normalize_apply(params: NormalizeApplyInput) -> str:
 
         db.execute(
             """INSERT OR IGNORE INTO memories
-               (id, content, category, tags, source, metadata, created_at, updated_at, node_id, client)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (id, content, category, tags, source, metadata, created_at, updated_at,
+                node_id, client, doc_id, chunk_index)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 normalized_id,
                 content,
@@ -195,8 +202,20 @@ async def remind_me_normalize_apply(params: NormalizeApplyInput) -> str:
                 now,
                 NODE_ID,
                 CLIENT,
+                raw_row["doc_id"],
+                raw_row["chunk_index"],
             ),
         )
+
+        # FT-04: upsert mentioned entities and record the mention links, same
+        # as memory_add -- normalize_apply's raw source is never entity-linked
+        # automatically, so without this the normalized memory would be
+        # invisible to remind_me_entity/remind_me_entity_traverse.
+        for ent in entry.entities:
+            eid = _pkg._upsert_entity(
+                db, ent.name, ent.kind, ent.aliases, node_id=NODE_ID, now=now
+            )
+            _pkg._link_memory_entity(db, normalized_id, eid, now)
 
         results.append({"memory_id": entry.memory_id, "normalized_id": normalized_id})
 

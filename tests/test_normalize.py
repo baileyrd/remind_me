@@ -10,7 +10,12 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from remind_me_mcp.models import NormalizationEntry, NormalizeApplyInput, NormalizeBatchInput
+from remind_me_mcp.models import (
+    EntityInput,
+    NormalizationEntry,
+    NormalizeApplyInput,
+    NormalizeBatchInput,
+)
 from remind_me_mcp.tools.normalize import remind_me_normalize_apply, remind_me_normalize_batch
 
 if TYPE_CHECKING:
@@ -236,3 +241,118 @@ async def test_normalize_apply_extra_field_rejected() -> None:
         NormalizationEntry(
             memory_id="m1", question="Q?", summary="S.", bogus_field="nope"
         )
+
+
+async def test_normalize_apply_inherits_doc_id_and_chunk_index(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """The normalized memory must carry the raw import's doc_id/chunk_index,
+    or include_neighbors silently stops working for normalized content."""
+    raw = memory_factory(
+        content="Raw chunk from an imported document.",
+        source="document_import",
+        doc_id="doc-abc",
+        chunk_index=3,
+    )
+
+    result = json.loads(
+        await remind_me_normalize_apply(
+            NormalizeApplyInput(
+                normalizations=[
+                    NormalizationEntry(memory_id=raw["id"], question="Q?", summary="S.")
+                ]
+            )
+        )
+    )
+    normalized_id = result["results"][0]["normalized_id"]
+
+    row = db_conn.execute(
+        "SELECT doc_id, chunk_index FROM memories WHERE id = ?", (normalized_id,)
+    ).fetchone()
+    assert row["doc_id"] == "doc-abc"
+    assert row["chunk_index"] == 3
+
+
+async def test_normalize_apply_without_doc_id_leaves_it_null(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """Raw memories with no doc_id (not from a chunked import) normalize fine
+    and simply don't get neighbor expansion -- same as any other memory."""
+    raw = memory_factory(content="Raw content, no doc_id.", source="chat_import")
+
+    result = json.loads(
+        await remind_me_normalize_apply(
+            NormalizeApplyInput(
+                normalizations=[
+                    NormalizationEntry(memory_id=raw["id"], question="Q?", summary="S.")
+                ]
+            )
+        )
+    )
+    normalized_id = result["results"][0]["normalized_id"]
+
+    row = db_conn.execute(
+        "SELECT doc_id, chunk_index FROM memories WHERE id = ?", (normalized_id,)
+    ).fetchone()
+    assert row["doc_id"] is None
+    assert row["chunk_index"] is None
+
+
+async def test_normalize_apply_links_entities(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """Entities passed on a NormalizationEntry must be upserted and linked
+    to the normalized memory, same as remind_me_add -- otherwise normalized
+    memories are invisible to remind_me_entity/remind_me_entity_traverse."""
+    from remind_me_mcp.db import _entity_id
+
+    raw = memory_factory(content="Raw content about a VPN.", source="document_import")
+
+    result = json.loads(
+        await remind_me_normalize_apply(
+            NormalizeApplyInput(
+                normalizations=[
+                    NormalizationEntry(
+                        memory_id=raw["id"],
+                        question="How is the VPN configured?",
+                        summary="Split-tunnel VPN over WireGuard.",
+                        entities=[EntityInput(name="Bailey Robertson", kind="person")],
+                    )
+                ]
+            )
+        )
+    )
+    normalized_id = result["results"][0]["normalized_id"]
+
+    eid = _entity_id("Bailey Robertson")
+    ent = db_conn.execute("SELECT * FROM entities WHERE id = ?", (eid,)).fetchone()
+    assert ent is not None
+    assert ent["kind"] == "person"
+
+    link = db_conn.execute(
+        "SELECT * FROM memory_entities WHERE memory_id = ? AND entity_id = ?",
+        (normalized_id, eid),
+    ).fetchone()
+    assert link is not None
+
+
+async def test_normalize_apply_without_entities_links_none(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    raw = memory_factory(content="Raw content.", source="document_import")
+
+    result = json.loads(
+        await remind_me_normalize_apply(
+            NormalizeApplyInput(
+                normalizations=[
+                    NormalizationEntry(memory_id=raw["id"], question="Q?", summary="S.")
+                ]
+            )
+        )
+    )
+    normalized_id = result["results"][0]["normalized_id"]
+
+    count = db_conn.execute(
+        "SELECT COUNT(*) AS c FROM memory_entities WHERE memory_id = ?", (normalized_id,)
+    ).fetchone()["c"]
+    assert count == 0
