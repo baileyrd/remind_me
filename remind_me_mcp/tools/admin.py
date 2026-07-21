@@ -478,6 +478,37 @@ async def remind_me_reindex() -> str:
 
 
 @mcp.tool(
+    name="remind_me_backup",
+    annotations={
+        "title": "Backup Database",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def remind_me_backup() -> str:
+    """Create an on-demand, WAL-safe backup of the memory database.
+
+    Uses SQLite's Connection.backup() API, so it's safe to run even while the
+    server is actively serving other requests -- unlike a raw file copy, it
+    can't capture a torn or partially-checkpointed page. Backups are written
+    under MEMORY_DIR/backups/; only the most recent
+    REMIND_ME_BACKUP_RETENTION_COUNT (default 10) are kept, oldest pruned
+    automatically after each new backup.
+
+    Returns:
+        str: The backup file path and current backup count.
+    """
+    from remind_me_mcp.backup import create_backup, list_backups
+
+    db = _pkg._get_db()
+    path = await asyncio.to_thread(create_backup, db, label="manual")
+    backups = await asyncio.to_thread(list_backups)
+    return f"✓ Backup created: `{path}`\n\n**Total backups kept:** {len(backups)}"
+
+
+@mcp.tool(
     name="remind_me_server_status",
     annotations={
         "title": "Server Status",
@@ -511,6 +542,19 @@ async def remind_me_server_status() -> str:
 
     lines.append(f"\n**Database:** `{status['db_path']}`")
     lines.append(f"**DB exists:** {'yes' if status['db_exists'] else 'no'}")
+
+    # Backups (issue #17)
+    from remind_me_mcp.backup import BACKUP_DIR, list_backups
+
+    backups = await asyncio.to_thread(list_backups)
+    if backups:
+        lines.append(
+            f"**Backups:** {len(backups)} at `{BACKUP_DIR}` — last: "
+            f"{backups[0]['filename']} ({backups[0]['created_at']})"
+        )
+    else:
+        lines.append("**Backups:** none yet — run `remind_me_backup` to create one")
+
     lines.append("\n**MCP (stdio):** ✓ Active (this connection)")
 
     # Embedding status — the availability probe may hit the network (PF-01).

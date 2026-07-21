@@ -14,10 +14,19 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
-from remind_me_mcp.db import _ensure_schema, _make_id, _migrate_schema, _now_iso, _row_to_dict
+from remind_me_mcp.db import (
+    _ensure_schema,
+    _make_id,
+    _maybe_snapshot_before_migration,
+    _migrate_schema,
+    _now_iso,
+    _row_to_dict,
+)
 
 if TYPE_CHECKING:
     import sqlite3
+
+    import pytest
 
 # ---------------------------------------------------------------------------
 # _now_iso
@@ -834,3 +843,89 @@ def test_v13_to_v14_migration_from_v13_applies_cleanly(db_conn: sqlite3.Connecti
         ).fetchall()
     }
     assert "entity_relations" in tables
+
+
+# ---------------------------------------------------------------------------
+# _maybe_snapshot_before_migration (issue #17)
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_skipped_for_empty_db(
+    db_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A brand-new database with no memories has nothing to protect -- skip it."""
+    from remind_me_mcp import backup as backup_mod
+
+    called = []
+    monkeypatch.setattr(
+        backup_mod, "create_backup", lambda *a, **kw: called.append((a, kw))
+    )
+
+    _maybe_snapshot_before_migration(db_conn, 5)
+
+    assert called == []
+
+
+def test_snapshot_created_when_db_has_data(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """A database holding real memories gets a labeled pre-migration snapshot."""
+    from remind_me_mcp import backup as backup_mod
+
+    memory_factory(content="Has data worth protecting")
+
+    _maybe_snapshot_before_migration(db_conn, 5)
+
+    backups = backup_mod.list_backups()
+    assert len(backups) == 1
+    assert "pre-migration-v5" in backups[0]["filename"]
+
+
+def test_snapshot_failure_is_non_fatal(
+    db_conn: sqlite3.Connection, memory_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A snapshot failure (e.g. disk full) must never block migrations from proceeding."""
+    from remind_me_mcp import backup as backup_mod
+
+    memory_factory(content="Has data worth protecting")
+
+    def _boom(*_a, **_kw):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(backup_mod, "create_backup", _boom)
+
+    _maybe_snapshot_before_migration(db_conn, 5)  # must not raise
+
+
+def test_migration_rerun_does_not_resnapshot(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """Re-running _migrate_schema on an already-current DB takes no new snapshot."""
+    from remind_me_mcp import backup as backup_mod
+
+    memory_factory(content="Already migrated data")
+    assert backup_mod.list_backups() == []
+
+    _migrate_schema(db_conn)  # db_conn is already at _SCHEMA_VERSION
+
+    assert backup_mod.list_backups() == []
+
+
+def test_migration_from_old_version_snapshots_once(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """Simulating an upgrade from an older schema version takes exactly one snapshot."""
+    from remind_me_mcp import backup as backup_mod
+    from remind_me_mcp.db import _SCHEMA_VERSION
+
+    memory_factory(content="Pre-upgrade data")
+    db_conn.execute("PRAGMA user_version = 13")
+    db_conn.commit()
+
+    _migrate_schema(db_conn)
+
+    version = db_conn.execute("PRAGMA user_version").fetchone()[0]
+    assert version == _SCHEMA_VERSION
+    backups = backup_mod.list_backups()
+    assert len(backups) == 1
+    assert "pre-migration-v13" in backups[0]["filename"]

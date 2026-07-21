@@ -38,6 +38,7 @@ from remind_me_mcp.tools import (
     memory_stats,
     memory_update,
     remind_me_auto_capture,
+    remind_me_backup,
     remind_me_feedback,
     remind_me_get_capture,
     remind_me_reindex,
@@ -884,8 +885,59 @@ async def test_reindex_batches_embed_calls(
 
 
 # ---------------------------------------------------------------------------
+# remind_me_backup tests
+# ---------------------------------------------------------------------------
+
+
+async def test_backup_creates_file(db_conn: sqlite3.Connection) -> None:
+    """remind_me_backup reports success and the backup count."""
+    result = await remind_me_backup()
+
+    assert "Backup created" in result
+    assert "Total backups kept:** 1" in result
+
+
+async def test_backup_file_is_listed_afterward(db_conn: sqlite3.Connection) -> None:
+    """A backup created via the tool shows up in backup.list_backups()."""
+    from remind_me_mcp import backup as backup_mod
+
+    await remind_me_backup()
+
+    backups = backup_mod.list_backups()
+    assert len(backups) == 1
+    assert backups[0]["filename"].startswith("manual-")
+
+
+async def test_backup_twice_keeps_two(db_conn: sqlite3.Connection) -> None:
+    """Two manual backups in a row both survive (under the default retention count)."""
+    await remind_me_backup()
+    result = await remind_me_backup()
+
+    assert "Total backups kept:** 2" in result
+
+
+# ---------------------------------------------------------------------------
 # remind_me_server_status tests
 # ---------------------------------------------------------------------------
+
+
+async def test_server_status_reports_no_backups_by_default(
+    db_conn: sqlite3.Connection,
+) -> None:
+    result = await remind_me_server_status()
+
+    assert "**Backups:** none yet" in result
+    assert "remind_me_backup" in result
+
+
+async def test_server_status_reports_backup_count_after_backup(
+    db_conn: sqlite3.Connection,
+) -> None:
+    await remind_me_backup()
+
+    result = await remind_me_server_status()
+
+    assert "**Backups:** 1 at" in result
 
 
 async def test_server_status_no_ui(

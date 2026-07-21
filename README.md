@@ -354,6 +354,7 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_export_memories` | Export memories (+ entity graph by default) to JSON/JSONL, inline or to a file inside the export roots |
 | `remind_me_stats` | View statistics: counts, categories, recent activity |
 | `remind_me_reindex` | Build vector embeddings for any memories missing them |
+| `remind_me_backup` | Create an on-demand, WAL-safe backup of the database under `MEMORY_DIR/backups/` |
 | `remind_me_server_status` | Check dashboard, embedding, folder-watcher, and remote-connector state and verify DB connectivity |
 | `remind_me_watch_status` | Folder watcher status: watched dirs, scan counters, recent errors |
 | `remind_me_webhook_status` | Push/webhook ingestion status: bind/port, request counters, recent errors |
@@ -361,7 +362,7 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_check_update` | Check if a newer version is available on origin/main |
 | `remind_me_self_update` | Pull latest changes from origin and reinstall the package |
 
-41 tools + 4 resources (`memory://stats`, `memory://categories`, `wiki://schema`, `wiki://index`).
+43 tools + 4 resources (`memory://stats`, `memory://categories`, `wiki://schema`, `wiki://index`).
 
 ### Auto-Capture: Persisting Full Conversations
 
@@ -445,6 +446,15 @@ This only generates embeddings for memories that don't have them yet — existin
 ### Checking Status
 
 Use `remind_me_server_status` to see how many memories have embeddings and whether the model is loaded.
+
+## Backups
+
+For a single-user app where one SQLite file holds someone's entire memory store, a failed or buggy migration (or just wanting a checkpoint before a risky bulk edit) needs a real safety net, not a reminder to "remember to copy the file."
+
+- **On-demand** — run `remind_me_backup` any time. It uses SQLite's WAL-safe `Connection.backup()` API, so it's safe even while the server is actively handling other requests, unlike a raw file copy (which could capture a torn or partially-checkpointed page mid-write). Backups land under `MEMORY_DIR/backups/`.
+- **Pre-migration snapshot** — every server startup that has a pending schema migration takes an automatic snapshot first, so a migration that fails outright, or completes but is semantically wrong, can be rolled back by restoring it. Skipped for a brand-new, empty database (nothing to protect yet). A snapshot failure (e.g. disk full) is logged and never blocks the migration itself.
+- **Retention** — only the most recent `REMIND_ME_BACKUP_RETENTION_COUNT` backups (default 10, manual and pre-migration combined) are kept; older ones are pruned automatically after each new backup.
+- Check `remind_me_server_status` for the current backup count and most recent backup timestamp.
 
 ## Importing Chats & Documents
 
@@ -1020,6 +1030,7 @@ Every new memory used to start at a flat `base_weight=1.0` regardless of kind, s
 | `REMIND_ME_EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | HuggingFace model for semantic embeddings (ONNX backend) |
 | `REMIND_ME_EMBEDDING_BACKEND` | `onnx` | Embedding backend: `onnx` (in-process) or `ollama` (local daemon) |
 | `REMIND_ME_EMBEDDING_DIM` | `384` | Embedding dimension — must match the model (nomic-embed-text=768, bge-m3=1024). Changing it requires recreating the vector table + `remind_me_reindex` |
+| `REMIND_ME_BACKUP_RETENTION_COUNT` | `10` | Number of backup files (manual + pre-migration) kept under `MEMORY_DIR/backups/`; oldest pruned after each new backup |
 | `REMIND_ME_OLLAMA_URL` | `http://localhost:11434` | Ollama daemon URL (when backend is `ollama`) |
 | `REMIND_ME_OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Ollama embedding model name. Query/passage instruction prefixes (e.g. `search_query:`/`search_document:`) are applied automatically for known model families (`nomic-embed-text`, `bge-*`, `e5-*`) — see `embeddings._ROLE_PREFIXES` |
 | `REMIND_ME_EMBED_CHUNK_CHARS` | `1600` | Character window size for sliding-window embedding of long content |
@@ -1216,6 +1227,14 @@ remind_me is local-first, single-user, and MCP-native by design — some capabil
 ## Changelog
 
 See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for a per-version feature breakdown with PR references; this section summarizes the same history phase-by-phase.
+
+### 1.15.0 — 2026-07-21
+
+Closes a data-safety gap flagged in the application capability review: there was no backup command anywhere, and schema migrations ran with no snapshot or safety net — a failed or buggy migration against the single SQLite file holding someone's entire memory store had no way back short of a manual file copy.
+
+- **`remind_me_backup` tool** — on-demand backup via SQLite's WAL-safe `Connection.backup()` API (not a raw file copy, which could read a torn/mid-checkpoint page). Written under `MEMORY_DIR/backups/`.
+- **Pre-migration snapshot guard** — `_migrate_schema()` snapshots the database before running any pending migration, so a migration that fails or completes but is semantically wrong can be rolled back. Skipped for a brand-new empty database; snapshot failure is logged, never blocks the migration.
+- **Automatic retention** — only the most recent `REMIND_ME_BACKUP_RETENTION_COUNT` backups (default 10) are kept, pruned after each new backup.
 
 ### 1.14.0 — 2026-07-21
 

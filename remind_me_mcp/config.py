@@ -98,6 +98,11 @@ nomic-embed-text=768, bge-m3/mxbai-embed-large=1024). Changing this on an existi
 database requires recreating the memories_vec table and running remind_me_reindex."""
 MODEL_DIR = MEMORY_DIR / "models"
 
+BACKUP_DIR = MEMORY_DIR / "backups"
+BACKUP_RETENTION_COUNT = _env_int("REMIND_ME_BACKUP_RETENTION_COUNT", 10)
+"""Number of backup files (manual + pre-migration) to keep in BACKUP_DIR.
+Oldest backups beyond this count are pruned after each new backup is created."""
+
 # Embedding backend selection: "onnx" (default, in-process ONNX Runtime) or
 # "ollama" (a local Ollama daemon serving an embedding model).
 EMBEDDING_BACKEND = os.environ.get("REMIND_ME_EMBEDDING_BACKEND", "onnx").lower()
@@ -498,6 +503,8 @@ __all__ = [
     "ANN_MIN_CHUNKS",
     "CONSOLIDATE_MAX_CANDIDATES",
     "MODEL_DIR",
+    "BACKUP_DIR",
+    "BACKUP_RETENTION_COUNT",
     "SERVE_UI",
     "UI_PORT",
     "SERVE_MCP",

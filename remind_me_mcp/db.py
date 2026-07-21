@@ -262,11 +262,46 @@ _SCHEMA_VERSION = 17
 
 
 
+def _maybe_snapshot_before_migration(db: sqlite3.Connection, current_version: int) -> None:
+    """Snapshot the DB file before running a pending migration (issue #17).
+
+    Skipped for a brand-new, empty database (nothing to protect) -- detected
+    by checking whether the memories table already has any rows. A failed or
+    semantically-wrong migration then has a restorable pre-migration copy
+    instead of no safety net at all. Snapshot failure is logged and swallowed
+    rather than raised: it must never block startup or the migration itself.
+
+    Args:
+        db: An open SQLite connection.
+        current_version: The schema version read before migrations run, used
+            to label the snapshot with what it's a backup *of*.
+    """
+    try:
+        has_data = bool(
+            db.execute("SELECT EXISTS(SELECT 1 FROM memories LIMIT 1)").fetchone()[0]
+        )
+    except sqlite3.OperationalError:
+        has_data = False  # memories table doesn't exist yet -- truly fresh db
+
+    if not has_data:
+        return
+
+    try:
+        from remind_me_mcp.backup import create_backup
+
+        path = create_backup(db, label=f"pre-migration-v{current_version}")
+        log.info("Pre-migration snapshot created: %s", path)
+    except OSError as e:
+        log.warning("Pre-migration snapshot failed (continuing without one): %s", e)
+
+
 def _migrate_schema(db: sqlite3.Connection) -> None:
     """Apply incremental schema migrations using PRAGMA user_version.
 
     Each migration step is guarded by a version check so that re-running this
-    function on an already-migrated database is a safe no-op (idempotent).
+    function on an already-migrated database is a safe no-op (idempotent). A
+    snapshot of the DB file is taken before any pending migration runs (issue
+    #17), so a failed or buggy migration can be rolled back by restoring it.
 
     Migration history:
       v0 -> v1: capture_id TEXT column + index on memories; backfill from metadata JSON.
@@ -277,6 +312,9 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         db: An open SQLite connection with row_factory=sqlite3.Row set.
     """
     current_version: int = db.execute("PRAGMA user_version").fetchone()[0]
+
+    if current_version < _SCHEMA_VERSION:
+        _maybe_snapshot_before_migration(db, current_version)
 
     if current_version < 1:
         _migrate_v0_to_v1(db)
