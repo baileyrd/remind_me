@@ -278,6 +278,125 @@ def test_failed_embed_rolls_back_chunk_deletes(
 
 
 # ---------------------------------------------------------------------------
+# Internal batching (issue #16): _embed_and_store_rows must never hand an
+# unbounded number of rows to one embed()/transaction, regardless of how
+# many rows the caller passes in a single call. This is what fixes sync.py's
+# _upsert_records, which hands over its entire pulled batch in one call with
+# no batching of its own — the invariant now lives in _embed_and_store_rows
+# itself, not in each caller.
+# ---------------------------------------------------------------------------
+
+
+def test_embed_and_store_rows_batches_large_input(
+    db_conn_with_vec: sqlite3.Connection, mock_embedder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A single _embed_and_store_rows call with more than EMBED_BATCH_SIZE
+    rows is split into EMBED_BATCH_SIZE-sized (or smaller, for the
+    remainder) calls to _embed_and_store_batch — never one unbounded call."""
+    import remind_me_mcp.db as db_mod
+
+    monkeypatch.setattr(db_mod, "EMBED_BATCH_SIZE", 4)
+
+    batch_sizes: list[int] = []
+    real_batch = db_mod._embed_and_store_batch
+
+    def spy_batch(embedder, rows):
+        batch_sizes.append(len(rows))
+        return real_batch(embedder, rows)
+
+    monkeypatch.setattr(db_mod, "_embed_and_store_batch", spy_batch)
+
+    rows = []
+    for i in range(10):  # 10 rows over a batch size of 4 -> 4, 4, 2
+        content = f"batch invariant memory number {i}"
+        mem_id = _insert_memory(db_conn_with_vec, content)
+        rowid = db_conn_with_vec.execute(
+            "SELECT rowid FROM memories WHERE id = ?", (mem_id,)
+        ).fetchone()[0]
+        rows.append((rowid, content))
+
+    stored = db_mod._embed_and_store_rows(rows)
+
+    assert stored == 10
+    assert batch_sizes == [4, 4, 2]
+    assert all(n <= 4 for n in batch_sizes)
+
+
+def test_embed_and_store_rows_single_call_below_batch_size_unaffected(
+    db_conn_with_vec: sqlite3.Connection, mock_embedder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Input at or under EMBED_BATCH_SIZE still goes through in one batch —
+    the internal batching is transparent for the common case."""
+    import remind_me_mcp.db as db_mod
+
+    monkeypatch.setattr(db_mod, "EMBED_BATCH_SIZE", 32)
+
+    batch_sizes: list[int] = []
+    real_batch = db_mod._embed_and_store_batch
+
+    def spy_batch(embedder, rows):
+        batch_sizes.append(len(rows))
+        return real_batch(embedder, rows)
+
+    monkeypatch.setattr(db_mod, "_embed_and_store_batch", spy_batch)
+
+    rows = []
+    for i in range(3):
+        content = f"small batch memory {i}"
+        mem_id = _insert_memory(db_conn_with_vec, content)
+        rowid = db_conn_with_vec.execute(
+            "SELECT rowid FROM memories WHERE id = ?", (mem_id,)
+        ).fetchone()[0]
+        rows.append((rowid, content))
+
+    stored = db_mod._embed_and_store_rows(rows)
+
+    assert stored == 3
+    assert batch_sizes == [3]
+
+
+def test_sync_style_large_unbatched_pull_is_batched_internally(
+    db_conn_with_vec: sqlite3.Connection, mock_embedder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test for issue #16: sync.py's _upsert_records hands its
+    entire pulled batch to _embed_and_store_rows in one call with no
+    batching of its own. Simulate that call shape directly (more rows than
+    EMBED_BATCH_SIZE, one call) and confirm no single embed() call receives
+    more chunks than the batch size allows."""
+    import remind_me_mcp.db as db_mod
+
+    monkeypatch.setattr(db_mod, "EMBED_BATCH_SIZE", 5)
+
+    embed_call_sizes: list[int] = []
+    real_embed = mock_embedder.embed
+
+    def spy_embed(texts):
+        embed_call_sizes.append(len(texts))
+        return real_embed(texts)
+
+    monkeypatch.setattr(mock_embedder, "embed", spy_embed)
+
+    rows = []
+    for i in range(13):  # a pulled sync batch bigger than one embed batch
+        content = f"pulled sync record {i}"
+        mem_id = _insert_memory(db_conn_with_vec, content)
+        rowid = db_conn_with_vec.execute(
+            "SELECT rowid FROM memories WHERE id = ?", (mem_id,)
+        ).fetchone()[0]
+        rows.append((rowid, content))
+
+    # Mirrors sync.py's _upsert_records: the *entire* pulled batch in one call.
+    stored = db_mod._embed_and_store_rows(rows)
+
+    assert stored == 13
+    # Each chunk of work handed to embed() must be bounded by EMBED_BATCH_SIZE
+    # memories' worth of chunks (1 chunk/memory here, short content) -- never
+    # one call spanning the whole 13-row input.
+    assert all(n <= 5 for n in embed_call_sizes)
+    assert len(embed_call_sizes) > 1
+
+
+# ---------------------------------------------------------------------------
 # ANN index integration (gap #10) — _semantic_search's ANN/brute-force split
 # ---------------------------------------------------------------------------
 

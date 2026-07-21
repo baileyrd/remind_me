@@ -693,22 +693,28 @@ def test_reimport_short_circuits_before_parsing(
     assert second["import_id"] == first["import_id"]
 
 
-def test_import_embeds_in_batches_outside_lock(
+def test_import_embeds_outside_lock(
     db_conn: sqlite3.Connection,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Embedding is batched via _embed_and_store_rows and runs with the import
-    lock released (PF-03), so concurrent import workers are not serialized on
-    the (slow) embedding step."""
+    """Embedding runs with the import lock released (PF-03), so concurrent
+    import workers are not serialized on the (slow) embedding step.
+
+    _embed_and_store_rows batches internally by EMBED_BATCH_SIZE regardless
+    of how many rows a caller passes in one call (see
+    tests/test_chunking.py's ``test_embed_and_store_rows_batches_*`` for that
+    invariant directly) — the importer hands over every row in a single
+    call, so this test only needs to verify the lock state, not batch counts.
+    """
     import remind_me_mcp.importer as _importer_mod
     from remind_me_mcp.config import EMBED_BATCH_SIZE
 
-    batches: list[list[tuple[int, str]]] = []
+    calls: list[list[tuple[int, str]]] = []
     lock_states: list[bool] = []
 
     def spy_rows(rows: list[tuple[int, str]]) -> int:
-        batches.append(list(rows))
+        calls.append(list(rows))
         lock_states.append(_importer_mod._import_lock.locked())
         return len(rows)
 
@@ -728,12 +734,13 @@ def test_import_embeds_in_batches_outside_lock(
     assert result["status"] == "ok"
     assert result["memories_created"] == n_messages
 
-    # Batched: EMBED_BATCH_SIZE rows then the remainder — not one call per chunk.
-    assert [len(b) for b in batches] == [EMBED_BATCH_SIZE, 3]
+    # A single call handing over every row — _embed_and_store_rows owns batching.
+    assert len(calls) == 1
+    assert len(calls[0]) == n_messages
     # Outside the lock: the import lock must be released during embedding.
-    assert lock_states == [False, False]
+    assert lock_states == [False]
     # Every embedded rowid maps to a stored memory row.
-    for rowid, content in (pair for batch in batches for pair in batch):
+    for rowid, content in calls[0]:
         row = db_conn.execute(
             "SELECT content FROM memories WHERE rowid = ?", (rowid,)
         ).fetchone()

@@ -989,7 +989,7 @@ This is a deterministic heuristic, not an LLM planner call — no extra latency 
 | `REMIND_ME_EMBED_CHUNK_CHARS` | `1600` | Character window size for sliding-window embedding of long content |
 | `REMIND_ME_EMBED_CHUNK_OVERLAP` | `200` | Overlap between embedding windows |
 | `REMIND_ME_EMBED_MAX_CHUNKS` | `16` | Max embedding chunks per memory |
-| `REMIND_ME_EMBED_BATCH_SIZE` | `32` | Memories embedded per batch during reindex and import |
+| `REMIND_ME_EMBED_BATCH_SIZE` | `32` | Memories embedded per batch — enforced inside `_embed_and_store_rows` itself, so every caller (reindex, import, sync's pulled-record embedding) is bounded the same way regardless of how many rows it hands over in one call |
 | `REMIND_ME_EMBED_FORWARD_BATCH` | `32` | Chunks per ONNX forward pass inside the embedder — the hard ceiling on embedding memory per call |
 | `REMIND_ME_ANN_MIN_CHUNKS` | `5000` | Chunk-vector count above which semantic search uses the optional HNSW ANN index (`usearch`) instead of sqlite-vec's exact brute-force scan. Requires the `ann` extra (`pip install remind-me-mcp[ann]`); degrades gracefully to the exact scan if missing |
 | `REMIND_ME_MEMPALACE_PATH` | `~/.mempalace/palace` | Path to a MemPalace ChromaDB persistent store, read (read-only) by `remind_me_import_mempalace` |
@@ -1175,6 +1175,10 @@ remind_me is local-first, single-user, and MCP-native by design — some capabil
 ## Changelog
 
 See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for a per-version feature breakdown with PR references; this section summarizes the same history phase-by-phase.
+
+### 1.3.1 — 2026-07-21
+
+Defense-in-depth fix, not a new capability. `_embed_and_store_rows` now batches internally by `EMBED_BATCH_SIZE` regardless of how many rows a caller passes in one call — a single source of truth, instead of every bulk caller pre-slicing its own input. This fixes the one caller that never batched (sync's pulled-record embedding) without touching `sync.py`, and let the file/mempalace/dbs importers drop their now-redundant external batching loops.
 
 ### 1.3.0 — 2026-07-21
 

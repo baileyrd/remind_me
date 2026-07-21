@@ -1,5 +1,14 @@
 # Release Notes
 
+## v1.3.1 — 2026-07-21
+
+Defense-in-depth fix, not a new capability: the sync pull path was the one caller of `_embed_and_store_rows` that never batched its input, relying entirely on the downstream `EMBED_FORWARD_BATCH` forward-pass cap (added in PR #15) to bound memory.
+
+### Improvements
+
+- **`_embed_and_store_rows` now batches internally** by `EMBED_BATCH_SIZE`, regardless of how many rows a caller passes in one call — a single source of truth for "no caller flattens the whole store into one embed()/transaction," instead of every bulk caller having to remember to pre-slice its own input. Fixes sync's pulled-record embedding (`_upsert_records`) without any change to `sync.py` itself.
+- Removed the now-redundant external batching loops in the file/mempalace/dbs importers — each now hands its rows to `_embed_and_store_rows` in one call, same as sync already did.
+
 ## v1.3.0 — 2026-07-21
 
 Semantic search's `sqlite-vec` KNN was an exact brute-force scan over every chunk vector — correct, but O(n) per query, the one thing that would visibly degrade as a memory store grows into the tens of thousands of chunks.
