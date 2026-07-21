@@ -17,12 +17,17 @@ supplies the policy:
     (``hmac.compare_digest``, SE-05); a wrong credential or an explicit deny
     both produce the same ``access_denied`` redirect, so the form never
     leaks which part failed. Every authorization re-prompts.
-  - **Hashed token storage.** Registered clients and SHA-256 hashes of
-    issued access/refresh tokens persist in a small JSON state file
-    (``~/.remind-me/oauth.json``, 0600 — SE-01 conventions). Raw tokens are
-    never written to disk. The file is re-read on every lookup, so deleting
-    a client from another process (the ``remind_me_revoke_clients`` MCP tool
-    running in stdio mode) revokes it on the live remote server too.
+  - **No plaintext secrets at rest.** SHA-256 hashes of issued access/refresh
+    tokens persist in a small JSON state file (``~/.remind-me/oauth.json``,
+    0600 — SE-01 conventions); raw tokens are never written to disk.
+    Registered clients are forced to ``token_endpoint_auth_method="none"``
+    at registration (``register_client``) rather than storing a
+    ``client_secret`` at all -- PKCE (S256) already provides proof of
+    possession, so there's no secret whose plaintext-at-rest exposure would
+    need weighing against the SDK's own equality-based verification. The
+    file is re-read on every lookup, so deleting a client from another
+    process (the ``remind_me_revoke_clients`` MCP tool running in stdio
+    mode) revokes it on the live remote server too.
   - **Short-lived access, revocable everything.** Access tokens live
     ``ACCESS_TOKEN_TTL`` (1 h), refresh tokens ``REFRESH_TOKEN_TTL`` (30 d),
     authorization codes ``AUTH_CODE_TTL`` (5 min, single-use). The refresh
@@ -329,7 +334,34 @@ class SingleUserOAuthProvider:
         return OAuthClientInformationFull.model_validate(record) if record else None
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
-        """Persist a dynamically-registered client."""
+        """Persist a dynamically-registered client.
+
+        Forces token_endpoint_auth_method="none" (no client_secret),
+        overriding whatever the SDK's registration handler defaulted to --
+        it defaults to client_secret_post and auto-generates a secret
+        whenever the registering client doesn't explicitly request "none"
+        (mcp.server.auth.handlers.register). That secret would otherwise be
+        the one credential this module persists in plaintext: unlike access/
+        refresh tokens (SHA-256 hashed below), the SDK's own client-auth
+        middleware compares client.client_secret against the presented value
+        with a direct equality check, so storing only a hash would make
+        every subsequent client_secret_post/basic request fail -- there's no
+        way to verify a plaintext-in, hash-at-rest secret without patching
+        the SDK's comparison itself.
+
+        Removing the secret isn't a downgrade here: PKCE (S256) is already
+        mandatory for every authorization-code exchange, giving proof-of-
+        possession without a client secret, and the real trust boundary for
+        this single-user server is the owner-token consent step (SE-05),
+        not client confidentiality. The mutated client_info is also what the
+        registration handler returns to the caller, so the registering
+        client is told "none" up front and never expects to present a
+        secret it was never given.
+        """
+        client_info.token_endpoint_auth_method = "none"
+        client_info.client_secret = None
+        client_info.client_secret_expires_at = None
+
         client_id = client_info.client_id or ""
         self.store.put_client(client_id, client_info.model_dump(mode="json"))
         log.info(

@@ -321,6 +321,10 @@ def test_run_remote_serves_built_app(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     assert len(uvicorn_calls) == 1
     assert uvicorn_calls[0]["host"] == "127.0.0.1"
     assert uvicorn_calls[0]["port"] == 8768
+    # SEC-07: access_log=False -- uvicorn's default access logger would
+    # otherwise print the full request line, including /mcp/<token> in
+    # secret-path mode, for every request forever.
+    assert uvicorn_calls[0]["access_log"] is False
     route_paths = {route.path for route in uvicorn_calls[0]["app"].routes}
     assert "/mcp" in route_paths
     assert "/health" in route_paths

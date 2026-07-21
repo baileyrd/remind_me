@@ -152,6 +152,15 @@ def _run_remote(args) -> None:
     first use (config.resolve_connector_token); the startup log shows it
     redacted — the full URL path is logged once at generation time and
     stored in the token file.
+
+    Uvicorn's access log is disabled (SEC-07): its default per-request line
+    logs the full request path, which for the secret-path fallback IS the
+    credential (/mcp/<token>) -- every request would otherwise re-log the
+    token in plaintext forever, undermining the "only logged once, at
+    generation" guarantee above. This is scoped to the remote connector
+    specifically: combined/standalone MCP HTTP modes only ever send their
+    secret via the Authorization header, which uvicorn's access log never
+    includes.
     """
     import uvicorn
 
@@ -192,7 +201,7 @@ def _run_remote(args) -> None:
             args.remote_port,
             args.remote_port,
         )
-    uvicorn.run(app, host=args.remote_host, port=args.remote_port)
+    uvicorn.run(app, host=args.remote_host, port=args.remote_port, access_log=False)
 
 
 def main() -> None:
