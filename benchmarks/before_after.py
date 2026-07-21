@@ -39,6 +39,7 @@ _COMPARISONS = {
     "rerank": ("before (no reranker)", "after (cross-encoder rerank)"),
     "hyde": ("before (plain query)", "after (HyDE expansion)"),
     "score_fusion": ("before (rank fusion)", "after (score fusion)"),
+    "temporal": ("before (no temporal boost)", "after (temporal-expression recency boost)"),
 }
 
 
@@ -67,6 +68,12 @@ def _apply_stage(compare: str, stage: str) -> None:
         import remind_me_mcp.retrieval as retr
 
         retr.RRF_FUSION = "score" if stage == "after" else "rank"
+    elif compare == "temporal":
+        import remind_me_mcp.retrieval as retr
+
+        # 1.0 = no-op boost (isolates the temporal-detection effect itself,
+        # not the "auto" strategy routing it composes with).
+        retr._TEMPORAL_RECENCY_MULTIPLIER = 1.5 if stage == "after" else 1.0
 
 
 def _capture_state(compare: str) -> dict:
@@ -87,6 +94,10 @@ def _capture_state(compare: str) -> dict:
         import remind_me_mcp.retrieval as retr
 
         return {"RRF_FUSION": retr.RRF_FUSION}
+    if compare == "temporal":
+        import remind_me_mcp.retrieval as retr
+
+        return {"_TEMPORAL_RECENCY_MULTIPLIER": retr._TEMPORAL_RECENCY_MULTIPLIER}
     import remind_me_mcp.retrieval as retr
 
     return {"RRF_W_RECENCY": retr.RRF_W_RECENCY, "RRF_W_VITALITY": retr.RRF_W_VITALITY}
@@ -110,6 +121,10 @@ def _restore_state(compare: str, state: dict) -> None:
         import remind_me_mcp.retrieval as retr
 
         retr.RRF_FUSION = state["RRF_FUSION"]
+    elif compare == "temporal":
+        import remind_me_mcp.retrieval as retr
+
+        retr._TEMPORAL_RECENCY_MULTIPLIER = state["_TEMPORAL_RECENCY_MULTIPLIER"]
     else:
         import remind_me_mcp.retrieval as retr
 
@@ -219,8 +234,9 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Which change to measure: 'sanitize' (FTS5 fix), 'rrf' (drop "
             "recency+vitality), 'rerank' (cross-encoder over top-k), "
-            "'hyde' (query expansion via Ollama), or 'score_fusion' "
-            "(normalized-magnitude RRF fusion instead of rank-only)"
+            "'hyde' (query expansion via Ollama), 'score_fusion' "
+            "(normalized-magnitude RRF fusion instead of rank-only), or "
+            "'temporal' (recency boost for temporal-expression queries)"
         ),
     )
     p.add_argument("--ingest", default="verbatim", help="Ingest mode (default: verbatim)")

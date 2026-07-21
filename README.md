@@ -973,6 +973,8 @@ Documents and chat exports are chunked on import (per Markdown section or per me
 
 This is a deterministic heuristic, not an LLM planner call — no extra latency or opacity on the search hot path, consistent with keeping server-side synthesis out of scope. `keyword_favored`/`semantic_favored` are relative *multipliers* on top of whatever RRF weights are already configured (`REMIND_ME_RRF_W_*` env vars), not fixed replacements — a signal you've deliberately zeroed stays zeroed. `strategy` only affects the hybrid ranking path; structured `subject:`/`predicate:`/`entity:` lookups bypass RRF entirely. Pass `verbose=true` to see the resolved `strategy` and `weights_used` in each result's `debug_signals`.
 
+On top of the profile above, a query containing a temporal expression ("before I moved", "last summer", "when I lived in Seattle", a bare year like "2019") additionally boosts `w_recency` by 1.5x — recency-weighted ranking for questions that are asking to place a fact in time, regardless of whether the query is also short/keyword-shaped or long/semantic-shaped. Always active under `strategy="auto"`; no separate toggle.
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -1189,6 +1191,13 @@ remind_me is local-first, single-user, and MCP-native by design — some capabil
 ## Changelog
 
 See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for a per-version feature breakdown with PR references; this section summarizes the same history phase-by-phase.
+
+### 1.9.0 — 2026-07-21
+
+Closes a query-routing gap flagged in the application capability review: the `strategy="auto"` heuristic router had no awareness of temporal expressions, even though `temporal-reasoning` is one of the two weakest query categories documented in `benchmarks/RESULTS.md`.
+
+- **Temporal-expression query routing** — a new detector recognizes temporal expressions ("before I moved", "last summer", "when I lived in Seattle", a bare year) and boosts `w_recency` by 1.5x on top of whichever keyword/semantic profile the query's shape already picked. Composes with the existing routing rather than replacing it, so a temporal query gets recency-aware ranking regardless of whether it's also short/keyword-shaped or long/semantic-shaped. Always active under `strategy="auto"` — no separate toggle needed, same design as the existing keyword/semantic shape heuristics.
+- `benchmarks/before_after.py` gains `--compare temporal` for isolated A/B measurement against `RESULTS.md`'s `temporal-reasoning` category.
 
 ### 1.8.0 — 2026-07-21
 

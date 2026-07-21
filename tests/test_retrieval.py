@@ -907,8 +907,8 @@ class TestChooseRrfWeights:
         from remind_me_mcp.retrieval import choose_rrf_weights
 
         self._set_weights(monkeypatch)
-        # 3-5 words, no quotes/wildcards/question mark: neither heuristic fires.
-        weights = choose_rrf_weights("vpn config from last week")
+        # 3-5 words, no quotes/wildcards/question mark/temporal expression: no heuristic fires.
+        weights = choose_rrf_weights("vpn config network diagnostics")
         assert weights == {"w_keyword": 1.0, "w_semantic": 1.0, "w_recency": 1.0, "w_vitality": 1.0, "w_idf": 0.0}
 
     def test_balanced_reproduces_live_defaults_exactly(self, monkeypatch):
@@ -957,6 +957,116 @@ class TestChooseRrfWeights:
         }
         for name in STRATEGY_PRESETS:
             assert set(resolve_strategy_weights(name)) <= rank_rrf_kwargs, f"{name} has unexpected keys"
+
+
+# ---------------------------------------------------------------------------
+# Temporal-expression detection (issue #52)
+# ---------------------------------------------------------------------------
+
+
+class TestTemporalDetection:
+    """Tests for _looks_temporal_shaped and its composition into choose_rrf_weights."""
+
+    def _set_weights(self, monkeypatch, **overrides):
+        import remind_me_mcp.retrieval as retr
+
+        defaults = {"RRF_W_KEYWORD": 1.0, "RRF_W_SEMANTIC": 1.0, "RRF_W_RECENCY": 1.0, "RRF_W_VITALITY": 1.0, "RRF_W_IDF": 0.0}
+        defaults.update(overrides)
+        for name, value in defaults.items():
+            monkeypatch.setattr(retr, name, value)
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "before I moved to Seattle",
+            "what did I do when I lived in Seattle",
+            "last summer's vacation plans",
+            "trip we took last year",
+            "notes from last monday",
+            "what happened this winter",
+            "plans for next spring",
+            "what did I say yesterday",
+            "reminders set for tomorrow",
+            "conversation from 2019",
+            "meeting in january about budgets",
+            "things since I started this job",
+            "what changed after the migration",
+            "topics discussed during onboarding",
+            "a decision made 3 years ago",
+        ],
+    )
+    def test_detects_temporal_expressions(self, query):
+        from remind_me_mcp.retrieval import _looks_temporal_shaped
+
+        assert _looks_temporal_shaped(query), f"expected temporal match: {query!r}"
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "vpn configuration settings",
+            "favorite pizza toppings",
+            "how do I reset my password",
+            "notes about the tailscale setup",
+        ],
+    )
+    def test_non_temporal_queries_not_flagged(self, query):
+        from remind_me_mcp.retrieval import _looks_temporal_shaped
+
+        assert not _looks_temporal_shaped(query), f"unexpected temporal match: {query!r}"
+
+    def test_may_excluded_to_avoid_modal_verb_false_positives(self):
+        """'may' as a month is deliberately omitted -- 'may I ask' etc. would
+        otherwise be a disproportionate false-positive source."""
+        from remind_me_mcp.retrieval import _looks_temporal_shaped
+
+        assert not _looks_temporal_shaped("may I get a coffee recommendation")
+
+    def test_temporal_boosts_recency_on_keyword_favored_base(self, monkeypatch):
+        """Short + temporal: keyword-favored base, recency additionally boosted."""
+        from remind_me_mcp.retrieval import choose_rrf_weights
+
+        self._set_weights(monkeypatch)
+        weights = choose_rrf_weights("last summer")
+        assert weights["w_keyword"] == 1.5  # keyword_favored base, unaffected
+        assert weights["w_semantic"] == 0.5
+        assert weights["w_recency"] == pytest.approx(1.5)  # 1.0 * 1.5 temporal boost
+
+    def test_temporal_boosts_recency_on_semantic_favored_base(self, monkeypatch):
+        """Long/question-shaped + temporal: semantic-favored base, recency also boosted."""
+        from remind_me_mcp.retrieval import choose_rrf_weights
+
+        self._set_weights(monkeypatch)
+        weights = choose_rrf_weights("what did I do when I lived in Seattle last year")
+        assert weights["w_keyword"] == 0.5
+        assert weights["w_semantic"] == 1.5
+        assert weights["w_recency"] == pytest.approx(1.5)
+
+    def test_temporal_boosts_recency_on_balanced_base(self, monkeypatch):
+        """Mid-length, non-question + temporal: balanced base, recency also boosted."""
+        from remind_me_mcp.retrieval import choose_rrf_weights
+
+        self._set_weights(monkeypatch)
+        weights = choose_rrf_weights("vacation photos from last spring")
+        assert weights["w_keyword"] == 1.0
+        assert weights["w_semantic"] == 1.0
+        assert weights["w_recency"] == pytest.approx(1.5)
+
+    def test_non_temporal_query_recency_unaffected(self, monkeypatch):
+        from remind_me_mcp.retrieval import choose_rrf_weights
+
+        self._set_weights(monkeypatch)
+        weights = choose_rrf_weights("vpn config network diagnostics")
+        assert weights["w_recency"] == 1.0
+
+    def test_temporal_boost_respects_zeroed_recency_profile(self, monkeypatch):
+        """Regression guard mirroring test_favored_presets_never_resurrect_a_profile_zeroed_signal:
+        a profile that zeroed recency (e.g. --rrf-profile retrieval/semantic)
+        must stay zeroed -- 0 * 1.5 == 0, not resurrected."""
+        from remind_me_mcp.retrieval import choose_rrf_weights
+
+        self._set_weights(monkeypatch, RRF_W_RECENCY=0.0)
+        weights = choose_rrf_weights("last summer")
+        assert weights["w_recency"] == 0.0
 
 
 # ---------------------------------------------------------------------------

@@ -1,5 +1,14 @@
 # Release Notes
 
+## v1.9.0 — 2026-07-21
+
+Closes a query-routing gap flagged in the application capability review: `choose_rrf_weights` (the `strategy="auto"` heuristic router) routed purely on word count, `?`, and quoted phrases, with no awareness of temporal expressions — even though `temporal-reasoning` is one of the two weakest query categories documented in `benchmarks/RESULTS.md`.
+
+### New Features
+
+- **Temporal-expression query routing** — a new `_looks_temporal_shaped` detector recognizes temporal expressions ("before I moved", "last summer", "when I lived in Seattle", a bare 4-digit year) and boosts `w_recency` by `_TEMPORAL_RECENCY_MULTIPLIER` (1.5x) on top of whichever keyword/semantic profile the query's shape already resolved to. Composes rather than replaces: a temporal query gets the recency boost whether it's also short/keyword-shaped or long/semantic-shaped, and a profile that's already zeroed `w_recency` (e.g. `--rrf-profile semantic`) stays zeroed (`0 * 1.5 == 0`). Deliberately excludes "may" from the recognized month names, since as a modal auxiliary verb it's a disproportionate false-positive source. Always active under `strategy="auto"` — no separate env var or toggle, matching the existing keyword/semantic shape heuristics.
+- `benchmarks/before_after.py` gains `--compare temporal` for isolated A/B measurement of the temporal-detection effect against `RESULTS.md`'s `temporal-reasoning` category, independent of the `strategy="auto"` routing it composes with.
+
 ## v1.8.0 — 2026-07-21
 
 Closes a precision gap flagged in the application capability review: `rank_rrf` fuses keyword, semantic, recency, vitality, and IDF signals purely by ordinal rank position, discarding the actual score magnitude — a 0.95-cosine semantic match and a 0.55-cosine match tie if they happen to land in adjacent rank positions, even though one is a far stronger match than the other.
