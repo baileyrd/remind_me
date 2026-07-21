@@ -9,6 +9,9 @@ nothing is exposed beyond `127.0.0.1:8765` on the server.
 client (sync.py) ──ssh -L 8765──► server 127.0.0.1:8765 (hub) ──► postgres
 ```
 
+Prefer Docker Compose, Fly.io, or Railway instead of Podman quadlets? See
+[`deploy/README.md`](deploy/README.md) — same image, same env contract.
+
 ## Quick Start
 
 **On the server** (Fedora with Podman ≥ 4.4):
@@ -95,6 +98,7 @@ hub is pull-only (peers push to each other; nobody pushes hub state to you):
 | `deploy/remind-me-hub.container` | Quadlet unit for the hub |
 | `deploy/postgres.env.example` | Postgres credentials template |
 | `deploy/hub.env.example` | Hub `DATABASE_URL` + `SYNC_SECRET` template |
+| `deploy/docker-compose.yml`, `fly.toml`, `railway.json` | Alternative deploy targets — same image, same env contract; see [`deploy/README.md`](deploy/README.md) |
 
 Layout the installer manages on the server:
 

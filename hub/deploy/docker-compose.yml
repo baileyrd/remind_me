@@ -1,0 +1,54 @@
+# docker-compose.yml — Remind Me sync hub (Postgres + hub API).
+#
+# Reuses the exact same image (../Containerfile) and DATABASE_URL/SYNC_SECRET
+# env contract as the Podman Quadlet setup (remind-me-hub.container /
+# remind-me-postgres.container) — this is an alternative to the quadlets for
+# environments that prefer docker-compose, not a different hub.
+#
+# Quick start (from this directory):
+#   cp hub.env.example hub.env
+#   cp postgres.env.example postgres.env
+#   # Edit both files with real secrets:
+#   #   openssl rand -hex 24   -> POSTGRES_PASSWORD (postgres.env)
+#   #   openssl rand -hex 32   -> SYNC_SECRET        (hub.env)
+#   # The password must be identical in both files (hub.env's DATABASE_URL
+#   # embeds it). hub.env.example's DATABASE_URL host (remind-me-postgres) is
+#   # already correct here — the postgres service below is deliberately named
+#   # to match, so the same env files work unedited for both the quadlet and
+#   # compose deploy paths.
+#   docker compose up -d
+#   curl http://127.0.0.1:8765/health
+#
+# The hub binds 127.0.0.1:8765 ONLY, same as the quadlet default — reach it
+# over an SSH tunnel or Tailscale, never expose it directly to the public
+# internet (SYNC_SECRET is the only thing standing between the internet and
+# your memory database). Widen the `ports:` mapping below only if you
+# understand and accept that exposure.
+
+services:
+  remind-me-postgres:
+    image: docker.io/library/postgres:16-alpine
+    restart: always
+    env_file: postgres.env
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-remindme}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  remind-me-hub:
+    build:
+      context: ..
+      dockerfile: Containerfile
+    restart: always
+    env_file: hub.env
+    depends_on:
+      remind-me-postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8765:8765"
+
+volumes:
+  postgres-data:
