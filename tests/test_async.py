@@ -386,3 +386,28 @@ async def test_app_lifespan_stops_peer_server_before_closing_db(
 
     assert "stop_peer_server" in order
     assert order.index("stop_peer_server") < order.index("close_db")
+
+
+async def test_app_lifespan_stops_sync_thread_before_closing_db(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sync loop previously had no stop hook at all -- a bare
+    ``while True`` daemon thread app_lifespan's shutdown never signalled.
+    Assert stop_sync_thread() is called, and called before the DB closes,
+    regardless of whether sync was ever started (it's imported and called
+    unconditionally, same as stop_peer_server)."""
+    import remind_me_mcp.server as _srv_mod
+    import remind_me_mcp.sync as _sync_mod
+    import remind_me_mcp.updater as _updater_mod
+
+    order: list[str] = []
+    monkeypatch.setattr(_srv_mod, "_get_db", lambda: object())
+    monkeypatch.setattr(_srv_mod, "_close_db", lambda: order.append("close_db"))
+    monkeypatch.setattr(_updater_mod, "start_background_check", lambda: None)
+    monkeypatch.setattr(_sync_mod, "stop_sync_thread", lambda: order.append("stop_sync_thread"))
+
+    async with _srv_mod.app_lifespan(None):
+        pass
+
+    assert "stop_sync_thread" in order
+    assert order.index("stop_sync_thread") < order.index("close_db")
