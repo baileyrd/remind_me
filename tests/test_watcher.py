@@ -102,6 +102,28 @@ def test_new_file_ingested(db_conn: sqlite3.Connection, watch_dir: Path) -> None
     assert status["last_scan_at"] is not None
 
 
+def test_scan_once_wraps_pass_in_telemetry_span(
+    db_conn: sqlite3.Connection, watch_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Phase 7a: each scan pass is wrapped in a 'watcher.scan' OTEL span (a
+    no-op unless REMIND_ME_OTEL_ENABLED is set)."""
+    _write(watch_dir / "note.md", "# Plans\n\nRemember the launch date.")
+    watcher = FolderWatcher([watch_dir])
+
+    spans: list[str] = []
+    real_maybe_span = watcher_mod.maybe_span
+
+    def spy_maybe_span(name, **attrs):
+        spans.append(name)
+        return real_maybe_span(name, **attrs)
+
+    monkeypatch.setattr(watcher_mod, "maybe_span", spy_maybe_span)
+
+    watcher.scan_once()
+
+    assert spans == ["watcher.scan"]
+
+
 def test_unchanged_file_not_reimported(db_conn: sqlite3.Connection, watch_dir: Path) -> None:
     """An unchanged file is not touched again — not even re-hashed/skipped."""
     _write(watch_dir / "note.md", "# Plans\n\nRemember the launch date.")

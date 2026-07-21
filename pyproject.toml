@@ -24,6 +24,10 @@ semantic = [
 mempalace = [
     "chromadb>=0.5.0",
 ]
+otel = [
+    "opentelemetry-sdk>=1.20.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.20.0",
+]
 
 [project.scripts]
 remind-me-mcp = "remind_me_mcp.__main__:main"

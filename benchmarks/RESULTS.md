@@ -319,6 +319,43 @@ that embeddings can miss, and (b) makes the RRF fusion actually fuse two signals
 instead of one. Run the same command with `--embedder real` on a LongMemEval
 file to measure the effect inside full hybrid ranking on your machine.
 
+## Comparison against a shared benchmark standard (cognee gap #10)
+
+The MemPalace comparison above ("Equal-footing comparison with MemPalace") is a
+genuine apples-to-apples measurement: same LongMemEval-S questions, same
+embedding model, same metric (session-level R@k). That's the bar for a
+comparison to mean anything.
+
+**cognee** publishes results on **BEAM** ("Beyond a Million Tokens" —
+[mohammadtavakoli78/BEAM](https://github.com/mohammadtavakoli78/BEAM), ICLR
+2026) — per cognee's own materials, it beats SOTA on BEAM's 100K-token setting
+by 6.5% and matches SOTA at 10M tokens. We deliberately do **not** turn that
+into a side-by-side table with the LongMemEval-S numbers above: BEAM evaluates
+full agent memory pipelines up to 10M tokens across "10 distinct memory
+dimensions" with its own task/metric protocol, not session-level Recall@k/MRR
+at LongMemEval-S's ~115K-token scale. Lining those numbers up in one table
+would imply a comparability that isn't there — different benchmark, different
+metric, different context scale. (For context, cognee also cites ~90% accuracy
+on "graph-enhanced queries" vs. ~60% for standard RAG on unspecified internal
+tasks — a marketing figure, not a benchmark result, so it's not included here
+either.)
+
+What **is** directly comparable: LongMemEval itself is the shared standard —
+any system's published LongMemEval-S/M numbers use the same questions, gold
+sessions, and Recall@k/MRR definition remind_me's harness reports. The
+headline and equal-footing tables above (`python -m benchmarks.runner --data
+benchmarks/data/longmemeval_s_cleaned.json ...`, reproducible per the commands
+inline) are that comparison point — reproduce another system's LongMemEval
+numbers under the same harness convention (session-level scoring, same
+abstention handling) and the two are directly comparable, unlike BEAM vs.
+LongMemEval.
+
+A lightweight scheduled CI job (`.github/workflows/benchmark-smoke.yml`) runs
+the bundled 12-question sample weekly as a regression tripwire for the
+retrieval pipeline (not a substitute for the full LongMemEval-S run above,
+which takes hours on CPU and needs the real dataset download) — see that
+workflow file for what it does and doesn't cover.
+
 ## Notes / caveats
 
 - The bundled sample is a small, hand-built set designed to exercise the keyword

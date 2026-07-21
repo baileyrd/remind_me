@@ -1057,6 +1057,37 @@ async def test_sync_once_prunes_outbox(
     assert sync_db.execute("SELECT COUNT(*) FROM sync_outbox").fetchone()[0] == 0
 
 
+async def test_sync_once_wraps_cycle_in_telemetry_span(
+    sync_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Phase 7a: each sync cycle is wrapped in a 'sync.cycle' OTEL span
+    (a no-op unless REMIND_ME_OTEL_ENABLED is set)."""
+    recorder = RequestRecorder()
+    real_async_client = httpx.AsyncClient
+    monkeypatch.setattr(sync, "HUB_URL", "")
+    monkeypatch.setattr(sync, "_discover_peers", _no_peers)
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kw: real_async_client(
+            **{**kw, "transport": httpx.MockTransport(recorder)}
+        ),
+    )
+
+    spans: list[str] = []
+    real_maybe_span = sync.maybe_span
+
+    def spy_maybe_span(name, **attrs):
+        spans.append(name)
+        return real_maybe_span(name, **attrs)
+
+    monkeypatch.setattr(sync, "maybe_span", spy_maybe_span)
+
+    await sync._sync_once()
+
+    assert spans == ["sync.cycle"]
+
+
 async def test_sync_once_hub_error_does_not_raise(
     sync_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:

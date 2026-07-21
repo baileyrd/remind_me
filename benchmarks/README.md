@@ -223,3 +223,18 @@ These are fully offline (the end-to-end test uses `--embedder none`).
 - ACT-R vitality decay is effectively neutral here: each query runs on a fresh
   haystack and `include_dormant=True`, so decay never hides a just-ingested
   result. Benchmarking decay's effect over time would need a different harness.
+
+## Comparison against other systems
+
+`RESULTS.md`'s "Equal-footing comparison with MemPalace" section is a real,
+model-matched, same-metric comparison. Its "Comparison against a shared
+benchmark standard" section explains why we don't force a numeric comparison
+against cognee's published BEAM scores — different benchmark, different
+metric, different context scale; see that section for what a genuinely
+comparable measurement would need (another system's LongMemEval-S/M numbers
+under the same session-level Recall@k/MRR convention).
+
+A scheduled, non-blocking CI job
+([`benchmark-smoke.yml`](../.github/workflows/benchmark-smoke.yml)) runs the
+bundled 12-question sample weekly, offline, as a lightweight tripwire — not a
+substitute for a real LongMemEval-S/M run, which takes hours on CPU.

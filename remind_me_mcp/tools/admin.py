@@ -499,6 +499,22 @@ async def remind_me_server_status() -> str:
             "to enable push ingestion via POST /ingest)"
         )
 
+    # OpenTelemetry tracing (cognee gap #9, Phase 7a)
+    from remind_me_mcp import telemetry
+
+    if telemetry.OTEL_ENABLED:
+        state = (
+            "✓ Enabled"
+            if telemetry.is_enabled()
+            else "✗ Enabled but unavailable (missing 'otel' extra or setup failed — see logs)"
+        )
+        lines.append(f"\n**OpenTelemetry tracing:** {state}")
+    else:
+        lines.append(
+            "\n**OpenTelemetry tracing:** ✗ Disabled (set REMIND_ME_OTEL_ENABLED=1 "
+            "and install the 'otel' extra to trace tool calls, sync cycles, and watcher scans)"
+        )
+
     # LLM Wiki (FT-08)
     try:
         from remind_me_mcp import wiki

@@ -13,13 +13,42 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING, Any
 
 from mcp.server.fastmcp import FastMCP
 
 from remind_me_mcp.config import DB_PATH, SYNC_ENABLED
 from remind_me_mcp.db import _close_db, _get_db
+from remind_me_mcp.telemetry import maybe_span
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from mcp.types import ContentBlock
 
 log = logging.getLogger("remind_me_mcp.server")
+
+
+class _TracedFastMCP(FastMCP):
+    """FastMCP with an OTEL span wrapped around every tool call (Phase 7a).
+
+    ``call_tool`` is the single choke point every MCP tool invocation passes
+    through, but wrapping it AFTER construction (``mcp.call_tool = ...``)
+    doesn't work: FastMCP's own ``__init__`` registers ``self.call_tool`` as
+    the protocol-level handler while it runs, capturing whichever method the
+    instance's actual class resolves at that moment. Subclassing overrides
+    the method before that registration happens (Python's normal MRO
+    lookup), so this is the only reliable place to intercept every call
+    without touching each of the ~40 individually-decorated tool functions.
+    ``maybe_span`` is a no-op unless REMIND_ME_OTEL_ENABLED is set, so this
+    has no effect (and negligible overhead) by default.
+    """
+
+    async def call_tool(
+        self, name: str, arguments: dict[str, Any]
+    ) -> Sequence[ContentBlock] | dict[str, Any]:
+        with maybe_span(f"tool.{name}"):
+            return await super().call_tool(name, arguments)
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +124,7 @@ async def app_lifespan(app: FastMCP):
 # MCP server instance
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("remind_me_mcp", lifespan=app_lifespan)
+mcp = _TracedFastMCP("remind_me_mcp", lifespan=app_lifespan)
 
 # ---------------------------------------------------------------------------
 # Exports

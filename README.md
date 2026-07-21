@@ -49,6 +49,7 @@ Persistent, searchable memory that works across **Claude.ai**, **Claude Code**, 
 - **Dashboard UI** — browse, search, add, edit, and delete memories from a web interface
 - **Claude.ai custom connector** — expose the server over an HTTPS tunnel with single-user OAuth 2.1 (or a secret-path URL fallback) and attach it to claude.ai
 - **WAL mode** — SQLite Write-Ahead Logging ensures safe concurrent reads
+- **Optional OpenTelemetry tracing** — off by default; export tool-call/sync/watcher spans to any OTLP collector you already run
 
 ## Quick Start
 
@@ -517,6 +518,18 @@ curl -X POST http://127.0.0.1:8769/ingest \
 
 Raw imports (chat/document, from a file import, the watcher, or a webhook push) are often verbatim and noisy. `remind_me_normalize_batch` surfaces un-normalized `document_import`/`chat_import` chunks for the calling agent to distill into `{question, summary, resolution?, refs?}` — the LLM work happens client-side, exactly like `remind_me_decompose` already does for atomic-fact extraction, so the server itself has no LLM dependency. `remind_me_normalize_apply` then writes each distillation as a new memory (category `normalized`), non-destructively linked back to the raw row via a `normalized_from` metadata pointer — the raw memory is kept, not replaced, and `remind_me_normalize_batch` skips it on the next call.
 
+## Observability (OpenTelemetry)
+
+Off by default and zero-cost when unset. Enable tracing to see where time goes across three boundaries — every MCP tool call, each sync cycle, and each folder-watcher scan pass — exported to whatever OTLP collector you already run (Jaeger, Tempo, Honeycomb, ...). remind_me never bundles or manages a collector itself, which would conflict with the zero-ops, local-first design.
+
+```bash
+uv pip install "remind-me-mcp[otel]"
+REMIND_ME_OTEL_ENABLED=1 REMIND_ME_OTEL_ENDPOINT=http://localhost:4318/v1/traces remind-me-mcp
+```
+
+- **Graceful degradation** — if `REMIND_ME_OTEL_ENABLED=1` is set but the `otel` extra isn't installed (or setup fails for any other reason), tracing silently no-ops after a one-time warning in the log — it can never break the server it's observing.
+- **Status** — `remind_me_server_status` reports whether tracing is enabled and actually active.
+
 ## Entity Knowledge Graph
 
 Memories can carry a structured **subject/predicate/object triple** plus links to **entities** (people, projects, tools, places, orgs — each with a kind and aliases). The graph builds up through normal use:
@@ -936,6 +949,9 @@ This is a deterministic heuristic, not an LLM planner call — no extra latency 
 | `REMIND_ME_WEBHOOK_SECRET` | *(unset)* | Bearer token for the push/webhook ingestion server. Empty = disabled — the server refuses to start without it |
 | `REMIND_ME_WEBHOOK_PORT` | `8769` | Port for the push/webhook ingestion server |
 | `REMIND_ME_WEBHOOK_BIND` | `127.0.0.1` | Bind address for the push/webhook ingestion server. Widen deliberately (e.g. a Tailscale IP) since it writes arbitrary pushed content directly into memory |
+| `REMIND_ME_OTEL_ENABLED` | `false` | Enable OpenTelemetry tracing of tool calls, sync cycles, and watcher scans. Requires the `otel` extra (`pip install remind-me-mcp[otel]`); degrades gracefully to a no-op if missing |
+| `REMIND_ME_OTEL_ENDPOINT` | *(unset)* | OTLP/HTTP collector endpoint (e.g. `http://localhost:4318/v1/traces`). Unset uses the OTLP exporter's own default |
+| `REMIND_ME_OTEL_SERVICE_NAME` | `remind-me-mcp` | `service.name` resource attribute reported to the collector |
 | `REMIND_ME_AUTO_UPDATE_CHECK` | `true` | Set to `false` to skip the background `git fetch` update check at server startup (the manual check/update tools keep working) |
 | `REMIND_ME_RRF_K` | `60` | Smoothing constant for Reciprocal Rank Fusion scoring |
 | `REMIND_ME_RRF_W_KEYWORD` | `1.0` | RRF weight for the keyword (FTS5) signal |
@@ -968,12 +984,13 @@ remind-me-mcp/
 │   ├── __init__.py             # Package exports, version
 │   ├── __main__.py             # CLI entry point, mode dispatch
 │   ├── server.py               # FastMCP instance, app lifespan
-│   ├── tools/                  # 34 MCP tools + 4 resources
+│   ├── tools/                  # 40 MCP tools + 4 resources
 │   │   ├── search.py           # Hybrid search + structured/entity queries
 │   │   ├── crud.py             # add / list / get / update / delete
 │   │   ├── capture.py          # auto-capture, decompose, extract/annotate
 │   │   ├── lifecycle.py        # vitality, reclassify, consolidate
-│   │   ├── entity.py           # entity lookup
+│   │   ├── entity.py           # entity lookup + multi-hop relation traversal
+│   │   ├── normalize.py        # ingest-time normalization batch/apply
 │   │   ├── wiki.py             # LLM Wiki: page read/write/list/search/load/delete + compile
 │   │   └── admin.py            # import/export, stats, status, updates, OAuth revocation
 │   ├── models.py               # Pydantic input models
@@ -986,6 +1003,8 @@ remind-me-mcp/
 │   ├── importer.py             # Chat export + document parser & import engine
 │   ├── exporter.py             # Memory + entity-graph export engine
 │   ├── watcher.py              # Watched-folder auto-ingest (poll, debounce, supersede)
+│   ├── webhook_server.py       # Push/webhook ingestion HTTP endpoint
+│   ├── telemetry.py            # Optional OpenTelemetry span instrumentation
 │   ├── embeddings.py           # ONNX/Ollama embedding engine
 │   ├── formatting.py           # Memory markdown/JSON formatters
 │   ├── retrieval.py            # RRF rank fusion, recency signals, token budget
@@ -1081,3 +1100,4 @@ The server uses:
 - **Starlette + Uvicorn** for the optional HTTP dashboard and REST API
 - **Self-contained HTML** — the dashboard is served as a single inline page with no build step
 - **Graceful degradation** — semantic search, vitality scoring, and distributed sync are all optional; core functionality works with just FTS5 and local storage
+- **Optional OTEL instrumentation** — a single `maybe_span()` no-op context manager wraps tool calls, sync cycles, and watcher scans; zero-cost and zero-dependency unless `REMIND_ME_OTEL_ENABLED=1` and the `otel` extra are both set, exporting to any OTLP/HTTP collector (no bundled collector — that would conflict with the zero-ops, local-first design)
