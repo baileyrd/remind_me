@@ -1,5 +1,14 @@
 # Release Notes
 
+## v1.6.0 — 2026-07-21
+
+Closes a retrieval-quality gap: modern embedding models (`nomic-embed-text`, `bge-*`, `e5-*`) are trained with an asymmetric query/passage convention — a search query and an indexed document are expected to carry different instruction prefixes (e.g. `search_query:` vs `search_document:`). remind_me embedded both identically, silently leaving quality on the table for anyone using one of these models via the Ollama backend.
+
+### Improvements
+
+- **Query/document embedding prefix asymmetry** — `_Embedder.embed`/`embed_one` (ONNX) and `OllamaEmbedder.embed`/`embed_one` gain a `role: Literal["query", "passage"]` parameter (default `"passage"`). A per-model-family lookup table (`embeddings._ROLE_PREFIXES`, matched by substring against the configured model name) applies the correct instruction prefix — `nomic-embed-text`'s `search_query:`/`search_document:`, `e5-*`'s `query:`/`passage:`, `bge-*`'s query-only instruction — before encoding. Models with no known convention (the ONNX default `all-MiniLM-L6-v2`) are unaffected — no prefix, identical behavior to before.
+- Every embed call site is now correctly labeled: document chunks are embedded with `role="passage"` at write time; a search query is embedded with `role="query"`; a fused query+HyDE-passage embedding embeds the literal query as `"query"` and the synthetic HyDE passage as `"passage"` before averaging, rather than treating both halves as the same role.
+
 ## v1.5.0 — 2026-07-21
 
 Closes a real gap in the living-memory model: supersession only ever happened via similarity-merge (near-duplicate memories get consolidated), so a genuinely contradictory update — "I moved to Boston" — never replaced an old fact like "I live in Seattle," since the two statements share no text.

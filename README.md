@@ -995,7 +995,7 @@ This is a deterministic heuristic, not an LLM planner call — no extra latency 
 | `REMIND_ME_EMBEDDING_BACKEND` | `onnx` | Embedding backend: `onnx` (in-process) or `ollama` (local daemon) |
 | `REMIND_ME_EMBEDDING_DIM` | `384` | Embedding dimension — must match the model (nomic-embed-text=768, bge-m3=1024). Changing it requires recreating the vector table + `remind_me_reindex` |
 | `REMIND_ME_OLLAMA_URL` | `http://localhost:11434` | Ollama daemon URL (when backend is `ollama`) |
-| `REMIND_ME_OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Ollama embedding model name |
+| `REMIND_ME_OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Ollama embedding model name. Query/passage instruction prefixes (e.g. `search_query:`/`search_document:`) are applied automatically for known model families (`nomic-embed-text`, `bge-*`, `e5-*`) — see `embeddings._ROLE_PREFIXES` |
 | `REMIND_ME_EMBED_CHUNK_CHARS` | `1600` | Character window size for sliding-window embedding of long content |
 | `REMIND_ME_EMBED_CHUNK_OVERLAP` | `200` | Overlap between embedding windows |
 | `REMIND_ME_EMBED_MAX_CHUNKS` | `16` | Max embedding chunks per memory |
@@ -1188,6 +1188,12 @@ remind_me is local-first, single-user, and MCP-native by design — some capabil
 ## Changelog
 
 See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for a per-version feature breakdown with PR references; this section summarizes the same history phase-by-phase.
+
+### 1.6.0 — 2026-07-21
+
+Closes a retrieval-quality gap flagged in the application capability review: modern embedding models (`nomic-embed-text`, `bge-*`, `e5-*`) expect different instruction prefixes on search queries vs. indexed passages, but remind_me embedded both identically.
+
+- **Query/document embedding prefix asymmetry.** The embed path gains a `role: Literal["query", "passage"]` parameter, applying the correct per-model-family prefix (e.g. `nomic-embed-text`'s `search_query:`/`search_document:`) before encoding, via a lookup table keyed by model name. Models with no such convention (the ONNX default) are unaffected. Every call site — document indexing, plain query search, and fused query+HyDE-passage search — now passes the correct role.
 
 ### 1.5.0 — 2026-07-21
 

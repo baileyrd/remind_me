@@ -202,8 +202,13 @@ class FakeEmbedder:
         """Always returns True — no model needed."""
         return True
 
-    def embed(self, texts: list[str]) -> np.ndarray:
-        """Return a deterministic (len(texts), 384) float32 array, L2-normalised."""
+    def embed(self, texts: list[str], *, role: str = "passage") -> np.ndarray:
+        """Return a deterministic (len(texts), 384) float32 array, L2-normalised.
+
+        ``role`` is accepted (query/passage prefix asymmetry) but ignored —
+        this fake has no per-model prefix convention; content hash alone
+        determines the vector, same as before that parameter existed.
+        """
         rows: list[np.ndarray] = []
         for text in texts:
             # Stable across processes — Python's hash() is salted per run.
@@ -216,9 +221,9 @@ class FakeEmbedder:
             rows.append(vec)
         return np.stack(rows, axis=0)
 
-    def embed_one(self, text: str) -> bytes:
+    def embed_one(self, text: str, *, role: str = "passage") -> bytes:
         """Embed a single text and return raw bytes for sqlite-vec storage."""
-        return self.embed([text])[0].tobytes()
+        return self.embed([text], role=role)[0].tobytes()
 
 
 @pytest.fixture()

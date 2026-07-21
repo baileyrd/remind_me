@@ -234,13 +234,13 @@ class _WrongDimEmbedder:
     """Embedder whose vectors don't fit the vec0 table — INSERT fails after
     the old chunks were already DELETEd inside the same transaction."""
 
-    def embed(self, texts):
+    def embed(self, texts, *, role="passage"):
         import numpy as np
 
         return np.zeros((len(texts), 8), dtype=np.float32)
 
-    def embed_one(self, text):
-        return self.embed([text])[0].tobytes()
+    def embed_one(self, text, *, role="passage"):
+        return self.embed([text], role=role)[0].tobytes()
 
 
 def test_failed_embed_rolls_back_chunk_deletes(
@@ -370,9 +370,9 @@ def test_sync_style_large_unbatched_pull_is_batched_internally(
     embed_call_sizes: list[int] = []
     real_embed = mock_embedder.embed
 
-    def spy_embed(texts):
+    def spy_embed(texts, *, role="passage"):
         embed_call_sizes.append(len(texts))
-        return real_embed(texts)
+        return real_embed(texts, role=role)
 
     monkeypatch.setattr(mock_embedder, "embed", spy_embed)
 

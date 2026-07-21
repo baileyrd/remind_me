@@ -231,10 +231,10 @@ class _FakeSyncEmbedder:
     """Never actually used by these tests (no embed_rows should be built for
     a tombstoned record), but present so _get_embedder() returns non-None."""
 
-    def embed(self, texts):
+    def embed(self, texts, *, role="passage"):
         raise AssertionError("a tombstoned record must never be embedded")
 
-    def embed_one(self, text):
+    def embed_one(self, text, *, role="passage"):
         raise AssertionError("a tombstoned record must never be embedded")
 
 
