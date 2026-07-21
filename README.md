@@ -303,7 +303,7 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | Tool | Description |
 |------|-------------|
 | `remind_me_normalize_batch` | Fetch raw document/chat import chunks that have not been normalized yet |
-| `remind_me_normalize_apply` | Write a distilled `{question, summary, resolution?, refs?}` as a new memory, non-destructively linked back to the raw import |
+| `remind_me_normalize_apply` | Write a distilled `{question, summary, resolution?, refs?, entities?}` as a new memory, non-destructively linked back to the raw import |
 
 ### Entity graph & annotation
 
@@ -520,7 +520,7 @@ curl -X POST http://127.0.0.1:8769/ingest \
 
 ## Ingest-Time Normalization
 
-Raw imports (chat/document, from a file import, the watcher, or a webhook push) are often verbatim and noisy. `remind_me_normalize_batch` surfaces un-normalized `document_import`/`chat_import` chunks for the calling agent to distill into `{question, summary, resolution?, refs?}` — the LLM work happens client-side, exactly like `remind_me_decompose` already does for atomic-fact extraction, so the server itself has no LLM dependency. `remind_me_normalize_apply` then writes each distillation as a new memory (category `normalized`), non-destructively linked back to the raw row via a `normalized_from` metadata pointer — the raw memory is kept, not replaced, and `remind_me_normalize_batch` skips it on the next call.
+Raw imports (chat/document, from a file import, the watcher, or a webhook push) are often verbatim and noisy. `remind_me_normalize_batch` surfaces un-normalized `document_import`/`chat_import` chunks for the calling agent to distill into `{question, summary, resolution?, refs?}` — the LLM work happens client-side, exactly like `remind_me_decompose` already does for atomic-fact extraction, so the server itself has no LLM dependency. `remind_me_normalize_apply` then writes each distillation as a new memory (category `normalized`), non-destructively linked back to the raw row via a `normalized_from` metadata pointer — the raw memory is kept, not replaced, and `remind_me_normalize_batch` skips it on the next call. The normalized memory inherits the raw row's `doc_id`/`chunk_index` (so `include_neighbors` still finds it) and accepts its own optional `entities` list (FT-04) — the raw import is never entity-linked automatically, so without it a normalized memory would be invisible to `remind_me_entity`/`remind_me_entity_traverse`.
 
 ## Observability (OpenTelemetry)
 
