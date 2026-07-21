@@ -448,6 +448,7 @@ async def memory_search(params: MemorySearchInput) -> str:
     Returns:
         str: Matching memories in the requested format.
     """
+    from remind_me_mcp.db import vec_search_available
     from remind_me_mcp.embeddings import _get_embedder
 
     db = _pkg._get_db()
@@ -612,7 +613,11 @@ async def memory_search(params: MemorySearchInput) -> str:
     # consumed by the semantic tier — skip the (slow) generation entirely
     # when no embedder is available (DI-08).
     def _probe_embedder_and_expand(query: str) -> tuple[bool, list[str]]:
-        if _get_embedder() is None:
+        # Both must hold: an embedder that can compute a vector, and an
+        # actual memories_vec table to query it against. These can split
+        # (e.g. the ONNX embedder loads fine but sqlite-vec's native
+        # extension fails to load) -- see vec_search_available's docstring.
+        if _get_embedder() is None or not vec_search_available():
             return False, []
         return True, _pkg.expand_query(query)
 

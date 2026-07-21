@@ -117,6 +117,27 @@ def _get_db() -> sqlite3.Connection:
     return db
 
 
+def vec_search_available() -> bool:
+    """True when ``memories_vec`` actually exists and is queryable.
+
+    Deliberately distinct from "the ``sqlite-vec`` package is installed" or
+    "the ONNX embedder loaded" (:func:`remind_me_mcp.embeddings._get_embedder`)
+    -- the native ``sqlite-vec`` extension can fail to load via
+    ``enable_load_extension``/``sqlite_vec.load`` even when the Python
+    package imports fine (e.g. a ``sqlite3`` build without loadable-extension
+    support), in which case ``memories_vec`` is never created and semantic
+    search has nothing to query even though an embedding could still be
+    computed. Callers deciding whether to route/weight semantic results
+    (:func:`remind_me_mcp.retrieval.choose_rrf_weights`'s ``has_semantic``)
+    need this, not just embedder availability.
+    """
+    db = _get_db()
+    row = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memories_vec'"
+    ).fetchone()
+    return row is not None
+
+
 def _close_db() -> None:
     """Close all tracked database connections (any thread's) and reset state.
 

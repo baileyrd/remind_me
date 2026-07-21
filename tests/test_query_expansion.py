@@ -207,6 +207,7 @@ def test_semantic_search_without_extras_unchanged(db_conn_with_vec, mock_embedde
 
 async def test_memory_search_passes_expansion(monkeypatch, db_conn, memory_factory):
     """memory_search feeds expand_query output into the semantic tier."""
+    import remind_me_mcp.db as db_mod
     import remind_me_mcp.embeddings as emb_mod
     import remind_me_mcp.tools as tools_mod
     from remind_me_mcp.models import MemorySearchInput, ResponseFormat
@@ -219,8 +220,13 @@ async def test_memory_search_passes_expansion(monkeypatch, db_conn, memory_facto
         seen["extra_texts"] = extra_texts
         return []
 
-    # Expansion only runs when an embedder is available (DI-08).
+    # Expansion only runs when an embedder is available (DI-08) and semantic
+    # search actually has a table to query (db_conn has no sqlite-vec
+    # loaded, so this stands in for db_conn_with_vec without the real
+    # extension dependency -- this test is about expand_query plumbing, not
+    # real vector search).
     monkeypatch.setattr(emb_mod, "_get_embedder", lambda: object())
+    monkeypatch.setattr(db_mod, "vec_search_available", lambda: True)
     monkeypatch.setattr(tools_mod, "expand_query", lambda q: ["hypothetical passage"])
     monkeypatch.setattr(tools_mod, "_semantic_search", fake_semantic)
     monkeypatch.setattr(tools_mod, "record_accesses", lambda *_a, **_k: 0)
