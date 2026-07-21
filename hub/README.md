@@ -69,7 +69,10 @@ The hub implements the same wire protocol as the peer server
 (`remind_me_mcp/peer_server.py`): bearer-authenticated `/sync/push` with
 `processed_ids` responses, keyset-cursor `/sync/pull`, and the FT-04
 entity-graph endpoints `/sync/pull_entities` and `/sync/pull_links`.
-`GET /health` is an unauthenticated liveness probe.
+`GET /health` is an unauthenticated liveness probe — 200 when Postgres is
+reachable, 503 otherwise, so deploy-time healthchecks (Railway, Docker
+Compose's `depends_on: condition: service_healthy`) correctly catch a
+broken DB connection instead of always reporting success.
 
 Two deliberate divergences from the peer protocol, both required because the
 hub is pull-only (peers push to each other; nobody pushes hub state to you):

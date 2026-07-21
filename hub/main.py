@@ -15,7 +15,8 @@ implementation:
                               (record_type='memory_entity', synthetic id)
 - GET  /sync/pull_entity_relations — entity_relations records
                               (record_type='entity_relation', real id)
-- GET  /health              — unauthenticated liveness probe
+- GET  /health              — unauthenticated liveness probe (200 when the
+                              DB is reachable, 503 otherwise)
 
 Push records dispatch on record_type: absent = memory, 'entity' upserts
 with LWW except aliases (always union-merged), 'memory_entity' and
@@ -47,6 +48,7 @@ from typing import Annotated, Any
 
 import psycopg
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -276,19 +278,35 @@ def _require_auth(request: Request) -> None:
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
-def health() -> dict:
+def health() -> JSONResponse:
+    """Liveness probe -- responds even when Postgres is unreachable.
+
+    The HTTP status code reflects DB connectivity (200 when reachable, 503
+    when not) so deploy-time healthchecks that gate on 2xx (Railway's
+    healthcheckPath, Docker Compose's ``depends_on: condition:
+    service_healthy``) correctly catch "the hub can't reach its database" at
+    rollout instead of always reporting success. This is deliberately NOT
+    wired up as a continuously-polled auto-restart trigger anywhere in this
+    repo's deploy templates -- a transient DB blip shouldn't kill and
+    restart an otherwise-healthy hub process, only block a *new* deploy from
+    being promoted while the old one keeps serving.
+    """
     db_status = "ok"
     try:
         with _connect() as conn:
             conn.execute("SELECT 1")
     except Exception as e:
         db_status = f"error: {e}"
-    return {
-        "status": "ok",
-        "role": "hub",
-        "db": db_status,
-        "time": datetime.now(UTC).isoformat(),
-    }
+    healthy = db_status == "ok"
+    return JSONResponse(
+        status_code=200 if healthy else 503,
+        content={
+            "status": "ok" if healthy else "degraded",
+            "role": "hub",
+            "db": db_status,
+            "time": datetime.now(UTC).isoformat(),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

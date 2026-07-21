@@ -33,7 +33,15 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-remindme}"]
+      # $$POSTGRES_USER (double-dollar) is deliberate: env_file: values are
+      # only injected into the container's own runtime environment, never
+      # into Compose's own ${...} interpolation (that only reads the shell
+      # env / a top-level .env file) -- a single-dollar ${POSTGRES_USER}
+      # here would silently always resolve to nothing at Compose parse
+      # time, before postgres.env is ever read. Escaping it lets the
+      # literal $POSTGRES_USER reach the container's own shell, which DOES
+      # have it (via env_file: postgres.env below).
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER"]
       interval: 5s
       timeout: 5s
       retries: 10
