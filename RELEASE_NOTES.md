@@ -1,5 +1,15 @@
 # Release Notes
 
+## v1.8.0 — 2026-07-21
+
+Closes a precision gap flagged in the application capability review: `rank_rrf` fuses keyword, semantic, recency, vitality, and IDF signals purely by ordinal rank position, discarding the actual score magnitude — a 0.95-cosine semantic match and a 0.55-cosine match tie if they happen to land in adjacent rank positions, even though one is a far stronger match than the other.
+
+### New Features
+
+- **Score-based fusion mode, opt-in** — `rank_rrf` gains a `fusion` parameter (`"rank"` default, `"score"` new) plus a module-level `REMIND_ME_RRF_FUSION` env var. `"score"` mode min-max normalizes the real underlying magnitudes across the candidate pool — FTS5 `bm25()` score, semantic distance, `created_at`, and `vitality` — into `[0, 1]` (higher = better) and sums `weight * normalized_score`, instead of `1/(k + rank)` terms. A memory missing a signal (e.g. a semantic-only hit has no `bm25` score) gets `0.0` for that signal, mirroring rank mode's penalty-rank treatment. `w_idf` reuses the same normalized keyword score in this mode, since both derive from the identical `bm25` magnitude. `"rank"` stays the default, so existing callers and benchmark numbers are unaffected unless explicitly opted in.
+- Rank fields (`_keyword_rank` etc.) are still computed and set in `"score"` mode too, so existing debug tooling keeps working; `build_debug_signals` additionally surfaces `keyword_score`/`semantic_score`/`recency_score`/`vitality_score`/`fusion_mode` when score fusion was used (omitted entirely for rank-mode results).
+- `benchmarks/runner.py` gains `--rrf-fusion {rank,score}`; `benchmarks/before_after.py` gains `--compare score_fusion` for A/B measurement against the rank-only baseline.
+
 ## v1.7.0 — 2026-07-21
 
 Ships the single most-cited unused retrieval-quality lever flagged in the application capability review: cross-encoder reranking (`reranker.py`) was built, tested, and off by default — adoption was effectively zero even though `benchmarks/RESULTS.md` already documented its value clearly.

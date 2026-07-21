@@ -1023,6 +1023,7 @@ This is a deterministic heuristic, not an LLM planner call — no extra latency 
 | `REMIND_ME_RRF_W_RECENCY` | `1.0` | RRF weight for the recency signal (set `0` for a pure-retrieval profile) |
 | `REMIND_ME_RRF_W_VITALITY` | `1.0` | RRF weight for the vitality signal (set `0` for a pure-retrieval profile) |
 | `REMIND_ME_RRF_W_IDF` | `0.0` | RRF weight for the IDF signal (derived from FTS5's `bm25()` score). Off by default — set a positive value to opt in |
+| `REMIND_ME_RRF_FUSION` | `rank` | Fusion mode: `rank` (classic ordinal Reciprocal Rank Fusion) or `score` (normalized-magnitude fusion over `bm25`/semantic-distance/recency/vitality — preserves match-strength information that rank-only RRF discards). Off by default; opt in with `score` |
 | `REMIND_ME_RERANK` | `onnx` | Reranks the top search candidates with a cross-encoder (on by default — bounded to `REMIND_ME_RERANK_TOP_K` candidates, so latency is small and constant). Set to `""` to disable for latency-sensitive deployments |
 | `REMIND_ME_RERANK_MODEL` | `BAAI/bge-reranker-base` | HuggingFace cross-encoder repo (must ship `onnx/model.onnx`) |
 | `REMIND_ME_RERANK_TOP_K` | `20` | How many top RRF candidates the reranker rescores |
@@ -1188,6 +1189,14 @@ remind_me is local-first, single-user, and MCP-native by design — some capabil
 ## Changelog
 
 See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for a per-version feature breakdown with PR references; this section summarizes the same history phase-by-phase.
+
+### 1.8.0 — 2026-07-21
+
+Closes a precision gap flagged in the application capability review: RRF fuses signals purely by ordinal rank, discarding the actual score magnitude — a 0.95-cosine match and a 0.55-cosine match tie if they land in adjacent rank positions.
+
+- **Score-based RRF fusion (opt-in)** — `rank_rrf` gains a `fusion="score"` mode (`REMIND_ME_RRF_FUSION=score`) that min-max normalizes the real underlying magnitudes (`bm25` score, semantic distance, recency, vitality) into `[0, 1]` and sums weighted normalized scores, instead of `1/(k+rank)` terms. Preserves match-confidence information rank-only fusion throws away; `fusion="rank"` stays the default, so no existing behavior changes unless explicitly enabled.
+- `remind_me_search`'s `verbose=True` debug signals surface the new `keyword_score`/`semantic_score`/`recency_score`/`vitality_score`/`fusion_mode` fields when score fusion is active.
+- `benchmarks/runner.py --rrf-fusion score` and `benchmarks/before_after.py --compare score_fusion` added for A/B measurement.
 
 ### 1.7.0 — 2026-07-21
 

@@ -148,8 +148,10 @@ async def run(args: argparse.Namespace) -> int:
     saved_sanitize = tools_mod.FTS_SANITIZE_FALLBACK
     saved_weights = (retr.RRF_W_KEYWORD, retr.RRF_W_RECENCY, retr.RRF_W_VITALITY)
     saved_rerank = (rr_mod.RERANK_BACKEND, rr_mod.RERANK_TOP_K)
+    saved_fusion = retr.RRF_FUSION
     saved_expand = qe_mod.EXPANSION_MODE
     tools_mod.FTS_SANITIZE_FALLBACK = not args.no_sanitize
+    retr.RRF_FUSION = args.rrf_fusion
     # Explicit either way (issue #50 made RERANK_BACKEND default to "onnx" in
     # production) so --rerank stays a clean lever-isolation switch here: a
     # run without --rerank must measure the pre-rerank baseline, not
@@ -180,6 +182,7 @@ async def run(args: argparse.Namespace) -> int:
         tools_mod.FTS_SANITIZE_FALLBACK = saved_sanitize
         retr.RRF_W_KEYWORD, retr.RRF_W_RECENCY, retr.RRF_W_VITALITY = saved_weights
         rr_mod.RERANK_BACKEND, rr_mod.RERANK_TOP_K = saved_rerank
+        retr.RRF_FUSION = saved_fusion
         qe_mod.EXPANSION_MODE = saved_expand
 
     by_mode_buckets = {
@@ -249,6 +252,16 @@ def build_parser() -> argparse.ArgumentParser:
             "RRF signal profile: 'default' (all four signals), 'retrieval' (drop "
             "recency+vitality), or 'semantic' (semantic vector search only — drop "
             "keyword+recency+vitality; mirrors MemPalace's ChromaDB headline protocol)"
+        ),
+    )
+    p.add_argument(
+        "--rrf-fusion",
+        choices=["rank", "score"],
+        default="rank",
+        help=(
+            "RRF fusion mode: 'rank' (default, ordinal Reciprocal Rank Fusion) or "
+            "'score' (normalized-magnitude fusion over bm25/semantic-distance/"
+            "recency/vitality — issue #49)"
         ),
     )
     p.add_argument(

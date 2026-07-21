@@ -6,6 +6,8 @@ import os
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
+import pytest
+
 if TYPE_CHECKING:
     from remind_me_mcp.retrieval import SearchEnvelope
 
@@ -217,6 +219,27 @@ class TestRRFKConfig:
             assert mod.RRF_K == 42
         finally:
             os.environ.pop("REMIND_ME_RRF_K", None)
+            importlib.reload(mod)
+
+    def test_rrf_fusion_defaults_to_rank(self):
+        """Issue #49: score fusion is opt-in, so the default stays 'rank'."""
+        os.environ.pop("REMIND_ME_RRF_FUSION", None)
+        import importlib
+
+        import remind_me_mcp.retrieval as mod
+        importlib.reload(mod)
+        assert mod.RRF_FUSION == "rank"
+
+    def test_rrf_fusion_from_env(self):
+        os.environ["REMIND_ME_RRF_FUSION"] = "score"
+        try:
+            import importlib
+
+            import remind_me_mcp.retrieval as mod
+            importlib.reload(mod)
+            assert mod.RRF_FUSION == "score"
+        finally:
+            os.environ.pop("REMIND_ME_RRF_FUSION", None)
             importlib.reload(mod)
 
 
@@ -466,6 +489,182 @@ class TestRankRRFIdf:
 
 
 # ---------------------------------------------------------------------------
+# _minmax_normalize
+# ---------------------------------------------------------------------------
+
+
+class TestMinMaxNormalize:
+    """Tests for the _minmax_normalize helper (score-fusion building block)."""
+
+    def test_normalizes_to_zero_one_range(self):
+        from remind_me_mcp.retrieval import _minmax_normalize
+
+        result = _minmax_normalize({"A": 0.0, "B": 5.0, "C": 10.0})
+        assert result == {"A": 0.0, "B": 0.5, "C": 1.0}
+
+    def test_invert_flips_direction(self):
+        """invert=True: the lowest raw value gets the highest (best) score."""
+        from remind_me_mcp.retrieval import _minmax_normalize
+
+        result = _minmax_normalize({"A": 0.0, "B": 5.0, "C": 10.0}, invert=True)
+        assert result == {"A": 1.0, "B": 0.5, "C": 0.0}
+
+    def test_empty_input_returns_empty(self):
+        from remind_me_mcp.retrieval import _minmax_normalize
+
+        assert _minmax_normalize({}) == {}
+
+    def test_all_tied_values_score_one(self):
+        """No spread to normalize -- every id gets 1.0 rather than a division by zero."""
+        from remind_me_mcp.retrieval import _minmax_normalize
+
+        assert _minmax_normalize({"A": 3.0, "B": 3.0}) == {"A": 1.0, "B": 1.0}
+
+    def test_single_value_scores_one(self):
+        from remind_me_mcp.retrieval import _minmax_normalize
+
+        assert _minmax_normalize({"A": 7.0}) == {"A": 1.0}
+
+
+# ---------------------------------------------------------------------------
+# Score-based fusion (issue #49)
+# ---------------------------------------------------------------------------
+
+
+class TestRankRRFScoreFusion:
+    """Tests for fusion='score' -- normalized-magnitude fusion instead of rank-only."""
+
+    def test_defaults_to_rank_mode(self):
+        """Without an explicit fusion arg (and RRF_FUSION unset), behavior is unchanged."""
+        from remind_me_mcp.retrieval import rank_rrf
+
+        a = _mem("A", created_at=_ts(0), _bm25_score=-8.0)
+        b = _mem("B", created_at=_ts(0), _bm25_score=-1.0)
+
+        result = rank_rrf([a, b], [a, b], k=60)
+        assert "_fusion_mode" not in result[0]
+        assert "_keyword_score" not in result[0]
+
+    def test_score_mode_preserves_strong_match_magnitude(self):
+        """The headline case: a much stronger semantic match must outrank a
+        weaker one even if rank-only fusion would have tied them (adjacent
+        rank positions), because score mode reads the real magnitude."""
+        from remind_me_mcp.retrieval import rank_rrf
+
+        strong = _mem("STRONG", created_at=_ts(0), semantic_distance=0.05)
+        weak = _mem("WEAK", created_at=_ts(0), semantic_distance=0.95)
+
+        # Adjacent rank positions (1 and 2) -- rank-only RRF would barely
+        # distinguish them; score mode should read the large distance gap.
+        result = rank_rrf(
+            [], [strong, weak], k=60, fusion="score", w_recency=0.0, w_vitality=0.0
+        )
+        scores = {m["id"]: m["_rrf_score"] for m in result}
+        assert scores["STRONG"] > scores["WEAK"]
+        # The gap should be substantial (near the full normalized range),
+        # unlike rank-only fusion's tiny 1/(k+1) vs 1/(k+2) difference.
+        assert scores["STRONG"] - scores["WEAK"] > 0.5
+
+    def test_score_mode_sets_score_debug_fields(self):
+        from remind_me_mcp.retrieval import rank_rrf
+
+        a = _mem("A", created_at=_ts(0), _bm25_score=-5.0, semantic_distance=0.2)
+        result = rank_rrf([a], [a], k=60, fusion="score")
+
+        m = result[0]
+        assert m["_fusion_mode"] == "score"
+        assert m["_keyword_score"] == pytest.approx(1.0)  # only candidate -> tied -> 1.0
+        assert m["_semantic_score"] == pytest.approx(1.0)
+        assert "_recency_score" in m
+        assert "_vitality_score" in m
+
+    def test_score_mode_still_sets_rank_fields(self):
+        """Rank fields stay populated in score mode too, for debug/back-compat."""
+        from remind_me_mcp.retrieval import rank_rrf
+
+        a = _mem("A", created_at=_ts(0))
+        result = rank_rrf([a], [a], k=60, fusion="score")
+
+        m = result[0]
+        assert "_keyword_rank" in m
+        assert "_semantic_rank" in m
+        assert "_recency_rank" in m
+        assert "_vitality_rank" in m
+        assert "_idf_rank" in m
+
+    def test_missing_signal_scores_zero_not_dropped(self):
+        """A semantic-only hit (no _bm25_score) gets keyword_score=0.0, the
+        worst possible score -- mirroring rank mode's penalty-rank treatment,
+        but it must still appear in the results."""
+        from remind_me_mcp.retrieval import rank_rrf
+
+        scored = _mem("SCORED", created_at=_ts(0), _bm25_score=-3.0)
+        unscored = _mem("UNSCORED", created_at=_ts(0))  # semantic-only
+
+        result = rank_rrf([scored], [scored, unscored], k=60, fusion="score")
+
+        by_id = {m["id"]: m for m in result}
+        assert by_id["UNSCORED"]["_keyword_score"] == 0.0
+        assert by_id["SCORED"]["_keyword_score"] > 0.0
+
+    def test_recency_score_favors_newer(self):
+        from remind_me_mcp.retrieval import rank_rrf
+
+        newer = _mem("NEW", created_at=_ts(0))
+        older = _mem("OLD", created_at=_ts(365))
+
+        result = rank_rrf(
+            [newer, older], [newer, older], k=60, fusion="score", w_keyword=0.0, w_semantic=0.0
+        )
+        scores = {m["id"]: m["_rrf_score"] for m in result}
+        assert scores["NEW"] > scores["OLD"]
+
+    def test_vitality_score_favors_higher_vitality(self):
+        from remind_me_mcp.retrieval import rank_rrf
+
+        high = _mem("HIGH", created_at=_ts(0), vitality=0.9)
+        low = _mem("LOW", created_at=_ts(0), vitality=0.1)
+
+        result = rank_rrf(
+            [high, low], [high, low], k=60, fusion="score",
+            w_keyword=0.0, w_semantic=0.0, w_recency=0.0,
+        )
+        scores = {m["id"]: m["_rrf_score"] for m in result}
+        assert scores["HIGH"] > scores["LOW"]
+
+    def test_idf_weight_reuses_keyword_score_in_score_mode(self):
+        """w_idf has no separate signal in score mode -- it's the same
+        underlying bm25 magnitude as w_keyword, just an extra multiplier."""
+        from remind_me_mcp.retrieval import rank_rrf
+
+        a = _mem("A", created_at=_ts(0), _bm25_score=-8.0)
+        b = _mem("B", created_at=_ts(0), _bm25_score=-1.0)
+
+        result = rank_rrf(
+            [a, b], [a, b], k=60, fusion="score",
+            w_keyword=1.0, w_idf=1.0, w_semantic=0.0, w_recency=0.0, w_vitality=0.0,
+        )
+        by_id = {m["id"]: m for m in result}
+        # Both weights apply the same normalized keyword_score, so the score
+        # is exactly double the keyword_score alone.
+        assert by_id["A"]["_rrf_score"] == pytest.approx(2 * by_id["A"]["_keyword_score"])
+
+    def test_rrf_fusion_env_default_applies(self, monkeypatch):
+        """With fusion=None, the module-level RRF_FUSION constant is used."""
+        import remind_me_mcp.retrieval as retr
+
+        monkeypatch.setattr(retr, "RRF_FUSION", "score")
+        a = _mem("A", created_at=_ts(0), _bm25_score=-5.0)
+        result = retr.rank_rrf([a], [a], k=60)
+        assert result[0]["_fusion_mode"] == "score"
+
+    def test_zero_candidates_returns_empty_in_score_mode(self):
+        from remind_me_mcp.retrieval import rank_rrf
+
+        assert rank_rrf([], [], fusion="score") == []
+
+
+# ---------------------------------------------------------------------------
 # build_debug_signals
 # ---------------------------------------------------------------------------
 
@@ -587,6 +786,42 @@ class TestBuildDebugSignals:
 
         assert signals["strategy"] == "keyword_favored"
         assert signals["weights_used"] == weights
+
+    def test_fusion_score_fields_omitted_for_rank_mode(self):
+        """A rank-mode result (no _fusion_mode key) adds no new debug keys —
+        preserves the exact-9-key contract for pre-#49 callers."""
+        from remind_me_mcp.retrieval import build_debug_signals
+
+        mem = _mem("A", created_at=_ts(0))
+        mem["_keyword_rank"] = 1
+        mem["_semantic_rank"] = 1
+        mem["_recency_rank"] = 1
+        mem["_vitality_rank"] = 1
+        mem["_idf_rank"] = 1
+
+        signals = build_debug_signals(mem)
+
+        assert "fusion_mode" not in signals
+        assert "keyword_score" not in signals
+
+    def test_fusion_score_fields_included_when_present(self):
+        """Issue #49: score-mode results surface their normalized magnitudes."""
+        from remind_me_mcp.retrieval import build_debug_signals
+
+        mem = _mem("A", created_at=_ts(0))
+        mem["_fusion_mode"] = "score"
+        mem["_keyword_score"] = 0.8
+        mem["_semantic_score"] = 0.6
+        mem["_recency_score"] = 0.4
+        mem["_vitality_score"] = 0.2
+
+        signals = build_debug_signals(mem)
+
+        assert signals["fusion_mode"] == "score"
+        assert signals["keyword_score"] == 0.8
+        assert signals["semantic_score"] == 0.6
+        assert signals["recency_score"] == 0.4
+        assert signals["vitality_score"] == 0.2
 
 
 # ---------------------------------------------------------------------------
