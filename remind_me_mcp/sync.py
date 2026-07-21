@@ -953,6 +953,7 @@ async def sync_loop() -> None:
 
 _stop = threading.Event()
 _thread: threading.Thread | None = None
+_thread_lock = threading.Lock()
 
 
 def start_sync_thread() -> threading.Thread:
@@ -962,39 +963,43 @@ def start_sync_thread() -> threading.Thread:
     which may run in a thread pool rather than the main event loop.
 
     Idempotent — a second call while already running returns the existing
-    thread.
+    thread. The check-then-act is lock-protected (mirroring
+    ``peer_server.start_peer_server``/``webhook_server.start_webhook_server``)
+    so two concurrent callers can't both pass the liveness check and start
+    two competing loops.
     """
     global _thread
-    if _thread is not None and _thread.is_alive():
-        return _thread
+    with _thread_lock:
+        if _thread is not None and _thread.is_alive():
+            return _thread
 
-    def _run():
-        log.info("Sync thread starting")
-        while not _stop.is_set():
-            try:
-                from remind_me_mcp.sidecars import ensure_sidecars
-                ensure_sidecars()
-            except Exception as e:
-                log.warning("Sidecar ensure failed: %s", e)
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
+        def _run():
+            log.info("Sync thread starting")
+            while not _stop.is_set():
                 try:
-                    loop.run_until_complete(_sync_once())
-                finally:
-                    loop.close()
-                    asyncio.set_event_loop(None)
-            except Exception as e:
-                log.error("Sync thread error: %s", e, exc_info=True)
-            log.info("Sync thread sleeping %ds", SYNC_INTERVAL)
-            _stop.wait(SYNC_INTERVAL)
-        log.info("Sync thread stopped")
+                    from remind_me_mcp.sidecars import ensure_sidecars
+                    ensure_sidecars()
+                except Exception as e:
+                    log.warning("Sidecar ensure failed: %s", e)
+                try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    try:
+                        loop.run_until_complete(_sync_once())
+                    finally:
+                        loop.close()
+                        asyncio.set_event_loop(None)
+                except Exception as e:
+                    log.error("Sync thread error: %s", e, exc_info=True)
+                log.info("Sync thread sleeping %ds", SYNC_INTERVAL)
+                _stop.wait(SYNC_INTERVAL)
+            log.info("Sync thread stopped")
 
-    _stop.clear()
-    _thread = threading.Thread(target=_run, daemon=True, name="sync-loop")
-    _thread.start()
-    log.info("Sync loop thread started — alive: %s", _thread.is_alive())
-    return _thread
+        _stop.clear()
+        _thread = threading.Thread(target=_run, daemon=True, name="sync-loop")
+        _thread.start()
+        log.info("Sync loop thread started — alive: %s", _thread.is_alive())
+        return _thread
 
 
 def stop_sync_thread(timeout: float = 10.0) -> None:
@@ -1008,7 +1013,10 @@ def stop_sync_thread(timeout: float = 10.0) -> None:
     Args:
         timeout: Max seconds to wait for the thread to exit.
     """
+    global _thread
     _stop.set()
-    thread = _thread
+    with _thread_lock:
+        thread = _thread
+        _thread = None
     if thread is not None and thread.is_alive():
         thread.join(timeout)

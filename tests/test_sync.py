@@ -1194,6 +1194,39 @@ def test_stop_sync_thread_is_noop_when_never_started(
     sync.stop_sync_thread()  # must not raise
 
 
+def test_concurrent_start_sync_thread_calls_return_the_same_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """start_sync_thread()'s check-then-act is lock-protected -- concurrent
+    callers must never both pass the liveness check and start two competing
+    loops (mirrors watcher.FolderWatcher.start()'s equivalent test)."""
+    import threading
+
+    async def fake_sync_once() -> None:
+        pass
+
+    monkeypatch.setattr(sync, "_sync_once", fake_sync_once)
+
+    results: list[threading.Thread] = []
+    barrier = threading.Barrier(5)
+
+    def call_start() -> None:
+        barrier.wait(timeout=5)
+        results.append(sync.start_sync_thread())
+
+    callers = [threading.Thread(target=call_start) for _ in range(5)]
+    try:
+        for t in callers:
+            t.start()
+        for t in callers:
+            t.join(timeout=5)
+
+        assert len(results) == 5
+        assert len({id(r) for r in results}) == 1
+    finally:
+        sync.stop_sync_thread()
+
+
 # ---------------------------------------------------------------------------
 # Entity graph sync (FT-04)
 # ---------------------------------------------------------------------------
