@@ -445,6 +445,15 @@ AUTO_UPDATE_CHECK: bool = os.environ.get(
 update check at server startup (SE-06). The manual `remind_me_check_update`
 and `remind_me_self_update` tools keep working regardless."""
 
+UPDATE_EXPECTED_ORIGIN: str | None = os.environ.get("REMIND_ME_UPDATE_EXPECTED_ORIGIN") or None
+"""Optional trust pin for `remind_me_self_update` (SEC-05). remind_me_self_update
+always does `git pull --ff-only origin main` -- nothing verifies `origin`
+actually points where you expect, so a repointed remote (compromise, a stray
+`git remote set-url`) would otherwise be pulled and pip-installed without
+question. When set, perform_update() refuses to proceed unless the local
+`origin` remote's URL matches this value exactly. Unset by default since
+there's no single correct value for every fork of this package."""
+
 # ---------------------------------------------------------------------------
 # Exports
 # ---------------------------------------------------------------------------
@@ -498,6 +507,7 @@ __all__ = [
     "WEBHOOK_BIND",
     "WEBHOOK_SECRET",
     "AUTO_UPDATE_CHECK",
+    "UPDATE_EXPECTED_ORIGIN",
 ]
 
 # ---------------------------------------------------------------------------
