@@ -1162,6 +1162,38 @@ def test_start_sync_thread_runs_cycles(monkeypatch: pytest.MonkeyPatch) -> None:
     assert not thread.is_alive()
 
 
+def test_start_sync_thread_is_idempotent_and_stoppable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sync loop previously had no stop mechanism at all -- a bare
+    ``while True`` daemon thread that app_lifespan's shutdown couldn't
+    signal, risking a write against a closed DB connection. Assert a second
+    start() call is a no-op and stop_sync_thread() cleanly ends the loop."""
+    import threading
+
+    ran = threading.Event()
+
+    async def fake_sync_once() -> None:
+        ran.set()
+
+    monkeypatch.setattr(sync, "_sync_once", fake_sync_once)
+    try:
+        thread = sync.start_sync_thread()
+        assert ran.wait(timeout=5), "_sync_once never ran in the sync thread"
+        assert sync.start_sync_thread() is thread
+    finally:
+        sync.stop_sync_thread()
+
+    assert not thread.is_alive()
+
+
+def test_stop_sync_thread_is_noop_when_never_started(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sync, "_thread", None)
+    sync.stop_sync_thread()  # must not raise
+
+
 # ---------------------------------------------------------------------------
 # Entity graph sync (FT-04)
 # ---------------------------------------------------------------------------

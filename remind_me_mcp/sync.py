@@ -951,18 +951,26 @@ async def sync_loop() -> None:
 # Thread runner
 # ---------------------------------------------------------------------------
 
+_stop = threading.Event()
+_thread: threading.Thread | None = None
+
 
 def start_sync_thread() -> threading.Thread:
     """Run the sync loop in a daemon thread with its own event loop.
 
     More reliable than asyncio.create_task() inside FastMCP's lifespan,
     which may run in a thread pool rather than the main event loop.
+
+    Idempotent — a second call while already running returns the existing
+    thread.
     """
-    import time
+    global _thread
+    if _thread is not None and _thread.is_alive():
+        return _thread
 
     def _run():
         log.info("Sync thread starting")
-        while True:
+        while not _stop.is_set():
             try:
                 from remind_me_mcp.sidecars import ensure_sidecars
                 ensure_sidecars()
@@ -979,10 +987,28 @@ def start_sync_thread() -> threading.Thread:
             except Exception as e:
                 log.error("Sync thread error: %s", e, exc_info=True)
             log.info("Sync thread sleeping %ds", SYNC_INTERVAL)
-            time.sleep(SYNC_INTERVAL)
-            log.info("Sync thread waking up")
+            _stop.wait(SYNC_INTERVAL)
+        log.info("Sync thread stopped")
 
-    thread = threading.Thread(target=_run, daemon=True, name="sync-loop")
-    thread.start()
-    log.info("Sync loop thread started — alive: %s", thread.is_alive())
-    return thread
+    _stop.clear()
+    _thread = threading.Thread(target=_run, daemon=True, name="sync-loop")
+    _thread.start()
+    log.info("Sync loop thread started — alive: %s", _thread.is_alive())
+    return _thread
+
+
+def stop_sync_thread(timeout: float = 10.0) -> None:
+    """Signal the sync loop to stop and join the thread (no-op when not running).
+
+    Called from the server lifespan shutdown *before* ``_close_db()`` so an
+    in-flight sync cycle finishes (or aborts) before the connection closes
+    (SE-07), mirroring ``watcher.stop_watcher()`` and
+    ``peer_server.stop_peer_server()``.
+
+    Args:
+        timeout: Max seconds to wait for the thread to exit.
+    """
+    _stop.set()
+    thread = _thread
+    if thread is not None and thread.is_alive():
+        thread.join(timeout)
