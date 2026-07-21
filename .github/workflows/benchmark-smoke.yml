@@ -1,0 +1,46 @@
+# Non-blocking scheduled tripwire for the retrieval pipeline (cognee gap #10,
+# Phase 7b). Runs the bundled 12-question sample set — fully offline, no
+# dataset download, no embedding model — so RESULTS.md's headline numbers
+# don't silently rot between the occasional real LongMemEval-S runs (which
+# take hours on CPU and need the full dataset; see benchmarks/README.md).
+#
+# This is deliberately NOT a substitute for that full run, and it never fails
+# the workflow on a regression — it's a weekly nudge for a human to notice a
+# drop in the job summary, not an automated gate.
+name: Benchmark smoke check
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  smoke:
+    name: Bundled sample (FTS-only, offline)
+    runs-on: ubuntu-latest
+    continue-on-error: true # non-blocking: never fails the run for anyone
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Run the bundled sample benchmark
+        run: |
+          {
+            echo "## Benchmark smoke check — bundled sample (12 questions, FTS-only)"
+            echo
+            echo "Not a substitute for the full LongMemEval-S run in \`benchmarks/RESULTS.md\`."
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          uv run python -m benchmarks.runner \
+            --data benchmarks/sample/longmemeval_sample.json \
+            --embedder none \
+            --ingest verbatim \
+            --ks 1,3,5 \
+            >> "$GITHUB_STEP_SUMMARY"

@@ -60,6 +60,7 @@ from remind_me_mcp.config import (
     SYNC_SECRET,
 )
 from remind_me_mcp.db import _embed_and_store_rows, _get_db, _now_iso
+from remind_me_mcp.telemetry import maybe_span
 
 log = logging.getLogger("remind_me_mcp.sync")
 
@@ -876,51 +877,55 @@ async def _probe_peer(client: httpx.AsyncClient, peer: dict) -> bool:
 
 async def _sync_once() -> None:
     """Run one full sync cycle: hub push/pull, peer push/pull, outbox prune."""
-    async with httpx.AsyncClient() as client:
+    # maybe_span is a plain (sync) context manager -- it can't share an
+    # `async with` statement with httpx.AsyncClient (async), so it wraps the
+    # whole cycle as its own outer `with` instead.
+    with maybe_span("sync.cycle"):
+        async with httpx.AsyncClient() as client:
 
-        # --- Hub sync ---
-        if HUB_URL:
-            try:
-                await _push_outbox(client, HUB_URL, "hub")
-                await _pull_remote(client, HUB_URL, "hub")
-                # Entity graph (FT-04) — no-ops against pre-FT-04 remotes.
-                await _pull_entities(client, HUB_URL, "hub")
-                await _pull_links(client, HUB_URL, "hub")
-                # Entity relations (Phase 3) — no-op against older remotes.
-                await _pull_entity_relations(client, HUB_URL, "hub")
-                log.info("Hub sync complete")
-            except httpx.ConnectError:
-                log.debug("Hub unreachable, skipping")
-            except httpx.HTTPStatusError as e:
-                log.warning("Hub sync error: %s", e)
-            except Exception as e:
-                log.warning("Hub sync unexpected error: %s", e)
+            # --- Hub sync ---
+            if HUB_URL:
+                try:
+                    await _push_outbox(client, HUB_URL, "hub")
+                    await _pull_remote(client, HUB_URL, "hub")
+                    # Entity graph (FT-04) — no-ops against pre-FT-04 remotes.
+                    await _pull_entities(client, HUB_URL, "hub")
+                    await _pull_links(client, HUB_URL, "hub")
+                    # Entity relations (Phase 3) — no-op against older remotes.
+                    await _pull_entity_relations(client, HUB_URL, "hub")
+                    log.info("Hub sync complete")
+                except httpx.ConnectError:
+                    log.debug("Hub unreachable, skipping")
+                except httpx.HTTPStatusError as e:
+                    log.warning("Hub sync error: %s", e)
+                except Exception as e:
+                    log.warning("Hub sync unexpected error: %s", e)
 
-        # --- Peer sync ---
-        peers = await _discover_peers()
-        for peer in peers:
-            if peer["node_id"] == NODE_ID:
-                continue  # skip self
-            if not await _probe_peer(client, peer):
-                continue
-            try:
-                await _push_outbox(client, peer["url"], peer["node_id"])
-                await _pull_remote(client, peer["url"], peer["node_id"])
-                # Entity graph (FT-04) — no-ops against pre-FT-04 peers.
-                await _pull_entities(client, peer["url"], peer["node_id"])
-                await _pull_links(client, peer["url"], peer["node_id"])
-                # Entity relations (Phase 3) — no-op against older peers.
-                await _pull_entity_relations(client, peer["url"], peer["node_id"])
-                log.info("Peer sync complete: %s", peer["node_id"])
-            except httpx.ConnectError:
-                log.debug("Peer %s unreachable", peer["node_id"])
-            except Exception as e:
-                log.warning("Peer sync error (%s): %s", peer["node_id"], e)
+            # --- Peer sync ---
+            peers = await _discover_peers()
+            for peer in peers:
+                if peer["node_id"] == NODE_ID:
+                    continue  # skip self
+                if not await _probe_peer(client, peer):
+                    continue
+                try:
+                    await _push_outbox(client, peer["url"], peer["node_id"])
+                    await _pull_remote(client, peer["url"], peer["node_id"])
+                    # Entity graph (FT-04) — no-ops against pre-FT-04 peers.
+                    await _pull_entities(client, peer["url"], peer["node_id"])
+                    await _pull_links(client, peer["url"], peer["node_id"])
+                    # Entity relations (Phase 3) — no-op against older peers.
+                    await _pull_entity_relations(client, peer["url"], peer["node_id"])
+                    log.info("Peer sync complete: %s", peer["node_id"])
+                except httpx.ConnectError:
+                    log.debug("Peer %s unreachable", peer["node_id"])
+                except Exception as e:
+                    log.warning("Peer sync error (%s): %s", peer["node_id"], e)
 
-    try:
-        _prune_outbox(_get_db())
-    except Exception as e:
-        log.warning("Outbox prune failed: %s", e)
+        try:
+            _prune_outbox(_get_db())
+        except Exception as e:
+            log.warning("Outbox prune failed: %s", e)
 
 
 async def sync_loop() -> None:

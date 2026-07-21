@@ -41,6 +41,7 @@ from remind_me_mcp import config
 from remind_me_mcp.config import is_in_import_roots
 from remind_me_mcp.db import _get_db, _now_iso
 from remind_me_mcp.importer import import_chat_file
+from remind_me_mcp.telemetry import maybe_span
 
 log = logging.getLogger("remind_me_mcp.watcher")
 
@@ -187,6 +188,12 @@ class FolderWatcher:
             dedup recognised already-imported content (e.g. the first scan
             after a restart); an unchanged signature is not counted at all.
         """
+        with maybe_span("watcher.scan"):
+            return self._scan_once_inner()
+
+    def _scan_once_inner(self) -> dict[str, int]:
+        """The actual scan pass — see :meth:`scan_once`, split out only so
+        the OTEL span wraps the whole thing without reindenting its body."""
         counts = {"ingested": 0, "skipped": 0, "debounced": 0, "superseded": 0, "errors": 0}
         now = time.time()
         seen: set[Path] = set()

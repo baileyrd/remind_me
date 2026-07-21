@@ -875,6 +875,29 @@ async def test_server_status_no_ui(
     assert "Not running" in result
 
 
+async def test_server_status_otel_disabled_by_default(
+    db_conn: sqlite3.Connection,
+) -> None:
+    result = await remind_me_server_status()
+
+    assert "OpenTelemetry tracing:** ✗ Disabled" in result
+    assert "REMIND_ME_OTEL_ENABLED" in result
+
+
+async def test_server_status_otel_enabled(
+    db_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from remind_me_mcp import telemetry as _tel_mod
+
+    monkeypatch.setattr(_tel_mod, "OTEL_ENABLED", True)
+    monkeypatch.setattr(_tel_mod, "_init_attempted", True)
+    monkeypatch.setattr(_tel_mod, "_tracer", object())  # any non-None sentinel
+
+    result = await remind_me_server_status()
+
+    assert "OpenTelemetry tracing:** ✓ Enabled" in result
+
+
 # ---------------------------------------------------------------------------
 # remind_me_list_connectors tests (Phase 4)
 # ---------------------------------------------------------------------------
