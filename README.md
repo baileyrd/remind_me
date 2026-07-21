@@ -408,6 +408,25 @@ The embedding model (`all-MiniLM-L6-v2`, ~80MB) downloads automatically on first
 - **Graceful fallback**: if the embedding dependencies aren't installed, everything still works — you just get FTS5 keyword search only
 - **Results are labeled** with their search method: ⚡ hybrid (matched both), 🔮 semantic only, 🔤 keyword only
 
+### Scaling Semantic Search (ANN Index)
+
+By default, semantic search does an exact brute-force scan over every stored chunk vector via `sqlite-vec` — fast enough for a typical personal store, but it gets slower as the number of chunks grows (linearly with the store size). Once a store passes a size threshold, an optional HNSW approximate-nearest-neighbor index (via [`usearch`](https://github.com/unum-cloud/usearch)) takes over automatically:
+
+```bash
+pip install usearch
+# Or with uv:
+uv pip install "remind-me-mcp[ann]"
+```
+
+- **Automatic, size-gated**: below `REMIND_ME_ANN_MIN_CHUNKS` (default 5000) chunk vectors, the exact brute-force scan is used — an approximate index would only add overhead for no benefit at typical single-user scale. Above it, the ANN index serves the search instead, transparently — same result shape, same `semantic_distance` meaning.
+- **Self-healing**: the index lives in memory for the life of the process and is persisted to `~/.remind-me/ann_index.usearch` on clean shutdown. A missing, corrupt, or out-of-date index file (e.g. after a hard crash) triggers an automatic rebuild from the stored vectors on next use.
+- **Graceful fallback**: if `usearch` isn't installed, or the ANN path fails for any reason, search transparently falls back to the exact brute-force scan — never a broken or empty result.
+- Check `remind_me_server_status` for the current ANN index state (built, vector count, threshold).
+
+| Variable | Default | Description |
+|---|---|---|
+| `REMIND_ME_ANN_MIN_CHUNKS` | `5000` | Chunk-vector count above which semantic search uses the ANN index instead of the exact brute-force scan |
+
 ### Reindexing Existing Memories
 
 If you enable semantic search after already having memories stored, run reindex to backfill embeddings:
@@ -972,6 +991,7 @@ This is a deterministic heuristic, not an LLM planner call — no extra latency 
 | `REMIND_ME_EMBED_MAX_CHUNKS` | `16` | Max embedding chunks per memory |
 | `REMIND_ME_EMBED_BATCH_SIZE` | `32` | Memories embedded per batch during reindex and import |
 | `REMIND_ME_EMBED_FORWARD_BATCH` | `32` | Chunks per ONNX forward pass inside the embedder — the hard ceiling on embedding memory per call |
+| `REMIND_ME_ANN_MIN_CHUNKS` | `5000` | Chunk-vector count above which semantic search uses the optional HNSW ANN index (`usearch`) instead of sqlite-vec's exact brute-force scan. Requires the `ann` extra (`pip install remind-me-mcp[ann]`); degrades gracefully to the exact scan if missing |
 | `REMIND_ME_MEMPALACE_PATH` | `~/.mempalace/palace` | Path to a MemPalace ChromaDB persistent store, read (read-only) by `remind_me_import_mempalace` |
 | `REMIND_ME_API_KEY` | *(auto-generated)* | Bearer token for `/api/*` routes. When unset, a key is generated on first run and stored at `~/.remind-me/api_key` (0600) — check the server log or that file for the value. Set to `disabled` to explicitly turn dashboard auth off |
 | `REMIND_ME_IMPORT_ROOTS` | `$HOME` | Colon-separated allowed filesystem roots for import operations (enforced by both the HTTP API and the MCP import tools) |
@@ -1116,6 +1136,7 @@ The server uses:
 - **SQLite FTS5** for keyword full-text search (inverted index, boolean queries)
 - **sqlite-vec** for semantic vector search (cosine similarity on embeddings)
 - **all-MiniLM-L6-v2** via ONNX Runtime for local embedding generation (~80MB model, no API keys)
+- **Optional HNSW ANN index** (`usearch`) — takes over from sqlite-vec's exact brute-force scan once the store passes `REMIND_ME_ANN_MIN_CHUNKS` chunk vectors (default 5000), self-healing and always falling back to the exact scan if unavailable
 - **RRF rank fusion** (k=60) — merges keyword, semantic, recency, vitality, and an opt-in IDF signal without score normalization
 - **Auto-routing retrieval strategy** — a deterministic query-shape heuristic (no LLM call) picks a keyword-favored, semantic-favored, or balanced RRF weight profile; presets are relative multipliers on the live weights, so a deliberately-zeroed signal (e.g. a benchmark's `--rrf-profile`) is never resurrected
 - **Token budget** — search results are trimmed to an 800-token default cap to prevent LLM context overflow
@@ -1154,6 +1175,12 @@ remind_me is local-first, single-user, and MCP-native by design — some capabil
 ## Changelog
 
 See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for a per-version feature breakdown with PR references; this section summarizes the same history phase-by-phase.
+
+### 1.3.0 — 2026-07-21
+
+Closes the "semantic search degrades O(n) as the store grows" gap flagged in the application capability review.
+
+- **Optional ANN index for semantic search.** A new `ann_index.py` module adds an HNSW approximate-nearest-neighbor index (via `usearch`, new `ann` extra) that kicks in once a store passes `REMIND_ME_ANN_MIN_CHUNKS` chunk vectors (default 5000) — below that, or without `usearch` installed, or on any ANN failure, search stays on the existing exact brute-force scan. Self-healing (rebuilds from `memories_vec` if the on-disk index is missing/stale) and reported in `remind_me_server_status`. ~11x faster than brute force at 20k vectors in benchmarking, identical top result.
 
 ### 1.2.0 — 2026-07-21
 

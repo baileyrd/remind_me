@@ -124,6 +124,15 @@ bulk hub sync flattening thousands of chunks into one call) can allocate tens
 of GB and OOM the process. Callers may pass any number of texts; embed()
 processes them in slices of this size and concatenates. Keep it small."""
 
+ANN_MIN_CHUNKS = _env_int("REMIND_ME_ANN_MIN_CHUNKS", 5000)
+"""Minimum chunk-vector count (rows in memories_vec) before _semantic_search
+consults the optional HNSW ANN index (remind_me_mcp.ann_index) instead of
+sqlite-vec's exact brute-force scan. Below this, brute force is already fast
+enough that an approximate index only adds overhead and approximation error
+for no benefit — a typical single-user store never crosses it. Has no effect
+if the optional `usearch` package (the `ann` extra) isn't installed; the
+brute-force scan is always the fallback."""
+
 # ---------------------------------------------------------------------------
 # UI / dashboard
 # ---------------------------------------------------------------------------
@@ -476,6 +485,7 @@ __all__ = [
     "EMBED_CHUNK_CHARS",
     "EMBED_CHUNK_OVERLAP",
     "EMBED_MAX_CHUNKS",
+    "ANN_MIN_CHUNKS",
     "MODEL_DIR",
     "SERVE_UI",
     "UI_PORT",

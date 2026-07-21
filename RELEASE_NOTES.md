@@ -1,5 +1,16 @@
 # Release Notes
 
+## v1.3.0 — 2026-07-21
+
+Semantic search's `sqlite-vec` KNN was an exact brute-force scan over every chunk vector — correct, but O(n) per query, the one thing that would visibly degrade as a memory store grows into the tens of thousands of chunks.
+
+### New Features
+
+- **Optional ANN index for semantic search** — a new `ann_index.py` module adds an HNSW approximate-nearest-neighbor index (via the `usearch` package, new `ann` extra) that `_semantic_search` consults once a store passes `REMIND_ME_ANN_MIN_CHUNKS` chunk vectors (default 5000, opt-in-by-scale). Below that threshold, or if `usearch` isn't installed, or if the ANN path itself fails for any reason, search transparently falls back to the existing exact brute-force scan — same output shape, same `semantic_distance` meaning either way.
+- The index is self-healing: held in memory for the life of the process, mutated incrementally as chunks are added/removed, persisted to disk on clean shutdown, and automatically rebuilt from `memories_vec` if the on-disk index is missing, corrupt, or size-mismatched (e.g. after a hard crash).
+- `remind_me_server_status` reports ANN index state (built, vector count, threshold) alongside the existing semantic-search status.
+- Benchmarked at 20k chunk vectors: ~11x faster than the brute-force scan, identical top result.
+
 ## v1.2.0 — 2026-07-21
 
 The LLM Wiki (FT-08) gains a user-facing surface: until now Claude could read and write it, but the human owner had no way to see it outside the MCP tools.

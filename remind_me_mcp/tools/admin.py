@@ -520,6 +520,22 @@ async def remind_me_server_status() -> str:
         lines.append(f"**Embeddings:** {total_vecs}/{total_mems} memories indexed")
         if total_vecs < total_mems:
             lines.append(f"_Run `remind_me_reindex` to embed the remaining {total_mems - total_vecs} memories._")
+
+        # Gap #10: optional ANN index — brute-force sqlite-vec scan otherwise.
+        from remind_me_mcp import ann_index
+
+        ann = ann_index.status()
+        if ann["available"]:
+            state = f"✓ {ann['size']} vector(s) indexed" if ann["loaded"] else "not built yet (loads on first search)"
+            lines.append(
+                f"**ANN index:** {state} — used once memories_vec passes "
+                f"{ann['min_chunks_threshold']} chunks, brute-force scan below that"
+            )
+        else:
+            lines.append(
+                "**ANN index:** ✗ Unavailable (install the `ann` extra: `pip install usearch`) "
+                "— always using the exact brute-force scan"
+            )
     else:
         lines.append("\n**Semantic search:** ✗ Unavailable (install onnxruntime, tokenizers, huggingface-hub, numpy, sqlite-vec)")
 

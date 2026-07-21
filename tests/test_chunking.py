@@ -275,3 +275,165 @@ def test_failed_embed_rolls_back_chunk_deletes(
         "SELECT COUNT(*) FROM vec_chunks WHERE memory_rowid = ?", (rowid,)
     ).fetchone()[0]
     assert after == before
+
+
+# ---------------------------------------------------------------------------
+# ANN index integration (gap #10) — _semantic_search's ANN/brute-force split
+# ---------------------------------------------------------------------------
+
+usearch = pytest.importorskip("usearch", reason="usearch (the 'ann' extra) not installed")
+
+
+def test_semantic_search_uses_ann_path_once_over_threshold(
+    db_conn_with_vec: sqlite3.Connection, mock_embedder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lowering ANN_MIN_CHUNKS to 0 forces every search through the ANN path
+    (verified via a spy), and results still land on the right memory."""
+    import remind_me_mcp.db as db_mod
+    from remind_me_mcp import ann_index
+
+    monkeypatch.setattr(db_mod, "ANN_MIN_CHUNKS", 0)
+
+    calls = []
+    real_search = ann_index.search
+
+    def spy_search(db, query_vector, k):
+        calls.append(1)
+        return real_search(db, query_vector, k)
+
+    monkeypatch.setattr(ann_index, "search", spy_search)
+
+    content = "the ANN path should find this memory"
+    mem_id = _insert_memory(db_conn_with_vec, content)
+    _embed_and_store(mem_id, content)
+
+    results = _semantic_search(content, limit=5)
+    assert calls, "expected the ANN search path to be consulted"
+    assert any(r["id"] == mem_id for r in results)
+
+
+def test_semantic_search_stays_on_brute_force_below_threshold(
+    db_conn_with_vec: sqlite3.Connection, mock_embedder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default (large) threshold means a small test corpus never touches
+    the ANN path at all — verified via a spy that must not be called."""
+    import remind_me_mcp.db as db_mod
+    from remind_me_mcp import ann_index
+
+    assert db_mod.ANN_MIN_CHUNKS > 0  # sanity: production default is opt-in-by-scale
+
+    calls = []
+    monkeypatch.setattr(ann_index, "search", lambda *a, **k: calls.append(1))
+
+    content = "brute force should handle this small corpus"
+    mem_id = _insert_memory(db_conn_with_vec, content)
+    _embed_and_store(mem_id, content)
+
+    results = _semantic_search(content, limit=5)
+    assert not calls, "ANN path must not be consulted below ANN_MIN_CHUNKS"
+    assert any(r["id"] == mem_id for r in results)
+
+
+def test_semantic_search_falls_back_to_brute_force_when_ann_returns_none(
+    db_conn_with_vec: sqlite3.Connection, mock_embedder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the ANN path can't serve a result (unavailable/failed), search still
+    succeeds via the brute-force fallback — never a silent empty result."""
+    import remind_me_mcp.db as db_mod
+    from remind_me_mcp import ann_index
+
+    monkeypatch.setattr(db_mod, "ANN_MIN_CHUNKS", 0)
+    monkeypatch.setattr(ann_index, "search", lambda *a, **k: None)
+
+    content = "fallback path should still find this memory"
+    mem_id = _insert_memory(db_conn_with_vec, content)
+    _embed_and_store(mem_id, content)
+
+    results = _semantic_search(content, limit=5)
+    assert any(r["id"] == mem_id for r in results)
+
+
+def test_semantic_search_ann_path_respects_category_and_tag_filters(
+    db_conn_with_vec: sqlite3.Connection, mock_embedder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Category/tag filters apply identically whether ANN or brute force served
+    the KNN — _hydrate_ann_hits mirrors the SQL path's filter semantics."""
+    import remind_me_mcp.db as db_mod
+
+    monkeypatch.setattr(db_mod, "ANN_MIN_CHUNKS", 0)
+
+    content_a = "shared topic memory in category alpha"
+    content_b = "shared topic memory in category beta"
+    mem_a = _make_id(content_a)
+    mem_b = _make_id(content_b)
+    now = _now_iso()
+    db_conn_with_vec.execute(
+        """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
+           VALUES (?, ?, 'alpha', '[]', 'manual', '{}', ?, ?)""",
+        (mem_a, content_a, now, now),
+    )
+    db_conn_with_vec.execute(
+        """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
+           VALUES (?, ?, 'beta', '[]', 'manual', '{}', ?, ?)""",
+        (mem_b, content_b, now, now),
+    )
+    db_conn_with_vec.commit()
+    _embed_and_store(mem_a, content_a)
+    _embed_and_store(mem_b, content_b)
+
+    results = _semantic_search("shared topic memory", limit=10, category="alpha")
+    ids = {r["id"] for r in results}
+    assert mem_a in ids
+    assert mem_b not in ids
+
+
+def test_semantic_search_ann_path_excludes_superseded_memories(
+    db_conn_with_vec: sqlite3.Connection, mock_embedder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A superseded memory is excluded from ANN-served results, same as the
+    brute-force SQL path's WHERE m.superseded_by IS NULL."""
+    import remind_me_mcp.db as db_mod
+
+    monkeypatch.setattr(db_mod, "ANN_MIN_CHUNKS", 0)
+
+    content = "this memory will be marked superseded"
+    mem_id = _insert_memory(db_conn_with_vec, content)
+    _embed_and_store(mem_id, content)
+    db_conn_with_vec.execute(
+        "UPDATE memories SET superseded_by = 'someone-else' WHERE id = ?", (mem_id,)
+    )
+    db_conn_with_vec.commit()
+
+    results = _semantic_search(content, limit=10)
+    assert all(r["id"] != mem_id for r in results)
+
+
+def test_semantic_search_ann_and_brute_force_agree_on_dedup_and_ranking(
+    db_conn_with_vec: sqlite3.Connection, mock_embedder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same corpus, same query: the ANN path and the brute-force path return
+    the same set of memory ids in the same order (exact KNN either way at
+    this small scale — usearch's HNSW is exact, not approximate, until the
+    corpus is large enough to build a multi-layer graph)."""
+    import remind_me_mcp.db as db_mod
+    from remind_me_mcp import ann_index
+
+    content = " ".join(f"piece{i}" for i in range(800))  # multi-chunk memory
+    chunks = chunk_text(content)
+    assert len(chunks) > 1
+    mem_id = _insert_memory(db_conn_with_vec, content)
+    _embed_and_store(mem_id, content)
+    for i in range(4):
+        _insert_memory(db_conn_with_vec, f"unrelated noise memory number {i}")
+        # (left unembedded — brute force and ANN both only see embedded rows)
+
+    monkeypatch.setattr(db_mod, "ANN_MIN_CHUNKS", 999999)
+    brute_force = _semantic_search(chunks[0], limit=10)
+
+    ann_index.reset_for_tests()
+    monkeypatch.setattr(db_mod, "ANN_MIN_CHUNKS", 0)
+    via_ann = _semantic_search(chunks[0], limit=10)
+
+    assert [r["id"] for r in via_ann] == [r["id"] for r in brute_force]
+    for a, b in zip(via_ann, brute_force, strict=True):
+        assert a["semantic_distance"] == pytest.approx(b["semantic_distance"], abs=1e-4)
