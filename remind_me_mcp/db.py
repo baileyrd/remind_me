@@ -2247,6 +2247,86 @@ def _entity_profile(
     }
 
 
+def _supersede_contradicting_facts(
+    db: sqlite3.Connection,
+    memory_id: str,
+    subject: str | None,
+    predicate: str | None,
+    obj: str | None,
+    now: str,
+) -> list[str]:
+    """Supersede facts a new/updated SPO triple contradicts (gap #5).
+
+    Supersession previously only happened via similarity-merge
+    (``remind_me_consolidate``) — near-duplicate memories get merged. Nothing
+    let a genuinely contradictory update replace an old fact: "I moved to
+    Boston" doesn't textually resemble "I live in Seattle" even though
+    they're in direct conflict. This closes that gap deterministically using
+    the SPO columns that already exist: another non-superseded, non-deleted
+    memory that shares this triple's (subject, predicate) but has a
+    *different* object is a contradiction and gets superseded by
+    *memory_id* — the same ``superseded_by`` mechanism similarity-merge
+    already uses, so every existing superseded-exclusion read path picks
+    this up for free.
+
+    Comparison uses :func:`_normalize_entity_name` (lowercase + whitespace-
+    collapse, the same normalization the entity graph uses for identity) on
+    all three fields in Python — not predicate-inference: "I live in
+    Seattle" (predicate ``lives_in``) does NOT contradict "I visited
+    Seattle" (predicate ``visited``) — the two facts simply don't share a
+    predicate, so a differently-worded predicate for a related-but-distinct
+    claim is a false-positive risk the caller (an LLM choosing predicate
+    names) controls, not something this function tries to resolve.
+
+    Args:
+        db: An open SQLite connection. Does not commit.
+        memory_id: The id of the new/updated memory whose triple is being
+            checked — excluded from its own candidate search, and used as
+            the new ``superseded_by`` target for anything it contradicts.
+        subject: The triple's subject, or None/empty to skip (no-op).
+        predicate: The triple's predicate, or None/empty to skip.
+        obj: The triple's object, or None/empty to skip.
+        now: Canonical timestamp written to a superseded row's ``updated_at``
+            (so the change syncs, same as any other supersession).
+
+    Returns:
+        The ids of memories that were superseded by this call (0 or more).
+    """
+    if not subject or not predicate or not obj:
+        return []
+    subj_canon = _normalize_entity_name(subject)
+    pred_canon = _normalize_entity_name(predicate)
+    obj_canon = _normalize_entity_name(obj)
+
+    # A plain SQL lower()/= comparison would miss internal-whitespace
+    # variants (_normalize_entity_name also collapses those), so this only
+    # narrows to non-null-triple candidates in SQL and does the exact
+    # subject/predicate/object comparison in Python.
+    rows = db.execute(
+        """SELECT id, subject, predicate, object FROM memories
+           WHERE id != ?
+             AND superseded_by IS NULL AND deleted_at IS NULL
+             AND subject IS NOT NULL AND predicate IS NOT NULL AND object IS NOT NULL""",
+        (memory_id,),
+    ).fetchall()
+
+    superseded_ids: list[str] = []
+    for row in rows:
+        if (
+            _normalize_entity_name(str(row["subject"])) != subj_canon
+            or _normalize_entity_name(str(row["predicate"])) != pred_canon
+        ):
+            continue
+        if _normalize_entity_name(str(row["object"])) == obj_canon:
+            continue  # same fact restated verbatim, not a contradiction
+        db.execute(
+            "UPDATE memories SET superseded_by = ?, updated_at = ? WHERE id = ?",
+            (memory_id, now, row["id"]),
+        )
+        superseded_ids.append(row["id"])
+    return superseded_ids
+
+
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     """Convert a sqlite3.Row to a plain dict, deserializing JSON fields.
 
@@ -2298,5 +2378,6 @@ __all__ = [
     "_upsert_entity_relation",
     "_resolve_entity",
     "_entity_profile",
+    "_supersede_contradicting_facts",
     "_row_to_dict",
 ]

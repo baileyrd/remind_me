@@ -1,5 +1,14 @@
 # Release Notes
 
+## v1.5.0 — 2026-07-21
+
+Closes a real gap in the living-memory model: supersession only ever happened via similarity-merge (near-duplicate memories get consolidated), so a genuinely contradictory update — "I moved to Boston" — never replaced an old fact like "I live in Seattle," since the two statements share no text.
+
+### New Features
+
+- **Contradiction-based supersession** — a new `_supersede_contradicting_facts` (`db.py`) deterministically supersedes any other non-superseded, non-deleted memory that shares a new/updated SPO triple's subject+predicate but has a different object. Wired into every place a triple gets attached to a memory: `remind_me_add`, `remind_me_decompose` (per extracted fact), and `remind_me_annotate` (re-checking the memory's full current triple, since annotations can be partial). Uses the same `superseded_by` mechanism as similarity-merge, so every existing superseded-exclusion read path (search, list, entity lookups) picks it up automatically.
+- Deliberately narrow to avoid false positives: a differently-worded predicate never contradicts — "I live in Seattle" and "I visited Boston" don't collide, since they don't share a predicate.
+
 ## v1.4.0 — 2026-07-21
 
 Fixes a real multi-device correctness bug: sync had no delete semantics at all. Deleting a memory on one device was a hard `DELETE`, which produces no `sync_outbox` row (the sync triggers only fire on INSERT/UPDATE) — so the next pull from another device silently resurrected it.

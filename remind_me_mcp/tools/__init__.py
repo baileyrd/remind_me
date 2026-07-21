@@ -54,6 +54,7 @@ from remind_me_mcp.db import (
     _resolve_entity,
     _row_to_dict,
     _semantic_search,
+    _supersede_contradicting_facts,
     _upsert_entity,
     _upsert_entity_relation,
 )
