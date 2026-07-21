@@ -30,6 +30,24 @@ class ResponseFormat(StrEnum):
     JSON = "json"
 
 
+class RetrievalStrategy(StrEnum):
+    """RRF weight profile for remind_me_search (Phase 6).
+
+    AUTO applies a deterministic heuristic router based on query shape:
+    quoted phrases, prefix* wildcards, or very short queries favor keyword
+    relevance and the IDF signal; long natural-language/question-shaped
+    queries favor semantic similarity. The other three values pin an
+    explicit preset — an escape hatch, and easy to A/B in benchmarks/.
+    BALANCED reproduces the tuned RRF defaults exactly (no signal
+    overridden).
+    """
+
+    AUTO = "auto"
+    BALANCED = "balanced"
+    KEYWORD_FAVORED = "keyword_favored"
+    SEMANTIC_FAVORED = "semantic_favored"
+
+
 # ---------------------------------------------------------------------------
 # Pydantic input models
 # ---------------------------------------------------------------------------
@@ -183,6 +201,18 @@ class MemorySearchInput(BaseModel):
             "adjacent chunk position) for any result that came from an import, "
             "in a separate related_via_neighbors section. Does not affect the "
             "main ranking."
+        ),
+    )
+    strategy: RetrievalStrategy = Field(
+        default=RetrievalStrategy.AUTO,
+        description=(
+            "RRF weight profile: 'auto' (default) routes by query shape — "
+            "quoted phrases/prefix*/short queries favor keyword+IDF, long "
+            "natural-language/question-shaped queries favor semantic. "
+            "'balanced' pins the tuned defaults; 'keyword_favored' and "
+            "'semantic_favored' pin an explicit preset regardless of query "
+            "shape. Only affects the hybrid ranking path (not structured "
+            "subject:/predicate:/entity: lookups)."
         ),
     )
 
@@ -1034,6 +1064,7 @@ class VitalityReportInput(BaseModel):
 
 __all__ = [
     "ResponseFormat",
+    "RetrievalStrategy",
     "MemoryAddInput",
     "MemorySearchInput",
     "FeedbackInput",

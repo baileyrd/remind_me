@@ -566,6 +566,163 @@ class TestBuildDebugSignals:
 
         assert signals["days_old"] is None
 
+    def test_strategy_and_weights_omitted_by_default(self):
+        """Pre-Phase-6 callers (no strategy/weights args) see no new keys."""
+        from remind_me_mcp.retrieval import build_debug_signals
+
+        mem = _mem("A")
+
+        signals = build_debug_signals(mem)
+
+        assert "strategy" not in signals
+        assert "weights_used" not in signals
+
+    def test_strategy_and_weights_included_when_provided(self):
+        from remind_me_mcp.retrieval import build_debug_signals
+
+        mem = _mem("A")
+        weights = {"w_keyword": 1.5, "w_semantic": 0.5}
+
+        signals = build_debug_signals(mem, strategy="keyword_favored", weights=weights)
+
+        assert signals["strategy"] == "keyword_favored"
+        assert signals["weights_used"] == weights
+
+
+# ---------------------------------------------------------------------------
+# choose_rrf_weights / resolve_strategy_weights (Phase 6: auto-routing)
+# ---------------------------------------------------------------------------
+
+
+class TestChooseRrfWeights:
+    """Tests for the deterministic query-shape heuristic router.
+
+    resolve_strategy_weights() reads the live RRF_W_* module constants, so
+    every case here monkeypatches them to a fixed, known baseline first —
+    tests must not depend on whatever the ambient default happens to be.
+    """
+
+    def _set_weights(self, monkeypatch, **overrides):
+        import remind_me_mcp.retrieval as retr
+
+        defaults = {"RRF_W_KEYWORD": 1.0, "RRF_W_SEMANTIC": 1.0, "RRF_W_RECENCY": 1.0, "RRF_W_VITALITY": 1.0, "RRF_W_IDF": 0.0}
+        defaults.update(overrides)
+        for name, value in defaults.items():
+            monkeypatch.setattr(retr, name, value)
+
+    def test_short_query_favors_keyword(self, monkeypatch):
+        from remind_me_mcp.retrieval import choose_rrf_weights
+
+        self._set_weights(monkeypatch)
+        expected = {"w_keyword": 1.5, "w_semantic": 0.5, "w_recency": 1.0, "w_vitality": 1.0, "w_idf": 0.0}
+        assert choose_rrf_weights("tailscale") == expected
+        assert choose_rrf_weights("vpn setup") == expected
+
+    def test_quoted_phrase_favors_keyword(self, monkeypatch):
+        from remind_me_mcp.retrieval import choose_rrf_weights
+
+        self._set_weights(monkeypatch)
+        weights = choose_rrf_weights('"exact phrase match" in a longer natural sentence')
+        assert weights["w_keyword"] == 1.5
+        assert weights["w_semantic"] == 0.5
+
+    def test_prefix_wildcard_favors_keyword(self, monkeypatch):
+        from remind_me_mcp.retrieval import choose_rrf_weights
+
+        self._set_weights(monkeypatch)
+        weights = choose_rrf_weights("deploy* related notes from last quarter")
+        assert weights["w_keyword"] == 1.5
+        assert weights["w_semantic"] == 0.5
+
+    def test_structured_always_favors_keyword_regardless_of_shape(self, monkeypatch):
+        from remind_me_mcp.retrieval import choose_rrf_weights
+
+        self._set_weights(monkeypatch)
+        long_natural_language = "how did we decide to configure the VPN last month?"
+        weights = choose_rrf_weights(long_natural_language, structured=True)
+        assert weights["w_keyword"] == 1.5
+        assert weights["w_semantic"] == 0.5
+
+    def test_no_semantic_always_favors_keyword_regardless_of_shape(self, monkeypatch):
+        from remind_me_mcp.retrieval import choose_rrf_weights
+
+        self._set_weights(monkeypatch)
+        long_natural_language = "how did we decide to configure the VPN last month?"
+        weights = choose_rrf_weights(long_natural_language, has_semantic=False)
+        assert weights["w_keyword"] == 1.5
+        assert weights["w_semantic"] == 0.5
+
+    def test_long_natural_language_query_favors_semantic(self, monkeypatch):
+        from remind_me_mcp.retrieval import choose_rrf_weights
+
+        self._set_weights(monkeypatch)
+        weights = choose_rrf_weights("what did we decide about the VPN configuration last month")
+        assert weights["w_keyword"] == 0.5
+        assert weights["w_semantic"] == 1.5
+
+    def test_question_shaped_query_favors_semantic(self, monkeypatch):
+        from remind_me_mcp.retrieval import choose_rrf_weights
+
+        self._set_weights(monkeypatch)
+        weights = choose_rrf_weights("why is the vpn slow?")
+        assert weights["w_keyword"] == 0.5
+        assert weights["w_semantic"] == 1.5
+
+    def test_mid_length_non_question_query_is_balanced(self, monkeypatch):
+        from remind_me_mcp.retrieval import choose_rrf_weights
+
+        self._set_weights(monkeypatch)
+        # 3-5 words, no quotes/wildcards/question mark: neither heuristic fires.
+        weights = choose_rrf_weights("vpn config from last week")
+        assert weights == {"w_keyword": 1.0, "w_semantic": 1.0, "w_recency": 1.0, "w_vitality": 1.0, "w_idf": 0.0}
+
+    def test_balanced_reproduces_live_defaults_exactly(self, monkeypatch):
+        """Splatting the balanced resolution into rank_rrf is identical to
+        no override at all — the "auto"-safe guarantee for typical queries."""
+        import remind_me_mcp.retrieval as retr
+        from remind_me_mcp.retrieval import resolve_strategy_weights
+
+        self._set_weights(monkeypatch, RRF_W_IDF=1.0)  # a non-default value, to prove it's read live
+        keyword = [_mem("A"), _mem("B")]
+        semantic = [_mem("B"), _mem("A")]
+
+        default = retr.rank_rrf(keyword, semantic)
+        with_balanced = retr.rank_rrf(keyword, semantic, **resolve_strategy_weights("balanced"))
+
+        assert [m["id"] for m in default] == [m["id"] for m in with_balanced]
+        assert [m["_rrf_score"] for m in default] == [m["_rrf_score"] for m in with_balanced]
+
+    def test_favored_presets_never_resurrect_a_profile_zeroed_signal(self, monkeypatch):
+        """Regression guard: benchmarks/runner.py's --rrf-profile monkeypatches
+        RRF_W_KEYWORD/RECENCY/VITALITY to 0 directly. A keyword/semantic
+        rebalance must not silently un-zero a signal a profile deliberately
+        dropped (0 * multiplier == 0, not the multiplier's raw value)."""
+        from remind_me_mcp.retrieval import resolve_strategy_weights
+
+        self._set_weights(monkeypatch, RRF_W_KEYWORD=0.0, RRF_W_RECENCY=0.0, RRF_W_VITALITY=0.0)
+
+        keyword_favored = resolve_strategy_weights("keyword_favored")
+        assert keyword_favored["w_keyword"] == 0.0  # stays zeroed, not bumped to 1.5x-of-zero-but-nonzero
+        assert keyword_favored["w_recency"] == 0.0
+        assert keyword_favored["w_vitality"] == 0.0
+
+        semantic_favored = resolve_strategy_weights("semantic_favored")
+        assert semantic_favored["w_keyword"] == 0.0
+        assert semantic_favored["w_recency"] == 0.0
+        assert semantic_favored["w_vitality"] == 0.0
+
+    def test_strategy_presets_keys_match_rank_rrf_kwargs(self):
+        """Every resolved preset is directly splattable into rank_rrf's weight kwargs."""
+        import inspect
+
+        from remind_me_mcp.retrieval import STRATEGY_PRESETS, rank_rrf, resolve_strategy_weights
+
+        rank_rrf_kwargs = set(inspect.signature(rank_rrf).parameters) - {
+            "keyword_results", "semantic_results", "k",
+        }
+        for name in STRATEGY_PRESETS:
+            assert set(resolve_strategy_weights(name)) <= rank_rrf_kwargs, f"{name} has unexpected keys"
+
 
 # ---------------------------------------------------------------------------
 # compute_tier_breakdown

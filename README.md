@@ -36,6 +36,7 @@ Persistent, searchable memory that works across **Claude.ai**, **Claude Code**, 
 - **Full-text search** via SQLite FTS5 — fast, offline, no external services
 - **Hybrid semantic search** — FTS5 keyword matching + vector similarity via `sqlite-vec` and a local ONNX embedding model
 - **RRF rank fusion** — Reciprocal Rank Fusion merges keyword, semantic, recency, vitality, and an opt-in IDF signal for best-match retrieval
+- **Auto-routing retrieval strategy** — `strategy=auto` (default) heuristically rebalances keyword vs. semantic weight by query shape (short/quoted/wildcard queries favor keyword, long/question-shaped queries favor semantic); pin `balanced`/`keyword_favored`/`semantic_favored` explicitly to A/B test
 - **Structured queries** — `subject:`, `predicate:`, and `entity:"..."` filters route straight to indexed lookups; opt-in 1-hop graph expansion surfaces related memories
 - **Neighbor-aware chunk retrieval** — opt-in expansion surfaces a result's adjacent chunks from the same source document, so context split apart by chunking isn't lost
 - **Token budget** — search results are trimmed to fit within an 800-token default cap (configurable), preventing context overflow
@@ -270,7 +271,7 @@ The stats view replaces the main content area with summary cards, horizontal bar
 
 | Tool | Description |
 |------|-------------|
-| `remind_me_search` | Hybrid search with RRF rank fusion, token budget, dormant exclusion, structured `subject:`/`predicate:`/`entity:` queries, opt-in `expand_entities` graph expansion, and opt-in `include_neighbors` sibling-chunk expansion |
+| `remind_me_search` | Hybrid search with RRF rank fusion, auto-routed or pinned ranking `strategy`, token budget, dormant exclusion, structured `subject:`/`predicate:`/`entity:` queries, opt-in `expand_entities` graph expansion, and opt-in `include_neighbors` sibling-chunk expansion |
 | `remind_me_entity` | Look up a knowledge-graph entity by name or alias: canonical record, facts, and linked memories |
 | `remind_me_entity_traverse` | Multi-hop traversal of the typed entity-relation graph (1-3 hops, both directions, optional relation filter) — for questions that require chaining relations, not just co-mention |
 | `remind_me_feedback` | Mark a memory helpful/unhelpful for a search result — a signed signal into `base_weight`/vitality (and therefore future ranking), distinct from the always-positive reinforcement of a plain access |
@@ -886,6 +887,19 @@ An unresolvable `entity:` filter returns an empty result with a message (no sile
 
 Documents and chat exports are chunked on import (per Markdown section or per message); every chunk from the same file is tagged with a shared `doc_id` and a sequential `chunk_index`. Pass `include_neighbors=true` on `remind_me_search` to append up to 5 additional non-superseded sibling chunks — chunk_index ± 1 within the same `doc_id` — for any result that came from an import, in a separate `related_via_neighbors` section that doesn't affect ranking. This surfaces the surrounding context (a preceding heading, a caveat in the next paragraph) that per-chunk retrieval alone can split apart. Manually added memories (`remind_me_add`, `remind_me_auto_capture`, ...) have no `doc_id`/`chunk_index` and are skipped.
 
+### Auto-Routing Retrieval Strategy
+
+`remind_me_search`'s `strategy` parameter picks the RRF weight profile used to fuse keyword and semantic ranking:
+
+| Value | Behavior |
+|-------|----------|
+| `auto` (default) | Deterministic heuristic on query shape: quoted phrases, `prefix*` wildcards, or queries of 2 words or fewer favor keyword relevance; long (6+ word) or question-shaped (ending in `?`) natural-language queries favor semantic similarity; everything else is balanced |
+| `balanced` | Pins the tuned RRF defaults (equivalent to not overriding anything) |
+| `keyword_favored` | Always favors keyword relevance, regardless of query shape |
+| `semantic_favored` | Always favors semantic similarity, regardless of query shape |
+
+This is a deterministic heuristic, not an LLM planner call — no extra latency or opacity on the search hot path, consistent with keeping server-side synthesis out of scope. `keyword_favored`/`semantic_favored` are relative *multipliers* on top of whatever RRF weights are already configured (`REMIND_ME_RRF_W_*` env vars), not fixed replacements — a signal you've deliberately zeroed stays zeroed. `strategy` only affects the hybrid ranking path; structured `subject:`/`predicate:`/`entity:` lookups bypass RRF entirely. Pass `verbose=true` to see the resolved `strategy` and `weights_used` in each result's `debug_signals`.
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -1046,6 +1060,7 @@ The server uses:
 - **sqlite-vec** for semantic vector search (cosine similarity on embeddings)
 - **all-MiniLM-L6-v2** via ONNX Runtime for local embedding generation (~80MB model, no API keys)
 - **RRF rank fusion** (k=60) — merges keyword, semantic, recency, vitality, and an opt-in IDF signal without score normalization
+- **Auto-routing retrieval strategy** — a deterministic query-shape heuristic (no LLM call) picks a keyword-favored, semantic-favored, or balanced RRF weight profile; presets are relative multipliers on the live weights, so a deliberately-zeroed signal (e.g. a benchmark's `--rrf-profile`) is never resurrected
 - **Token budget** — search results are trimmed to an 800-token default cap to prevent LLM context overflow
 - **ACT-R vitality model** — cognitive-science decay with per-category rates, access reinforcement, signed helpful/unhelpful feedback, and bridge protection
 - **Structured triples** — subject/predicate/object columns with indexed query routing

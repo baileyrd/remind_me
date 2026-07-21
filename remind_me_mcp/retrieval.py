@@ -198,6 +198,130 @@ def rank_rrf(
 
 
 # ---------------------------------------------------------------------------
+# Auto-routing retrieval strategy (Phase 6)
+# ---------------------------------------------------------------------------
+
+# Named RRF weight profiles, expressed as MULTIPLIERS applied on top of the
+# LIVE RRF_W_* module constants (read at call time by
+# :func:`resolve_strategy_weights`) rather than fixed absolute numbers. This
+# matters: those constants are exactly what env vars and
+# ``benchmarks/runner.py --rrf-profile`` override/monkeypatch, and a
+# multiplicative nudge composes with that instead of silently overriding it
+# -- e.g. under ``--rrf-profile semantic`` (w_keyword forced to 0), a
+# "keyword_favored" route still leaves w_keyword at 0 (0 * 1.5 == 0) rather
+# than resurrecting a signal the profile deliberately zeroed. A key absent
+# from a preset has an implicit multiplier of 1.0 (no change).
+_BALANCED_MULTIPLIERS: dict[str, float] = {}
+
+# Quoted phrases, prefix* wildcards, and structured/no-semantic queries are
+# exact-match-shaped -- lean on keyword relevance. Semantic isn't dropped to
+# 0: even a keyword-shaped query can have a semantically-relevant hit worth
+# surfacing, just weighted lower.
+_KEYWORD_FAVORED_MULTIPLIERS: dict[str, float] = {"w_keyword": 1.5, "w_semantic": 0.5}
+
+# Long, natural-language, question-shaped queries rarely share exact terms
+# with the memory they're looking for -- lean on semantic similarity.
+_SEMANTIC_FAVORED_MULTIPLIERS: dict[str, float] = {"w_keyword": 0.5, "w_semantic": 1.5}
+
+STRATEGY_PRESETS: dict[str, dict[str, float]] = {
+    "balanced": _BALANCED_MULTIPLIERS,
+    "keyword_favored": _KEYWORD_FAVORED_MULTIPLIERS,
+    "semantic_favored": _SEMANTIC_FAVORED_MULTIPLIERS,
+}
+"""Maps a ``MemorySearchInput.strategy`` value (the non-``"auto"`` explicit
+pins -- the escape hatch, also handy for A/B testing in ``benchmarks/``) to
+its RRF weight multipliers. These are multipliers, not final weights --
+resolve with :func:`resolve_strategy_weights`, don't splat this dict
+directly into :func:`rank_rrf`."""
+
+
+def resolve_strategy_weights(strategy: str) -> dict[str, float]:
+    """Resolve a named strategy preset into concrete RRF weights.
+
+    Applies the preset's multiplier (from :data:`STRATEGY_PRESETS`) on top
+    of the current ``RRF_W_*`` module constants, read at call time so env
+    overrides and test/benchmark monkeypatches are always respected --
+    ``"balanced"`` (an empty multiplier dict) reproduces them exactly.
+
+    Args:
+        strategy: One of :data:`STRATEGY_PRESETS`'s keys.
+
+    Returns:
+        Concrete weights (``w_keyword``/``w_semantic``/``w_recency``/
+        ``w_vitality``/``w_idf``) suitable for splatting into
+        :func:`rank_rrf`.
+    """
+    multipliers = STRATEGY_PRESETS[strategy]
+    base = {
+        "w_keyword": RRF_W_KEYWORD,
+        "w_semantic": RRF_W_SEMANTIC,
+        "w_recency": RRF_W_RECENCY,
+        "w_vitality": RRF_W_VITALITY,
+        "w_idf": RRF_W_IDF,
+    }
+    return {key: value * multipliers.get(key, 1.0) for key, value in base.items()}
+
+
+# A query this short reads as a keyword/id lookup rather than a natural-
+# language question -- there usually isn't enough text for semantic
+# similarity to add value over exact term matching.
+_KEYWORD_SHAPE_MAX_WORDS = 2
+
+# A query this long, or one that reads as a question, is natural-language
+# shaped -- it rarely shares exact terms with the memory it's looking for.
+_SEMANTIC_SHAPE_MIN_WORDS = 6
+
+
+def _looks_keyword_shaped(query: str) -> bool:
+    """True for quoted phrases, prefix* wildcards, or very short queries.
+
+    These read as exact-match/keyword-style lookups (FTS5 phrase/prefix
+    syntax, or a bare word or two) rather than natural-language questions.
+    """
+    return '"' in query or "*" in query or len(query.split()) <= _KEYWORD_SHAPE_MAX_WORDS
+
+
+def _looks_semantic_shaped(query: str) -> bool:
+    """True for long or question-shaped natural-language queries."""
+    return len(query.split()) >= _SEMANTIC_SHAPE_MIN_WORDS or query.rstrip().endswith("?")
+
+
+def choose_rrf_weights(
+    query: str,
+    *,
+    structured: bool = False,
+    has_semantic: bool = True,
+) -> dict[str, float]:
+    """Heuristically route a query to an RRF weight profile (Phase 6).
+
+    A deterministic heuristic on the query's observable shape -- not an
+    in-server LLM planner call, which would add latency/cost/opacity to a
+    deliberately lightweight retrieval layer (the same reasoning that keeps
+    server-side answer synthesis out of scope). Extends the same "route by
+    query shape" idea already used by ``_detect_structured_query``.
+
+    Args:
+        query: The search query (structured subject:/predicate:/entity:
+            prefixes already stripped, if any were present).
+        structured: True when the query used structured (subject:/
+            predicate:/entity:) syntax -- these are keyword-shaped by
+            construction, even after stripping for the fallback search.
+        has_semantic: False when no semantic tier is available (no
+            embedder) -- a semantic weight is meaningless then, so always
+            favor keyword regardless of query shape.
+
+    Returns:
+        Concrete weights from :func:`resolve_strategy_weights`, suitable
+        for splatting into :func:`rank_rrf`.
+    """
+    if structured or not has_semantic or _looks_keyword_shaped(query):
+        return resolve_strategy_weights("keyword_favored")
+    if _looks_semantic_shaped(query):
+        return resolve_strategy_weights("semantic_favored")
+    return resolve_strategy_weights("balanced")
+
+
+# ---------------------------------------------------------------------------
 # Token budget trimming
 # ---------------------------------------------------------------------------
 
@@ -265,7 +389,12 @@ def apply_token_budget(ranked_memories: list[dict], budget: int) -> SearchEnvelo
 # ---------------------------------------------------------------------------
 
 
-def build_debug_signals(memory: dict) -> dict:
+def build_debug_signals(
+    memory: dict,
+    *,
+    strategy: str | None = None,
+    weights: dict[str, float | None] | None = None,
+) -> dict:
     """Extract ranking debug signals from an RRF-ranked memory dict.
 
     Returns a dict with keys: semantic_rank, keyword_rank, recency_rank,
@@ -276,6 +405,12 @@ def build_debug_signals(memory: dict) -> dict:
 
     Args:
         memory: A memory dict augmented by :func:`rank_rrf` with rank metadata.
+        strategy: The resolved ``MemorySearchInput.strategy`` value (Phase
+            6), when the caller wants it surfaced. Omitted (None) leaves it
+            out of the result entirely, so pre-Phase-6 callers see no change.
+        weights: The RRF weight profile actually used for this search (a
+            :data:`STRATEGY_PRESETS`-shaped dict; ``None`` entries mean "the
+            module default was used"). Omitted the same way as *strategy*.
 
     Returns:
         Dict of debug signal values for transparency/explainability.
@@ -291,7 +426,7 @@ def build_debug_signals(memory: dict) -> dict:
         except (ValueError, TypeError):
             days_old = None
 
-    return {
+    signals = {
         "semantic_rank": memory.get("_semantic_rank"),
         "keyword_rank": memory.get("_keyword_rank"),
         "recency_rank": memory.get("_recency_rank"),
@@ -302,6 +437,11 @@ def build_debug_signals(memory: dict) -> dict:
         "search_method": memory.get("_search_method"),
         "days_old": days_old,
     }
+    if strategy is not None:
+        signals["strategy"] = strategy
+    if weights is not None:
+        signals["weights_used"] = weights
+    return signals
 
 
 def compute_tier_breakdown(memories: list[dict]) -> dict[str, int]:
@@ -333,4 +473,7 @@ __all__ = [
     "apply_token_budget",
     "build_debug_signals",
     "compute_tier_breakdown",
+    "STRATEGY_PRESETS",
+    "resolve_strategy_weights",
+    "choose_rrf_weights",
 ]
