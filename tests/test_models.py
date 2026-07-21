@@ -17,6 +17,7 @@ from remind_me_mcp.models import (
     AutoCaptureInput,
     BulkImportDirInput,
     ChatImportInput,
+    DbsImportInput,
     MemoryAddInput,
     MemoryDeleteInput,
     MemoryListInput,
@@ -325,6 +326,81 @@ def test_bulk_import_respects_custom_roots(tmp_path: Path, monkeypatch: pytest.M
     with pytest.raises(ValidationError) as exc_info:
         BulkImportDirInput(directory=str(outside))
     assert "not in allowed import roots" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# DbsImportInput
+# ---------------------------------------------------------------------------
+
+
+def test_dbs_import_valid(tmp_path: Path) -> None:
+    """Real file path is accepted by the validator."""
+    f = tmp_path / "dbs.sqlite3"
+    f.write_text("")
+    m = DbsImportInput(db_path=str(f))
+    assert Path(m.db_path).exists()
+
+
+def test_dbs_import_nonexistent_path(tmp_path: Path) -> None:
+    """Path to a missing file (inside allowed roots) raises 'File not found'.
+
+    SE-02: the containment check fires before the existence check, so the
+    missing file must live inside IMPORT_ROOTS to exercise this branch.
+    """
+    with pytest.raises(ValidationError) as exc_info:
+        DbsImportInput(db_path=str(tmp_path / "missing.sqlite3"))
+    assert "File not found" in str(exc_info.value)
+
+
+def test_dbs_import_rejects_path_outside_import_roots() -> None:
+    """SE-02: a file outside IMPORT_ROOTS is rejected before any existence check.
+
+    Previously missing on DbsImportInput entirely -- _open_dbs_db only
+    checked existence, so a caller could point db_path at any readable
+    file anywhere on disk.
+    """
+    with pytest.raises(ValidationError) as exc_info:
+        DbsImportInput(db_path="/etc/passwd")
+    assert "not in allowed import roots" in str(exc_info.value)
+
+
+def test_dbs_import_rejects_traversal_outside_roots() -> None:
+    """SE-02: traversal sequences are resolved before the containment check."""
+    traversal = str(Path.home() / ".." / ".." / "etc" / "passwd")
+    with pytest.raises(ValidationError) as exc_info:
+        DbsImportInput(db_path=traversal)
+    assert "not in allowed import roots" in str(exc_info.value)
+
+
+def test_dbs_import_respects_custom_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """SE-02: restricting IMPORT_ROOTS rejects files outside the configured root."""
+    import remind_me_mcp.config as _cfg
+
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    inside = allowed / "dbs.sqlite3"
+    inside.write_text("")
+    outside = tmp_path / "dbs.sqlite3"
+    outside.write_text("")
+
+    monkeypatch.setattr(_cfg, "IMPORT_ROOTS", [allowed.resolve()])
+
+    assert DbsImportInput(db_path=str(inside)).db_path == str(inside.resolve())
+    with pytest.raises(ValidationError) as exc_info:
+        DbsImportInput(db_path=str(outside))
+    assert "not in allowed import roots" in str(exc_info.value)
+
+
+def test_dbs_import_defaults(tmp_path: Path) -> None:
+    f = tmp_path / "dbs.sqlite3"
+    f.write_text("")
+    m = DbsImportInput(db_path=str(f))
+    assert m.source == ""
+    assert m.item_type == ""
+    assert m.limit == 500
+    assert m.offset == 0
+    assert m.tags == []
+    assert m.dry_run is False
 
 
 # ---------------------------------------------------------------------------

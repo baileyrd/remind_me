@@ -217,6 +217,11 @@ async def memory_import_dbs(params: DbsImportInput) -> str:
         return json.dumps(result, indent=2)
     except FileNotFoundError as e:
         return json.dumps({"status": "error", "error": str(e)})
+    except sqlite3.DatabaseError as e:
+        # Covers both a locked dbs database (dbs itself writing
+        # concurrently -- sqlite3.OperationalError, a DatabaseError
+        # subclass) and a corrupt/non-SQLite file at db_path.
+        return json.dumps({"status": "error", "error": f"Could not read dbs database: {e}"})
 
 
 @mcp.tool(
