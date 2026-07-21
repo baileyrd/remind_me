@@ -141,6 +141,26 @@ def test_ingest_creates_memories(
     assert row["content"] == "Pushed via webhook, hello world."
 
 
+def test_ingest_wrapped_in_telemetry_span(
+    webhook_url: str, webhook_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Webhook ingestion previously had no OTEL span at all, unlike every
+    other ingestion path (file import, watcher scan, sync cycle) -- assert
+    do_POST wraps import_content() in a 'webhook.ingest' span."""
+    spans: list[str] = []
+    real_maybe_span = webhook_server.maybe_span
+
+    def spy_maybe_span(name, **attrs):
+        spans.append(name)
+        return real_maybe_span(name, **attrs)
+
+    monkeypatch.setattr(webhook_server, "maybe_span", spy_maybe_span)
+
+    resp = httpx.post(f"{webhook_url}/ingest", json=chat_payload(), headers=AUTH)
+    assert resp.status_code == 200
+    assert spans == ["webhook.ingest"]
+
+
 def test_ingest_document_kind(webhook_url: str, webhook_db: sqlite3.Connection) -> None:
     resp = httpx.post(
         f"{webhook_url}/ingest",

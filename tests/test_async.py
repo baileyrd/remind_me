@@ -363,3 +363,26 @@ async def test_app_lifespan_closes_db_when_body_raises(monkeypatch: pytest.Monke
             raise RuntimeError("boom")
 
     assert closed == [True]
+
+
+async def test_app_lifespan_stops_peer_server_before_closing_db(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The peer server previously had no stop hook in app_lifespan, so an
+    in-flight peer request could race _close_db() on shutdown. Assert the
+    stop happens, and happens before the DB closes."""
+    import remind_me_mcp.peer_server as _peer_mod
+    import remind_me_mcp.server as _srv_mod
+    import remind_me_mcp.updater as _updater_mod
+
+    order: list[str] = []
+    monkeypatch.setattr(_srv_mod, "_get_db", lambda: object())
+    monkeypatch.setattr(_srv_mod, "_close_db", lambda: order.append("close_db"))
+    monkeypatch.setattr(_updater_mod, "start_background_check", lambda: None)
+    monkeypatch.setattr(_peer_mod, "stop_peer_server", lambda: order.append("stop_peer_server"))
+
+    async with _srv_mod.app_lifespan(None):
+        pass
+
+    assert "stop_peer_server" in order
+    assert order.index("stop_peer_server") < order.index("close_db")

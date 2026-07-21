@@ -37,6 +37,7 @@ from typing import Any
 
 from remind_me_mcp.config import WEBHOOK_BIND, WEBHOOK_PORT, WEBHOOK_SECRET
 from remind_me_mcp.importer import IMPORT_KINDS, import_content
+from remind_me_mcp.telemetry import maybe_span
 
 log = logging.getLogger("remind_me_mcp.webhook_server")
 
@@ -125,15 +126,16 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": error})
             return
 
-        result = import_content(
-            content=payload["content"].encode("utf-8"),
-            filename=payload["filename"],
-            category=payload.get("category", "chat_import"),
-            tags=payload.get("tags", []),
-            extract_mode=payload.get("extract_mode", "assistant_messages"),
-            max_length=payload.get("max_length", 10000),
-            kind=payload.get("kind", "auto"),
-        )
+        with maybe_span("webhook.ingest", filename=payload["filename"]):
+            result = import_content(
+                content=payload["content"].encode("utf-8"),
+                filename=payload["filename"],
+                category=payload.get("category", "chat_import"),
+                tags=payload.get("tags", []),
+                extract_mode=payload.get("extract_mode", "assistant_messages"),
+                max_length=payload.get("max_length", 10000),
+                kind=payload.get("kind", "auto"),
+            )
 
         status = result.get("status")
         if status in ("ok", "skipped"):
