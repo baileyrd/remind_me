@@ -1114,3 +1114,24 @@ remind_me is local-first, single-user, and MCP-native by design — some capabil
 - **Multi-tenant / cross-agent isolation** — deferred. remind_me is explicitly single-owner by design: one OAuth owner token, one SQLite file per node. Multi-tenancy is an architecture change orthogonal to "personal memory," not a gap in the current design — worth revisiting only if the project's scope deliberately shifts toward shared/team memory infrastructure.
 - **Client SDKs beyond MCP** — no hand-written TS/Rust/etc. SDKs (maintenance surface disproportionate to a single-user local tool whose real client is Claude via MCP). Instead, the existing `GET /api/*` REST surface is published as an [OpenAPI 3.0 spec](docs/openapi.yaml) so any language can generate a thin client for free.
 - **Cloud/managed & serverless hosting** — no managed hosting product. The per-user SQLite node is designed to stay local; the one component that's natural to host centrally (the sync hub) already had a Podman quadlet deploy path, and now also has [Docker Compose, Fly.io, and Railway templates](hub/deploy/) — deliberately still self-hosted, not a one-click managed service.
+
+## Changelog
+
+### 1.1.0 — 2026-07-21
+
+Eight-phase capability expansion, closing the gaps identified in a comparison against [cognee](docs/cognee-capability-review-2026-07-20.md) and [Cerebras's internal knowledge system](docs/cerebras-knowledge-capability-review-2026-07-20.md). All additions are backward-compatible and opt-in or default-preserving — no breaking changes to existing tools, storage, or sync wire formats.
+
+- **Phase 1 — Search feedback loop + IDF ranking signal.** `remind_me_feedback` records a helpful/unhelpful signal into `base_weight`/vitality; a new opt-in IDF (`bm25`-derived) RRF signal, off by default.
+- **Phase 2 — Neighbor-aware chunk retrieval.** Every import-produced chunk carries a `doc_id`/`chunk_index`; opt-in `include_neighbors` search expansion surfaces adjacent chunks from the same source document.
+- **Phase 3 — Typed entity-to-entity relations.** A new `entity_relations` table and `remind_me_entity_traverse` tool for multi-hop graph queries (e.g. "who introduced me to the person who recommended this tool"), fully synced across hub and peers.
+- **Phase 4 — Pluggable import connector framework.** `chat`/`document` (and third-party kinds) are parser functions registered by kind string, not a hardcoded dispatch; `remind_me_list_connectors` reports the registry.
+- **Phase 5 — Push/webhook ingestion + ingest-time normalization.** A bearer-authenticated `POST /ingest` endpoint accepts content directly, sharing the import pipeline's connector dispatch and hash dedup; `remind_me_normalize_batch`/`remind_me_normalize_apply` distill noisy raw imports into clean `{question, summary, resolution?}` memories client-side.
+- **Phase 6 — Auto-routing retrieval strategy.** `remind_me_search` gains a `strategy` parameter (`auto`/`balanced`/`keyword_favored`/`semantic_favored`); a deterministic query-shape heuristic (no LLM call) rebalances RRF weights as relative multipliers on top of whatever profile is already configured.
+- **Phase 7 — Optional OpenTelemetry tracing + benchmark comparison docs.** `maybe_span()` instruments tool calls, sync cycles, and watcher scans, zero-cost unless explicitly enabled; `benchmarks/RESULTS.md` documents why cognee's BEAM figures aren't directly comparable to remind_me's LongMemEval-S numbers, plus a new weekly non-blocking CI smoke check.
+- **Phase 8 — Storage-interface prep, alternative hub deploy targets, OpenAPI spec.** `storage_interfaces.py` documents the storage layer as `Protocol`s (no new backend); `hub/deploy/` gained Docker Compose, Fly.io, and Railway templates alongside the existing Podman quadlets; `docs/openapi.yaml` publishes the REST API for client-SDK generation in any language. Multimodal ingestion and multi-tenant isolation were evaluated and explicitly deferred — see "Design Scope" above.
+
+Tool count: 34 → 40. Full detail in each phase's merged PR (#19–#26).
+
+### 1.0.0
+
+Initial tagged baseline: hybrid FTS5 + semantic search with RRF rank fusion, ACT-R vitality/decay, structured SPO triples and entity graph (FT-04), chat/document import (FT-02) with folder watching (FT-03), JSON/JSONL export (FT-01), LLM Wiki (FT-08), distributed sync (hub + peer-to-peer), dashboard UI + REST API, and remote MCP connector support (FT-05/FT-07).
