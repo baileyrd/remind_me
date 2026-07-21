@@ -293,6 +293,35 @@ python -m benchmarks.before_after \
 > step adds one LLM call per query, so the run is slower than the other
 > comparisons. Paste the resulting table here once run.
 
+## Score-based RRF fusion (lever F)
+
+`rank_rrf` fuses signals purely by ordinal rank — it keeps only each
+candidate's position in each ranked list, discarding the actual score
+magnitude. A 0.95-cosine match and a 0.55-cosine match tie if they land in
+adjacent rank positions, even though one is a far stronger semantic match.
+The opt-in `fusion="score"` mode (`REMIND_ME_RRF_FUSION=score`) instead
+min-max normalizes the real underlying magnitudes (`bm25` score, semantic
+distance, recency, vitality) across the candidate pool into `[0, 1]` and
+sums weighted normalized scores. `"rank"` stays the default — this is purely
+additive, no existing behavior changes unless explicitly enabled. Proven
+deterministically in `tests/test_retrieval.py::TestRankRRFScoreFusion`.
+
+Measure the effect on real data (A/B on the chunked semantic-only baseline):
+
+```bash
+python -m benchmarks.before_after \
+  --compare score_fusion \
+  --data benchmarks/data/longmemeval_s_cleaned.json \
+  --ingest verbatim --embedder real --rrf-profile semantic --ks 1,3,5,10
+```
+
+> Not yet run on `longmemeval_s` here. Expect this to matter most for
+> `single-session-preference` and other categories where the correct answer
+> is a strong-but-not-top-rank hit — rank-only RRF can't distinguish "barely
+> made the cut" from "an unambiguous match," while score fusion can. A full
+> per-type run is available via `python -m benchmarks.runner --rrf-fusion
+> score ...`. Paste the resulting table here once run.
+
 ## FTS5 query-sanitization fix — before/after
 
 Natural-language questions contain punctuation (`?`, `,`, `'`, `$`, `.`) that

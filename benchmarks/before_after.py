@@ -38,6 +38,7 @@ _COMPARISONS = {
     "rrf": ("before (recency+vitality on)", "after (recency+vitality dropped)"),
     "rerank": ("before (no reranker)", "after (cross-encoder rerank)"),
     "hyde": ("before (plain query)", "after (HyDE expansion)"),
+    "score_fusion": ("before (rank fusion)", "after (score fusion)"),
 }
 
 
@@ -62,6 +63,10 @@ def _apply_stage(compare: str, stage: str) -> None:
         import remind_me_mcp.query_expansion as qe_mod
 
         qe_mod.EXPANSION_MODE = "hyde" if stage == "after" else ""
+    elif compare == "score_fusion":
+        import remind_me_mcp.retrieval as retr
+
+        retr.RRF_FUSION = "score" if stage == "after" else "rank"
 
 
 def _capture_state(compare: str) -> dict:
@@ -78,6 +83,10 @@ def _capture_state(compare: str) -> dict:
         import remind_me_mcp.query_expansion as qe_mod
 
         return {"EXPANSION_MODE": qe_mod.EXPANSION_MODE}
+    if compare == "score_fusion":
+        import remind_me_mcp.retrieval as retr
+
+        return {"RRF_FUSION": retr.RRF_FUSION}
     import remind_me_mcp.retrieval as retr
 
     return {"RRF_W_RECENCY": retr.RRF_W_RECENCY, "RRF_W_VITALITY": retr.RRF_W_VITALITY}
@@ -97,6 +106,10 @@ def _restore_state(compare: str, state: dict) -> None:
         import remind_me_mcp.query_expansion as qe_mod
 
         qe_mod.EXPANSION_MODE = state["EXPANSION_MODE"]
+    elif compare == "score_fusion":
+        import remind_me_mcp.retrieval as retr
+
+        retr.RRF_FUSION = state["RRF_FUSION"]
     else:
         import remind_me_mcp.retrieval as retr
 
@@ -205,8 +218,9 @@ def build_parser() -> argparse.ArgumentParser:
         default="sanitize",
         help=(
             "Which change to measure: 'sanitize' (FTS5 fix), 'rrf' (drop "
-            "recency+vitality), 'rerank' (cross-encoder over top-k), or "
-            "'hyde' (query expansion via Ollama)"
+            "recency+vitality), 'rerank' (cross-encoder over top-k), "
+            "'hyde' (query expansion via Ollama), or 'score_fusion' "
+            "(normalized-magnitude RRF fusion instead of rank-only)"
         ),
     )
     p.add_argument("--ingest", default="verbatim", help="Ingest mode (default: verbatim)")

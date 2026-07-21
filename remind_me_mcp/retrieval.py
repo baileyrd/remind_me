@@ -30,6 +30,12 @@ RRF_W_VITALITY: float = float(os.environ.get("REMIND_ME_RRF_W_VITALITY", "1.0"))
 # REMIND_ME_RRF_W_IDF=1 (or any positive weight).
 RRF_W_IDF: float = float(os.environ.get("REMIND_ME_RRF_W_IDF", "0.0"))
 
+# Fusion mode: 'rank' (default, the original ordinal-position RRF) or
+# 'score' (normalized-magnitude fusion -- see rank_rrf's docstring). 'rank'
+# is the default so existing callers/benchmarks are unaffected; opt in with
+# REMIND_ME_RRF_FUSION=score.
+RRF_FUSION: str = os.environ.get("REMIND_ME_RRF_FUSION", "rank").lower()
+
 
 # ---------------------------------------------------------------------------
 # Types
@@ -52,6 +58,34 @@ class SearchEnvelope(TypedDict):
 # ---------------------------------------------------------------------------
 
 
+def _minmax_normalize(raw: dict[str, float], *, invert: bool = False) -> dict[str, float]:
+    """Min-max normalize a ``{id: raw_value}`` mapping to ``[0, 1]``, higher = better.
+
+    Args:
+        raw: Raw magnitude per id (e.g. bm25 score, semantic distance).
+        invert: True when a *lower* raw value is better (bm25 and cosine
+            distance are both lower-is-better), so the normalized score is
+            flipped (``1 - normalized``) to keep "higher = better" uniform
+            across all signals.
+
+    Returns:
+        ``{id: normalized_score}``, empty if *raw* is empty. When every value
+        ties (including a single value), every id gets a score of 1.0 --
+        there's no meaningful spread to normalize, and 1.0 (rather than 0.0)
+        avoids silently zeroing out a signal that's simply uniform.
+    """
+    if not raw:
+        return {}
+    lo = min(raw.values())
+    hi = max(raw.values())
+    if hi - lo < 1e-12:
+        return dict.fromkeys(raw, 1.0)
+    return {
+        mid: (1.0 - (v - lo) / (hi - lo)) if invert else ((v - lo) / (hi - lo))
+        for mid, v in raw.items()
+    }
+
+
 def rank_rrf(
     keyword_results: list[dict],
     semantic_results: list[dict],
@@ -62,38 +96,64 @@ def rank_rrf(
     w_recency: float | None = None,
     w_vitality: float | None = None,
     w_idf: float | None = None,
+    fusion: str | None = None,
 ) -> list[dict]:
-    """Fuse keyword, semantic, recency, vitality, and IDF ranked lists via Reciprocal Rank Fusion.
+    """Fuse keyword, semantic, recency, vitality, and IDF ranked lists.
 
-    Each memory receives five rank signals:
-      - keyword_rank: position in *keyword_results* (1-indexed)
-      - semantic_rank: position in *semantic_results* (1-indexed)
-      - recency_rank: position when all unique memories are sorted by created_at DESC
-      - vitality_rank: position when all unique memories are sorted by vitality DESC
-        (higher vitality = better rank). Memories without a ``vitality`` key default to 1.0.
-      - idf_rank: position when all unique memories are sorted by FTS5 ``bm25()``
-        score ascending (lower = better match). Memories with no ``_bm25_score``
-        (semantic-only hits, no FTS match) sort last. Off by default (see
-        ``RRF_W_IDF``) -- keyword_rank already reflects FTS5 relevance order,
-        so this only matters once a caller opts in with a positive weight.
+    Two fusion modes (``fusion``, defaults to module-level ``RRF_FUSION``,
+    itself defaulting to ``"rank"``):
 
-    The RRF score is ``sum(weight / (k + rank))`` across all five signals.
-    Memories absent from a list receive a penalty rank of ``len(list) + 1``.
+    - ``"rank"`` (default): classic Reciprocal Rank Fusion. Each memory
+      receives five rank signals:
+        - keyword_rank: position in *keyword_results* (1-indexed)
+        - semantic_rank: position in *semantic_results* (1-indexed)
+        - recency_rank: position when all unique memories are sorted by created_at DESC
+        - vitality_rank: position when all unique memories are sorted by vitality DESC
+          (higher vitality = better rank). Memories without a ``vitality`` key default to 1.0.
+        - idf_rank: position when all unique memories are sorted by FTS5 ``bm25()``
+          score ascending (lower = better match). Memories with no ``_bm25_score``
+          (semantic-only hits, no FTS match) sort last. Off by default (see
+          ``RRF_W_IDF``) -- keyword_rank already reflects FTS5 relevance order,
+          so this only matters once a caller opts in with a positive weight.
+
+      The RRF score is ``sum(weight / (k + rank))`` across all five signals.
+      Memories absent from a list receive a penalty rank of ``len(list) + 1``.
+
+    - ``"score"``: normalized-magnitude fusion (gap #1 / issue #49). Rank-only
+      RRF discards how *strong* a match is -- a 0.95-cosine match and a
+      0.55-cosine match tie if they land in adjacent rank positions. This
+      mode instead min-max normalizes the real underlying magnitudes
+      (``_bm25_score``, ``semantic_distance``, ``created_at``, ``vitality``)
+      across the candidate pool into ``[0, 1]`` (higher = better; see
+      :func:`_minmax_normalize`) and sums ``weight * normalized_score``.
+      Memories missing a signal (e.g. a semantic-only hit has no
+      ``_bm25_score``) get 0.0 for that signal -- the worst possible score,
+      mirroring rank mode's penalty-rank treatment. ``w_idf`` reuses the same
+      normalized keyword score in this mode (both derive from the identical
+      ``_bm25_score`` magnitude, so there is no separate IDF signal to
+      normalize once magnitude, not just position, is in play).
+
+    Rank fields (``_keyword_rank`` etc.) are always computed and set
+    regardless of *fusion*, so debug tooling and callers that read them keep
+    working unchanged; ``"score"`` mode additionally sets ``_keyword_score``,
+    ``_semantic_score``, ``_recency_score``, ``_vitality_score``, and
+    ``_fusion_mode``.
 
     Args:
         keyword_results: Memories ranked by keyword/FTS relevance (best first).
         semantic_results: Memories ranked by semantic similarity (best first).
-        k: RRF smoothing constant. Defaults to module-level ``RRF_K``.
+        k: RRF smoothing constant (rank mode only). Defaults to module-level ``RRF_K``.
         w_keyword, w_semantic, w_recency, w_vitality, w_idf: Per-signal weights.
             Each defaults to its module-level ``RRF_W_*`` constant. Set a weight
             to 0 to drop that signal (e.g. recency/vitality for a retrieval
             profile). ``w_idf`` defaults to 0 (off).
+        fusion: ``"rank"`` or ``"score"``. Defaults to module-level ``RRF_FUSION``.
 
     Returns:
-        De-duplicated list of memory dicts sorted by RRF score descending,
+        De-duplicated list of memory dicts sorted by fused score descending,
         each augmented with ``_rrf_score``, ``_keyword_rank``,
         ``_semantic_rank``, ``_recency_rank``, ``_vitality_rank``, and
-        ``_idf_rank`` keys.
+        ``_idf_rank`` keys (plus the ``_*_score`` keys in ``"score"`` mode).
     """
     if k is None:
         k = RRF_K
@@ -107,6 +167,8 @@ def rank_rrf(
         w_vitality = RRF_W_VITALITY
     if w_idf is None:
         w_idf = RRF_W_IDF
+    if fusion is None:
+        fusion = RRF_FUSION
 
     # Collect unique memories by id, preserving dict contents. A memory hit by
     # both tiers merges the second occurrence's keys (e.g. semantic_distance)
@@ -167,7 +229,29 @@ def rank_rrf(
         mem["id"]: i + 1 for i, mem in enumerate(idf_sorted)
     }
 
-    # Compute RRF scores (5 signals)
+    keyword_score: dict[str, float] = {}
+    semantic_score: dict[str, float] = {}
+    recency_score: dict[str, float] = {}
+    vitality_score: dict[str, float] = {}
+    if fusion == "score":
+        keyword_score = _minmax_normalize(
+            {mid: m["_bm25_score"] for mid, m in seen.items() if m.get("_bm25_score") is not None},
+            invert=True,
+        )
+        semantic_score = _minmax_normalize(
+            {
+                mid: m["semantic_distance"]
+                for mid, m in seen.items()
+                if m.get("semantic_distance") is not None
+            },
+            invert=True,
+        )
+        recency_score = _minmax_normalize(_recency_epochs(seen))
+        vitality_score = _minmax_normalize(
+            {mid: m.get("vitality", 1.0) for mid, m in seen.items()}
+        )
+
+    # Compute fused scores
     results: list[dict] = []
     for mid, mem in seen.items():
         kr = keyword_rank.get(mid, kw_penalty)
@@ -176,25 +260,61 @@ def rank_rrf(
         vr = vitality_rank[mid]
         ir = idf_rank[mid]
 
-        score = (
-            w_keyword / (k + kr)
-            + w_semantic / (k + sr)
-            + w_recency / (k + rr)
-            + w_vitality / (k + vr)
-            + w_idf / (k + ir)
-        )
-
-        mem["_rrf_score"] = score
         mem["_keyword_rank"] = kr
         mem["_semantic_rank"] = sr
         mem["_recency_rank"] = rr
         mem["_vitality_rank"] = vr
         mem["_idf_rank"] = ir
+
+        if fusion == "score":
+            ks_ = keyword_score.get(mid, 0.0)
+            ss_ = semantic_score.get(mid, 0.0)
+            rs_ = recency_score.get(mid, 0.0)
+            vs_ = vitality_score.get(mid, 0.0)
+            score = (
+                w_keyword * ks_
+                + w_semantic * ss_
+                + w_recency * rs_
+                + w_vitality * vs_
+                + w_idf * ks_  # same underlying magnitude as keyword -- see docstring
+            )
+            mem["_keyword_score"] = ks_
+            mem["_semantic_score"] = ss_
+            mem["_recency_score"] = rs_
+            mem["_vitality_score"] = vs_
+            mem["_fusion_mode"] = "score"
+        else:
+            score = (
+                w_keyword / (k + kr)
+                + w_semantic / (k + sr)
+                + w_recency / (k + rr)
+                + w_vitality / (k + vr)
+                + w_idf / (k + ir)
+            )
+
+        mem["_rrf_score"] = score
         results.append(mem)
 
-    # Sort by RRF score descending (stable sort preserves insertion order for ties)
+    # Sort by fused score descending (stable sort preserves insertion order for ties)
     results.sort(key=lambda m: m["_rrf_score"], reverse=True)
     return results
+
+
+def _recency_epochs(memories: dict[str, dict]) -> dict[str, float]:
+    """Parse each memory's ``created_at`` into a Unix timestamp for normalization.
+
+    A missing or unparseable ``created_at`` is treated as the epoch (the
+    oldest possible value), so it normalizes to the worst recency score
+    rather than raising or being silently dropped from the candidate pool.
+    """
+    epochs: dict[str, float] = {}
+    for mid, mem in memories.items():
+        created_at = mem.get("created_at")
+        try:
+            epochs[mid] = datetime.fromisoformat(str(created_at)).timestamp()
+        except (ValueError, TypeError):
+            epochs[mid] = 0.0
+    return epochs
 
 
 # ---------------------------------------------------------------------------
@@ -441,6 +561,16 @@ def build_debug_signals(
         signals["strategy"] = strategy
     if weights is not None:
         signals["weights_used"] = weights
+    # Score-based fusion (issue #49) only sets these when fusion="score" was
+    # used; omitted entirely (not None) for rank-mode results, so existing
+    # readers of this dict see no change.
+    fusion_mode = memory.get("_fusion_mode")
+    if fusion_mode is not None:
+        signals["fusion_mode"] = fusion_mode
+        signals["keyword_score"] = memory.get("_keyword_score")
+        signals["semantic_score"] = memory.get("_semantic_score")
+        signals["recency_score"] = memory.get("_recency_score")
+        signals["vitality_score"] = memory.get("_vitality_score")
     return signals
 
 
