@@ -351,6 +351,73 @@ def test_run_remote_logs_redacted_token(
 
 
 # ---------------------------------------------------------------------------
+# SEC-09: non-loopback bind warning
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1"])
+def test_warn_if_remote_host_widened_silent_for_loopback(
+    host: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING", logger="remind_me_mcp.__main__"):
+        main_mod._warn_if_remote_host_widened(host, 8768)
+    assert caplog.text == ""
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "100.64.1.2", "my-tailnet-host"])
+def test_warn_if_remote_host_widened_warns_for_non_loopback(
+    host: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING", logger="remind_me_mcp.__main__"):
+        main_mod._warn_if_remote_host_widened(host, 8768)
+    assert host in caplog.text
+    assert "8768" in caplog.text
+    assert "tunnel" in caplog.text.lower()
+
+
+def test_run_remote_warns_on_non_loopback_bind(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """_run_remote surfaces the SEC-09 warning at actual startup, not just
+    when _warn_if_remote_host_widened is called directly."""
+    import argparse
+
+    import uvicorn
+
+    monkeypatch.setattr(cfg, "REMOTE_MCP_TOKEN", "fixed-token")
+    monkeypatch.setattr(cfg, "MEMORY_DIR", tmp_path)
+    monkeypatch.setattr(main_mod.mcp, "_session_manager", None)
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: None)
+
+    with caplog.at_level("WARNING", logger="remind_me_mcp.__main__"):
+        main_mod._run_remote(argparse.Namespace(remote_host="0.0.0.0", remote_port=8768))
+
+    assert "0.0.0.0" in caplog.text
+    assert "tunnel" in caplog.text.lower()
+
+
+def test_run_remote_silent_on_loopback_bind(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    import argparse
+
+    import uvicorn
+
+    monkeypatch.setattr(cfg, "REMOTE_MCP_TOKEN", "fixed-token")
+    monkeypatch.setattr(cfg, "MEMORY_DIR", tmp_path)
+    monkeypatch.setattr(main_mod.mcp, "_session_manager", None)
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: None)
+
+    with caplog.at_level("WARNING", logger="remind_me_mcp.__main__"):
+        main_mod._run_remote(argparse.Namespace(remote_host="127.0.0.1", remote_port=8768))
+
+    # A separate, unrelated warning (OAuth inactive, since no issuer is set
+    # in this test) is expected here -- only the SEC-09 bind-widening
+    # warning itself must be absent.
+    assert "not loopback" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
 # Status reporting
 # ---------------------------------------------------------------------------
 
