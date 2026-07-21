@@ -292,20 +292,26 @@ class FolderWatcher:
     def start(self) -> threading.Thread:
         """Start the polling loop in a daemon thread (idempotent).
 
+        The check-then-act is lock-protected (mirroring
+        ``peer_server.start_peer_server``/``sync.start_sync_thread``) so two
+        concurrent callers can't both pass the liveness check and start two
+        competing loops.
+
         Returns:
             The running watcher thread.
         """
-        if self._thread is not None and self._thread.is_alive():
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return self._thread
+            self._stop.clear()
+            self._thread = threading.Thread(target=self._run, daemon=True, name="folder-watcher")
+            self._thread.start()
+            log.info(
+                "Folder watcher started — dirs=%s interval=%ds",
+                [str(d) for d in self.watch_dirs],
+                self.interval,
+            )
             return self._thread
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True, name="folder-watcher")
-        self._thread.start()
-        log.info(
-            "Folder watcher started — dirs=%s interval=%ds",
-            [str(d) for d in self.watch_dirs],
-            self.interval,
-        )
-        return self._thread
 
     def stop(self, timeout: float = 10.0) -> None:
         """Signal the loop to stop and join the thread.
@@ -317,7 +323,8 @@ class FolderWatcher:
             timeout: Max seconds to wait for the thread to exit.
         """
         self._stop.set()
-        thread = self._thread
+        with self._lock:
+            thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout)
 

@@ -362,6 +362,32 @@ def test_thread_start_stop_joins_promptly(watch_dir: Path) -> None:
     assert watcher.status()["running"] is False
 
 
+def test_concurrent_start_calls_return_the_same_thread(watch_dir: Path) -> None:
+    """start()'s check-then-act is lock-protected -- concurrent callers must
+    never both pass the liveness check and start two competing loops."""
+    import threading
+
+    watcher = FolderWatcher([watch_dir], interval=3600)  # never wakes on its own
+    results: list[threading.Thread] = []
+    barrier = threading.Barrier(5)
+
+    def call_start() -> None:
+        barrier.wait(timeout=5)
+        results.append(watcher.start())
+
+    callers = [threading.Thread(target=call_start) for _ in range(5)]
+    try:
+        for t in callers:
+            t.start()
+        for t in callers:
+            t.join(timeout=5)
+
+        assert len(results) == 5
+        assert len({id(r) for r in results}) == 1
+    finally:
+        watcher.stop(timeout=10.0)
+
+
 def test_global_start_stop_lifecycle(
     monkeypatch: pytest.MonkeyPatch, watch_dir: Path
 ) -> None:
