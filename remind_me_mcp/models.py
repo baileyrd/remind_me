@@ -548,6 +548,25 @@ class MempalaceImportInput(BaseModel):
     dry_run: bool = Field(default=False, description="Report what would be imported without writing")
 
 
+class DbsImportInput(BaseModel):
+    """Input for pulling memories from a dbs (daily-backup-system) SQLite store."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    db_path: str = Field(description="Path to the dbs SQLite database (e.g. dbs.sqlite3)")
+    source: str = Field(default="", description="Restrict to one dbs source name (e.g. 'raindrop'), or '' for all")
+    item_type: str = Field(default="", description="Restrict to one dbs item_kind (e.g. 'link'), or '' for all")
+    limit: int = Field(
+        default=500,
+        ge=1,
+        le=2000,
+        description="Max items to fetch and embed in this call; page through with offset",
+    )
+    offset: int = Field(default=0, ge=0)
+    tags: list[str] = Field(default_factory=list, description="Extra tags added to every imported memory")
+    dry_run: bool = Field(default=False, description="Report what would be imported without writing")
+
+
 class AutoCaptureInput(BaseModel):
     """Input for automatically capturing a full conversation and its summary."""
 

@@ -340,6 +340,7 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_import_chat` | Import a single chat export or document file (`kind`: auto/chat/document) |
 | `remind_me_import_directory` | Bulk import all exports/documents from a directory |
 | `remind_me_import_mempalace` | Bulk-import memories from a MemPalace ChromaDB store, one page at a time (requires the optional `mempalace` extra) |
+| `remind_me_import_dbs` | Bulk-import memories from a [dbs](https://github.com/baileyrd/daily-backup-system) SQLite store, one page at a time — source and tags land as knowledge-graph entities, not flattened prose |
 | `remind_me_list_connectors` | List every registered import connector (built-in and third-party) and which are valid `remind_me_import_chat` kinds |
 | `remind_me_export_memories` | Export memories (+ entity graph by default) to JSON/JSONL, inline or to a file inside the export roots |
 | `remind_me_stats` | View statistics: counts, categories, recent activity |
@@ -435,7 +436,21 @@ Imports are restricted to paths inside `REMIND_ME_IMPORT_ROOTS` (default: your h
 
 ### Pluggable Connectors
 
-The `chat` and `document` kinds are plain parser functions registered by kind string in `remind_me_mcp/importer.py` (`register_connector(kind, connector)`), not a hardcoded dispatch — `remind_me_import_chat`/`remind_me_import_directory` resolve the effective kind exactly as before, then look it up in the registry. A third-party module can register more connectors without touching `importer.py`; `remind_me_mcp/mempalace_import.py` does this for its own `_parse_frontmatter` step, registered under `"mempalace"` purely for discovery (its real ingestion path, `remind_me_import_mempalace`, keeps its own bespoke per-drawer dedup/paging loop — MemPalace drawers arrive individually from a paginated ChromaDB read, not as one raw file). Call `remind_me_list_connectors` to see every registered connector and which are valid `remind_me_import_chat` kinds.
+The `chat` and `document` kinds are plain parser functions registered by kind string in `remind_me_mcp/importer.py` (`register_connector(kind, connector)`), not a hardcoded dispatch — `remind_me_import_chat`/`remind_me_import_directory` resolve the effective kind exactly as before, then look it up in the registry. A third-party module can register more connectors without touching `importer.py`; `remind_me_mcp/mempalace_import.py` does this for its own `_parse_frontmatter` step, registered under `"mempalace"` purely for discovery (its real ingestion path, `remind_me_import_mempalace`, keeps its own bespoke per-drawer dedup/paging loop — MemPalace drawers arrive individually from a paginated ChromaDB read, not as one raw file). `remind_me_mcp/dbs_import.py` follows the same pattern for [dbs](https://github.com/baileyrd/daily-backup-system) — see [Importing from dbs](#importing-from-dbs) below. Call `remind_me_list_connectors` to see every registered connector and which are valid `remind_me_import_chat` kinds.
+
+### Importing from dbs
+
+[dbs](https://github.com/baileyrd/daily-backup-system) archives a user's data from many external sources (Reddit, YouTube, Raindrop, GitHub stars, podcasts, ...) into one SQLite database with a uniform `items`/`sources` schema. `remind_me_import_dbs` reads that database directly (read-only, no dependency on the `dbs` package itself) and imports each live item as a memory — with dbs's source and tags preserved as first-class knowledge-graph entities (linked via `memory_entities`), not flattened into note prose:
+
+```
+remind_me_import_dbs(db_path="/path/to/dbs.sqlite3")
+```
+
+- Already-imported items are skipped when unchanged, tracked by `(dbs source, external_id)` plus a content hash (the `dbs_imports` table) — reruns, including paging through a large database with `limit`/`offset`, are safe.
+- An item whose content changed since its last import (detected by content_hash, not a creation-date cutoff) gets a *fresh* memory, with the previous one marked `superseded_by` the new id — the same pattern the folder watcher uses for a changed file. This is what lets this path pick up edited items with no equivalent to the file-export pipeline's `item_created_at`-only staleness gap (see dbs's own `docs/BACKLOG.md` #4).
+- `source`/`item_type` filter to one dbs source or item kind; `tags` adds extra tags to every imported memory; `dry_run` reports what would happen without writing.
+
+This is the highest-fidelity of the three ways to feed dbs's collected content into remind_me (see dbs's `docs/remind-me-integration-review-2026-07-21.md` for the other two — an unzipped-notes export watched by `REMIND_ME_WATCH_DIRS`, or a per-item webhook push) — the only one that gives Claude entity-level provenance (which source, which tags) instead of prose to parse back out.
 
 ### Claude Export Format
 
@@ -1009,6 +1024,7 @@ remind-me-mcp/
 │   ├── oauth.py                # Single-user OAuth 2.1 authorization server
 │   ├── importer.py             # Chat export + document parser & import engine
 │   ├── mempalace_import.py     # Optional MemPalace (ChromaDB) bulk importer
+│   ├── dbs_import.py           # dbs (SQLite) bulk importer, entities not prose
 │   ├── exporter.py             # Memory + entity-graph export engine
 │   ├── watcher.py              # Watched-folder auto-ingest (poll, debounce, supersede)
 │   ├── webhook_server.py       # Push/webhook ingestion HTTP endpoint

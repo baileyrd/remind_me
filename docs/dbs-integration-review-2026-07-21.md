@@ -65,14 +65,15 @@ without new architecture on either side.
    right after each incremental fetch, instead of waiting for a batch
    export. Near real-time; same flattened-text fidelity unless the payload
    also carries structured fields.
-3. **Dedicated `dbs` import connector (highest effort, best fit).**
-   remind_me's import pipeline has a connector registry (used today for
-   `chat`/`document`/`mempalace` kinds). A `dbs`-specific connector reading
-   dbs's SQLite directly could preserve per-source structure — subreddit,
-   channel, tags, kind — as entities in remind_me's knowledge graph instead
-   of collapsing everything to prose, and could track dbs's own cursors to
-   pull only what changed. This is the option that matches both projects'
-   stated extension points as designed, rather than routing around them.
+3. **Dedicated `dbs` import connector (highest effort, best fit). SHIPPED,
+   remind_me side only.** `remind_me_mcp/dbs_import.py` reads dbs's
+   `items`/`sources` tables directly (read-only, no dependency on the `dbs`
+   package) and registers under the `"dbs"` kind, mirroring
+   `mempalace_import.py`'s pattern of a bespoke bulk-pull loop plus a
+   discovery-only connector registration. Each live item becomes a memory
+   with its dbs source and tags linked as first-class knowledge-graph
+   entities (`memory_entities`), not collapsed into prose. New MCP tool:
+   `remind_me_import_dbs`.
 
 ## Recommendation
 
@@ -98,9 +99,22 @@ from option 1 or 3 above without re-deriving the tradeoffs.
   `dbs export-notes` run followed by remind_me's actual
   `FolderWatcher.scan_once()` against that directory produced a memory row
   with the item's title/tags/body content intact.
-- **Options 2 and 3 — not started.** Option 3 (a dedicated `dbs` import
-  connector registered in remind_me's import pipeline, preserving
-  structured entities instead of prose) is the one worth reaching for if
-  dbs becomes a primary, ongoing memory source rather than an occasional
-  feed — see the dbs-side doc's BACKLOG entry for why the current
-  option-1 filename bookkeeping is a workaround this would remove entirely.
+- **Option 3 — shipped**, entirely in remind_me (`remind_me_mcp/dbs_import.py`
+  + the `remind_me_import_dbs` tool). Reads dbs's SQLite directly; each item
+  becomes a memory with its dbs source (kind `dbs_source`) and tags (kind
+  `tag`) linked as entities via `memory_entities`, and a new `dbs_imports`
+  table (keyed by `(dbs_source, external_id)` + content_hash) tracks what's
+  already imported. An edited item gets a fresh memory with the old one
+  marked `superseded_by`, so — unlike option 1 — this has no
+  `item_created_at`-only staleness gap at all: every pull compares the
+  actual current content_hash, not a date cutoff. No dbs-side changes were
+  needed (dbs's items/sources schema is read directly, the same way
+  MemPalace's ChromaDB store is read directly rather than through its own
+  MCP tools). Verified end-to-end against a real `dbs.sqlite3` produced by
+  the actual `dbs` CLI (`dbs init` + `dbs restore`), including a rerun
+  no-op and an edited-item resupersession.
+- **Option 2 — not started.** The remaining gap between the three options:
+  near-real-time push instead of on-demand/scheduled pulls. Worth
+  reaching for only if option 3's pull cadence (call `remind_me_import_dbs`
+  after each `dbs backup`, e.g. from the same cron job) turns out to be too
+  slow for a given use case.

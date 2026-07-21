@@ -30,6 +30,10 @@ Current schema versions:
             sync outbox triggers (the file layer is what would be synced).
   11 -> 12: MemPalace importer — mempalace_imports dedup table (drawer_id ->
             memory_id), mirroring chat_imports for the file-based importer.
+  14 -> 15: dbs importer — dbs_imports dedup/update-tracking table, keyed by
+            (dbs_source, external_id) rather than a single id column since
+            that's dbs's own item identity; also stores content_hash so a
+            rerun can tell an edited item from an unchanged one.
 """
 
 from __future__ import annotations
@@ -250,7 +254,7 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 # Current target schema version.  Increment when adding a new migration step.
-_SCHEMA_VERSION = 14
+_SCHEMA_VERSION = 15
 
 
 
@@ -339,6 +343,11 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         _migrate_v13_to_v14(db)
         db.execute("PRAGMA user_version = 14")
         current_version = 14
+
+    if current_version < 15:
+        _migrate_v14_to_v15(db)
+        db.execute("PRAGMA user_version = 15")
+        current_version = 15
 
     db.commit()
 
@@ -1341,6 +1350,28 @@ def _migrate_v13_to_v14(db: sqlite3.Connection) -> None:
             INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
             VALUES (NEW.id, 'insert', {relation_payload}, {_SQL_NOW_ISO});
         END;
+    """)
+
+
+def _migrate_v14_to_v15(db: sqlite3.Connection) -> None:
+    """v14 -> v15: dbs_imports dedup/update-tracking table for the dbs importer.
+
+    Mirrors mempalace_imports (dedup-by-id for the MemPalace importer), but
+    keyed by (dbs_source, external_id) -- dbs's own item identity -- rather
+    than a single id column, and storing content_hash so a rerun can tell an
+    edited dbs item (content_hash changed) from an unchanged one (skip) or a
+    brand new one (import). No sync outbox trigger: purely local bookkeeping
+    for the importer, same as mempalace_imports.
+    """
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS dbs_imports (
+            dbs_source   TEXT NOT NULL,
+            external_id  TEXT NOT NULL,
+            memory_id    TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            imported_at  TEXT NOT NULL,
+            PRIMARY KEY (dbs_source, external_id)
+        );
     """)
 
 
