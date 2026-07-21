@@ -118,6 +118,44 @@ async def test_memory_add_default_category(db_conn: sqlite3.Connection) -> None:
 
 
 # ---------------------------------------------------------------------------
+# memory_add: importance prior at write time (issue #56)
+# ---------------------------------------------------------------------------
+
+
+async def test_memory_add_manual_source_gets_flat_base_weight(db_conn: sqlite3.Connection) -> None:
+    import re
+
+    result = await memory_add(MemoryAddInput(content="a manual note", source="manual"))
+    m = re.search(r"`([a-f0-9]+)`", result)
+    assert m is not None
+    mem_id = m.group(1)
+
+    row = db_conn.execute(
+        "SELECT base_weight, vitality FROM memories WHERE id = ?", (mem_id,)
+    ).fetchone()
+    assert row["base_weight"] == 1.0
+    assert row["vitality"] == 1.0
+
+
+async def test_memory_add_chat_import_source_gets_lower_base_weight(db_conn: sqlite3.Connection) -> None:
+    """Issue #56's own example: raw chat_import should start below manual."""
+    import re
+
+    result = await memory_add(MemoryAddInput(content="an imported line", source="chat_import"))
+    m = re.search(r"`([a-f0-9]+)`", result)
+    assert m is not None
+    mem_id = m.group(1)
+
+    row = db_conn.execute(
+        "SELECT base_weight, vitality FROM memories WHERE id = ?", (mem_id,)
+    ).fetchone()
+    assert row["base_weight"] < 1.0
+    # A fresh memory's vitality equals its base_weight (access_count=0,
+    # days_since_last_access=0) -- both columns must stay consistent.
+    assert row["vitality"] == pytest.approx(row["base_weight"])
+
+
+# ---------------------------------------------------------------------------
 # memory_get tests
 # ---------------------------------------------------------------------------
 
@@ -2349,6 +2387,48 @@ async def test_decompose_creates_one_memory_per_fact(
         assert row["source_capture_id"] == "cap_001"
         assert row["source"] == "decomposition"
         assert row["category"] == "fact"
+
+
+async def test_decompose_seeds_base_weight_from_memory_type(
+    db_conn: sqlite3.Connection,
+    memory_factory,
+) -> None:
+    """Issue #56: a decision-classified fact starts with a higher base_weight
+    (and matching vitality) than an unclassified one."""
+    from remind_me_mcp.models import AtomicFact, DecomposeInput
+    from remind_me_mcp.tools import remind_me_decompose
+
+    memory_factory(
+        content="A conversation about infra choices",
+        source="auto_capture",
+        capture_id="cap_priors",
+    )
+
+    params = DecomposeInput(
+        capture_id="cap_priors",
+        facts=[
+            AtomicFact(content="We're migrating to Postgres", memory_type="decision"),
+            AtomicFact(content="It's raining today"),  # unclassified
+        ],
+    )
+    result = await remind_me_decompose(params)
+    data = json.loads(result)
+
+    decision_id, unclassified_id = data["fact_ids"]
+    decision_row = db_conn.execute(
+        "SELECT base_weight, vitality, memory_type FROM memories WHERE id = ?", (decision_id,)
+    ).fetchone()
+    unclassified_row = db_conn.execute(
+        "SELECT base_weight, vitality, memory_type FROM memories WHERE id = ?", (unclassified_id,)
+    ).fetchone()
+
+    assert decision_row["memory_type"] == "decision"
+    assert unclassified_row["memory_type"] == "unclassified"
+    assert decision_row["base_weight"] > unclassified_row["base_weight"]
+    assert unclassified_row["base_weight"] == 1.0
+    # vitality must match base_weight exactly for a fresh memory.
+    assert decision_row["vitality"] == pytest.approx(decision_row["base_weight"])
+    assert unclassified_row["vitality"] == pytest.approx(unclassified_row["base_weight"])
 
 
 async def test_decompose_inherits_parent_tags(

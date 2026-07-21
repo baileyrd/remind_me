@@ -16,6 +16,8 @@ from remind_me_mcp.db import _make_id, _now_iso
 from remind_me_mcp.vitality import (
     BASE_WEIGHT_MAX,
     BASE_WEIGHT_MIN,
+    BASE_WEIGHT_SOURCE_PRIORS,
+    BASE_WEIGHT_TYPE_PRIORS,
     BRIDGE_THRESHOLD,
     DECAY_RATES,
     FEEDBACK_ADJUSTMENT_CAP,
@@ -31,6 +33,7 @@ from remind_me_mcp.vitality import (
     record_accesses,
     record_contextual_feedback,
     record_feedback,
+    seed_base_weight,
 )
 
 if TYPE_CHECKING:
@@ -213,6 +216,63 @@ def test_decay_rates_ordering() -> None:
     """Decisions decay slowest, action_items decay fastest."""
     assert DECAY_RATES["decision"] < DECAY_RATES["action_item"]
     assert DECAY_RATES["preference"] < DECAY_RATES["blocker"]
+
+
+# ---------------------------------------------------------------------------
+# seed_base_weight — importance prior at write time (issue #56)
+# ---------------------------------------------------------------------------
+
+
+def test_base_weight_type_priors_within_clamp_range() -> None:
+    """Every type prior stays within [BASE_WEIGHT_MIN, BASE_WEIGHT_MAX]."""
+    for key, value in BASE_WEIGHT_TYPE_PRIORS.items():
+        assert BASE_WEIGHT_MIN <= value <= BASE_WEIGHT_MAX, f"{key!r} out of range: {value}"
+
+
+def test_base_weight_source_priors_within_clamp_range() -> None:
+    for key, value in BASE_WEIGHT_SOURCE_PRIORS.items():
+        assert BASE_WEIGHT_MIN <= value <= BASE_WEIGHT_MAX, f"{key!r} out of range: {value}"
+
+
+def test_seed_base_weight_decision_outranks_unclassified() -> None:
+    """The headline case: a decision must start above a throwaway aside."""
+    assert seed_base_weight(memory_type="decision") > seed_base_weight(memory_type="unclassified")
+
+
+def test_seed_base_weight_prefers_memory_type_over_source() -> None:
+    """A known, specific memory_type wins even when source is also known."""
+    assert seed_base_weight(memory_type="decision", source="chat_import") == BASE_WEIGHT_TYPE_PRIORS["decision"]
+
+
+def test_seed_base_weight_falls_back_to_source_when_type_unknown() -> None:
+    assert seed_base_weight(memory_type=None, source="chat_import") == BASE_WEIGHT_SOURCE_PRIORS["chat_import"]
+
+
+def test_seed_base_weight_unclassified_type_falls_back_to_source() -> None:
+    """memory_type='unclassified' is treated the same as "not known yet"."""
+    assert seed_base_weight(memory_type="unclassified", source="chat_import") == BASE_WEIGHT_SOURCE_PRIORS["chat_import"]
+
+
+def test_seed_base_weight_manual_source_is_flat_default() -> None:
+    assert seed_base_weight(source="manual") == 1.0
+
+
+def test_seed_base_weight_no_signal_defaults_to_one() -> None:
+    assert seed_base_weight() == 1.0
+    assert seed_base_weight(memory_type="unclassified", source="some_unrecognized_source") == 1.0
+
+
+def test_seed_base_weight_unrecognized_type_falls_back_to_source() -> None:
+    """A memory_type string outside the known table (defensive -- shouldn't
+    happen given the Literal-validated field, but the function must not
+    raise) falls through to source, then the flat default."""
+    assert seed_base_weight(memory_type="not_a_real_type", source="chat_import") == BASE_WEIGHT_SOURCE_PRIORS["chat_import"]
+    assert seed_base_weight(memory_type="not_a_real_type") == 1.0
+
+
+def test_seed_base_weight_chat_import_starts_below_manual() -> None:
+    """Issue #56's own comparison: raw chat_import should start lower than manual entry."""
+    assert seed_base_weight(source="chat_import") < seed_base_weight(source="manual")
 
 
 # ---------------------------------------------------------------------------

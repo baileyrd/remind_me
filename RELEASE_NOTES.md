@@ -1,5 +1,18 @@
 # Release Notes
 
+## v1.12.0 — 2026-07-21
+
+Closes a ranking gap flagged in the application capability review: every new memory started at a flat `base_weight=1.0` regardless of kind, so a throwaway aside ("it's raining today") competed evenly in ranking with a real decision ("we're migrating to Postgres") until feedback or access patterns accrued enough signal to differentiate them — and the highest-value memories (decisions) are exactly the ones a user is least likely to re-query immediately, so they'd lose the ranking race to frequently-hit trivia before feedback ever kicked in.
+
+### New Features
+
+- **Importance prior at write time** — a new `vitality.seed_base_weight(*, memory_type=None, source=None)` seeds `base_weight` from a small lookup table (`BASE_WEIGHT_TYPE_PRIORS`, `BASE_WEIGHT_SOURCE_PRIORS`) instead of the flat 1.0 default:
+  - `remind_me_decompose` already classifies each fact's `memory_type` at write time, so it seeds directly from that (`decision` 1.3x, `blocker` 1.2x, `fact`/`insight` 1.15x, `preference` 1.1x, `learning` 1.05x, `action_item`/`unclassified` at the flat default).
+  - `remind_me_add` doesn't have a `memory_type` yet (set later by `remind_me_reclassify`), so it seeds from `source` instead — `manual` keeps the flat default; `chat_import`/`document_import`/`webhook` start slightly lower (0.85–0.9x), since raw imports are unreviewed and often noisy.
+  - A fresh memory's `vitality` is set to match its seeded `base_weight` exactly (the ACT-R formula reduces to `vitality == base_weight` when `access_count=0` and `days_since_last_access=0`) — previously it defaulted to a hardcoded 1.0 independent of `base_weight`, which would have been silently inconsistent once seeding was added.
+  - Purely additive: an unrecognized or absent source, or `memory_type="unclassified"`, still falls through to the original flat 1.0 default, so this changes nothing for content that predates the feature.
+  - Deliberately scoped to the two write paths above for now — the chat/document importer's bulk INSERT, `mempalace`/`dbs` imports, `remind_me_normalize_apply`, and the dashboard REST API's `POST /api/memories` still use the flat default; an explicit, documented scope decision (see README), not an oversight.
+
 ## v1.11.0 — 2026-07-21
 
 Closes a vault-hygiene gap flagged in the application capability review: `merge_cluster` (`consolidation.py`) unioned raw content lines from clustered memories rather than summarizing them, so merged memories grew unbounded and stayed verbose instead of becoming genuinely consolidated. Its clustering step was also a Python-level O(n²) double loop, worth capping regardless of the summarization fix.

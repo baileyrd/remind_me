@@ -27,6 +27,7 @@ from remind_me_mcp.models import (  # noqa: TC001  # FastMCP resolves these anno
 )
 from remind_me_mcp.server import mcp
 from remind_me_mcp.tools._shared import _maybe_update_notice, log
+from remind_me_mcp.vitality import seed_base_weight
 
 
 @mcp.tool(
@@ -51,12 +52,20 @@ async def memory_add(params: MemoryAddInput) -> str:
     db = _pkg._get_db()
     mem_id = _make_id(params.content)
     now = _now_iso()
+    # Importance prior at write time (issue #56): memory_type isn't known
+    # yet here (set later by remind_me_reclassify), so this seeds from
+    # source alone -- falls back to the flat 1.0 default for "manual" or
+    # any unrecognized source. A fresh memory's vitality equals its
+    # base_weight exactly (access_count=0, days_since_last_access=0 in
+    # compute_vitality's formula), so both columns must carry the same
+    # seeded value or vitality would start inconsistent with base_weight.
+    base_weight = seed_base_weight(source=params.source)
     try:
         db.execute(
             """INSERT INTO memories (id, content, category, tags, source, metadata,
                                      created_at, updated_at, node_id, client,
-                                     subject, predicate, object)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                     subject, predicate, object, base_weight, vitality)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 mem_id,
                 params.content,
@@ -71,6 +80,8 @@ async def memory_add(params: MemoryAddInput) -> str:
                 params.subject,
                 params.predicate,
                 params.object,
+                base_weight,
+                base_weight,
             ),
         )
         # FT-04: upsert mentioned entities and record the mention links.

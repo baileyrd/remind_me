@@ -29,7 +29,7 @@ Persistent, searchable memory that works across **Claude.ai**, **Claude Code**, 
 - **Compile workflow** — `remind_me_wiki_compile` surfaces pending raw memories plus the current wiki state and schema, then advances a watermark once the batch is integrated
 
 **Evolve & maintain**
-- **ACT-R vitality model** — cognitive-science-inspired memory decay with per-category rates, access-based reinforcement, and bridge protection for high-value memories
+- **ACT-R vitality model** — cognitive-science-inspired memory decay with per-category rates, access-based reinforcement, bridge protection for high-value memories, and an importance prior seeded from `memory_type`/`source` at write time so a decision outranks a throwaway aside before any feedback exists
 - **Vault consolidation** — semantic clustering with Union-Find, canonical selection, and dry-run merge previews; merging requires an LLM-authored summary per cluster (real consolidation, not unbounded concatenation)
 
 **Search & retrieval**
@@ -983,6 +983,17 @@ On top of the profile above, a query containing a temporal expression ("before I
 - **With `query`** — query-contextual instead: a memory can be a poor match for "what's my favorite editor" but a perfect match for "what IDE did I mention last year," and global demotion would punish the second case for the first's feedback. The event is logged (memory, query, signal, magnitude) rather than touching `base_weight`; at ranking time, a future search's query is compared against every stored feedback query for that memory using Jaccard token-overlap similarity (coarse clustering, no embedder dependency), and matches above a threshold nudge that memory's RRF score up or down by up to 40%, before reranking. A memory with no matching feedback is completely unaffected — this only ever adds signal, never removes a candidate.
 - Feedback logs are per-node local bookkeeping (like the dbs/MemPalace import dedup tables) and aren't synced across devices — an explicit scope decision, not an oversight.
 
+### Importance Prior at Write Time
+
+Every new memory used to start at a flat `base_weight=1.0` regardless of kind, so a throwaway aside ("it's raining today") competed evenly in ranking with a real decision ("we're migrating to Postgres") until feedback or access patterns accrued enough signal to differentiate them — and the highest-value memories (decisions) are exactly the ones a user is least likely to re-query immediately, so they'd lose the ranking race to frequently-hit trivia before feedback ever kicked in.
+
+`base_weight` (and the matching initial `vitality`, since a fresh memory's vitality equals its base_weight exactly) is now seeded at write time:
+
+- `remind_me_decompose` already classifies each fact's `memory_type` at write time, so it seeds directly from that (`decision`/`blocker` highest, down to `action_item` at the flat 1.0 default).
+- `remind_me_add` doesn't have a `memory_type` yet (that's set later by `remind_me_reclassify`), so it seeds from `source` instead — a deliberate `manual` entry keeps the historical flat default; raw bulk-import sources (`chat_import`, `document_import`, `webhook`) start slightly lower, since they're unreviewed and often noisy.
+- An unrecognized or absent source (and `memory_type="unclassified"`) falls through to the original flat 1.0 default — this is purely additive, not a behavior change for existing content.
+- Other write paths (the chat/document importer's bulk INSERT, `mempalace`/`dbs` imports, `remind_me_normalize_apply`, the dashboard REST API) still use the flat default for now — an explicit, documented scope decision, not an oversight; extend the same `seed_base_weight()` helper (`vitality.py`) there later if it proves valuable.
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -1200,6 +1211,12 @@ remind_me is local-first, single-user, and MCP-native by design — some capabil
 ## Changelog
 
 See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for a per-version feature breakdown with PR references; this section summarizes the same history phase-by-phase.
+
+### 1.12.0 — 2026-07-21
+
+Closes a ranking gap flagged in the application capability review: every new memory started at a flat `base_weight=1.0` regardless of kind, so a throwaway aside competed evenly with a real decision until feedback/access signal accrued — and decisions are exactly the memories least likely to be re-queried immediately, so they'd lose that early ranking race.
+
+- **Importance prior at write time** — `remind_me_decompose` seeds `base_weight` from its already-known `memory_type` (`decision`/`blocker` highest); `remind_me_add` seeds from `source` since `memory_type` isn't known yet (`manual` keeps the flat default, raw import sources start slightly lower). A fresh memory's `vitality` is set to match its seeded `base_weight` exactly. Purely additive — an unrecognized or absent source, or the `unclassified` type, still falls through to the original flat 1.0 default.
 
 ### 1.11.0 — 2026-07-21
 
