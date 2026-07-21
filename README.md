@@ -11,8 +11,10 @@ Persistent, searchable memory that works across **Claude.ai**, **Claude Code**, 
 - **Document ingestion** — import Markdown notes and plain-text files, chunked per-section (heading context preserved) or per-paragraph; `kind=auto` detects chat vs document per file
 - **Bulk directory import** — point at a folder of exports/notes and import them all
 - **Watched folders** — set `REMIND_ME_WATCH_DIRS` and new or changed files auto-ingest in the background; changed files supersede their previous import
+- **Push/webhook ingestion** — set `REMIND_ME_WEBHOOK_SECRET` and `POST /ingest` accepts content directly over the network, no filesystem staging required
+- **Ingest-time normalization** — `remind_me_normalize_batch`/`remind_me_normalize_apply` distill noisy raw imports into clean `{question, summary, resolution?}` memories, non-destructively linked back to the source
 - **Auto-capture** — store a full conversation dialog plus a distilled summary as two linked memories
-- **Deduplication** — re-importing the same file is a safe no-op (tracked by file hash)
+- **Deduplication** — re-importing the same content is a safe no-op (tracked by content hash)
 
 **Organize: entity knowledge graph**
 - **Atomic decomposition** — Claude-driven extraction of atomic facts from conversations, linked to parent memories
@@ -292,6 +294,13 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_decompose` | Break a conversation capture into atomic facts with parent-child linking, SPO triples, and entity mentions |
 | `remind_me_decompose_batch` | Fetch captures that have not been decomposed yet |
 
+### Ingest-time normalization
+
+| Tool | Description |
+|------|-------------|
+| `remind_me_normalize_batch` | Fetch raw document/chat import chunks that have not been normalized yet |
+| `remind_me_normalize_apply` | Write a distilled `{question, summary, resolution?, refs?}` as a new memory, non-destructively linked back to the raw import |
+
 ### Entity graph & annotation
 
 | Tool | Description |
@@ -332,11 +341,12 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_reindex` | Build vector embeddings for any memories missing them |
 | `remind_me_server_status` | Check dashboard, embedding, folder-watcher, and remote-connector state and verify DB connectivity |
 | `remind_me_watch_status` | Folder watcher status: watched dirs, scan counters, recent errors |
+| `remind_me_webhook_status` | Push/webhook ingestion status: bind/port, request counters, recent errors |
 | `remind_me_revoke_clients` | List OAuth connector clients, or revoke one (with all of its tokens) |
 | `remind_me_check_update` | Check if a newer version is available on origin/main |
 | `remind_me_self_update` | Pull latest changes from origin and reinstall the package |
 
-37 tools + 4 resources (`memory://stats`, `memory://categories`, `wiki://schema`, `wiki://index`).
+40 tools + 4 resources (`memory://stats`, `memory://categories`, `wiki://schema`, `wiki://index`).
 
 ### Auto-Capture: Persisting Full Conversations
 
@@ -480,6 +490,31 @@ REMIND_ME_WATCH_DIRS=~/notes:~/Downloads/exports remind-me-mcp
 - **Changed files supersede** — a changed file has a new hash, so it imports fresh; the watcher then marks every memory from the file's previous import as superseded (`superseded_by` = the new import id). Stale chunks drop out of search results (which filter `superseded_by IS NULL`) but remain in the database for audit.
 - **Status** — the `remind_me_watch_status` tool reports watched dirs, scan counters, ingest/skip/supersede counts, and recent errors; `remind_me_server_status` includes a watcher summary too.
 - **Wiki is downstream, not automatic** — the watcher feeds the **memory store**, not the wiki. Synthesis into wiki pages is a separate LLM-driven step (`remind_me_wiki_compile`). So both status tools also report `pending_wiki_compile` — the count of non-superseded memories created since the last compile watermark — as a nudge that newly ingested files are waiting to be folded into the wiki.
+
+## Push/Webhook Ingestion
+
+For content that shows up as an event rather than a file on disk (a chat-export tool, a CI job, another automation), set `REMIND_ME_WEBHOOK_SECRET` and the server accepts pushes directly instead of waiting for the folder watcher to find a file:
+
+```bash
+REMIND_ME_WEBHOOK_SECRET=$(openssl rand -hex 32) remind-me-mcp
+```
+
+```bash
+curl -X POST http://127.0.0.1:8769/ingest \
+  -H "Authorization: Bearer $REMIND_ME_WEBHOOK_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"filename": "export.json", "content": "{\"chat_messages\": [...]}"}'
+```
+
+- **Disabled by default** — without `REMIND_ME_WEBHOOK_SECRET` the server refuses to start; every request needs the bearer token, so an unsecured push endpoint never exists.
+- **Localhost by default** — `REMIND_ME_WEBHOOK_BIND` defaults to `127.0.0.1` (unlike the Tailscale-oriented peer sync server's `0.0.0.0` default), since a push endpoint writes arbitrary content directly into memory; widen it deliberately if you need remote access.
+- **Same pipeline as file import** — `content` is UTF-8 text; `filename`'s extension selects the parser (JSON/JSONL chat exports, Markdown/plain-text documents), and hash dedup applies exactly like `remind_me_import_chat`. `category`, `tags`, `extract_mode`, `max_length`, and `kind` are all optional, with the same defaults as `remind_me_import_chat`.
+- **Status** — `remind_me_webhook_status` reports enabled/running state, bind/port, and request counters (ingested/skipped/errored); `remind_me_server_status` includes a one-line summary too.
+- **Configuration** — `REMIND_ME_WEBHOOK_PORT` (default 8769), `REMIND_ME_WEBHOOK_BIND`, `REMIND_ME_WEBHOOK_SECRET`.
+
+## Ingest-Time Normalization
+
+Raw imports (chat/document, from a file import, the watcher, or a webhook push) are often verbatim and noisy. `remind_me_normalize_batch` surfaces un-normalized `document_import`/`chat_import` chunks for the calling agent to distill into `{question, summary, resolution?, refs?}` — the LLM work happens client-side, exactly like `remind_me_decompose` already does for atomic-fact extraction, so the server itself has no LLM dependency. `remind_me_normalize_apply` then writes each distillation as a new memory (category `normalized`), non-destructively linked back to the raw row via a `normalized_from` metadata pointer — the raw memory is kept, not replaced, and `remind_me_normalize_batch` skips it on the next call.
 
 ## Entity Knowledge Graph
 
@@ -884,6 +919,9 @@ Documents and chat exports are chunked on import (per Markdown section or per me
 | `REMIND_ME_WATCH_DIRS` | *(unset)* | Colon-separated directories for the folder watcher to auto-ingest. Empty = watcher disabled. Each directory must lie inside `REMIND_ME_IMPORT_ROOTS` |
 | `REMIND_ME_WATCH_INTERVAL` | `60` | Seconds between folder watcher scan passes |
 | `REMIND_ME_WATCH_GRACE` | `5` | Debounce grace period in seconds — files modified more recently than this are deferred until a scan sees a stable (mtime, size) |
+| `REMIND_ME_WEBHOOK_SECRET` | *(unset)* | Bearer token for the push/webhook ingestion server. Empty = disabled — the server refuses to start without it |
+| `REMIND_ME_WEBHOOK_PORT` | `8769` | Port for the push/webhook ingestion server |
+| `REMIND_ME_WEBHOOK_BIND` | `127.0.0.1` | Bind address for the push/webhook ingestion server. Widen deliberately (e.g. a Tailscale IP) since it writes arbitrary pushed content directly into memory |
 | `REMIND_ME_AUTO_UPDATE_CHECK` | `true` | Set to `false` to skip the background `git fetch` update check at server startup (the manual check/update tools keep working) |
 | `REMIND_ME_RRF_K` | `60` | Smoothing constant for Reciprocal Rank Fusion scoring |
 | `REMIND_ME_RRF_W_KEYWORD` | `1.0` | RRF weight for the keyword (FTS5) signal |
@@ -1017,6 +1055,8 @@ The server uses:
 - **Pluggable connectors** — `chat`/`document` (and third-party kinds like `mempalace`) are parser functions registered by kind string, not a hardcoded dispatch — `remind_me_list_connectors` reports the registry
 - **Neighbor-aware chunk retrieval** — every import-produced chunk carries a `doc_id`/`chunk_index`; opt-in search expansion surfaces adjacent chunks from the same source document
 - **Polling folder watcher** — mtime/size scans with a debounce grace window and changed-file supersession (no inotify dependency)
+- **Push/webhook ingestion** — a bearer-authenticated `POST /ingest` endpoint accepts content directly (no filesystem staging), sharing the same connector pipeline and hash dedup as file import
+- **Client-side ingest normalization** — `remind_me_normalize_batch`/`remind_me_normalize_apply` distill noisy raw imports into `{question, summary, resolution?}` memories; the LLM work happens in the calling agent, not the server, same as `remind_me_decompose`
 - **Outbox-based sync** — local writes (memories, entities, links) are captured in `sync_outbox`, pushed to hub/peers in background
 - **Postgres hub** — central sync point with last-write-wins conflict resolution
 - **Peer-to-peer sync** — direct machine-to-machine sync via Tailscale peer discovery

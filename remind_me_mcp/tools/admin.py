@@ -482,6 +482,23 @@ async def remind_me_server_status() -> str:
             "auto-ingest a notes/docs folder)"
         )
 
+    # Push/webhook ingestion (FT-09, Phase 5a)
+    from remind_me_mcp.webhook_server import get_webhook_status
+
+    webhook = get_webhook_status()
+    if webhook["enabled"]:
+        state = "✓ Running" if webhook["running"] else "✗ Not running"
+        lines.append(
+            f"\n**Webhook ingestion:** {state} at {webhook['bind']}:{webhook['port']} — "
+            f"{webhook['requests_ingested']} ingested / {webhook['requests_skipped']} skipped"
+        )
+        lines.append("_Details: `remind_me_webhook_status`_")
+    else:
+        lines.append(
+            "\n**Webhook ingestion:** ✗ Disabled (set REMIND_ME_WEBHOOK_SECRET "
+            "to enable push ingestion via POST /ingest)"
+        )
+
     # LLM Wiki (FT-08)
     try:
         from remind_me_mcp import wiki
@@ -573,6 +590,35 @@ async def remind_me_watch_status() -> str:
     status = get_watch_status()
     status["pending_wiki_compile"] = wiki.pending_compile_count()
     return json.dumps(status, indent=2)
+
+
+@mcp.tool(
+    name="remind_me_webhook_status",
+    annotations={
+        "title": "Webhook Ingestion Status",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def remind_me_webhook_status() -> str:
+    """Report the push/webhook ingestion server's state (FT-09/Phase 5a).
+
+    When REMIND_ME_WEBHOOK_SECRET is configured, a small HTTP server accepts
+    POST /ingest requests (bearer-authenticated) and imports their content
+    through the same pipeline as remind_me_import_chat — a way for external
+    senders (chat-export tools, CI jobs, automations) to push content
+    directly into memory over the network.
+
+    Returns:
+        str: JSON status — enabled/running flags, bind address/port, request
+        counters (ingested/skipped/errored), and recent errors. When
+        disabled, includes a configuration hint.
+    """
+    from remind_me_mcp.webhook_server import get_webhook_status
+
+    return json.dumps(get_webhook_status(), indent=2)
 
 
 @mcp.tool(

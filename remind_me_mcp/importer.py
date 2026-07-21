@@ -26,6 +26,14 @@ one under ``"mempalace"``, purely for discovery) without touching this
 module. Hash dedup, chunk storage, and embedding stay source-agnostic and
 unchanged either way.
 
+Phase 5: :func:`import_content` is the same pipeline entered from in-memory
+bytes instead of a filesystem path — the entry point ``webhook_server.py``
+uses for push ingestion. ``import_chat_file`` and ``import_content`` share
+one parse/store/embed core (:func:`_ingest_parsed`); only how ``raw``,
+``fhash``, and ``import_id`` are obtained differs (file read + content hash
+vs. in-memory bytes + hash), so both keep the exact same validation, dedup,
+and storage semantics.
+
 FT-06: exports may carry entity-graph records tagged with a ``record_type``
 discriminator ('entity' / 'memory_entity'; absent = memory, mirroring the
 FT-04 sync wire format). Message extraction skips them, and JSON/JSONL chat
@@ -181,6 +189,21 @@ def _file_hash(path: str) -> str:
         for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
     return h.hexdigest()[:16]
+
+
+def _hash_bytes(data: bytes) -> str:
+    """Compute a short SHA-256 hash of in-memory bytes for deduplication (Phase 5).
+
+    Same digest/truncation convention as :func:`_file_hash`, for content that
+    is already fully in memory (e.g. a webhook push) rather than on disk.
+
+    Args:
+        data: The raw bytes to hash.
+
+    Returns:
+        First 16 hex characters of the SHA-256 digest (64-bit fingerprint).
+    """
+    return hashlib.sha256(data).hexdigest()[:16]
 
 
 def _chunk_text(text: str, max_len: int) -> list[str]:
@@ -727,8 +750,196 @@ def _restore_graph_records(
 
 
 # ---------------------------------------------------------------------------
-# Public import function
+# Public import functions
 # ---------------------------------------------------------------------------
+
+
+def _validate_kind_and_suffix(kind: str, suffix: str, filename: str) -> dict[str, Any] | None:
+    """Shared kind/suffix validation for both import entry points.
+
+    Args:
+        kind: 'chat', 'document', or 'auto'.
+        suffix: Lowercased file extension (from the path or the pushed
+            filename).
+        filename: Display name for the error's 'file' field.
+
+    Returns:
+        An error status dict, or None when valid.
+    """
+    if kind not in IMPORT_KINDS:
+        return {
+            "status": "error",
+            "reason": f"invalid kind: {kind!r} (use 'auto', 'chat', or 'document')",
+            "file": filename,
+        }
+    if suffix not in (".json", ".jsonl", ".md", ".markdown", ".txt"):
+        return {"status": "error", "reason": f"unsupported format: {suffix}", "file": filename}
+    if kind == "document" and suffix in (".json", ".jsonl"):
+        return {
+            "status": "error",
+            "reason": f"document import does not support {suffix}: use .md, .markdown, or .txt",
+            "file": filename,
+        }
+    return None
+
+
+def _ingest_parsed(
+    raw: str,
+    suffix: str,
+    filename: str,
+    fhash: str,
+    import_id: str,
+    category: str,
+    tags: list[str],
+    extract_mode: str,
+    max_length: int,
+    kind: str,
+) -> dict[str, Any]:
+    """Parse already-read content and store it (Phase 5): the connector
+    dispatch, chunk/memory INSERTs, and batched embedding shared by
+    :func:`import_chat_file` and :func:`import_content`.
+
+    Callers have already run :func:`_validate_kind_and_suffix` and the early
+    (pre-parse) hash-dedup check — this re-checks the hash once more under
+    the lock (another worker may have won the race in between) before
+    writing anything.
+
+    Args:
+        raw: The full raw text content to import.
+        suffix: Lowercased file extension, used for connector dispatch and
+            chat/document auto-sniffing.
+        filename: Display name stored in metadata and the chat_imports row.
+        fhash: Content hash (already computed by the caller) for dedup.
+        import_id: Deterministic id shared by every chunk from this import.
+        category: Category to assign to all imported memories.
+        tags: Tags to apply to all imported memories.
+        extract_mode: Message extraction strategy (chat imports only).
+        max_length: Maximum characters per memory chunk.
+        kind: 'chat', 'document', or 'auto'.
+
+    Returns:
+        Same result shape as :func:`import_chat_file`.
+    """
+    db = _get_db()
+
+    # Resolve the effective kind (FT-02). JSON/JSONL are always chat exports;
+    # markdown/text files are content-sniffed in auto mode so chat-style
+    # markdown keeps importing as chat (existing behavior preserved).
+    if suffix in (".json", ".jsonl"):
+        effective_kind = "chat"
+    elif kind == "auto":
+        effective_kind = "chat" if _looks_like_chat_markdown(raw) else "document"
+    else:
+        effective_kind = kind
+
+    # Entity-graph records found in JSON/JSONL exports (FT-06) — restored
+    # below, never parsed as chat messages. Extracted independently of the
+    # connector dispatch (Phase 4): see _extract_graph_records.
+    graph_records = _extract_graph_records(raw, suffix)
+
+    # (chunk_content, chunk_metadata) pairs, via the kind's registered
+    # connector (Phase 4) — effective_kind is always "chat" or "document"
+    # (resolved just above), and both are always registered, so this lookup
+    # cannot miss.
+    connector = _CONNECTORS[effective_kind]
+    parsed, raw_entries = connector(
+        raw, {"suffix": suffix, "extract_mode": extract_mode, "max_length": max_length}
+    )
+
+    if effective_kind == "document":
+        source = DOCUMENT_SOURCE
+        if category in ("", "chat_import"):
+            category = DOCUMENT_CATEGORY
+    else:
+        source = "chat_import"
+
+    # Pre-compute chunk/embed entries before acquiring the lock
+    now = _now_iso()
+    embed_entries: list[tuple[str, str, dict[str, Any]]] = [
+        (_make_id(chunk), chunk, chunk_meta) for chunk, chunk_meta in parsed
+    ]
+
+    # --- Dedup re-check + INSERTs in one short locked transaction. The lock
+    # covers only the DB writes; parsing (above) and embedding (below) run
+    # unlocked so concurrent import workers make progress (PF-03). ---
+    with _import_lock:
+        # Re-check under the lock: another worker importing the same content
+        # may have won the race since the caller's early check.
+        existing = db.execute(
+            "SELECT import_id FROM chat_imports WHERE hash = ?", (fhash,)
+        ).fetchone()
+        if existing:
+            return {"status": "skipped", "reason": "already_imported", "file": filename, "import_id": existing["import_id"]}
+
+        # Chunk and store — collect (mem_id, chunk) pairs so the same IDs are used
+        # for both INSERT and embedding (BUGF-01 fix: prevents ID mismatch).
+        # doc_id/chunk_index group every chunk from this file together in
+        # source order, so a search hit's siblings can be looked up directly
+        # (neighbor-aware chunk retrieval) instead of re-parsing metadata.
+        stored = 0
+        for chunk_index, (mem_id, chunk, chunk_meta) in enumerate(embed_entries):
+            metadata: dict[str, Any] = {
+                "import_id": import_id, "filename": filename, **chunk_meta,
+            }
+            db.execute(
+                """INSERT OR IGNORE INTO memories
+                   (id, content, category, tags, source, metadata, created_at, updated_at, doc_id, chunk_index)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    mem_id,
+                    chunk,
+                    category,
+                    json.dumps(tags),
+                    source,
+                    json.dumps(metadata),
+                    now,
+                    now,
+                    import_id,
+                    chunk_index,
+                ),
+            )
+            stored += 1
+
+        stats: dict[str, Any] = {
+            "kind": effective_kind,
+            "memories_created": stored,
+            "raw_entries": raw_entries,
+            "file": filename,
+        }
+        if graph_records:
+            # Restore the entity graph from an FT-06 export: entities upsert
+            # (alias union-merge), links insert-or-ignore when both endpoints
+            # exist — dangling links (the referenced memory id is gone, e.g.
+            # a fresh-DB re-import assigned new ids) are skipped and counted.
+            stats.update(_restore_graph_records(db, graph_records))
+        db.execute(
+            "INSERT INTO chat_imports (import_id, filename, hash, imported_at, stats) VALUES (?, ?, ?, ?, ?)",
+            (import_id, filename, fhash, now, json.dumps(stats)),
+        )
+        db.commit()
+
+    # --- Embed OUTSIDE the lock, in batches (PF-03). The rows use the SAME
+    # mem_ids that were INSERTed (BUGF-01); any failure here is healed later
+    # by remind_me_reindex. ---
+    if embed_entries:
+        chunk_by_id = {mem_id: chunk for mem_id, chunk, _chunk_meta in embed_entries}
+        ids = list(chunk_by_id)
+        rows_to_embed: list[tuple[int, str]] = []
+        # The quick rowid lookups reuse the lock only because tests may share
+        # one connection across workers; the slow embed calls stay unlocked.
+        with _import_lock:
+            for i in range(0, len(ids), _ROWID_LOOKUP_BATCH):
+                batch_ids = ids[i : i + _ROWID_LOOKUP_BATCH]
+                placeholders = ",".join("?" for _ in batch_ids)
+                for row in db.execute(
+                    f"SELECT id, rowid FROM memories WHERE id IN ({placeholders})",
+                    batch_ids,
+                ).fetchall():
+                    rows_to_embed.append((row["rowid"], chunk_by_id[row["id"]]))
+        for i in range(0, len(rows_to_embed), EMBED_BATCH_SIZE):
+            _embed_and_store_rows(rows_to_embed[i : i + EMBED_BATCH_SIZE])
+
+    return {"status": "ok", "import_id": import_id, **stats}
 
 
 def import_chat_file(
@@ -747,7 +958,7 @@ def import_chat_file(
     (Markdown headings) or per-paragraph (plain text), recording the section
     heading in each memory's metadata. Deduplicates by file hash — if the same
     file content has already been imported, returns a 'skipped' result
-    immediately.
+    immediately, without reading the file's text (only its bytes are hashed).
 
     Args:
         file_path: Path to the file to import.
@@ -776,25 +987,13 @@ def import_chat_file(
     path = Path(file_path)
     suffix = path.suffix.lower()
 
-    if kind not in IMPORT_KINDS:
-        return {
-            "status": "error",
-            "reason": f"invalid kind: {kind!r} (use 'auto', 'chat', or 'document')",
-            "file": path.name,
-        }
+    error = _validate_kind_and_suffix(kind, suffix, path.name)
+    if error is not None:
+        return error
 
-    if suffix not in (".json", ".jsonl", ".md", ".markdown", ".txt"):
-        return {"status": "error", "reason": f"unsupported format: {suffix}", "file": path.name}
-
-    if kind == "document" and suffix in (".json", ".jsonl"):
-        return {
-            "status": "error",
-            "reason": f"document import does not support {suffix}: use .md, .markdown, or .txt",
-            "file": path.name,
-        }
-
-    # --- Phase 1: hash dedup BEFORE any parsing/chunking (PF-03) so
-    # re-importing an already-imported file short-circuits immediately. ---
+    # --- Hash dedup BEFORE any parsing/chunking (PF-03) so re-importing an
+    # already-imported file short-circuits immediately, without reading its
+    # full text. ---
     fhash = _file_hash(file_path)
     db = _get_db()
     with _import_lock:
@@ -809,128 +1008,73 @@ def import_chat_file(
             "import_id": existing["import_id"],
         }
 
-    # --- Phase 2: file I/O and parsing (no lock needed; pure CPU/disk work) ---
     raw = path.read_text(encoding="utf-8", errors="replace")
-
-    # Resolve the effective kind (FT-02). JSON/JSONL are always chat exports;
-    # markdown/text files are content-sniffed in auto mode so chat-style
-    # markdown keeps importing as chat (existing behavior preserved).
-    if suffix in (".json", ".jsonl"):
-        effective_kind = "chat"
-    elif kind == "auto":
-        effective_kind = "chat" if _looks_like_chat_markdown(raw) else "document"
-    else:
-        effective_kind = kind
-
-    # Entity-graph records found in JSON/JSONL exports (FT-06) — restored
-    # below, never parsed as chat messages. Extracted independently of the
-    # connector dispatch (Phase 4): see _extract_graph_records.
-    graph_records = _extract_graph_records(raw, suffix)
-
-    # (chunk_content, chunk_metadata) pairs, via the kind's registered
-    # connector (Phase 4) — chat.effective_kind is always "chat" or
-    # "document" (resolved just above), and both are always registered, so
-    # this lookup cannot miss.
-    connector = _CONNECTORS[effective_kind]
-    parsed, raw_entries = connector(
-        raw, {"suffix": suffix, "extract_mode": extract_mode, "max_length": max_length}
+    import_id = _make_id(file_path)
+    return _ingest_parsed(
+        raw, suffix, path.name, fhash, import_id, category, tags, extract_mode, max_length, kind
     )
 
-    if effective_kind == "document":
-        source = DOCUMENT_SOURCE
-        if category in ("", "chat_import"):
-            category = DOCUMENT_CATEGORY
-    else:
-        source = "chat_import"
 
-    # Pre-compute chunk/embed entries before acquiring the lock
-    now = _now_iso()
-    import_id = _make_id(file_path)
-    embed_entries: list[tuple[str, str, dict[str, Any]]] = [
-        (_make_id(chunk), chunk, chunk_meta) for chunk, chunk_meta in parsed
-    ]
+def import_content(
+    content: bytes,
+    filename: str,
+    category: str,
+    tags: list[str],
+    extract_mode: str,
+    max_length: int,
+    kind: str = "auto",
+) -> dict[str, Any]:
+    """Import already-in-memory bytes through the same pipeline as
+    :func:`import_chat_file` (Phase 5): the filesystem-free entry point
+    push/webhook ingestion uses, since a pushed payload has no path to read.
 
-    # --- Phase 3: dedup re-check + INSERTs in one short locked transaction.
-    # The lock covers only the DB writes; parsing (above) and embedding
-    # (below) run unlocked so concurrent import workers make progress (PF-03).
+    ``filename`` supplies the extension used for parser dispatch (exactly
+    like a real file's suffix) and is stored as the display name in each
+    memory's metadata and the chat_imports row — it does not need to
+    reference anything on disk. Deduplicates by content hash, same as a
+    file import: pushing byte-identical content twice is a no-op.
+
+    Args:
+        content: Raw file bytes (decoded as UTF-8, replacing invalid bytes).
+        filename: Display name; its extension selects the parser
+            (.json, .jsonl, .md, .markdown, or .txt).
+        category: Category to assign to all imported memories. For document
+            imports, the generic chat default ('chat_import') or an empty
+            string is replaced with 'document'.
+        tags: Tags to apply to all imported memories.
+        extract_mode: Message extraction strategy (chat imports only).
+        max_length: Maximum characters per memory chunk.
+        kind: 'chat', 'document', or 'auto' (default) — see
+            :func:`import_chat_file`.
+
+    Returns:
+        Same result shape as :func:`import_chat_file`.
+    """
+    suffix = Path(filename).suffix.lower()
+
+    error = _validate_kind_and_suffix(kind, suffix, filename)
+    if error is not None:
+        return error
+
+    fhash = _hash_bytes(content)
+    db = _get_db()
     with _import_lock:
-        # Re-check under the lock: another worker importing the same content
-        # may have won the race since the early check in phase 1.
         existing = db.execute(
             "SELECT import_id FROM chat_imports WHERE hash = ?", (fhash,)
         ).fetchone()
-        if existing:
-            return {"status": "skipped", "reason": "already_imported", "file": path.name, "import_id": existing["import_id"]}
-
-        # Chunk and store — collect (mem_id, chunk) pairs so the same IDs are used
-        # for both INSERT and embedding (BUGF-01 fix: prevents ID mismatch).
-        # doc_id/chunk_index group every chunk from this file together in
-        # source order, so a search hit's siblings can be looked up directly
-        # (neighbor-aware chunk retrieval) instead of re-parsing metadata.
-        stored = 0
-        for chunk_index, (mem_id, chunk, chunk_meta) in enumerate(embed_entries):
-            metadata: dict[str, Any] = {
-                "import_id": import_id, "filename": path.name, **chunk_meta,
-            }
-            db.execute(
-                """INSERT OR IGNORE INTO memories
-                   (id, content, category, tags, source, metadata, created_at, updated_at, doc_id, chunk_index)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    mem_id,
-                    chunk,
-                    category,
-                    json.dumps(tags),
-                    source,
-                    json.dumps(metadata),
-                    now,
-                    now,
-                    import_id,
-                    chunk_index,
-                ),
-            )
-            stored += 1
-
-        stats: dict[str, Any] = {
-            "kind": effective_kind,
-            "memories_created": stored,
-            "raw_entries": raw_entries,
-            "file": path.name,
+    if existing:
+        return {
+            "status": "skipped",
+            "reason": "already_imported",
+            "file": filename,
+            "import_id": existing["import_id"],
         }
-        if graph_records:
-            # Restore the entity graph from an FT-06 export: entities upsert
-            # (alias union-merge), links insert-or-ignore when both endpoints
-            # exist — dangling links (the referenced memory id is gone, e.g.
-            # a fresh-DB re-import assigned new ids) are skipped and counted.
-            stats.update(_restore_graph_records(db, graph_records))
-        db.execute(
-            "INSERT INTO chat_imports (import_id, filename, hash, imported_at, stats) VALUES (?, ?, ?, ?, ?)",
-            (import_id, path.name, fhash, now, json.dumps(stats)),
-        )
-        db.commit()
 
-    # --- Phase 4: embed OUTSIDE the lock, in batches (PF-03). The rows use
-    # the SAME mem_ids that were INSERTed (BUGF-01); any failure here is
-    # healed later by remind_me_reindex. ---
-    if embed_entries:
-        chunk_by_id = {mem_id: chunk for mem_id, chunk, _chunk_meta in embed_entries}
-        ids = list(chunk_by_id)
-        rows_to_embed: list[tuple[int, str]] = []
-        # The quick rowid lookups reuse the lock only because tests may share
-        # one connection across workers; the slow embed calls stay unlocked.
-        with _import_lock:
-            for i in range(0, len(ids), _ROWID_LOOKUP_BATCH):
-                batch_ids = ids[i : i + _ROWID_LOOKUP_BATCH]
-                placeholders = ",".join("?" for _ in batch_ids)
-                for row in db.execute(
-                    f"SELECT id, rowid FROM memories WHERE id IN ({placeholders})",
-                    batch_ids,
-                ).fetchall():
-                    rows_to_embed.append((row["rowid"], chunk_by_id[row["id"]]))
-        for i in range(0, len(rows_to_embed), EMBED_BATCH_SIZE):
-            _embed_and_store_rows(rows_to_embed[i : i + EMBED_BATCH_SIZE])
-
-    return {"status": "ok", "import_id": import_id, **stats}
+    raw = content.decode("utf-8", errors="replace")
+    import_id = _make_id(fhash)
+    return _ingest_parsed(
+        raw, suffix, filename, fhash, import_id, category, tags, extract_mode, max_length, kind
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1024,6 +1168,7 @@ __all__ = [
     "register_connector",
     "_CONNECTORS",
     "import_chat_file",
+    "import_content",
     "import_directory",
     "_chunk_text",
     "_extract_messages_from_json",
@@ -1034,6 +1179,7 @@ __all__ = [
     "_split_markdown_sections",
     "_parse_document",
     "_file_hash",
+    "_hash_bytes",
     "_extract_graph_records",
     "_restore_graph_records",
 ]
