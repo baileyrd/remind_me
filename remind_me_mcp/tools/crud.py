@@ -16,7 +16,7 @@ from typing import Any
 
 from remind_me_mcp import ann_index
 from remind_me_mcp import tools as _pkg
-from remind_me_mcp.config import CLIENT, NODE_ID
+from remind_me_mcp.config import CLIENT, NODE_ID, SYNC_ENABLED
 from remind_me_mcp.db import _delete_chunks, _make_id, _now_iso, _row_to_dict
 from remind_me_mcp.formatting import _fmt_memories, _fmt_memory_md
 from remind_me_mcp.models import (  # noqa: TC001  # FastMCP resolves these annotations at runtime for tool schemas
@@ -110,7 +110,7 @@ async def memory_list(params: MemoryListInput) -> str:
         str: Memories in the requested format with pagination info.
     """
     db = _pkg._get_db()
-    conditions: list[str] = []
+    conditions: list[str] = ["m.deleted_at IS NULL"]
     bindings: list[Any] = []
 
     if params.category:
@@ -129,7 +129,7 @@ async def memory_list(params: MemoryListInput) -> str:
             )
             bindings.append(tag)
 
-    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    where = f"WHERE {' AND '.join(conditions)}"
     total = db.execute(f"SELECT COUNT(*) as cnt FROM memories m {where}", bindings).fetchone()["cnt"]
     rows = db.execute(
         f"SELECT m.* FROM memories m {where} ORDER BY m.created_at DESC LIMIT ? OFFSET ?",
@@ -160,7 +160,9 @@ async def memory_get(memory_id: str) -> str:
         str: The memory in markdown format, or an error message.
     """
     db = _pkg._get_db()
-    row = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+    row = db.execute(
+        "SELECT * FROM memories WHERE id = ? AND deleted_at IS NULL", (memory_id,)
+    ).fetchone()
     if not row:
         return f"Memory `{memory_id}` not found."
     return _fmt_memory_md(_row_to_dict(row))
@@ -186,7 +188,9 @@ async def memory_update(params: MemoryUpdateInput) -> str:
         str: Confirmation or error message.
     """
     db = _pkg._get_db()
-    row = db.execute("SELECT * FROM memories WHERE id = ?", (params.memory_id,)).fetchone()
+    row = db.execute(
+        "SELECT * FROM memories WHERE id = ? AND deleted_at IS NULL", (params.memory_id,)
+    ).fetchone()
     if not row:
         return f"Memory `{params.memory_id}` not found."
 
@@ -231,7 +235,19 @@ async def memory_update(params: MemoryUpdateInput) -> str:
     },
 )
 async def memory_delete(params: MemoryDeleteInput) -> str:
-    """Permanently delete a memory by ID.
+    """Delete a memory by ID.
+
+    When sync is configured (any of hub or peer sync — config.SYNC_ENABLED),
+    this is a soft delete: the row is tombstoned (``deleted_at`` set) rather
+    than removed, so the deletion propagates to other devices via the normal
+    sync path (gap #11) — a hard DELETE produces no outbox row at all (the
+    sync triggers only fire on INSERT/UPDATE), so it would otherwise silently
+    resurrect on the next pull elsewhere. The tombstone is excluded from
+    every normal read (search/list/get) and is eventually hard-deleted by a
+    background compaction pass once it's safely old
+    (config.TOMBSTONE_RETENTION_DAYS). On a node with sync disabled, there's
+    nothing to propagate to, so this is a plain, immediate delete exactly as
+    before.
 
     Args:
         params (MemoryDeleteInput): The memory ID to delete.
@@ -241,12 +257,14 @@ async def memory_delete(params: MemoryDeleteInput) -> str:
     """
     db = _pkg._get_db()
     row = db.execute(
-        "SELECT rowid FROM memories WHERE id = ?", (params.memory_id,)
+        "SELECT rowid FROM memories WHERE id = ? AND deleted_at IS NULL",
+        (params.memory_id,),
     ).fetchone()
     if row is None:
         return f"Memory `{params.memory_id}` not found."
     # Remove chunk vectors first — FTS and tags are cleaned by triggers, but
-    # vec_chunks/memories_vec are not, and SQLite reuses freed rowids (DI-01).
+    # vec_chunks/memories_vec are not, and (for a hard delete) SQLite reuses
+    # freed rowids (DI-01).
     removed_vec_rowids: list[int] = []
     with contextlib.suppress(sqlite3.OperationalError):
         removed_vec_rowids = _delete_chunks(db, row[0])
@@ -256,7 +274,14 @@ async def memory_delete(params: MemoryDeleteInput) -> str:
     db.execute(
         "DELETE FROM memory_entities WHERE memory_id = ?", (params.memory_id,)
     )
-    db.execute("DELETE FROM memories WHERE id = ?", (params.memory_id,))
+    if SYNC_ENABLED:
+        now = _now_iso()
+        db.execute(
+            "UPDATE memories SET deleted_at = ?, updated_at = ? WHERE id = ?",
+            (now, now, params.memory_id),
+        )
+    else:
+        db.execute("DELETE FROM memories WHERE id = ?", (params.memory_id,))
     db.commit()
     # ANN mutations only after the commit succeeds — see db._delete_chunks.
     for vec_rowid in removed_vec_rowids:

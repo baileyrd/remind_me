@@ -270,7 +270,7 @@ def _compile_sync(params: WikiCompileInput) -> str:
     watermark = wiki.get_meta(wiki.COMPILE_WATERMARK_KEY, "")
     rows = db.execute(
         """SELECT id, category, content, created_at FROM memories
-            WHERE superseded_by IS NULL AND created_at > ?
+            WHERE superseded_by IS NULL AND deleted_at IS NULL AND created_at > ?
             ORDER BY created_at ASC LIMIT ?""",
         (watermark or wiki._EPOCH, params.limit),
     ).fetchall()

@@ -489,6 +489,7 @@ async def remind_me_decompose_batch(params: DecomposeBatchInput) -> str:
 # that already has SPO is excluded by the subject/predicate/object check.
 _UNANNOTATED_WHERE = """
     m.superseded_by IS NULL
+    AND m.deleted_at IS NULL
     AND m.category != 'dialog'
     AND m.subject IS NULL AND m.predicate IS NULL AND m.object IS NULL
     AND NOT EXISTS (

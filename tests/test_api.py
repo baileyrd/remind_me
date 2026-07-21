@@ -1695,3 +1695,111 @@ def test_api_wiki_endpoints_require_auth(client_with_auth: TestClient, wiki_dir:
     assert client_with_auth.get("/api/wiki/load").status_code == 401
     assert client_with_auth.get("/api/wiki/status").status_code == 401
     assert client_with_auth.get("/api/wiki/some-page").status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Tombstone propagation (gap #11) — soft vs hard delete, read-path exclusion
+# ---------------------------------------------------------------------------
+
+
+def test_api_delete_hard_deletes_when_sync_disabled(
+    client: TestClient, db_conn, memory_factory
+) -> None:
+    """Default (no sync configured): DELETE truly removes the row, exactly
+    as before this feature."""
+    mem = memory_factory(content="hard delete via REST")
+    response = client.delete(f"/api/memories/{mem['id']}")
+    assert response.status_code == 200
+
+    row = db_conn.execute("SELECT * FROM memories WHERE id = ?", (mem["id"],)).fetchone()
+    assert row is None
+
+
+def test_api_delete_soft_deletes_when_sync_enabled(
+    client: TestClient, db_conn, memory_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With sync configured: DELETE tombstones the row instead of removing
+    it, so the deletion can propagate."""
+    import remind_me_mcp.api as api_mod
+
+    monkeypatch.setattr(api_mod, "SYNC_ENABLED", True)
+
+    mem = memory_factory(content="soft delete via REST")
+    response = client.delete(f"/api/memories/{mem['id']}")
+    assert response.status_code == 200
+
+    row = db_conn.execute("SELECT * FROM memories WHERE id = ?", (mem["id"],)).fetchone()
+    assert row is not None
+    assert row["deleted_at"] is not None
+
+    # But it's gone from every normal read.
+    assert client.get(f"/api/memories/{mem['id']}").status_code == 404
+
+
+def test_api_delete_already_soft_deleted_returns_404(
+    client: TestClient, memory_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import remind_me_mcp.api as api_mod
+
+    monkeypatch.setattr(api_mod, "SYNC_ENABLED", True)
+    mem = memory_factory(content="delete twice via REST")
+    assert client.delete(f"/api/memories/{mem['id']}").status_code == 200
+    assert client.delete(f"/api/memories/{mem['id']}").status_code == 404
+
+
+def test_api_list_excludes_soft_deleted_memories(
+    client: TestClient, memory_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import remind_me_mcp.api as api_mod
+
+    monkeypatch.setattr(api_mod, "SYNC_ENABLED", True)
+    mem = memory_factory(content="soft deleted, should not list")
+    memory_factory(content="kept memory")
+    client.delete(f"/api/memories/{mem['id']}")
+
+    r = client.get("/api/memories")
+    ids = {m["id"] for m in r.json()["memories"]}
+    assert mem["id"] not in ids
+    assert r.json()["total"] == 1
+
+
+def test_api_search_excludes_soft_deleted_memories(
+    client: TestClient, memory_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import remind_me_mcp.api as api_mod
+
+    monkeypatch.setattr(api_mod, "SYNC_ENABLED", True)
+    mem = memory_factory(content="unique quokka widget memory")
+    client.delete(f"/api/memories/{mem['id']}")
+
+    r = client.get("/api/memories/search", params={"q": "quokka widget"})
+    assert r.status_code == 200
+    ids = {m["id"] for m in r.json()["memories"]}
+    assert mem["id"] not in ids
+
+
+def test_api_stats_excludes_soft_deleted_memories_from_total(
+    client: TestClient, memory_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import remind_me_mcp.api as api_mod
+
+    monkeypatch.setattr(api_mod, "SYNC_ENABLED", True)
+    mem = memory_factory(content="soft deleted, should not count")
+    memory_factory(content="kept memory")
+    client.delete(f"/api/memories/{mem['id']}")
+
+    r = client.get("/api/stats")
+    assert r.json()["total"] == 1
+
+
+def test_api_update_excludes_soft_deleted_memories(
+    client: TestClient, memory_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import remind_me_mcp.api as api_mod
+
+    monkeypatch.setattr(api_mod, "SYNC_ENABLED", True)
+    mem = memory_factory(content="deleted then PATCHed?")
+    client.delete(f"/api/memories/{mem['id']}")
+
+    r = client.patch(f"/api/memories/{mem['id']}", json={"content": "resurrected"})
+    assert r.status_code == 404

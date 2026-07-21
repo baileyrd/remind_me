@@ -1,5 +1,16 @@
 # Release Notes
 
+## v1.4.0 — 2026-07-21
+
+Fixes a real multi-device correctness bug: sync had no delete semantics at all. Deleting a memory on one device was a hard `DELETE`, which produces no `sync_outbox` row (the sync triggers only fire on INSERT/UPDATE) — so the next pull from another device silently resurrected it.
+
+### New Features
+
+- **Delete/tombstone propagation across sync** — a new `deleted_at` column turns delete into a soft-delete UPDATE, which rides the *existing* update-outbox trigger and last-write-wins conflict resolution for free — no new operation type or wire format. Every normal read path (search, list, get, entity profile, dashboard REST routes) excludes tombstoned memories; sync's pull/push wire paths and full-backup exports deliberately don't, since they need to carry/preserve tombstones.
+- **Automatic tombstone compaction** — a background pass hard-deletes tombstones older than `REMIND_ME_TOMBSTONE_RETENTION_DAYS` (default 180, deliberately more generous than the 30-day outbox retention) so the table doesn't grow forever.
+- **Hub parity** — the Postgres hub's schema, upsert, and pull-wire columns all carry `deleted_at`, so hub-mediated sync propagates tombstones exactly like direct peer sync.
+- On a node with sync disabled entirely, delete stays a plain, immediate hard delete exactly as before — there's nothing to propagate to, so nothing changes for single-device users.
+
 ## v1.3.1 — 2026-07-21
 
 Defense-in-depth fix, not a new capability: the sync pull path was the one caller of `_embed_and_store_rows` that never batched its input, relying entirely on the downstream `EMBED_FORWARD_BATCH` forward-pass cap (added in PR #15) to bound memory.

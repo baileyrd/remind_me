@@ -699,6 +699,10 @@ Sync is enabled automatically when `NODE_ID`, `HUB_URL`, and `SYNC_SECRET` are a
 5. Optionally, peers discover each other via Tailscale and sync directly
 6. The **entity graph syncs too**: entity and link records carry a `record_type` discriminator on the wire; entities upsert with alias union-merge, links are insert-or-ignore (see [Entity Knowledge Graph](#entity-knowledge-graph))
 
+#### Deletion Propagates Too
+
+Deleting a memory (`remind_me_delete` or `DELETE /api/memories/{id}`) is a **soft delete** whenever sync is configured: the row is tombstoned (a `deleted_at` timestamp set) instead of removed outright. A tombstone is just another update, so it rides the same outbox/LWW machinery as any other edit — no separate delete protocol. The tombstoned memory is excluded from every normal read (search, list, get, the dashboard), but the row itself sticks around long enough for the deletion to actually reach your other devices; a background compaction pass hard-deletes it once it's old enough (`REMIND_ME_TOMBSTONE_RETENTION_DAYS`, default 180 days) that every device has almost certainly already seen it. On a single device with no sync configured, delete is a plain, immediate hard delete exactly as before — there's nothing to propagate to.
+
 #### Peer Server Endpoints
 
 Each node runs a small HTTP server (default port 8766, bind via `REMIND_ME_PEER_BIND`) for direct peer sync. Every request requires `Authorization: Bearer <REMIND_ME_SYNC_SECRET>`:
@@ -1027,6 +1031,7 @@ This is a deterministic heuristic, not an LLM planner call — no extra latency 
 | `REMIND_ME_PEER_PORT` | `8766` | Local port for the peer-to-peer sync server |
 | `REMIND_ME_PEER_BIND` | `0.0.0.0` | Bind address for the peer sync server (set to a Tailscale IP or `127.0.0.1` to narrow exposure; every request still requires the sync secret) |
 | `REMIND_ME_OUTBOX_RETENTION_DAYS` | `30` | Sync outbox rows older than this are pruned each sync cycle |
+| `REMIND_ME_TOMBSTONE_RETENTION_DAYS` | `180` | A deleted memory (tombstoned via `deleted_at`) is hard-deleted this many days after the delete — purely time-based, no per-peer acknowledgment tracking. Deliberately more generous than `OUTBOX_RETENTION_DAYS`: compacting a tombstone too early risks a still-offline device later resurrecting it |
 | `REMIND_ME_STATIC_PEERS` | `[]` | JSON array of static peer configs (for environments without Tailscale) |
 | `REMIND_ME_TAILSCALE_SOCKET` | *(unset)* | Path to Tailscale socket for peer discovery (auto-detected if empty) |
 
@@ -1151,6 +1156,7 @@ The server uses:
 - **Push/webhook ingestion** — a bearer-authenticated `POST /ingest` endpoint accepts content directly (no filesystem staging), sharing the same connector pipeline and hash dedup as file import
 - **Client-side ingest normalization** — `remind_me_normalize_batch`/`remind_me_normalize_apply` distill noisy raw imports into `{question, summary, resolution?}` memories; the LLM work happens in the calling agent, not the server, same as `remind_me_decompose`
 - **Outbox-based sync** — local writes (memories, entities, links) are captured in `sync_outbox`, pushed to hub/peers in background
+- **Tombstone-based delete propagation** — deleting a memory sets `deleted_at` instead of removing the row, so the deletion rides the existing update/LWW sync path instead of silently failing to propagate; a background compaction pass hard-deletes old-enough tombstones
 - **Postgres hub** — central sync point with last-write-wins conflict resolution
 - **Peer-to-peer sync** — direct machine-to-machine sync via Tailscale peer discovery
 - **WAL journal mode** for safe concurrent access
@@ -1175,6 +1181,12 @@ remind_me is local-first, single-user, and MCP-native by design — some capabil
 ## Changelog
 
 See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for a per-version feature breakdown with PR references; this section summarizes the same history phase-by-phase.
+
+### 1.4.0 — 2026-07-21
+
+Closes a real multi-device correctness bug flagged in the application capability review: sync had no delete semantics, so a memory deleted on one device silently resurrected on the next pull elsewhere.
+
+- **Delete/tombstone propagation.** Deleting a memory (when sync is configured) is now a soft delete — a `deleted_at` UPDATE that rides the existing outbox trigger and LWW conflict resolution, instead of a hard DELETE that produced no sync signal at all. Every normal read path excludes tombstones; a background compaction pass (`REMIND_ME_TOMBSTONE_RETENTION_DAYS`, default 180) hard-deletes them once safely old. Hub schema/upsert/pull-wire columns updated for parity. A node with sync disabled keeps the old plain-hard-delete behavior unchanged.
 
 ### 1.3.1 — 2026-07-21
 

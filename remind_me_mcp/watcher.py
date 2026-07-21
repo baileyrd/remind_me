@@ -60,13 +60,15 @@ _ERROR_HISTORY = 10
 def _supersede_import(old_import_id: str, new_import_id: str) -> int:
     """Mark all memories from a prior import as superseded (FT-03).
 
-    Sets ``superseded_by = new_import_id`` on every non-superseded memory
-    whose metadata carries *old_import_id*. Search excludes superseded
-    memories (``superseded_by IS NOT NULL``), so stale chunks from the old
-    version of a changed file drop out of results while staying in the
-    database for audit. Note: lifecycle consolidation stores a canonical
-    *memory* id in ``superseded_by``; here the superseding *import* id is
-    stored instead — both satisfy the IS-NULL search filter.
+    Sets ``superseded_by = new_import_id`` on every non-superseded,
+    non-deleted memory whose metadata carries *old_import_id* (gap #11: a
+    soft-deleted memory is left alone rather than superseded, so a re-import
+    of a changed file never touches a memory the user explicitly deleted).
+    Search excludes superseded memories (``superseded_by IS NOT NULL``), so
+    stale chunks from the old version of a changed file drop out of results
+    while staying in the database for audit. Note: lifecycle consolidation
+    stores a canonical *memory* id in ``superseded_by``; here the superseding
+    *import* id is stored instead — both satisfy the IS-NULL search filter.
 
     Args:
         old_import_id: import_id of the file's previous import.
@@ -80,6 +82,7 @@ def _supersede_import(old_import_id: str, new_import_id: str) -> int:
         """UPDATE memories
               SET superseded_by = ?, updated_at = ?
             WHERE superseded_by IS NULL
+              AND deleted_at IS NULL
               AND json_extract(metadata, '$.import_id') = ?""",
         (new_import_id, _now_iso(), old_import_id),
     )

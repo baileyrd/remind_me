@@ -83,8 +83,9 @@ def _structured_lookup(
     """Perform indexed SQL lookup for structured fact triples.
 
     Builds a WHERE clause dynamically based on which fields are provided.
-    Always excludes superseded facts (superseded_by IS NOT NULL). The
-    optional resolved *entity* (FT-04) AND-composes with subject/predicate:
+    Always excludes superseded facts (superseded_by IS NOT NULL) and
+    soft-deleted memories (deleted_at IS NOT NULL, gap #11). The optional
+    resolved *entity* (FT-04) AND-composes with subject/predicate:
     a memory matches when it is linked to the entity via memory_entities OR
     its SPO subject/object equals the entity's canonical name
     (case-insensitive; the canonical name is already whitespace-collapsed).
@@ -99,7 +100,7 @@ def _structured_lookup(
     Returns:
         List of memory dicts from matching rows.
     """
-    conditions: list[str] = ["m.superseded_by IS NULL"]
+    conditions: list[str] = ["m.superseded_by IS NULL", "m.deleted_at IS NULL"]
     bindings: list[Any] = []
 
     if subject is not None:
@@ -284,6 +285,7 @@ def _expand_via_entities(
             WHERE seed.memory_id IN ({ph})
               AND nbr.memory_id NOT IN ({ph})
               AND m.superseded_by IS NULL
+              AND m.deleted_at IS NULL
             ORDER BY m.created_at DESC, m.id, e.name""",
         [*seed_ids, *seed_ids],
     ).fetchall()
@@ -382,6 +384,7 @@ def _expand_via_neighbors(
                WHERE doc_id = ?
                  AND chunk_index BETWEEN ? AND ?
                  AND superseded_by IS NULL
+                 AND deleted_at IS NULL
                ORDER BY chunk_index""",
             (doc_id, chunk_index - window, chunk_index + window),
         ).fetchall()
@@ -581,7 +584,8 @@ async def memory_search(params: MemorySearchInput) -> str:
             f"""SELECT m.*, bm25(memories_fts) AS _bm25_score FROM memories m
                JOIN memories_fts fts ON m.rowid = fts.rowid
                WHERE memories_fts MATCH ?
-               AND m.superseded_by IS NULL{conditions}
+               AND m.superseded_by IS NULL
+               AND m.deleted_at IS NULL{conditions}
                ORDER BY rank
                LIMIT ?""",
             bindings,

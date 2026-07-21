@@ -156,6 +156,32 @@ content = db.execute(
     "SELECT content FROM memories WHERE id = 'node-a-mem-1'"
 ).fetchone()["content"]
 check("LWW update propagated B -> hub -> A", content == "Updated by node B", content)
+
+# ---------------- Gap #11: delete/tombstone propagates A -> hub -> B ----------------
+# Mirrors remind_me_delete's soft-delete path: an UPDATE setting deleted_at,
+# not a hard DELETE (which would produce no outbox row at all).
+deleted_at = db_mod._now_iso()
+db.execute(
+    "UPDATE memories SET deleted_at = ?, updated_at = ? WHERE id = 'node-a-mem-1'",
+    (deleted_at, deleted_at),
+)
+db.commit()
+asyncio.run(sync_mod._sync_once())
+db_mod._close_db()
+
+with psycopg.connect(DSN) as conn:
+    row = conn.execute(
+        "SELECT deleted_at FROM memories WHERE id = 'node-a-mem-1'"
+    ).fetchone()
+    check("hub stored the tombstone", row is not None and row[0] is not None, str(row))
+
+db_mod, sync_mod, db = make_node("node-b", "/tmp/node-b")
+asyncio.run(sync_mod._sync_once())
+row = db.execute(
+    "SELECT deleted_at FROM memories WHERE id = 'node-a-mem-1'"
+).fetchone()
+check("node B pulled the tombstone (no resurrection)",
+      row is not None and row["deleted_at"] is not None, str(dict(row) if row else None))
 db_mod._close_db()
 
 # ---------------- Wire-level edge cases ----------------
