@@ -39,6 +39,17 @@ def test_docker_compose_is_valid_yaml_with_expected_services() -> None:
         str(p).startswith("127.0.0.1:") for p in hub["ports"]
     ), f"expected a 127.0.0.1-bound port, got {hub['ports']}"
 
+    postgres = services["remind-me-postgres"]
+    healthcheck_test = postgres["healthcheck"]["test"]
+    # $$POSTGRES_USER (escaped, single literal $) is deliberate: Compose's
+    # own ${...} interpolation never sees env_file: values (those only
+    # reach the container's runtime env), so a single-dollar
+    # ${POSTGRES_USER} here would silently always resolve to nothing at
+    # Compose parse time -- before postgres.env is ever read. Guard against
+    # that regressing back in.
+    assert "$$POSTGRES_USER" in healthcheck_test[-1]
+    assert "${POSTGRES_USER" not in healthcheck_test[-1]
+
 
 def test_fly_toml_is_valid_and_uses_the_containerfile() -> None:
     with (_DEPLOY_DIR / "fly.toml").open("rb") as f:
