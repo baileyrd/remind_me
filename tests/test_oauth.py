@@ -145,7 +145,12 @@ def _approve_for_code(client: Any, info: dict[str, Any], challenge: str) -> str:
 
 
 def _exchange_code(client: Any, info: dict[str, Any], code: str, verifier: str) -> Any:
-    """POST the authorization-code grant to /token."""
+    """POST the authorization-code grant to /token.
+
+    No client_secret: registration always forces token_endpoint_auth_method
+    "none" (SEC-08) regardless of what the client requests, so a real
+    client is never issued one to send here.
+    """
     return client.post(
         "/token",
         data={
@@ -153,7 +158,6 @@ def _exchange_code(client: Any, info: dict[str, Any], code: str, verifier: str) 
             "code": code,
             "redirect_uri": _REDIRECT,
             "client_id": info["client_id"],
-            "client_secret": info["client_secret"],
             "code_verifier": verifier,
         },
     )
@@ -216,15 +220,55 @@ def test_mcp_401_advertises_resource_metadata(oauth_client) -> None:
 
 
 def test_dcr_registers_client(oauth_client, tmp_path: Path) -> None:
-    """POST /register issues client_id + client_secret and persists the client."""
+    """POST /register issues a client_id and persists the client."""
     info = _register(oauth_client)
     assert info["client_id"]
-    assert info["client_secret"]
     assert info["client_name"] == "claude.ai"
 
     store = OAuthStateStore(tmp_path / "oauth.json")
     clients = store.list_clients()
     assert [c["client_id"] for c in clients] == [info["client_id"]]
+
+
+def test_dcr_forces_no_client_secret(oauth_client, tmp_path: Path) -> None:
+    """SEC-08: registration always forces token_endpoint_auth_method="none"
+    and issues no client_secret, even when the client explicitly requests
+    client_secret_post -- there's no secret to leak in plaintext at rest
+    (unlike the SDK's default behavior, which would auto-generate one and
+    store it verbatim), and PKCE already provides proof of possession."""
+    info = _register(oauth_client)
+    assert info["token_endpoint_auth_method"] == "none"
+    # exclude_none=True on the registration response means an unset
+    # client_secret is omitted entirely, not present-with-null.
+    assert "client_secret" not in info
+    assert "client_secret_expires_at" not in info
+
+    # Nothing sensitive lands in the state file either.
+    raw = json.loads((tmp_path / "oauth.json").read_text())
+    persisted = raw["clients"][info["client_id"]]
+    assert persisted.get("client_secret") is None
+    assert persisted["token_endpoint_auth_method"] == "none"
+
+
+def test_token_exchange_ignores_a_stray_client_secret(oauth_client) -> None:
+    """Since no client_secret is ever issued, /token doesn't check one --
+    a client mistakenly sending one is simply ignored, not rejected."""
+    info = _register(oauth_client)
+    verifier, challenge = _pkce_pair()
+    code = _approve_for_code(oauth_client, info, challenge)
+
+    r = oauth_client.post(
+        "/token",
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": _REDIRECT,
+            "client_id": info["client_id"],
+            "client_secret": "some-value-that-was-never-issued",
+            "code_verifier": verifier,
+        },
+    )
+    assert r.status_code == 200, r.text
 
 
 def test_state_file_permissions(oauth_client, tmp_path: Path) -> None:
@@ -360,16 +404,6 @@ def test_authorization_code_single_use(oauth_client) -> None:
     assert replay.json()["error"] == "invalid_grant"
 
 
-def test_wrong_client_secret_rejected(oauth_client) -> None:
-    """/token authenticates the client before any grant logic runs."""
-    info = _register(oauth_client)
-    verifier, challenge = _pkce_pair()
-    code = _approve_for_code(oauth_client, info, challenge)
-
-    r = _exchange_code(oauth_client, {**info, "client_secret": "wrong"}, code, verifier)
-    assert r.status_code == 401, r.text
-
-
 # ---------------------------------------------------------------------------
 # Refresh grant + expiry
 # ---------------------------------------------------------------------------
@@ -386,7 +420,6 @@ def test_refresh_grant_rotates(oauth_client) -> None:
             "grant_type": "refresh_token",
             "refresh_token": tokens["refresh_token"],
             "client_id": info["client_id"],
-            "client_secret": info["client_secret"],
         },
     )
     assert r.status_code == 200, r.text
@@ -409,7 +442,6 @@ def test_refresh_grant_rotates(oauth_client) -> None:
             "grant_type": "refresh_token",
             "refresh_token": tokens["refresh_token"],
             "client_id": info["client_id"],
-            "client_secret": info["client_secret"],
         },
     )
     assert replay.status_code == 400
@@ -437,7 +469,17 @@ def test_expired_access_token_rejected(oauth_client, monkeypatch: pytest.MonkeyP
 
 
 def test_revocation_endpoint_kills_access_and_refresh(oauth_client) -> None:
-    """RFC 7009 /revoke with either token kills the client's whole session."""
+    """RFC 7009 /revoke with either token kills the client's whole session.
+
+    client_secret="" (empty, not omitted): the installed SDK's
+    RevocationRequest model declares client_secret as str | None with no
+    default, so pydantic requires the *key* to be present even for a "none"
+    auth-method client -- the value itself is never checked (client.client_secret
+    is falsy). This is an upstream SDK quirk, not something remind_me_mcp
+    controls; the actually-relied-upon revocation path in this codebase is
+    the remind_me_revoke_clients tool, which operates on OAuthStateStore
+    directly and never goes through this HTTP endpoint at all.
+    """
     info = _register(oauth_client)
     tokens = _obtain_tokens(oauth_client, info)
 
@@ -446,7 +488,7 @@ def test_revocation_endpoint_kills_access_and_refresh(oauth_client) -> None:
         data={
             "token": tokens["refresh_token"],
             "client_id": info["client_id"],
-            "client_secret": info["client_secret"],
+            "client_secret": "",
         },
     )
     assert r.status_code == 200, r.text
@@ -465,7 +507,6 @@ def test_revocation_endpoint_kills_access_and_refresh(oauth_client) -> None:
             "grant_type": "refresh_token",
             "refresh_token": tokens["refresh_token"],
             "client_id": info["client_id"],
-            "client_secret": info["client_secret"],
         },
     )
     assert r.status_code == 400
