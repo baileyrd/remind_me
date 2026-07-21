@@ -30,7 +30,7 @@ Persistent, searchable memory that works across **Claude.ai**, **Claude Code**, 
 
 **Evolve & maintain**
 - **ACT-R vitality model** — cognitive-science-inspired memory decay with per-category rates, access-based reinforcement, and bridge protection for high-value memories
-- **Vault consolidation** — semantic clustering with Union-Find, canonical selection, and dry-run merge previews
+- **Vault consolidation** — semantic clustering with Union-Find, canonical selection, and dry-run merge previews; merging requires an LLM-authored summary per cluster (real consolidation, not unbounded concatenation)
 
 **Search & retrieval**
 - **Full-text search** via SQLite FTS5 — fast, offline, no external services
@@ -325,7 +325,7 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_vitality_report` | Generate vault health metrics with decay and vitality scores |
 | `remind_me_reclassify` | Apply a memory type classification to a single memory |
 | `remind_me_reclassify_batch` | Fetch unclassified memories for batch classification |
-| `remind_me_consolidate` | Find semantically similar memories, preview clusters, and merge duplicates |
+| `remind_me_consolidate` | Find semantically similar memories, preview clusters (dry_run=true), and merge duplicates using an LLM-authored `summaries` entry per cluster (dry_run=false) — a cluster with no matching summary is skipped, not merged with a raw concatenation |
 
 ### LLM Wiki
 
@@ -1013,6 +1013,7 @@ On top of the profile above, a query containing a temporal expression ("before I
 | `REMIND_ME_EMBED_FORWARD_BATCH` | `32` | Chunks per ONNX forward pass inside the embedder — the hard ceiling on embedding memory per call |
 | `REMIND_ME_ANN_MIN_CHUNKS` | `5000` | Chunk-vector count above which semantic search uses the optional HNSW ANN index (`usearch`) instead of sqlite-vec's exact brute-force scan. Requires the `ann` extra (`pip install remind-me-mcp[ann]`); degrades gracefully to the exact scan if missing |
 | `REMIND_ME_MEMPALACE_PATH` | `~/.mempalace/palace` | Path to a MemPalace ChromaDB persistent store, read (read-only) by `remind_me_import_mempalace` |
+| `REMIND_ME_CONSOLIDATE_MAX_CANDIDATES` | `1500` | Hard cap on how many memories `remind_me_consolidate`'s clustering step pairwise-compares in one call — `remind_me_consolidate`'s own `limit` (max 5000) doesn't alone bound the O(n²) comparison cost |
 | `REMIND_ME_API_KEY` | *(auto-generated)* | Bearer token for `/api/*` routes. When unset, a key is generated on first run and stored at `~/.remind-me/api_key` (0600) — check the server log or that file for the value. Set to `disabled` to explicitly turn dashboard auth off |
 | `REMIND_ME_IMPORT_ROOTS` | `$HOME` | Colon-separated allowed filesystem roots for import operations (enforced by both the HTTP API and the MCP import tools) |
 | `REMIND_ME_EXPORT_ROOTS` | `$HOME` | Colon-separated allowed filesystem roots for export destinations (enforced by both the HTTP API and the MCP export tool) |
@@ -1199,6 +1200,13 @@ remind_me is local-first, single-user, and MCP-native by design — some capabil
 ## Changelog
 
 See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for a per-version feature breakdown with PR references; this section summarizes the same history phase-by-phase.
+
+### 1.11.0 — 2026-07-21
+
+Closes a vault-hygiene gap flagged in the application capability review: `merge_cluster` unioned raw content lines from clustered memories rather than summarizing them, so merged memories grew unbounded and stayed verbose instead of becoming genuinely consolidated. Its clustering step was also a Python-level O(n²) double loop.
+
+- **Summarization instead of concatenation** — `remind_me_consolidate`'s auto-merge (`dry_run=False`) now requires an LLM-authored `summaries` entry (`{canonical_id: summary}`) per cluster, produced client-side after reviewing a `dry_run=True` report — the same pattern already used by `remind_me_decompose`/`remind_me_normalize_apply`. A found cluster with no matching summary is skipped and reported (`skipped_no_summary`), not silently merged with a raw concatenation. `merge_cluster` gained an optional `summary` parameter that replaces the union entirely when given; omitted, it falls back to the original union (kept for callers without an LLM in the loop, e.g. tests).
+- **Bounded, vectorized clustering** — `find_clusters`'s pairwise similarity-threshold check is now a single vectorized numpy comparison instead of an O(n²) Python loop; a new `REMIND_ME_CONSOLIDATE_MAX_CANDIDATES` (default 1500) hard-caps the candidate pool so a large vault degrades gracefully (a logged truncation) instead of an unbounded comparison.
 
 ### 1.10.0 — 2026-07-21
 

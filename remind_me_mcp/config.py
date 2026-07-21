@@ -133,6 +133,16 @@ for no benefit — a typical single-user store never crosses it. Has no effect
 if the optional `usearch` package (the `ann` extra) isn't installed; the
 brute-force scan is always the fallback."""
 
+CONSOLIDATE_MAX_CANDIDATES = _env_int("REMIND_ME_CONSOLIDATE_MAX_CANDIDATES", 1500)
+"""Hard cap on how many memories consolidation.find_clusters pairwise-compares
+in one call. remind_me_consolidate's own `limit` (default 500, max 5000)
+already bounds the candidate pool, but find_clusters' clustering step is
+O(n^2) — at the pool's own max, an all-near-duplicate vault could still
+produce a huge edge list even with the vectorized similarity comparison.
+Excess candidates are dropped (oldest-considered-first, i.e. the tail of
+whatever order the caller passed in) and the truncation is reported back to
+the caller rather than happening silently."""
+
 # ---------------------------------------------------------------------------
 # UI / dashboard
 # ---------------------------------------------------------------------------
@@ -486,6 +496,7 @@ __all__ = [
     "EMBED_CHUNK_OVERLAP",
     "EMBED_MAX_CHUNKS",
     "ANN_MIN_CHUNKS",
+    "CONSOLIDATE_MAX_CANDIDATES",
     "MODEL_DIR",
     "SERVE_UI",
     "UI_PORT",

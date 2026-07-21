@@ -16,10 +16,15 @@ Key concepts:
 
 from __future__ import annotations
 
+import logging
 import struct
 from typing import Any
 
 import numpy as np
+
+from remind_me_mcp.config import CONSOLIDATE_MAX_CANDIDATES
+
+log = logging.getLogger("remind_me_mcp.consolidation")
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -90,6 +95,8 @@ def find_clusters(
     memories: list[dict[str, Any]],
     embeddings: dict[str, bytes],
     similarity_threshold: float = 0.85,
+    *,
+    max_candidates: int = CONSOLIDATE_MAX_CANDIDATES,
 ) -> list[list[dict[str, Any]]]:
     """Find clusters of similar memories based on cosine similarity.
 
@@ -97,15 +104,35 @@ def find_clusters(
     matrix, and uses Union-Find to group indices where similarity >= threshold.
     Only clusters with 2+ members are returned, each sorted by vitality DESC.
 
+    The threshold comparison itself is vectorized (``np.triu_indices`` +
+    boolean masking) rather than a Python-level double loop over every pair —
+    the O(n^2) *comparison* cost stays, but at numpy/C speed instead of
+    Python speed; only the pairs that actually clear the threshold (usually
+    a small fraction of all pairs) cost a Python-level ``union()`` call
+    (issue #55). ``memories`` beyond *max_candidates* are dropped (a logged,
+    not silent, degradation) since the O(n^2) memory for the similarity
+    matrix itself (``n^2 * 4`` bytes) still grows without bound otherwise.
+
     Args:
         memories: List of memory dicts, each with at least an ``id`` and ``vitality`` key.
         embeddings: Mapping of memory ID to raw float32 embedding bytes.
         similarity_threshold: Minimum cosine similarity to cluster memories together.
+        max_candidates: Hard cap on how many memories are pairwise-compared in
+            one call. Defaults to :data:`config.CONSOLIDATE_MAX_CANDIDATES`.
 
     Returns:
         A list of clusters, where each cluster is a list of memory dicts
         sorted by vitality descending. Only clusters with 2+ members are included.
     """
+    if len(memories) > max_candidates:
+        log.warning(
+            "find_clusters: %d candidates exceeds max_candidates=%d; "
+            "considering only the first %d (degrade gracefully rather than "
+            "an unbounded O(n^2) comparison).",
+            len(memories), max_candidates, max_candidates,
+        )
+        memories = memories[:max_candidates]
+
     n = len(memories)
     if n < 2:
         return []
@@ -119,12 +146,15 @@ def find_clusters(
     # Cosine similarity matrix (vectors are already L2-normalized)
     sim_matrix = vectors @ vectors.T
 
-    # Union-Find clustering
+    # Vectorized threshold check over the upper triangle (excluding the
+    # diagonal): a single numpy comparison instead of an n^2 Python loop.
+    # Only pairs that actually clear the threshold cost a Python union() call.
+    rows, cols = np.triu_indices(n, k=1)
+    hits = sim_matrix[rows, cols] >= similarity_threshold
+
     uf = _UnionFind(n)
-    for i in range(n):
-        for j in range(i + 1, n):
-            if sim_matrix[i, j] >= similarity_threshold:
-                uf.union(i, j)
+    for i, j in zip(rows[hits].tolist(), cols[hits].tolist(), strict=True):
+        uf.union(i, j)
 
     # Group by root
     groups: dict[int, list[int]] = {}
@@ -170,34 +200,52 @@ def pick_canonical(cluster: list[dict[str, Any]]) -> dict[str, Any]:
 def merge_cluster(
     canonical: dict[str, Any],
     members: list[dict[str, Any]],
+    *,
+    summary: str | None = None,
 ) -> dict[str, Any]:
     """Merge cluster members into the canonical memory.
 
-    Produces merged content (deduplicated lines), summed access counts,
-    list of superseded IDs, and merged tags.
+    Produces merged content, summed access counts, list of superseded IDs,
+    and merged tags.
+
+    Without a *summary* (issue #55), merged clusters grow unbounded: content
+    was simply the deduplicated union of every member's lines, concatenation
+    rather than genuine consolidation. When *summary* is given -- an
+    LLM-authored distillation of the cluster, produced client-side exactly
+    like ``remind_me_decompose``/``remind_me_normalize_apply`` already do --
+    it replaces the raw union entirely as ``merged_content``.
 
     Args:
         canonical: The canonical memory dict (highest vitality in the cluster).
         members: List of non-canonical member dicts to merge into canonical.
+        summary: An LLM-authored consolidated summary of the cluster. When
+            given, this becomes ``merged_content`` verbatim. When omitted,
+            falls back to the original deduplicated-line-union behavior --
+            kept for callers with no LLM in the loop (e.g. tests,
+            benchmarks, or a caller that just wants the union).
 
     Returns:
         A dict with keys:
-          - ``merged_content``: Deduplicated content lines, canonical first.
+          - ``merged_content``: The summary if given, else deduplicated
+            content lines (canonical first).
           - ``total_access_count``: Sum of all access counts.
           - ``superseded_ids``: List of member IDs that will be superseded.
           - ``merged_tags``: Order-preserving deduplicated tags from all memories.
     """
-    # Merge content: canonical lines first, then unique lines from members
-    seen_lines: dict[str, None] = {}
-    for line in canonical.get("content", "").split("\n"):
-        seen_lines[line] = None
+    if summary is not None:
+        merged_content = summary
+    else:
+        # Merge content: canonical lines first, then unique lines from members
+        seen_lines: dict[str, None] = {}
+        for line in canonical.get("content", "").split("\n"):
+            seen_lines[line] = None
 
-    for member in members:
-        for line in member.get("content", "").split("\n"):
-            if line not in seen_lines:
-                seen_lines[line] = None
+        for member in members:
+            for line in member.get("content", "").split("\n"):
+                if line not in seen_lines:
+                    seen_lines[line] = None
 
-    merged_content = "\n".join(seen_lines)
+        merged_content = "\n".join(seen_lines)
 
     # Sum access counts
     total_access_count = canonical.get("access_count", 0) + sum(

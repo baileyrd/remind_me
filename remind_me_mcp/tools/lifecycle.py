@@ -288,10 +288,18 @@ async def remind_me_consolidate(params: ConsolidateInput) -> str:
     into the canonical memory, sets superseded_by on members, sums access counts,
     recalculates vitality, and re-embeds the canonical.
 
+    Merging requires a summary (issue #55): raw content is no longer
+    concatenated automatically, since unbounded concatenation isn't genuine
+    consolidation. A cluster only merges when its canonical id has a matching
+    entry in ``params.summaries`` — write one after reviewing a dry_run
+    report. Clusters found but missing a summary are skipped and listed
+    separately in the result, not silently merged with a raw union.
+
     Only active, non-superseded memories are considered for consolidation.
 
     Args:
-        params: Consolidation parameters (similarity_threshold, dry_run, category, limit).
+        params: Consolidation parameters (similarity_threshold, dry_run,
+            category, limit, summaries).
 
     Returns:
         JSON string with cluster report (dry_run) or merge results (auto-merge).
@@ -408,12 +416,21 @@ async def remind_me_consolidate(params: ConsolidateInput) -> str:
     now = _now_iso()
     total_superseded = 0
     canonical_ids: list[str] = []
+    skipped_no_summary: list[str] = []
+    summaries = params.summaries or {}
 
     for cluster in clusters:
         canonical = pick_canonical(cluster)
         members = [m for m in cluster if m["id"] != canonical["id"]]
 
-        merged = merge_cluster(canonical, members)
+        summary = summaries.get(canonical["id"])
+        if summary is None:
+            # No LLM-authored summary for this cluster (issue #55): skip it
+            # rather than falling back to a raw concatenation merge.
+            skipped_no_summary.append(canonical["id"])
+            continue
+
+        merged = merge_cluster(canonical, members, summary=summary)
 
         # Update canonical: content, access_count, tags, updated_at
         db.execute(
@@ -468,9 +485,11 @@ async def remind_me_consolidate(params: ConsolidateInput) -> str:
     db.commit()
 
     result = {
-        "clusters_merged": len(clusters),
+        "clusters_found": len(clusters),
+        "clusters_merged": len(canonical_ids),
         "memories_superseded": total_superseded,
         "canonical_ids": canonical_ids,
+        "skipped_no_summary": skipped_no_summary,
         "dry_run": False,
     }
     return json.dumps(result, indent=2)

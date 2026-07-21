@@ -1,5 +1,14 @@
 # Release Notes
 
+## v1.11.0 — 2026-07-21
+
+Closes a vault-hygiene gap flagged in the application capability review: `merge_cluster` (`consolidation.py`) unioned raw content lines from clustered memories rather than summarizing them, so merged memories grew unbounded and stayed verbose instead of becoming genuinely consolidated. Its clustering step was also a Python-level O(n²) double loop, worth capping regardless of the summarization fix.
+
+### New Features
+
+- **Summarization instead of concatenation** — `remind_me_consolidate`'s auto-merge (`dry_run=False`) now requires an LLM-authored `summaries` entry (`{canonical_id: summary}`) per cluster, produced client-side after reviewing a `dry_run=True` report — routing consolidation through the same client-side-LLM pattern already used by `remind_me_decompose`/`remind_me_normalize_apply`, rather than a server-side heuristic. A found cluster with no matching entry in `summaries` is skipped and listed in the response's `skipped_no_summary`, not silently merged with a raw concatenation. `merge_cluster` gained an optional `summary` keyword parameter: when given, it replaces `merged_content` entirely; when omitted, it falls back to the original deduplicated-line-union, preserving exact behavior for callers with no LLM in the loop (tests, benchmarks).
+- **Bounded, vectorized clustering** — `find_clusters`'s O(n²) similarity-threshold comparison is now a single vectorized numpy operation (`np.triu_indices` + boolean masking) instead of a Python-level double loop; only pairs that actually clear the threshold cost a Python `union()` call. A new `REMIND_ME_CONSOLIDATE_MAX_CANDIDATES` (default 1500) hard-caps the candidate pool per call — `remind_me_consolidate`'s own `limit` (max 5000) doesn't alone bound the O(n²) memory/comparison cost — so a large vault degrades gracefully (a logged, non-silent truncation) instead of an unbounded comparison.
+
 ## v1.10.0 — 2026-07-21
 
 Closes the biggest gap in the feedback loop flagged in the application capability review: `record_feedback` (`vitality.py`) always adjusted `base_weight` globally, silently discarding `FeedbackInput`'s `query` field — a memory marked unhelpful for "what's my favorite editor" got demoted for every future query, including an unrelated "what IDE did I mention last year."
