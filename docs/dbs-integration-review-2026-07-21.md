@@ -1,7 +1,9 @@
 # Daily Backup System (dbs) Integration Review — 2026-07-21
 
-> **Update (same day):** option 1 below has shipped on the dbs side as `dbs
-> export-notes` — no code changes were needed in remind_me itself. See
+> **Update (same day):** both option 1 (`dbs export-notes`, shipped on the
+> dbs side — no remind_me code changes needed) and option 3 (a dedicated
+> `dbs` import connector, shipped entirely in this repo as
+> `remind_me_mcp/dbs_import.py`) have since shipped. See
 > [Status](#status) at the end.
 
 Review of [baileyrd/daily-backup-system](https://github.com/baileyrd/daily-backup-system)
@@ -58,13 +60,13 @@ without new architecture on either side.
    directory and new items auto-ingest on the next poll. Freshness is
    per-backup-cycle; fidelity is flattened text — dbs's structured fields
    (source, tags, timestamps) arrive as YAML frontmatter inside each note's
-   body, ingested as plain content rather than structured metadata, until
-   option 3 exists.
-2. **Per-item webhook push (moderate effort).** A small adapter shapes new
-   dbs items into calls against remind_me's `POST /ingest` webhook endpoint
-   right after each incremental fetch, instead of waiting for a batch
-   export. Near real-time; same flattened-text fidelity unless the payload
-   also carries structured fields.
+   body, ingested as plain content rather than structured metadata (option
+   3, below, is the higher-fidelity alternative now that it's shipped too).
+2. **Per-item webhook push (moderate effort). Not started.** A small
+   adapter shapes new dbs items into calls against remind_me's `POST
+   /ingest` webhook endpoint right after each incremental fetch, instead
+   of waiting for a batch export. Near real-time; same flattened-text
+   fidelity unless the payload also carries structured fields.
 3. **Dedicated `dbs` import connector (highest effort, best fit). SHIPPED,
    remind_me side only.** `remind_me_mcp/dbs_import.py` reads dbs's
    `items`/`sources` tables directly (read-only, no dependency on the `dbs`
@@ -112,7 +114,7 @@ from option 1 or 3 above without re-deriving the tradeoffs.
   MemPalace's ChromaDB store is read directly rather than through its own
   MCP tools). Verified end-to-end against a real `dbs.sqlite3` produced by
   the actual `dbs` CLI (`dbs init` + `dbs restore`), including a rerun
-  no-op and an edited-item resupersession.
+  no-op and an edited-item supersession.
 - **Option 2 — not started.** The remaining gap between the three options:
   near-real-time push instead of on-demand/scheduled pulls. Worth
   reaching for only if option 3's pull cadence (call `remind_me_import_dbs`
