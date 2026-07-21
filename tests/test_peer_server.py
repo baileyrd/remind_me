@@ -409,6 +409,33 @@ def test_start_peer_server_port_in_use(monkeypatch: pytest.MonkeyPatch) -> None:
         sock.close()
 
 
+def test_start_and_stop_peer_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The peer server has a real stop mechanism (previously daemon-thread-only,
+    with no way to signal shutdown before the DB connections close)."""
+    monkeypatch.setattr(peer_server, "SYNC_SECRET", SECRET)
+    monkeypatch.setattr(peer_server, "PEER_PORT", 0)  # ephemeral
+    monkeypatch.setattr(peer_server, "PEER_BIND", "127.0.0.1")
+    try:
+        thread = peer_server.start_peer_server()
+        assert thread is not None
+        assert thread.is_alive()
+
+        # Idempotent: a second call while running returns the same thread.
+        assert peer_server.start_peer_server() is thread
+    finally:
+        peer_server.stop_peer_server()
+
+    assert not thread.is_alive()
+
+
+def test_stop_peer_server_is_noop_when_never_started(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(peer_server, "_server", None)
+    monkeypatch.setattr(peer_server, "_thread", None)
+    peer_server.stop_peer_server()  # must not raise
+
+
 # ---------------------------------------------------------------------------
 # Entity graph endpoints (FT-04)
 # ---------------------------------------------------------------------------

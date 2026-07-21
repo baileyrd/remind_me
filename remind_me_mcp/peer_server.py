@@ -22,6 +22,7 @@ import contextlib
 import hmac
 import json
 import logging
+import threading
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
@@ -323,6 +324,11 @@ class PeerHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "not found"})
 
 
+_server: ThreadingHTTPServer | None = None
+_thread: Thread | None = None
+_server_lock = threading.Lock()
+
+
 def start_peer_server() -> Thread | None:
     """Start the peer HTTP server in a daemon thread.
 
@@ -333,25 +339,53 @@ def start_peer_server() -> Thread | None:
 
     Returns the thread so the caller can join it on shutdown if needed.
     Returns None if the secret is missing or the port is already in use
-    (another instance is serving).
+    (another instance is serving). Idempotent — a second call while already
+    running returns the existing thread.
     """
+    global _server, _thread
     if not SYNC_SECRET:
         log.warning(
             "Peer server not started: REMIND_ME_SYNC_SECRET is not configured"
         )
         return None
-    try:
-        server = ThreadingHTTPServer((PEER_BIND, PEER_PORT), PeerHandler)
-        server.daemon_threads = True
-    except OSError as exc:
-        log.info(
-            "Peer server port %d already in use (another instance is "
-            "likely running) — skipping: %s",
-            PEER_PORT,
-            exc,
-        )
-        return None
-    thread = Thread(target=server.serve_forever, daemon=True, name="peer-server")
-    thread.start()
-    log.info("Peer server listening on %s:%d", PEER_BIND, PEER_PORT)
-    return thread
+    with _server_lock:
+        if _thread is not None and _thread.is_alive():
+            return _thread
+        try:
+            server = ThreadingHTTPServer((PEER_BIND, PEER_PORT), PeerHandler)
+            server.daemon_threads = True
+        except OSError as exc:
+            log.info(
+                "Peer server port %d already in use (another instance is "
+                "likely running) — skipping: %s",
+                PEER_PORT,
+                exc,
+            )
+            return None
+        thread = Thread(target=server.serve_forever, daemon=True, name="peer-server")
+        thread.start()
+        _server = server
+        _thread = thread
+        log.info("Peer server listening on %s:%d", PEER_BIND, PEER_PORT)
+        return thread
+
+
+def stop_peer_server(timeout: float = 10.0) -> None:
+    """Stop and discard the peer server (no-op when not running).
+
+    Called from the server lifespan shutdown *before* ``_close_db()`` so an
+    in-flight peer push/pull can't write to closed connections (SE-07),
+    mirroring ``watcher.stop_watcher()`` and ``webhook_server.stop_webhook_server()``.
+
+    Args:
+        timeout: Max seconds to wait for the thread to exit.
+    """
+    global _server, _thread
+    with _server_lock:
+        server, thread = _server, _thread
+        _server, _thread = None, None
+    if server is not None:
+        server.shutdown()
+        server.server_close()
+    if thread is not None and thread.is_alive():
+        thread.join(timeout)

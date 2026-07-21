@@ -77,6 +77,10 @@ async def app_lifespan(app: FastMCP):
     from remind_me_mcp.updater import start_background_check
     start_background_check()
 
+    # Imported unconditionally (not just under SYNC_ENABLED) so shutdown can
+    # always call it — stop_peer_server() is a no-op when never started.
+    from remind_me_mcp.peer_server import stop_peer_server
+
     if SYNC_ENABLED:
         from remind_me_mcp.peer_server import start_peer_server
         from remind_me_mcp.sync import start_sync_thread
@@ -108,16 +112,15 @@ async def app_lifespan(app: FastMCP):
     try:
         yield {"db": db}
     finally:
-        # FT-03/FT-09/SE-07: stop the watcher and webhook server threads
-        # *before* closing the database connections so an in-flight scan or
-        # request never writes to a closed handle.
+        # FT-03/FT-09/SY-*/SE-07: stop the watcher, webhook, and peer server
+        # threads *before* closing the database connections so an in-flight
+        # scan or request never writes to a closed handle.
         stop_watcher()
         stop_webhook_server()
+        stop_peer_server()
         # SE-07: always close every tracked connection, even when the body
         # raised — otherwise file descriptors leak and the WAL is never
-        # checkpointed. NOTE: sync/peer threads are daemon threads with no
-        # stop mechanism yet (see SY-* workstream); once one exists it should
-        # be signalled here *before* closing the connections.
+        # checkpointed.
         _close_db()
 
 # ---------------------------------------------------------------------------

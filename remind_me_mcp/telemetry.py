@@ -10,10 +10,10 @@ whatever OTLP collector you already run (Jaeger, Tempo, Honeycomb, ...) —
 remind_me never bundles or manages a collector itself, which would conflict
 with the zero-ops, local-first design center.
 
-Instrumented at three boundaries only — every MCP tool call (server.py),
-each sync cycle (sync.py), and each folder-watcher scan pass (watcher.py) —
-enough to see where time goes without turning this into a general-purpose
-tracing SDK integration.
+Instrumented at four boundaries only — every MCP tool call (server.py),
+each sync cycle (sync.py), each folder-watcher scan pass (watcher.py), and
+each webhook ingest request (webhook_server.py) — enough to see where time
+goes without turning this into a general-purpose tracing SDK integration.
 """
 
 from __future__ import annotations
@@ -121,7 +121,7 @@ def maybe_span(name: str, **attributes: Any) -> Iterator[None]:
 
     Args:
         name: Span name (e.g. ``'tool.remind_me_search'``, ``'sync.cycle'``,
-            ``'watcher.scan'``).
+            ``'watcher.scan'``, ``'webhook.ingest'``).
         **attributes: Optional span attributes. Keep these small — they are
             exported to the collector.
 
