@@ -1117,6 +1117,8 @@ remind_me is local-first, single-user, and MCP-native by design — some capabil
 
 ## Changelog
 
+See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for a per-version feature breakdown with PR references; this section summarizes the same history phase-by-phase.
+
 ### 1.1.0 — 2026-07-21
 
 Eight-phase capability expansion, closing the gaps identified in a comparison against [cognee](docs/cognee-capability-review-2026-07-20.md) and [Cerebras's internal knowledge system](docs/cerebras-knowledge-capability-review-2026-07-20.md). All additions are backward-compatible and opt-in or default-preserving — no breaking changes to existing tools, storage, or sync wire formats.
