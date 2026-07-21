@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Remind Me — Dashboard REST API
-  version: "1.1.0"
+  version: "1.2.0"
   description: |
     The `GET /api/*` REST surface served by `remind_me_mcp/api.py` (the
     dashboard's HTTP backend) — the same operations available as MCP tools,
@@ -367,6 +367,157 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /api/wiki:
+    get:
+      operationId: listWikiPages
+      summary: List every LLM Wiki page (FT-08)
+      description: |
+        The wiki (`config.WIKI_DIR`) is a synthesis layer distinct from raw
+        memories — markdown pages Claude curates via the `remind_me_wiki_*`
+        tools. This surface is read-only by design: writing stays an
+        MCP-tool-only, LLM-curated action (see SCHEMA.md), so there is no
+        POST/PUT/DELETE here. The on-disk files are reconciled into the
+        `wiki_pages`/`wiki_fts` cache before every read.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: integer
+                  pages:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/WikiPageSummary"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/wiki/search:
+    get:
+      operationId: searchWiki
+      summary: Full-text search the wiki (title + body)
+      description: BM25-ranked over `wiki_fts`; distinct from `/api/memories/search`.
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 10
+            maximum: 50
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: integer
+                  results:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/WikiSearchResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/wiki/load:
+    get:
+      operationId: loadWiki
+      summary: Concatenate the whole wiki into one blob (the core LLM-Wiki move)
+      description: |
+        Pages are concatenated newest-revised first until `token_budget`
+        (estimated `len // 4`) is hit; the rest are listed as omitted.
+      parameters:
+        - name: token_budget
+          in: query
+          description: Ceiling in estimated tokens. Omit to use `config.WIKI_LOAD_TOKEN_BUDGET`; `0` means unlimited.
+          schema:
+            type: integer
+        - name: include_index
+          in: query
+          description: Prepend the page catalogue.
+          schema:
+            type: boolean
+            default: true
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  content:
+                    type: string
+                  pages_included:
+                    type: integer
+                  pages_omitted:
+                    type: integer
+                  estimated_tokens:
+                    type: integer
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/wiki/status:
+    get:
+      operationId: getWikiStatus
+      summary: Small aggregate for a dashboard badge
+      description: Page count plus the count of raw memories not yet folded into the wiki.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pages:
+                    type: integer
+                  pending_compile:
+                    type: integer
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/wiki/{slug}:
+    get:
+      operationId: getWikiPage
+      summary: Read a single wiki page by title or slug
+      description: Accepts either a page title or its slug; returns outgoing links and backlinks.
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WikiPage"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: No wiki page matching that title or slug.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /api/import:
     post:
       operationId: importFile
@@ -609,3 +760,63 @@ components:
         chunk_index:
           type: integer
           nullable: true
+
+    WikiPageSummary:
+      type: object
+      description: One row from the wiki catalogue (`GET /api/wiki`).
+      properties:
+        slug:
+          type: string
+        title:
+          type: string
+        summary:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+
+    WikiLinkRef:
+      type: object
+      description: A link to/from another wiki page (used for both `links` and `backlinks`).
+      properties:
+        slug:
+          type: string
+        title:
+          type: string
+
+    WikiPage:
+      type: object
+      description: A single wiki page (`GET /api/wiki/{slug}`) with its outgoing links and backlinks.
+      properties:
+        slug:
+          type: string
+        title:
+          type: string
+        content:
+          type: string
+        summary:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+        links:
+          type: array
+          items:
+            $ref: "#/components/schemas/WikiLinkRef"
+        backlinks:
+          type: array
+          items:
+            $ref: "#/components/schemas/WikiLinkRef"
+
+    WikiSearchResult:
+      type: object
+      description: One BM25-ranked hit from `GET /api/wiki/search`, with `[`/`]` bracket markers around matched terms in `snippet`.
+      properties:
+        slug:
+          type: string
+        title:
+          type: string
+        summary:
+          type: string
+        snippet:
+          type: string
