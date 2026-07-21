@@ -79,6 +79,12 @@ async def memory_add(params: MemoryAddInput) -> str:
                 db, ent.name, ent.kind, ent.aliases, node_id=NODE_ID, now=now
             )
             _pkg._link_memory_entity(db, mem_id, eid, now)
+        # Contradiction-based supersession (gap #5): an SPO triple that
+        # conflicts with an existing fact (same subject+predicate, different
+        # object) supersedes it, same mechanism as similarity-merge.
+        superseded = _pkg._supersede_contradicting_facts(
+            db, mem_id, params.subject, params.predicate, params.object, now
+        )
         db.commit()
     except sqlite3.IntegrityError as e:
         log.error("Failed to add memory: %s", e)
@@ -87,7 +93,10 @@ async def memory_add(params: MemoryAddInput) -> str:
         log.error("Database error adding memory: %s", e)
         return f"Error: Database operation failed — {e}"
     await asyncio.to_thread(_pkg._embed_and_store, mem_id, params.content)
-    return _maybe_update_notice(f"✓ Memory stored with id `{mem_id}` in category '{params.category}'.")
+    msg = f"✓ Memory stored with id `{mem_id}` in category '{params.category}'."
+    if superseded:
+        msg += f" Superseded {len(superseded)} contradicted fact(s): {', '.join(superseded)}."
+    return _maybe_update_notice(msg)
 
 
 @mcp.tool(

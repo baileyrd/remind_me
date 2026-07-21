@@ -18,7 +18,7 @@ Persistent, searchable memory that works across **Claude.ai**, **Claude Code**, 
 
 **Organize: entity knowledge graph**
 - **Atomic decomposition** — Claude-driven extraction of atomic facts from conversations, linked to parent memories
-- **Structured triples** — subject/predicate/object columns written by add/decompose/annotate for precise query routing
+- **Structured triples** — subject/predicate/object columns written by add/decompose/annotate for precise query routing; a triple that contradicts an existing one (same subject+predicate, different object) automatically supersedes it
 - **Entity graph** — entities with kinds and aliases, deterministic ids, mention links from memories; backfill via `remind_me_extract_batch` + `remind_me_annotate`, look up with `remind_me_entity`
 - **Tagging & categorization** — organize memories with categories and tags
 - **Memory classification** — 7 memory types with single and batch reclassification tools
@@ -600,6 +600,12 @@ Memories can carry a structured **subject/predicate/object triple** plus links t
 - **`remind_me_entity_traverse`** walks this edge graph breadth-first from a starting entity, up to `hops` (1-3) steps in both directions, with an optional exact-match `relation` filter and a result cap. This answers questions that require chaining relations rather than co-mention — e.g. "who introduced me to the person who recommended this tool" (`Alice --introduced--> Bob`, `Bob --recommended--> tool`).
 - Relation edges have a **deterministic id** (hash of the subject/relation/object triple, same convergence property as entity ids) and are **immutable** — insert-or-ignore, like memory↔entity links, so re-recording the same triple is a no-op.
 
+### Contradiction-based supersession
+
+Supersession previously only happened via similarity-merge (`remind_me_consolidate`) — near-duplicate memories get merged. That misses a genuine contradiction: "I moved to Boston" doesn't textually resemble "I live in Seattle," even though they're in direct conflict. Whenever an SPO triple is written (`remind_me_add`, `remind_me_decompose`, `remind_me_annotate`), any other non-superseded, non-deleted memory sharing the same **subject + predicate** but a **different object** is automatically superseded — the same `superseded_by` mechanism, so every existing superseded-exclusion read path (search, list, entity lookups) picks it up for free.
+
+This is deliberately narrow: a differently-worded predicate never contradicts, e.g. "I *live in* Seattle" and "I *visited* Boston" don't collide, since they don't share a predicate — the caller (an LLM choosing predicate names) controls specificity, not this check. It's a cheap, deterministic first pass over the existing SPO columns; an LLM-based contradiction check is a possible later enhancement if this proves too narrow in practice.
+
 ### Sync & export
 
 The graph syncs between machines alongside memories: entity, link, and relation records travel with `record_type` discriminators through the outbox/hub and the peer endpoints (`/sync/pull_entities`, `/sync/pull_links`, `/sync/pull_entity_relations`). Deterministic ids make concurrent creation converge; aliases union-merge on receipt; links and relations are immutable insert-or-ignore rows, and a record that arrives before its endpoints simply stays invisible until they do. Exports include the graph by default (see [Exporting & Backup](#exporting--backup)).
@@ -1147,6 +1153,7 @@ The server uses:
 - **Token budget** — search results are trimmed to an 800-token default cap to prevent LLM context overflow
 - **ACT-R vitality model** — cognitive-science decay with per-category rates, access reinforcement, signed helpful/unhelpful feedback, and bridge protection
 - **Structured triples** — subject/predicate/object columns with indexed query routing
+- **Contradiction-based supersession** — a new/updated SPO triple sharing an existing fact's subject+predicate but a different object supersedes it, deterministically, at write time
 - **Entity knowledge graph** — `entities` and `memory_entities` tables with deterministic name-derived ids, alias union-merge, and 1-hop search expansion
 - **Union-Find clustering** — transitive semantic similarity grouping for vault consolidation
 - **Section-aware document chunking** — Markdown imports split per heading section, plain text per paragraph
@@ -1181,6 +1188,12 @@ remind_me is local-first, single-user, and MCP-native by design — some capabil
 ## Changelog
 
 See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for a per-version feature breakdown with PR references; this section summarizes the same history phase-by-phase.
+
+### 1.5.0 — 2026-07-21
+
+Closes a gap in the living-memory model flagged in the application capability review: supersession only ever happened via similarity-merge, so a contradictory update never replaced an old fact it didn't textually resemble.
+
+- **Contradiction-based supersession.** A new/updated SPO triple sharing an existing fact's subject+predicate but a different object now automatically supersedes it (`remind_me_add`, `remind_me_decompose`, `remind_me_annotate`) — deterministic, no LLM call, using the SPO columns and `superseded_by` mechanism that already exist. Deliberately narrow: a differently-worded predicate (e.g. "visited" vs. "lives in") never contradicts.
 
 ### 1.4.0 — 2026-07-21
 

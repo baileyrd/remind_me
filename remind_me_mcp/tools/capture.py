@@ -302,7 +302,10 @@ async def remind_me_decompose(params: DecomposeInput) -> str:
 
     Each fact is stored as a separate memory linked to the parent capture via
     source_capture_id. Facts inherit the parent's tags and can optionally
-    receive additional tags and a memory_type classification.
+    receive additional tags and a memory_type classification. A fact whose
+    SPO triple contradicts an existing one (same subject+predicate, different
+    object — e.g. "I live in Seattle" vs. "I moved to Boston") supersedes it
+    (gap #5).
 
     Args:
         params: The capture_id to decompose and the list of extracted facts.
@@ -335,6 +338,7 @@ async def remind_me_decompose(params: DecomposeInput) -> str:
     fact_ids: list[str] = []
     entities_linked = 0
     relations_linked = 0
+    superseded_ids: list[str] = []
 
     for fact in params.facts:
         fact_id = _make_id(fact.content)
@@ -391,6 +395,15 @@ async def remind_me_decompose(params: DecomposeInput) -> str:
         if _maybe_link_entity_relation(db, fact.subject, fact.predicate, fact.object, now):
             relations_linked += 1
 
+        # Contradiction-based supersession (gap #5): a decomposed fact whose
+        # SPO triple conflicts with an existing one (same subject+predicate,
+        # different object) supersedes it.
+        superseded_ids.extend(
+            _pkg._supersede_contradicting_facts(
+                db, fact_id, fact.subject, fact.predicate, fact.object, now
+            )
+        )
+
         # Fire-and-forget embed (reference held in _background_tasks, PF-04)
         _pkg._spawn_task(asyncio.to_thread(_pkg._embed_and_store, fact_id, fact.content))
 
@@ -403,6 +416,7 @@ async def remind_me_decompose(params: DecomposeInput) -> str:
         "parent_tags_inherited": parent_tags,
         "relations_linked": relations_linked,
         "entities_linked": entities_linked,
+        "superseded_ids": superseded_ids,
     }
     return json.dumps(result)
 
@@ -579,7 +593,10 @@ async def remind_me_annotate(params: AnnotateInput) -> str:
     (omitted fields are left unchanged), mentioned entities are upserted into
     the entity table (deterministic ids — the same name always maps to the
     same entity, aliases union-merge), and mention links are recorded.
-    updated_at is bumped so the changes sync to peers.
+    updated_at is bumped so the changes sync to peers. If the memory's
+    (possibly just-annotated) triple contradicts another fact — same
+    subject+predicate, different object — that other fact is superseded
+    (gap #5).
 
     Args:
         params: A batch of {memory_id, subject?, predicate?, object?, entities?}.
@@ -632,10 +649,18 @@ async def remind_me_annotate(params: AnnotateInput) -> str:
             db, current["subject"], current["predicate"], current["object"], now
         )
 
+        # Contradiction-based supersession (gap #5), same reasoning as
+        # above: re-read the full current triple rather than the possibly-
+        # partial annotation fields.
+        superseded = _pkg._supersede_contradicting_facts(
+            db, ann.memory_id, current["subject"], current["predicate"], current["object"], now
+        )
+
         results.append({
             "memory_id": ann.memory_id,
             "entities_linked": linked,
             "relation_linked": relation_linked,
+            "superseded_ids": superseded,
         })
 
     db.commit()
