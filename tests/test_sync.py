@@ -483,6 +483,194 @@ def test_upsert_malformed_tags_become_empty(sync_db: sqlite3.Connection) -> None
     assert json.loads(row["metadata"]) == {}
 
 
+# ---------------------------------------------------------------------------
+# Field-level conflict merge for tags/metadata (issue #60)
+# ---------------------------------------------------------------------------
+
+
+def test_upsert_newer_wins_but_tags_union_merge(sync_db: sqlite3.Connection) -> None:
+    """The headline case: one device edits content, another adds a tag.
+    The newer content wins LWW, but the tag added on the losing side
+    (issue #60) is NOT silently dropped -- tags always union-merge."""
+    insert_memory(
+        sync_db, "m1", "old content", tags=["local-tag"],
+        updated_at="2026-01-01T00:00:00+00:00",
+    )
+    rec = make_record(
+        "m1", "newer content",
+        tags=["remote-tag"],
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-02-01T00:00:00+00:00",
+    )
+    result = sync._upsert_records(sync_db, [rec])
+    assert result.applied == 1
+    row = sync_db.execute("SELECT content, tags FROM memories WHERE id = 'm1'").fetchone()
+    assert row["content"] == "newer content"
+    assert json.loads(row["tags"]) == ["local-tag", "remote-tag"]
+
+
+def test_upsert_older_loses_content_but_tags_still_merge(sync_db: sqlite3.Connection) -> None:
+    """A stale record cannot overwrite content, but its tag still merges in
+    -- without bumping updated_at (mirrors the entity alias precedent)."""
+    insert_memory(
+        sync_db, "m1", "newer local content", tags=["local-tag"],
+        updated_at="2026-03-01T00:00:00+00:00",
+    )
+    rec = make_record(
+        "m1", "stale remote content",
+        tags=["remote-tag"],
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+    )
+    result = sync._upsert_records(sync_db, [rec])
+    # Content lost LWW: no re-embed-worthy change, so applied stays 0 --
+    # unlike entities (see _upsert_one's docstring for why this differs).
+    assert result.applied == 0
+    assert result.processed_ids == ["m1"]
+    row = sync_db.execute(
+        "SELECT content, tags, updated_at FROM memories WHERE id = 'm1'"
+    ).fetchone()
+    assert row["content"] == "newer local content"
+    assert json.loads(row["tags"]) == ["local-tag", "remote-tag"]
+    assert row["updated_at"] == "2026-03-01T00:00:00+00:00"  # not bumped
+
+
+def test_upsert_metadata_shallow_merge_winner_takes_conflicting_key(sync_db: sqlite3.Connection) -> None:
+    """On a metadata key present on both sides, the LWW winner's value wins;
+    keys unique to either side are kept."""
+    insert_memory(
+        sync_db, "m1", "content",
+        metadata=json.dumps({"shared": "local-value", "local_only": "kept"}),
+        updated_at="2026-01-01T00:00:00+00:00",
+    )
+    rec = make_record(
+        "m1",
+        metadata={"shared": "remote-value", "remote_only": "kept"},
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-02-01T00:00:00+00:00",
+    )
+    sync._upsert_records(sync_db, [rec])
+    row = sync_db.execute("SELECT metadata FROM memories WHERE id = 'm1'").fetchone()
+    assert json.loads(row["metadata"]) == {
+        "shared": "remote-value",  # winner (newer) took the conflicting key
+        "local_only": "kept",
+        "remote_only": "kept",
+    }
+
+
+def test_upsert_metadata_merge_when_incoming_loses_local_key_wins(sync_db: sqlite3.Connection) -> None:
+    """When incoming loses LWW, its metadata is still merged in, but the
+    LOCAL (winning) side's value takes precedence on key collision."""
+    insert_memory(
+        sync_db, "m1", "newer local content",
+        metadata=json.dumps({"shared": "local-value"}),
+        updated_at="2026-03-01T00:00:00+00:00",
+    )
+    rec = make_record(
+        "m1", "stale remote content",
+        metadata={"shared": "stale-remote-value", "remote_only": "kept"},
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+    )
+    sync._upsert_records(sync_db, [rec])
+    row = sync_db.execute("SELECT metadata FROM memories WHERE id = 'm1'").fetchone()
+    assert json.loads(row["metadata"]) == {
+        "shared": "local-value",  # local (winner) kept its value
+        "remote_only": "kept",  # but the loser's unique key still merged in
+    }
+
+
+def test_upsert_no_merge_needed_is_noop(sync_db: sqlite3.Connection) -> None:
+    """A stale record with nothing new to merge doesn't touch the row at all."""
+    insert_memory(
+        sync_db, "m1", "local content", tags=["shared-tag"],
+        updated_at="2026-03-01T00:00:00+00:00",
+    )
+    rec = make_record(
+        "m1", "stale remote content", tags=["shared-tag"],
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+    )
+    result = sync._upsert_records(sync_db, [rec])
+    assert result.applied == 0
+    row = sync_db.execute(
+        "SELECT content, tags, updated_at FROM memories WHERE id = 'm1'"
+    ).fetchone()
+    assert row["content"] == "local content"
+    assert row["updated_at"] == "2026-03-01T00:00:00+00:00"
+
+
+def test_upsert_merge_only_suppresses_echo_outbox_row(sync_db: sqlite3.Connection) -> None:
+    """A merge-only update (incoming lost LWW) must not create a real,
+    un-suppressed outbox row -- otherwise it would echo straight back to
+    whichever remote just sent it (SY-05), same as the winning-LWW path."""
+    insert_memory(
+        sync_db, "m1", "newer local content", tags=["local-tag"],
+        updated_at="2026-03-01T00:00:00+00:00",
+    )
+    before = sync_db.execute(
+        "SELECT COUNT(*) AS n FROM sync_outbox WHERE sent_at = ''"
+    ).fetchone()["n"]
+
+    rec = make_record(
+        "m1", "stale remote content", tags=["remote-tag"],
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+    )
+    sync._upsert_records(sync_db, [rec])
+
+    after = sync_db.execute(
+        "SELECT COUNT(*) AS n FROM sync_outbox WHERE sent_at = ''"
+    ).fetchone()["n"]
+    assert after == before  # the merge's own trigger-fired row was suppressed
+
+
+# ---------------------------------------------------------------------------
+# merge_tags / merge_metadata — pure functions (issue #60)
+# ---------------------------------------------------------------------------
+
+
+def test_merge_tags_unions_and_dedups_local_first() -> None:
+    merged = sync.merge_tags(["a", "b"], ["b", "c"])
+    assert merged == ["a", "b", "c"]
+
+
+def test_merge_tags_handles_json_strings() -> None:
+    merged = sync.merge_tags('["a"]', '["b"]')
+    assert merged == ["a", "b"]
+
+
+def test_merge_tags_tolerates_malformed_input() -> None:
+    assert sync.merge_tags("{not json", "[also broken") == []
+    assert sync.merge_tags(None, ["a"]) == ["a"]
+
+
+def test_merge_metadata_incoming_wins_on_conflict() -> None:
+    merged = sync.merge_metadata(
+        {"shared": "local", "local_only": 1}, {"shared": "remote", "remote_only": 2},
+        incoming_wins=True,
+    )
+    assert merged == {"shared": "remote", "local_only": 1, "remote_only": 2}
+
+
+def test_merge_metadata_local_wins_on_conflict() -> None:
+    merged = sync.merge_metadata(
+        {"shared": "local", "local_only": 1}, {"shared": "remote", "remote_only": 2},
+        incoming_wins=False,
+    )
+    assert merged == {"shared": "local", "local_only": 1, "remote_only": 2}
+
+
+def test_merge_metadata_shallow_not_recursive() -> None:
+    """A key present on both sides with a nested dict value is replaced
+    wholesale by the winner's value, not recursively merged."""
+    merged = sync.merge_metadata(
+        {"nested": {"a": 1, "b": 2}}, {"nested": {"b": 99}},
+        incoming_wins=True,
+    )
+    assert merged == {"nested": {"b": 99}}  # loser's nested "a" key is gone
+
+
 def test_upsert_preserves_extended_columns(sync_db: sqlite3.Connection) -> None:
     """SY-03: vitality/classification/structured fields survive the wire."""
     rec = make_record(

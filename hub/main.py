@@ -357,7 +357,21 @@ _REQUIRED_MEMORY_KEYS = ("id", "content", "created_at", "updated_at")
 def _upsert_memory(
     conn: psycopg.Connection, rec: dict[str, Any], origin: str | None
 ) -> bool:
-    """Upsert one memory record (LWW on updated_at). True when applied."""
+    """Upsert one memory record (LWW on updated_at). True when applied.
+
+    Whole-row LWW for every column, unlike the client-side peer/hub-pull
+    path (``remind_me_mcp.sync._upsert_one``), which field-level merges
+    ``tags``/``metadata`` regardless of which side wins (issue #60). Two
+    devices pushing conflicting field-level edits *through the hub* can
+    still have one clobber the other's non-conflicting field here — a
+    known, deliberate scope decision (this module needs a live Postgres to
+    test at all; `hub/e2e_test.py` is explicitly outside the pytest suite),
+    not an oversight. Once a record reaches a client via pull, that
+    client's own merge logic still recovers the union for any field the
+    *client* independently changed, so the gap is narrower than it looks —
+    it's specifically "two pushes racing at the hub before either side
+    pulls," not the general two-devices-diverge case.
+    """
     missing = [k for k in _REQUIRED_MEMORY_KEYS if not rec.get(k)]
     if missing:
         raise ValueError(f"record missing required keys: {missing}")

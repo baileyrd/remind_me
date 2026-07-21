@@ -700,10 +700,12 @@ Sync is enabled automatically when `NODE_ID`, `HUB_URL`, and `SYNC_SECRET` are a
 
 1. Every local write (add, update, delete) is recorded in a `sync_outbox` table
 2. The background sync thread pushes outbox entries to the hub and pulls new records
-3. Incoming records are upserted with last-write-wins on `updated_at`
+3. Incoming records are upserted with last-write-wins on `updated_at` for most columns — **except `tags` and `metadata`, which field-level merge instead** (below)
 4. Records pulled from the hub are marked as already-sent in the outbox to prevent echo
 5. Optionally, peers discover each other via Tailscale and sync directly
 6. The **entity graph syncs too**: entity and link records carry a `record_type` discriminator on the wire; entities upsert with alias union-merge, links are insert-or-ignore (see [Entity Knowledge Graph](#entity-knowledge-graph))
+
+**Field-level conflict merge.** Whole-row LWW means two devices editing *different* fields of the same memory between sync cycles (one adds a tag, another edits content) would have whichever write arrived second silently clobber the other's change entirely — not just the field that actually conflicted. `tags` and `metadata` are field-level merged instead, regardless of which side wins LWW: `tags` union-merge (dedup, order-preserving — the same semantics entities already use for aliases); `metadata` shallow-merges key by key, with the LWW winner's value taking precedence only on an actual key collision, while keys unique to either side are kept. A record that loses LWW on `content`/other scalar fields still gets its tags/metadata folded in via a merge-only update that doesn't bump `updated_at` (so it doesn't cause sync churn). This client-side merge (`remind_me_mcp/sync.py`) applies uniformly whether pulling from a hub or a peer; the hub's own Postgres storage still does whole-row LWW for now — a documented scope decision (see `hub/main.py`), not an oversight, since two pushes racing at the hub before either side pulls is a narrower case than the general two-devices-diverge scenario this closes.
 
 #### Deletion Propagates Too
 
@@ -1211,6 +1213,12 @@ remind_me is local-first, single-user, and MCP-native by design — some capabil
 ## Changelog
 
 See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for a per-version feature breakdown with PR references; this section summarizes the same history phase-by-phase.
+
+### 1.13.0 — 2026-07-21
+
+Closes a multi-device data-loss gap flagged in the application capability review: `_upsert_one`'s whole-row last-write-wins meant two devices editing *different* fields of the same memory between sync cycles (one adds a tag, another edits content) had whichever write arrived second silently clobber the other's change entirely, not just the field that actually conflicted.
+
+- **Field-level conflict merge for memory sync** — `tags` union-merge (dedup, order-preserving, same semantics entities already use for aliases) and `metadata` shallow-merges key by key (the LWW winner's value wins only on an actual key collision; keys unique to either side are kept), regardless of which side wins on `updated_at`. A record that loses LWW on `content`/other scalar fields still gets its tags/metadata folded in via a merge-only update that doesn't bump `updated_at`. Applies to both hub-pull and peer-pull, since both go through the same client-side upsert. The hub's own Postgres storage still does whole-row LWW for now — a documented scope decision, not an oversight.
 
 ### 1.12.0 — 2026-07-21
 
