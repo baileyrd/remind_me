@@ -47,7 +47,8 @@ import threading
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from remind_me_mcp.config import DB_PATH, EMBEDDING_DIM
+from remind_me_mcp import ann_index
+from remind_me_mcp.config import ANN_MIN_CHUNKS, DB_PATH, EMBEDDING_DIM
 from remind_me_mcp.embeddings import _get_embedder, chunk_text
 
 # Over-fetch factor for chunked KNN: a single memory may own several chunk
@@ -1443,14 +1444,22 @@ def _reconcile_sync_enabled_flag(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _delete_chunks(db: sqlite3.Connection, memory_rowid: int) -> None:
-    """Remove all chunk vectors (and map rows) belonging to one memory."""
+def _delete_chunks(db: sqlite3.Connection, memory_rowid: int) -> list[int]:
+    """Remove all chunk vectors (and map rows) belonging to one memory.
+
+    Returns the vec_rowids that were removed, so a caller also maintaining
+    the optional ANN index (ann_index.py) can mirror the removal there —
+    but only *after* its own transaction commits, since ANN mutations
+    aren't part of the SQL transaction and can't be rolled back with it.
+    """
     old = db.execute(
         "SELECT vec_rowid FROM vec_chunks WHERE memory_rowid = ?", (memory_rowid,)
     ).fetchall()
-    for (vec_rowid,) in old:
+    removed = [vec_rowid for (vec_rowid,) in old]
+    for vec_rowid in removed:
         db.execute("DELETE FROM memories_vec WHERE rowid = ?", (vec_rowid,))
     db.execute("DELETE FROM vec_chunks WHERE memory_rowid = ?", (memory_rowid,))
+    return removed
 
 
 def _prune_orphan_chunks(db: sqlite3.Connection) -> int:
@@ -1473,11 +1482,15 @@ def _prune_orphan_chunks(db: sqlite3.Connection) -> int:
     ).fetchall()
     if not orphans:
         return 0
-    for (vec_rowid,) in orphans:
+    vec_rowids = [vec_rowid for (vec_rowid,) in orphans]
+    for vec_rowid in vec_rowids:
         db.execute("DELETE FROM memories_vec WHERE rowid = ?", (vec_rowid,))
         db.execute("DELETE FROM vec_chunks WHERE vec_rowid = ?", (vec_rowid,))
     db.commit()
-    return len(orphans)
+    # ANN mutations only after the commit succeeds — see _delete_chunks.
+    for vec_rowid in vec_rowids:
+        ann_index.remove_vector(db, vec_rowid)
+    return len(vec_rowids)
 
 
 def _embed_and_store_rows(rows: list[tuple[int, str]]) -> int:
@@ -1514,20 +1527,33 @@ def _embed_and_store_rows(rows: list[tuple[int, str]]) -> int:
     try:
         vecs = embedder.embed(flat_chunks)
         stored = 0
+        removed_vec_rowids: list[int] = []
+        added_vecs: list[tuple[int, bytes]] = []
         for memory_rowid, offset, count in plan:
-            _delete_chunks(db, memory_rowid)
+            removed_vec_rowids.extend(_delete_chunks(db, memory_rowid))
             for ci in range(count):
+                vec_bytes = vecs[offset + ci].tobytes()
                 cur = db.execute(
                     "INSERT INTO memories_vec(embedding) VALUES (?)",
-                    (vecs[offset + ci].tobytes(),),
+                    (vec_bytes,),
                 )
+                vec_rowid = cur.lastrowid
+                assert vec_rowid is not None  # guaranteed by the INSERT above
                 db.execute(
                     "INSERT INTO vec_chunks(vec_rowid, memory_rowid, chunk_ix) "
                     "VALUES (?, ?, ?)",
-                    (cur.lastrowid, memory_rowid, ci),
+                    (vec_rowid, memory_rowid, ci),
                 )
+                added_vecs.append((vec_rowid, vec_bytes))
             stored += 1
         db.commit()
+        # ANN mutations only after the commit succeeds, so a rollback in the
+        # except clause below never leaves the ANN index out of sync with
+        # memories_vec (ANN isn't part of the SQL transaction).
+        for vec_rowid in removed_vec_rowids:
+            ann_index.remove_vector(db, vec_rowid)
+        for vec_rowid, vec_bytes in added_vecs:
+            ann_index.add_vector(db, vec_rowid, vec_bytes)
         return stored
     except (sqlite3.DatabaseError, sqlite3.InterfaceError) as e:
         # InterfaceError is a sibling of DatabaseError in Python's sqlite3
@@ -1596,6 +1622,74 @@ def _fuse_query_embedding(embedder, texts: list[str]) -> bytes:
     return fused.astype(np.float32).tobytes()
 
 
+def _hydrate_ann_hits(
+    db: sqlite3.Connection,
+    hits: list[tuple[int, float]],
+    limit: int,
+    category: str | None,
+    tags: list[str] | None,
+) -> list[dict]:
+    """Turn ANN ``(vec_rowid, distance)`` pairs into full memory dicts.
+
+    Mirrors the brute-force SQL path's semantics exactly: dedupe to each
+    memory's best (smallest-distance) chunk, exclude superseded memories,
+    apply category/tag filters, sort by distance, and truncate to *limit*.
+    A ``vec_rowid`` with no matching ``vec_chunks`` row (a stale ANN entry —
+    e.g. a chunk removed between an in-flight search and an unrelated
+    delete) is silently skipped rather than treated as an error.
+    """
+    if not hits:
+        return []
+    vec_rowids = [vr for vr, _ in hits]
+    placeholders = ",".join("?" * len(vec_rowids))
+    chunk_rows = db.execute(
+        f"SELECT vec_rowid, memory_rowid FROM vec_chunks WHERE vec_rowid IN ({placeholders})",
+        vec_rowids,
+    ).fetchall()
+    vec_to_memory = {r["vec_rowid"]: r["memory_rowid"] for r in chunk_rows}
+
+    best_by_memory: dict[int, float] = {}
+    for vec_rowid, distance in hits:
+        memory_rowid = vec_to_memory.get(vec_rowid)
+        if memory_rowid is None:
+            continue
+        prev = best_by_memory.get(memory_rowid)
+        if prev is None or distance < prev:
+            best_by_memory[memory_rowid] = distance
+    if not best_by_memory:
+        return []
+
+    conditions = ""
+    bindings: list = []
+    if category:
+        conditions += " AND m.category = ?"
+        bindings.append(category)
+    for i, tag in enumerate(tags or []):
+        alias = f"mt{i}"
+        conditions += (
+            f" AND EXISTS (SELECT 1 FROM memory_tags {alias}"
+            f" WHERE {alias}.memory_id = m.id AND {alias}.tag = ?)"
+        )
+        bindings.append(tag)
+
+    memory_rowids = list(best_by_memory)
+    m_placeholders = ",".join("?" * len(memory_rowids))
+    rows = db.execute(
+        f"""SELECT m.*, m.rowid AS _ann_rowid FROM memories m
+           WHERE m.rowid IN ({m_placeholders}) AND m.superseded_by IS NULL{conditions}""",
+        [*memory_rowids, *bindings],
+    ).fetchall()
+
+    results = []
+    for r in rows:
+        d = _row_to_dict(r)
+        memory_rowid = d.pop("_ann_rowid")
+        d["semantic_distance"] = best_by_memory[memory_rowid]
+        results.append(d)
+    results.sort(key=lambda d: d["semantic_distance"])
+    return results[:limit]
+
+
 def _semantic_search(
     query: str,
     limit: int = 20,
@@ -1612,6 +1706,13 @@ def _semantic_search(
     memories survive the dedupe (a further 4x when category/tag filters prune
     candidates). Results carry a 'semantic_distance' key (lower = more similar).
     Returns [] when the embedder or vector table is unavailable.
+
+    Once the corpus grows past ``config.ANN_MIN_CHUNKS`` chunk vectors, the
+    KNN is served by the optional HNSW ANN index (ann_index.py) instead of
+    sqlite-vec's exact brute-force scan — same output shape either way. Below
+    that threshold, or whenever the optional ``usearch`` package isn't
+    installed, or if the ANN path itself fails, this transparently falls back
+    to the brute-force scan below.
 
     Args:
         query: The search query text to embed and compare.
@@ -1638,6 +1739,16 @@ def _semantic_search(
         # can prune candidates (DI-03).
         fanout = _CHUNK_KNN_FANOUT * (4 if (category or tags) else 1)
         knn_k = max(limit, limit * fanout)
+
+        try:
+            (chunk_count,) = db.execute("SELECT COUNT(*) FROM memories_vec").fetchone()
+        except sqlite3.OperationalError:
+            chunk_count = 0
+        if chunk_count >= ANN_MIN_CHUNKS:
+            ann_hits = ann_index.search(db, query_bytes, knn_k)
+            if ann_hits is not None:
+                return _hydrate_ann_hits(db, ann_hits, limit, category, tags)
+
         conditions = ""
         bindings: list = [query_bytes, knn_k]
         if category:
@@ -2073,6 +2184,7 @@ __all__ = [
     "_prune_orphan_chunks",
     "_fuse_query_embedding",
     "_semantic_search",
+    "_hydrate_ann_hits",
     "_now_iso",
     "_make_id",
     "_normalize_entity_name",

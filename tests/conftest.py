@@ -292,6 +292,27 @@ def db_conn_with_vec(monkeypatch: pytest.MonkeyPatch) -> sqlite3.Connection:
 
 
 # ---------------------------------------------------------------------------
+# ANN index (gap #10) — reset the process-wide singleton between tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reset_ann_index():
+    """Clear ann_index.py's cached index before and after every test.
+
+    The ANN index is a module-level singleton (by design — it mirrors an
+    in-memory process resource, not per-connection state), so without this a
+    test that builds/searches it would leak an index keyed against one
+    test's in-memory DB into the next test's fresh one.
+    """
+    from remind_me_mcp import ann_index
+
+    ann_index.reset_for_tests()
+    yield
+    ann_index.reset_for_tests()
+
+
+# ---------------------------------------------------------------------------
 # Memory factory
 # ---------------------------------------------------------------------------
 

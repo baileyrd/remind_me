@@ -14,6 +14,7 @@ import json
 import sqlite3
 from typing import Any
 
+from remind_me_mcp import ann_index
 from remind_me_mcp import tools as _pkg
 from remind_me_mcp.config import CLIENT, NODE_ID
 from remind_me_mcp.db import _delete_chunks, _make_id, _now_iso, _row_to_dict
@@ -246,8 +247,9 @@ async def memory_delete(params: MemoryDeleteInput) -> str:
         return f"Memory `{params.memory_id}` not found."
     # Remove chunk vectors first — FTS and tags are cleaned by triggers, but
     # vec_chunks/memories_vec are not, and SQLite reuses freed rowids (DI-01).
+    removed_vec_rowids: list[int] = []
     with contextlib.suppress(sqlite3.OperationalError):
-        _delete_chunks(db, row[0])
+        removed_vec_rowids = _delete_chunks(db, row[0])
     # FT-04: entity mention links have no FK (sync can deliver them out of
     # order), so clean them up explicitly — mirroring the DI-01 chunk cleanup.
     # Entities themselves stay; other memories may still mention them.
@@ -256,4 +258,7 @@ async def memory_delete(params: MemoryDeleteInput) -> str:
     )
     db.execute("DELETE FROM memories WHERE id = ?", (params.memory_id,))
     db.commit()
+    # ANN mutations only after the commit succeeds — see db._delete_chunks.
+    for vec_rowid in removed_vec_rowids:
+        ann_index.remove_vector(db, vec_rowid)
     return f"✓ Memory `{params.memory_id}` deleted."
