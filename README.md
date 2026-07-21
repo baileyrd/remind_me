@@ -214,12 +214,15 @@ The dashboard is powered by a REST API you can also use directly:
 |--------|----------|-------------|
 | `GET` | `/health` | Liveness probe (no auth) |
 | `GET` | `/api/stats` | Memory statistics, categories, tags, DB info |
-| `GET` | `/api/memories?category=&tags=&limit=&offset=` | List memories with filters |
-| `GET` | `/api/memories/search?q=&category=&tags=` | Full-text search |
+| `GET` | `/api/memories?category=&tags=&limit=&offset=` | List memories with filters, paginated (`total`/`count`/`offset`/`limit`/`has_more`) |
+| `GET` | `/api/memories/search?q=&category=&tags=&limit=&offset=` | Full-text search, paginated the same way |
 | `GET` | `/api/memories/{id}` | Get a single memory |
 | `POST` | `/api/memories` | Add a memory (JSON body: `{content, category, tags, source, metadata}`) |
 | `PUT`/`PATCH` | `/api/memories/{id}` | Update a memory |
 | `DELETE` | `/api/memories/{id}` | Delete a memory |
+| `POST` | `/api/memories/bulk/delete` | Delete multiple memories by id (JSON body: `{ids: [...]}`, max 200) |
+| `POST` | `/api/memories/bulk/tag` | Add/remove/set tags on multiple memories (JSON body: `{ids: [...], tags: [...], mode: "add"\|"remove"\|"set"}`) |
+| `POST` | `/api/memories/bulk/reclassify` | Apply `memory_type` classifications to multiple memories (JSON body: `{classifications: [{memory_id, memory_type}, ...]}`) |
 | `POST` | `/api/import` | Import a chat/document file or directory (JSON body: `{file_path, kind, extract_mode, category, tags, max_length}`; paths must be inside `REMIND_ME_IMPORT_ROOTS`) |
 | `GET` | `/api/export?format=&category=&tags=&file_path=&include_graph=` | Export memories (+ entity graph by default) as JSON/JSONL — streamed as the response body, or written server-side when `file_path` (inside `REMIND_ME_EXPORT_ROOTS`) is given |
 | `GET` | `/api/entity?name=&limit=` | Look up a knowledge-graph entity by name or alias (404 if unknown) |
@@ -1213,6 +1216,14 @@ remind_me is local-first, single-user, and MCP-native by design — some capabil
 ## Changelog
 
 See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for a per-version feature breakdown with PR references; this section summarizes the same history phase-by-phase.
+
+### 1.14.0 — 2026-07-21
+
+Closes a dashboard-usability gap flagged in the application capability review: `GET /api/memories/search` returned a flat, capped list with no way to page through results beyond the cap, and there was no bulk delete/tag/reclassify REST endpoint despite the equivalent single-item operations already existing.
+
+- **Search pagination** — `GET /api/memories/search` gains `offset` and now returns the same pagination envelope (`total`/`count`/`offset`/`limit`/`has_more`) `GET /api/memories` already had.
+- **Bulk REST endpoints** — `POST /api/memories/bulk/{delete,tag,reclassify}`, each taking an explicit id list (max 200) rather than a filter, so a request can never silently affect more than what a dashboard's list/search selection actually picked. `bulk/delete` mirrors single-delete's soft-delete-when-sync-configured behavior exactly; `bulk/tag` supports add/remove/set modes; `bulk/reclassify` mirrors `remind_me_reclassify`.
+- `docs/openapi.yaml` updated with the new routes and pagination fields.
 
 ### 1.13.0 — 2026-07-21
 

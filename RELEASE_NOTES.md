@@ -1,5 +1,19 @@
 # Release Notes
 
+## v1.14.0 — 2026-07-21
+
+Closes a dashboard-usability gap flagged in the application capability review: `api_search` (and, before this, the general listing routes) returned a flat, capped list with no `offset`/`total`/`has_more` fields, so a dashboard or external client had no way to page through results beyond the cap. Separately, there was no bulk delete/tag/reclassify REST endpoint despite the equivalent batch MCP tools already existing.
+
+### New Features
+
+- **Search pagination** — `GET /api/memories/search` gains an `offset` query parameter and now returns the standard pagination envelope (`total`, `count`, `offset`, `limit`, `has_more`) that `GET /api/memories` already had, including on the `entity:`-not-found early-return path.
+- **Bulk REST endpoints** — `POST /api/memories/bulk/delete`, `POST /api/memories/bulk/tag`, `POST /api/memories/bulk/reclassify`. Each takes an explicit id list (capped at 200 per request) rather than a filter — a deliberate scope choice: a dashboard selects a batch from a list/search result, then acts on exactly that selection, rather than a filter silently matching more than intended with no preview step.
+  - `bulk/delete` applies the exact same per-memory logic as `DELETE /api/memories/{id}` (chunk vector + ANN cleanup, `memory_entities` cleanup, soft-delete when sync is configured) to each id independently.
+  - `bulk/tag` supports `add` (default, union), `remove`, and `set` (replace wholesale) modes.
+  - `bulk/reclassify` mirrors the `remind_me_reclassify` MCP tool exactly: sets each memory's `memory_type` and its matching `decay_rate`.
+  - Every endpoint reports per-id success/failure (`not_found` alongside `deleted`/`updated`) instead of failing the whole batch on one bad id.
+- `docs/openapi.yaml` updated with the new routes and pagination fields.
+
 ## v1.13.0 — 2026-07-21
 
 Closes a multi-device data-loss gap flagged in the application capability review: `_upsert_one` (`sync.py`) overwrote *every* column on last-write-wins conflict resolution, so if two devices edited different fields of the same memory (one adds a tag, another edits the content) between sync cycles, whichever write arrived second silently clobbered the other's change entirely — not just the conflicting field. Entities already had union-merge semantics for aliases; memories didn't have the equivalent.
