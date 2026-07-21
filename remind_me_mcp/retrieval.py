@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from datetime import UTC, datetime
 from typing import TypedDict
 
@@ -406,6 +407,43 @@ def _looks_semantic_shaped(query: str) -> bool:
     return len(query.split()) >= _SEMANTIC_SHAPE_MIN_WORDS or query.rstrip().endswith("?")
 
 
+# Temporal-expression detection (issue #52): "before I moved", "last summer",
+# "when I lived in Seattle" all place a fact in time, even though none of
+# them affect keyword/semantic query *shape* the way the heuristics above
+# check for. `benchmarks/RESULTS.md` documents temporal-reasoning as one of
+# the two weakest query categories, alongside knowledge-update.
+#
+# Deliberately excludes "may" from the month names: as a modal auxiliary
+# verb ("may I ask...") it's far more common in natural questions than as
+# the month, and including it would be a disproportionate false-positive
+# source for a single word in the list.
+_TEMPORAL_PATTERN = re.compile(
+    r"\b("
+    r"before|after|since|until|when|during|ago|recently"
+    r"|last\s+(?:week|month|year|summer|fall|autumn|winter|spring|night|weekend"
+    r"|monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+    r"|this\s+(?:week|month|year|summer|fall|autumn|winter|spring)"
+    r"|next\s+(?:week|month|year|summer|fall|autumn|winter|spring)"
+    r"|yesterday|today|tomorrow"
+    r"|january|february|march|april|june|july|august|september|october|november|december"
+    r"|\d{4}"  # a bare 4-digit year, e.g. "in 2019"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Boosts w_recency on top of whichever keyword/semantic profile the query
+# shape otherwise picked -- only recency moves, so this composes with either
+# profile instead of replacing it (a temporal query can be short/keyword-
+# shaped, e.g. "last summer", or long/semantic-shaped, e.g. "what did I do
+# when I lived in Seattle last year").
+_TEMPORAL_RECENCY_MULTIPLIER = 1.5
+
+
+def _looks_temporal_shaped(query: str) -> bool:
+    """True when the query contains a recognizable temporal expression."""
+    return _TEMPORAL_PATTERN.search(query) is not None
+
+
 def choose_rrf_weights(
     query: str,
     *,
@@ -419,6 +457,13 @@ def choose_rrf_weights(
     deliberately lightweight retrieval layer (the same reasoning that keeps
     server-side answer synthesis out of scope). Extends the same "route by
     query shape" idea already used by ``_detect_structured_query``.
+
+    A temporal expression ("before I moved", "last summer", "when I lived in
+    Seattle" -- issue #52) additionally boosts ``w_recency`` by
+    :data:`_TEMPORAL_RECENCY_MULTIPLIER` on top of whichever profile below
+    was selected, since it composes with query *shape* rather than being a
+    shape itself -- a temporal query can be short/keyword-shaped or long/
+    semantic-shaped.
 
     Args:
         query: The search query (structured subject:/predicate:/entity:
@@ -435,10 +480,16 @@ def choose_rrf_weights(
         for splatting into :func:`rank_rrf`.
     """
     if structured or not has_semantic or _looks_keyword_shaped(query):
-        return resolve_strategy_weights("keyword_favored")
-    if _looks_semantic_shaped(query):
-        return resolve_strategy_weights("semantic_favored")
-    return resolve_strategy_weights("balanced")
+        weights = resolve_strategy_weights("keyword_favored")
+    elif _looks_semantic_shaped(query):
+        weights = resolve_strategy_weights("semantic_favored")
+    else:
+        weights = resolve_strategy_weights("balanced")
+
+    if _looks_temporal_shaped(query):
+        weights["w_recency"] *= _TEMPORAL_RECENCY_MULTIPLIER
+
+    return weights
 
 
 # ---------------------------------------------------------------------------

@@ -322,6 +322,40 @@ python -m benchmarks.before_after \
 > per-type run is available via `python -m benchmarks.runner --rrf-fusion
 > score ...`. Paste the resulting table here once run.
 
+## Temporal-expression query routing (lever G)
+
+`choose_rrf_weights` (the `strategy="auto"` heuristic router, Phase 6)
+routes purely on word count, `?`, and quoted phrases — it has no awareness
+of temporal expressions ("before I moved", "last summer", "when I lived in
+Seattle"), even though `temporal-reasoning` is one of the two weakest query
+categories in the headline table above (alongside `knowledge-update`). A new
+`_looks_temporal_shaped` detector composes an additional `w_recency` boost
+(`_TEMPORAL_RECENCY_MULTIPLIER`, 1.5x) on top of whichever keyword/semantic
+profile the query shape otherwise picked, so a temporal query gets more
+recency-aware ranking regardless of whether it's also short/keyword-shaped
+or long/semantic-shaped. Proven deterministically in
+`tests/test_retrieval.py::TestTemporalDetection`.
+
+Measure the effect on real data. Unlike the other levers, this one must run
+under the **default** RRF profile, not `--rrf-profile semantic` — that
+profile zeroes `RRF_W_RECENCY` entirely (`0 * 1.5 == 0`), which would hide
+the effect by construction:
+
+```bash
+python -m benchmarks.before_after \
+  --compare temporal \
+  --data benchmarks/data/longmemeval_s_cleaned.json \
+  --ingest verbatim --embedder real --ks 1,3,5,10
+```
+
+> Not yet run on `longmemeval_s` here. Watch `temporal-reasoning`
+> specifically — this lever should move it without regressing categories
+> that don't reference time at all. A full per-type run is available via
+> `python -m benchmarks.runner --rrf-profile default ...` (temporal
+> detection is always active once `strategy="auto"` is in effect; there's no
+> separate `runner.py` flag to gate it — see `--compare temporal` above for
+> an isolated A/B). Paste the resulting table here once run.
+
 ## FTS5 query-sanitization fix — before/after
 
 Natural-language questions contain punctuation (`?`, `,`, `'`, `$`, `.`) that
