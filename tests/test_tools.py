@@ -2949,12 +2949,44 @@ async def test_search_auto_strategy_picks_keyword_favored_for_short_query(
     assert signals["weights_used"] == resolve_strategy_weights("keyword_favored")
 
 
-async def test_search_auto_strategy_picks_semantic_favored_for_question(
+async def test_search_auto_strategy_prefers_keyword_when_embedder_available_but_vec_missing(
     db_conn: sqlite3.Connection, mock_embedder
+) -> None:
+    """A loadable embedder with no memories_vec table must still fall back
+    to keyword-favored weights -- semantic search has nothing to query
+    either way. This can happen for real: sqlite-vec's native extension can
+    fail to load (e.g. a sqlite3 build without loadable-extension support)
+    even though the Python package -- and an ONNX embedder that doesn't
+    depend on it -- import and load fine. Regression test for sem_available
+    having been derived from embedder-loadability alone (db_conn here has no
+    sqlite-vec loaded, unlike db_conn_with_vec, while mock_embedder still
+    reports a working embedder)."""
+    from remind_me_mcp.retrieval import resolve_strategy_weights
+
+    await memory_add(MemoryAddInput(content="The VPN was configured with split tunneling."))
+
+    params = MemorySearchInput(
+        query="how was the vpn configured for split tunneling access?",
+        response_format=ResponseFormat.JSON,
+        verbose=True,
+    )
+    result = await memory_search(params)
+    data = json.loads(result)
+
+    signals = data["memories"][0]["debug_signals"]
+    assert signals["weights_used"] == resolve_strategy_weights("keyword_favored")
+
+
+async def test_search_auto_strategy_picks_semantic_favored_for_question(
+    db_conn_with_vec: sqlite3.Connection, mock_embedder
 ) -> None:
     """Semantic favoring only makes sense when a semantic tier is actually
     available — has_semantic gates the heuristic (see
-    test_search_auto_strategy_prefers_keyword_when_no_embedder)."""
+    test_search_auto_strategy_prefers_keyword_when_no_embedder). That
+    requires both an embedder *and* a queryable memories_vec table, so this
+    uses db_conn_with_vec rather than plain db_conn (see
+    test_search_auto_strategy_prefers_keyword_when_embedder_available_but_vec_missing
+    for the split-failure case)."""
     from remind_me_mcp.retrieval import resolve_strategy_weights
 
     await memory_add(MemoryAddInput(content="The VPN was configured with split tunneling."))

@@ -48,7 +48,9 @@ def _job():
     import ctypes
     from ctypes import wintypes
 
-    class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    # Names below mirror the Win32 API exactly (winnt.h / jobapi2.h) rather
+    # than Python naming conventions, so they stay greppable against MSDN.
+    class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):  # noqa: N801
         _fields_ = [
             ("PerProcessUserTimeLimit", ctypes.c_int64),
             ("PerJobUserTimeLimit", ctypes.c_int64),
@@ -61,12 +63,12 @@ def _job():
             ("SchedulingClass", wintypes.DWORD),
         ]
 
-    class IO_COUNTERS(ctypes.Structure):
+    class IO_COUNTERS(ctypes.Structure):  # noqa: N801
         _fields_ = [(n, ctypes.c_uint64) for n in (
             "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
             "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
 
-    class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+    class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):  # noqa: N801
         _fields_ = [
             ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
             ("IoInfo", IO_COUNTERS),
@@ -76,8 +78,8 @@ def _job():
             ("PeakJobMemoryUsed", ctypes.c_size_t),
         ]
 
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
-    JobObjectExtendedLimitInformation = 9
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000  # noqa: N806
+    JobObjectExtendedLimitInformation = 9  # noqa: N806
     k32 = ctypes.windll.kernel32
     h = k32.CreateJobObjectW(None, None)
     info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
