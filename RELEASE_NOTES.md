@@ -24,7 +24,7 @@ Eight-phase capability expansion closing gaps identified in a comparison against
 - `benchmarks/RESULTS.md` gains an honest comparison section explaining why cognee's published BEAM figures aren't directly comparable to remind_me's LongMemEval-S numbers, plus a new weekly non-blocking CI benchmark smoke check (#25)
 - Documented explicit scope decisions for multimodal ingestion and multi-tenant/cross-agent isolation — both evaluated and deferred by design, not overlooked (#26)
 
-Tool count: 34 → 40. Full detail per phase is in the [README Changelog](README.md#changelog); complete diffs are in PRs #19–#27.
+Tool count: 35 → 41. Full detail per phase is in the [README Changelog](README.md#changelog); complete diffs are in PRs #19–#27.
 
 ## v1.0.0
 

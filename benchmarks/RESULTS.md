@@ -285,7 +285,7 @@ Natural-language questions contain punctuation (`?`, `,`, `'`, `$`, `.`) that
 FTS5 treats as operator syntax, so the raw query was an invalid `MATCH`
 expression and the **keyword tier was silently skipped**. The fix retries an
 invalid query as a sanitized OR-of-terms expression (see
-`remind_me_mcp/tools.py::_sanitize_fts_query`).
+`remind_me_mcp/tools/search.py::_sanitize_fts_query`).
 
 Reproduce:
 

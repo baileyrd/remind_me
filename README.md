@@ -339,6 +339,7 @@ The stats view replaces the main content area with summary cards, horizontal bar
 |------|-------------|
 | `remind_me_import_chat` | Import a single chat export or document file (`kind`: auto/chat/document) |
 | `remind_me_import_directory` | Bulk import all exports/documents from a directory |
+| `remind_me_import_mempalace` | Bulk-import memories from a MemPalace ChromaDB store, one page at a time (requires the optional `mempalace` extra) |
 | `remind_me_list_connectors` | List every registered import connector (built-in and third-party) and which are valid `remind_me_import_chat` kinds |
 | `remind_me_export_memories` | Export memories (+ entity graph by default) to JSON/JSONL, inline or to a file inside the export roots |
 | `remind_me_stats` | View statistics: counts, categories, recent activity |
@@ -350,7 +351,7 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_check_update` | Check if a newer version is available on origin/main |
 | `remind_me_self_update` | Pull latest changes from origin and reinstall the package |
 
-40 tools + 4 resources (`memory://stats`, `memory://categories`, `wiki://schema`, `wiki://index`).
+41 tools + 4 resources (`memory://stats`, `memory://categories`, `wiki://schema`, `wiki://index`).
 
 ### Auto-Capture: Persisting Full Conversations
 
@@ -942,6 +943,8 @@ This is a deterministic heuristic, not an LLM planner call — no extra latency 
 | `REMIND_ME_EMBED_CHUNK_OVERLAP` | `200` | Overlap between embedding windows |
 | `REMIND_ME_EMBED_MAX_CHUNKS` | `16` | Max embedding chunks per memory |
 | `REMIND_ME_EMBED_BATCH_SIZE` | `32` | Memories embedded per batch during reindex and import |
+| `REMIND_ME_EMBED_FORWARD_BATCH` | `32` | Chunks per ONNX forward pass inside the embedder — the hard ceiling on embedding memory per call |
+| `REMIND_ME_MEMPALACE_PATH` | `~/.mempalace/palace` | Path to a MemPalace ChromaDB persistent store, read (read-only) by `remind_me_import_mempalace` |
 | `REMIND_ME_API_KEY` | *(auto-generated)* | Bearer token for `/api/*` routes. When unset, a key is generated on first run and stored at `~/.remind-me/api_key` (0600) — check the server log or that file for the value. Set to `disabled` to explicitly turn dashboard auth off |
 | `REMIND_ME_IMPORT_ROOTS` | `$HOME` | Colon-separated allowed filesystem roots for import operations (enforced by both the HTTP API and the MCP import tools) |
 | `REMIND_ME_EXPORT_ROOTS` | `$HOME` | Colon-separated allowed filesystem roots for export destinations (enforced by both the HTTP API and the MCP export tool) |
@@ -986,7 +989,7 @@ remind-me-mcp/
 │   ├── __init__.py             # Package exports, version
 │   ├── __main__.py             # CLI entry point, mode dispatch
 │   ├── server.py               # FastMCP instance, app lifespan
-│   ├── tools/                  # 40 MCP tools + 4 resources
+│   ├── tools/                  # 41 MCP tools + 4 resources
 │   │   ├── search.py           # Hybrid search + structured/entity queries
 │   │   ├── crud.py             # add / list / get / update / delete
 │   │   ├── capture.py          # auto-capture, decompose, extract/annotate
@@ -998,15 +1001,17 @@ remind-me-mcp/
 │   ├── models.py               # Pydantic input models
 │   ├── config.py               # Environment configuration, constants
 │   ├── wiki.py                 # LLM Wiki engine: file IO, wikilinks, index/log, reconcile
-│   ├── db.py                   # SQLite schema, migrations (v0–v11), entity helpers
+│   ├── db.py                   # SQLite schema, migrations (v0–v14), entity helpers
 │   ├── api.py                  # Starlette HTTP API + dashboard HTML
 │   ├── remote.py               # Remote MCP connector (Streamable HTTP; OAuth or secret-path)
 │   ├── oauth.py                # Single-user OAuth 2.1 authorization server
 │   ├── importer.py             # Chat export + document parser & import engine
+│   ├── mempalace_import.py     # Optional MemPalace (ChromaDB) bulk importer
 │   ├── exporter.py             # Memory + entity-graph export engine
 │   ├── watcher.py              # Watched-folder auto-ingest (poll, debounce, supersede)
 │   ├── webhook_server.py       # Push/webhook ingestion HTTP endpoint
 │   ├── telemetry.py            # Optional OpenTelemetry span instrumentation
+│   ├── storage_interfaces.py   # Storage-layer Protocol documentation (prep-only, no new backend)
 │   ├── embeddings.py           # ONNX/Ollama embedding engine
 │   ├── formatting.py           # Memory markdown/JSON formatters
 │   ├── retrieval.py            # RRF rank fusion, recency signals, token budget
@@ -1015,18 +1020,19 @@ remind-me-mcp/
 │   ├── vitality.py             # ACT-R decay model, access recording, bridge protection
 │   ├── consolidation.py        # Semantic clustering (Union-Find), canonical selection, merge
 │   ├── pid.py                  # PID file management, instance detection
+│   ├── sidecars.py             # Tunnel/dashboard sidecar processes tied to server lifetime
 │   ├── updater.py              # Version checking, self-update logic
 │   ├── sync.py                 # Background sync engine (hub + peer push/pull, entity graph)
 │   ├── peer_server.py          # Lightweight HTTP server for peer-to-peer sync
 │   └── dashboard/
 │       └── App.jsx             # React dashboard component
 ├── benchmarks/                 # Retrieval benchmark harness (LongMemEval)
-├── tests/                      # Test suite — 850+ tests (pytest + pytest-asyncio)
+├── tests/                      # Test suite — 1100+ tests (pytest + pytest-asyncio)
 ├── pyproject.toml              # Package configuration and dependencies
 └── README.md                   # This file
 
 ~/.remind-me/                   # Data directory (synced across machines)
-├── memory.db                   # SQLite database with FTS5 + sqlite-vec (schema v11)
+├── memory.db                   # SQLite database with FTS5 + sqlite-vec (schema v14)
 ├── wiki/                       # LLM Wiki markdown files (source of truth: pages, index.md, log.md, SCHEMA.md)
 ├── models/                     # Cached ONNX embedding model (~80MB, auto-downloaded)
 ├── api_key                     # Auto-generated dashboard API key (0600)
@@ -1132,7 +1138,7 @@ Eight-phase capability expansion, closing the gaps identified in a comparison ag
 - **Phase 7 — Optional OpenTelemetry tracing + benchmark comparison docs.** `maybe_span()` instruments tool calls, sync cycles, and watcher scans, zero-cost unless explicitly enabled; `benchmarks/RESULTS.md` documents why cognee's BEAM figures aren't directly comparable to remind_me's LongMemEval-S numbers, plus a new weekly non-blocking CI smoke check.
 - **Phase 8 — Storage-interface prep, alternative hub deploy targets, OpenAPI spec.** `storage_interfaces.py` documents the storage layer as `Protocol`s (no new backend); `hub/deploy/` gained Docker Compose, Fly.io, and Railway templates alongside the existing Podman quadlets; `docs/openapi.yaml` publishes the REST API for client-SDK generation in any language. Multimodal ingestion and multi-tenant isolation were evaluated and explicitly deferred — see "Design Scope" above.
 
-Tool count: 34 → 40. Full detail in each phase's merged PR (#19–#26).
+Tool count: 35 → 41. Full detail in each phase's merged PR (#19–#26).
 
 ### 1.0.0
 
