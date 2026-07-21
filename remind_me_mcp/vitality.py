@@ -55,6 +55,63 @@ DECAY_RATES: dict[str, float] = {
 }
 """Mapping of memory_type to default decay rate. Lower values persist longer."""
 
+BASE_WEIGHT_TYPE_PRIORS: dict[str, float] = {
+    "decision": 1.3,
+    "blocker": 1.2,
+    "fact": 1.15,
+    "insight": 1.15,
+    "preference": 1.1,
+    "learning": 1.05,
+    "action_item": 1.0,
+    "unclassified": 1.0,
+}
+"""Seeds base_weight from memory_type at write time (issue #56) -- every new
+memory otherwise starts at a flat 1.0 regardless of kind, so a throwaway
+aside competes evenly in ranking with a real decision until feedback/access
+signal accrues enough to differentiate them. Multipliers on the default 1.0
+base_weight, in the same universe as record_feedback's adjustments, so a
+seeded prior composes naturally with later feedback rather than needing
+separate bookkeeping."""
+
+BASE_WEIGHT_SOURCE_PRIORS: dict[str, float] = {
+    "manual": 1.0,
+    "chat_import": 0.85,
+    "document_import": 0.9,
+    "webhook": 0.9,
+}
+"""Fallback seed from source (issue #56) for write paths where memory_type
+isn't known yet (e.g. remind_me_add, before any remind_me_reclassify pass) --
+a deliberately-entered manual memory keeps the historical flat 1.0 default;
+raw bulk imports start slightly lower since they're unreviewed and often
+noisy, until reclassify/normalize surfaces the real signal."""
+
+
+def seed_base_weight(*, memory_type: str | None = None, source: str | None = None) -> float:
+    """Compute the write-time base_weight prior for a new memory (issue #56).
+
+    Prefers a known, specific ``memory_type`` (e.g. ``remind_me_decompose``
+    already classifies facts at write time); otherwise falls back to a
+    ``source``-based prior; otherwise the original flat 1.0 default (an
+    unrecognized/absent source, or ``memory_type="unclassified"``, is
+    indistinguishable from "no signal available" -- exactly the pre-#56
+    behavior).
+
+    Args:
+        memory_type: The memory's classified type, if already known at
+            write time. ``None`` or ``"unclassified"`` means "not known yet."
+        source: The memory's origin (``"manual"``, ``"chat_import"``, ...).
+
+    Returns:
+        A base_weight value, typically in ``[BASE_WEIGHT_MIN, BASE_WEIGHT_MAX]``
+        though this function doesn't clamp -- the priors table itself is
+        kept within that range.
+    """
+    if memory_type and memory_type != "unclassified" and memory_type in BASE_WEIGHT_TYPE_PRIORS:
+        return BASE_WEIGHT_TYPE_PRIORS[memory_type]
+    if source and source in BASE_WEIGHT_SOURCE_PRIORS:
+        return BASE_WEIGHT_SOURCE_PRIORS[source]
+    return 1.0
+
 FEEDBACK_MAGNITUDE: float = 0.15
 """Default fractional adjustment applied to base_weight per feedback signal."""
 
@@ -530,6 +587,8 @@ def apply_feedback_adjustment(query: str, memories: list[dict]) -> list[dict]:
 __all__ = [
     "BASE_WEIGHT_MAX",
     "BASE_WEIGHT_MIN",
+    "BASE_WEIGHT_SOURCE_PRIORS",
+    "BASE_WEIGHT_TYPE_PRIORS",
     "BRIDGE_MULTIPLIER",
     "BRIDGE_THRESHOLD",
     "DECAY_RATES",
@@ -547,4 +606,5 @@ __all__ = [
     "record_accesses",
     "record_contextual_feedback",
     "record_feedback",
+    "seed_base_weight",
 ]

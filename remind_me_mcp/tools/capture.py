@@ -27,7 +27,7 @@ from remind_me_mcp.models import (  # noqa: TC001  # FastMCP resolves these anno
 )
 from remind_me_mcp.server import mcp
 from remind_me_mcp.tools._shared import log
-from remind_me_mcp.vitality import DECAY_RATES
+from remind_me_mcp.vitality import DECAY_RATES, seed_base_weight
 
 
 def _apply_entity_mentions(
@@ -349,6 +349,13 @@ async def remind_me_decompose(params: DecomposeInput) -> str:
         # Determine memory_type and decay_rate
         memory_type = fact.memory_type or "unclassified"
         decay_rate = DECAY_RATES.get(memory_type, 0.10)
+        # Importance prior at write time (issue #56): memory_type is already
+        # known here, so a decision/fact starts ranking above an unclassified
+        # aside before any feedback/access signal exists. A fresh memory's
+        # vitality equals its base_weight exactly (access_count=0,
+        # days_since_last_access=0 in compute_vitality's formula), so both
+        # columns carry the same seeded value.
+        base_weight = seed_base_weight(memory_type=memory_type)
 
         db.execute(
             """INSERT INTO memories (
@@ -374,8 +381,8 @@ async def remind_me_decompose(params: DecomposeInput) -> str:
                 CLIENT,
                 memory_type,
                 decay_rate,
-                1.0,  # vitality
-                1.0,  # base_weight
+                base_weight,  # vitality
+                base_weight,
                 "active",
                 now,  # accessed_at
                 0,  # access_count
