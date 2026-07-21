@@ -228,12 +228,23 @@ python -m benchmarks.before_after \
 RRF fuses independent rank lists, so it never scores the query and a candidate
 *together* — the precision ceiling at rank 1. The shipped reranker
 (`remind_me_mcp/reranker.py`) rescores the top `REMIND_ME_RERANK_TOP_K`
-(default 20) RRF candidates with an ONNX cross-encoder
-(`cross-encoder/ms-marco-MiniLM-L6-v2` by default — the reranker sibling of the
-embedding model, CPU-friendly) and reorders only that head; the tail keeps its
-RRF order, so reranking can never lose a candidate, only promote one. Off by
-default; enable with `REMIND_ME_RERANK=onnx`. The reordering logic is proven
-deterministically in `tests/test_reranker.py` with an injected scorer.
+(default 20) RRF candidates with an ONNX cross-encoder and reorders only that
+head; the tail keeps its RRF order, so reranking can never lose a candidate,
+only promote one. The reordering logic is proven deterministically in
+`tests/test_reranker.py` with an injected scorer.
+
+**On by default as of the application capability review (issue #50).**
+Previously off-by-default with `cross-encoder/ms-marco-MiniLM-L6-v2` (2019);
+`RESULTS.md` had flagged reranking as the single most-cited unused lever for
+retrieval quality despite being built, tested, and gated behind
+`REMIND_ME_RERANK=onnx`. It's now on by default (`BAAI/bge-reranker-base`, a
+2023 cross-encoder — still small enough for CPU, but meaningfully stronger
+than the previous default), since rescoring only ever touches the bounded
+`RERANK_TOP_K` head regardless of result-pool size, so the added latency is
+small and constant. Disable with `REMIND_ME_RERANK=""` for latency-sensitive
+deployments. `benchmarks/runner.py`'s `--rerank` flag explicitly forces the
+backend on/off for lever isolation regardless of the library default, so
+other lever comparisons (`before_after.py`) stay unaffected.
 
 Measure the effect on real data (A/B on the chunked semantic-only baseline):
 
@@ -244,13 +255,16 @@ python -m benchmarks.before_after \
   --ingest verbatim --embedder real --rrf-profile semantic --ks 1,3,5,10
 ```
 
-> Not yet run on `longmemeval_s` here — the cross-encoder model downloads from
-> HuggingFace on first use. Expect the gain to concentrate in **R@1 / MRR**
-> (the cross-encoder reorders the head; R@k for k ≥ top-k is unchanged by
-> construction). This is the most direct path to close the remaining gap to
-> MemPalace's LLM-reranked ≥0.99 / 1.000. Watch `single-session-preference`
-> in particular. Paste the resulting table here once run. A full per-type run
-> is available via `python -m benchmarks.runner --rerank ...`.
+> Not yet run on `longmemeval_s` here (this environment has no HuggingFace
+> network access to download either cross-encoder) — the cross-encoder model
+> downloads from HuggingFace on first use. Expect the gain to concentrate in
+> **R@1 / MRR** (the cross-encoder reorders the head; R@k for k ≥ top-k is
+> unchanged by construction), and the `BAAI/bge-reranker-base` swap to widen
+> that gain further versus the old `ms-marco-MiniLM-L6-v2` numbers. This is
+> the most direct path to close the remaining gap to MemPalace's LLM-reranked
+> ≥0.99 / 1.000. Watch `single-session-preference` in particular. Paste the
+> resulting table here once run. A full per-type run is available via
+> `python -m benchmarks.runner --rerank ...`.
 
 ## HyDE query expansion (lever E)
 

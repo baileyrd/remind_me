@@ -150,10 +150,13 @@ async def run(args: argparse.Namespace) -> int:
     saved_rerank = (rr_mod.RERANK_BACKEND, rr_mod.RERANK_TOP_K)
     saved_expand = qe_mod.EXPANSION_MODE
     tools_mod.FTS_SANITIZE_FALLBACK = not args.no_sanitize
-    if args.rerank:
-        rr_mod.RERANK_BACKEND = "onnx"
-        if args.rerank_top_k:
-            rr_mod.RERANK_TOP_K = args.rerank_top_k
+    # Explicit either way (issue #50 made RERANK_BACKEND default to "onnx" in
+    # production) so --rerank stays a clean lever-isolation switch here: a
+    # run without --rerank must measure the pre-rerank baseline, not
+    # whatever the library's own default happens to be.
+    rr_mod.RERANK_BACKEND = "onnx" if args.rerank else ""
+    if args.rerank and args.rerank_top_k:
+        rr_mod.RERANK_TOP_K = args.rerank_top_k
     if args.expand == "hyde":
         qe_mod.EXPANSION_MODE = "hyde"
     if args.rrf_profile in ("retrieval", "semantic"):
