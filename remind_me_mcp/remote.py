@@ -32,6 +32,22 @@ is rejected (404/401) before reaching the MCP app. Token comparisons use
 The app delegates its lifespan to the MCP HTTP sub-app (SE-03 pattern), so
 the DB / sync / watcher / embedder lifecycle is identical to stdio mode.
 
+TLS is the tunnel's job, not this app's (SEC-09). This app always speaks
+plain HTTP -- it never terminates TLS itself, by design, to stay a thin
+zero-ops layer that any HTTPS tunnel can front. That means every credential
+described above (the secret-path/bearer token, and OAuth access/refresh
+tokens) is only as protected as whatever sits in front of the bind address.
+The default bind (127.0.0.1, see config.REMOTE_MCP_HOST) exists precisely so
+those credentials never cross a wire in cleartext to anything but the tunnel
+process on the same host; widening the bind without an actual tunnel (or
+your own TLS termination) in front of it exposes them in plaintext to
+whatever can reach that address. __main__._run_remote logs a startup
+warning when the bind isn't loopback, but can't enforce this -- there is no
+reliable signal the app itself could use to tell "arrived through the
+tunnel" from "arrived directly" (trusting a header for that would repeat
+the exact attacker-influenced-header mistake DNS-rebinding protection above
+is designed to avoid).
+
 Starlette imports are kept lazy (inside build_remote_app) so importing this
 module in MCP stdio mode never loads the web framework.
 """

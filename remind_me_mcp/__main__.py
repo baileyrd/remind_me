@@ -139,6 +139,46 @@ def _run_combined(args) -> None:
     uvicorn.run(combined, host=args.ui_host, port=args.ui_port)
 
 
+_REMOTE_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _warn_if_remote_host_widened(host: str, port: int) -> None:
+    """Warn when the remote connector binds beyond loopback (SEC-09).
+
+    The remote connector's whole security model assumes an HTTPS tunnel
+    (Tailscale Funnel, or the operator's own TLS termination) sits in front
+    of it -- the app itself never terminates TLS and always speaks plain
+    HTTP. Binding directly to a non-loopback address with no tunnel in
+    front means every credential it accepts (the secret-path/bearer token,
+    and in OAuth mode issued access/refresh tokens) would cross the wire in
+    cleartext to anything that can reach that address.
+
+    There's no reliable way for the app itself to distinguish "this request
+    came through the tunnel" from "this request arrived directly" --
+    trusting a header for that would repeat exactly the kind of
+    attacker-influenced-header mistake DNS-rebinding protection is
+    deliberately designed to avoid (see build_remote_app's docstring). So
+    this is a startup warning, not an enforced block: widening the bind is
+    sometimes intentional (e.g. a tunnel that only forwards, doesn't proxy
+    on loopback) and the operator is in the best position to know whether
+    a tunnel is actually in place.
+    """
+    if host not in _REMOTE_LOOPBACK_HOSTS:
+        log.warning(
+            "Remote MCP connector is binding to %s:%d, not loopback. This "
+            "is only safe with an HTTPS tunnel (or your own TLS "
+            "termination) in front of it -- the connector always speaks "
+            "plain HTTP itself, so without a tunnel every credential it "
+            "accepts (the secret-path/bearer token, and any OAuth "
+            "access/refresh tokens) would cross the wire in cleartext to "
+            "anything that can reach %s:%d directly.",
+            host,
+            port,
+            host,
+            port,
+        )
+
+
 def _run_remote(args) -> None:
     """Run the remote MCP connector (FT-05/FT-07) on a dedicated Uvicorn instance.
 
@@ -161,11 +201,17 @@ def _run_remote(args) -> None:
     specifically: combined/standalone MCP HTTP modes only ever send their
     secret via the Authorization header, which uvicorn's access log never
     includes.
+
+    A non-loopback bind (SEC-09) logs a warning -- see
+    _warn_if_remote_host_widened -- since this app always speaks plain
+    HTTP and relies entirely on an external tunnel for transport security.
     """
     import uvicorn
 
     from remind_me_mcp import config as cfg
     from remind_me_mcp.remote import build_remote_app, redact_token
+
+    _warn_if_remote_host_widened(args.remote_host, args.remote_port)
 
     token = cfg.resolve_connector_token()
     issuer = cfg.REMOTE_MCP_ISSUER

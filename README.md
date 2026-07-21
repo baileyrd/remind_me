@@ -868,6 +868,12 @@ Without OAuth (legacy fallback), paste the full secret URL instead —
   auto-deny, and all comparisons are constant-time.
 - **Always front it with HTTPS.** Over a plain-HTTP tunnel the tokens travel
   in cleartext. Tailscale Funnel and the usual tunnels handle this for you.
+  This app never terminates TLS itself — that's deliberate, so any tunnel
+  can front it — which means the same cleartext risk applies to the raw
+  bind address too: widening `REMIND_ME_REMOTE_HOST` beyond `127.0.0.1`
+  without an actual tunnel (or your own TLS termination) in front logs a
+  startup warning, since every credential the connector accepts would then
+  cross the wire in cleartext to anything that can reach that address.
 - OAuth state lives at `~/.remind-me/oauth.json` (0600): client records plus
   SHA-256 hashes of issued tokens — raw tokens are never written to disk.
 - The OAuth issuer comes **only** from `REMIND_ME_REMOTE_ISSUER` — it is never
