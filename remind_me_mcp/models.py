@@ -942,7 +942,15 @@ class NormalizeApplyInput(BaseModel):
 
 
 class ConsolidateInput(BaseModel):
-    """Input for the remind_me_consolidate tool: find and merge duplicate memories."""
+    """Input for the remind_me_consolidate tool: find and merge duplicate memories.
+
+    Two-step workflow (issue #55 — real summarization, not concatenation):
+    1. Call with dry_run=True (default) to see the clusters found.
+    2. Write a short summary for each cluster you want merged, then call
+       again with dry_run=False and summaries={canonical_id: summary, ...}.
+       A cluster whose canonical id has no entry in summaries is skipped
+       (not merged with a raw concatenation) and reported separately.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -965,6 +973,17 @@ class ConsolidateInput(BaseModel):
         ge=10,
         le=5000,
         description="Maximum memories to consider (prevents runaway on large vaults)",
+    )
+    summaries: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "Required to actually merge a cluster when dry_run=False: "
+            "{canonical_id: llm_authored_summary}, one entry per cluster "
+            "(from a prior dry_run=True call) you want consolidated. This "
+            "summary becomes the canonical memory's new content, replacing "
+            "raw concatenation with genuine summarization. A found cluster "
+            "with no matching entry here is skipped, not merged."
+        ),
     )
 
 

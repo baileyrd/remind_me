@@ -165,6 +165,79 @@ class TestFindClusters:
         assert len(clusters) == 1
         assert len(clusters[0]) == 3
 
+    def test_max_candidates_caps_pool_size(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Issue #55: a pool larger than max_candidates is truncated (logged,
+        not silent) rather than pairwise-comparing everything."""
+        vec = _unit_vector(384, index=0)
+        emb_bytes = _make_embedding(vec)
+        memories = [
+            {"id": f"mem-{i}", "content": "x", "vitality": 1.0, "access_count": 0,
+             "accessed_at": "2026-01-01T00:00:00Z", "tags": []}
+            for i in range(10)
+        ]
+        embeddings = {m["id"]: emb_bytes for m in memories}
+
+        with caplog.at_level("WARNING", logger="remind_me_mcp.consolidation"):
+            clusters = find_clusters(memories, embeddings, similarity_threshold=0.85, max_candidates=5)
+
+        # Only the first 5 candidates are considered -> one cluster of 5, not 10.
+        assert len(clusters) == 1
+        assert len(clusters[0]) == 5
+        assert any("max_candidates" in r.message for r in caplog.records)
+
+    def test_max_candidates_no_truncation_when_under_cap(self) -> None:
+        """A pool at or under max_candidates is unaffected."""
+        vec = _unit_vector(384, index=0)
+        emb_bytes = _make_embedding(vec)
+        memories = [
+            {"id": f"mem-{i}", "content": "x", "vitality": 1.0, "access_count": 0,
+             "accessed_at": "2026-01-01T00:00:00Z", "tags": []}
+            for i in range(5)
+        ]
+        embeddings = {m["id"]: emb_bytes for m in memories}
+
+        clusters = find_clusters(memories, embeddings, similarity_threshold=0.85, max_candidates=5)
+
+        assert len(clusters) == 1
+        assert len(clusters[0]) == 5
+
+    def test_vectorized_threshold_matches_pairwise_semantics_at_scale(self) -> None:
+        """The vectorized upper-triangle comparison must produce identical
+        clustering to naive pairwise comparison for a larger, mixed pool
+        (a handful of near-duplicate groups plus unrelated singletons)."""
+        dim = 384
+        rng = np.random.default_rng(7)
+
+        def _group(base_index: int, count: int, noise_scale: float = 0.01) -> list[np.ndarray]:
+            base = _unit_vector(dim, index=base_index)
+            vecs = [base]
+            for _ in range(count - 1):
+                noisy = base + rng.standard_normal(dim).astype(np.float32) * noise_scale
+                noisy /= np.linalg.norm(noisy)
+                vecs.append(noisy)
+            return vecs
+
+        groups = [_group(0, 4), _group(50, 3), _group(100, 2)]
+        singletons = [_unit_vector(dim, index=i) for i in (150, 151, 152)]
+
+        memories: list[dict] = []
+        embeddings: dict[str, bytes] = {}
+        mid = 0
+        for group in groups + [[v] for v in singletons]:
+            for vec in group:
+                m_id = f"mem-{mid}"
+                memories.append({
+                    "id": m_id, "content": "x", "vitality": 1.0 - mid * 0.001,
+                    "access_count": 0, "accessed_at": "2026-01-01T00:00:00Z", "tags": [],
+                })
+                embeddings[m_id] = _make_embedding(vec)
+                mid += 1
+
+        clusters = find_clusters(memories, embeddings, similarity_threshold=0.85)
+
+        cluster_sizes = sorted(len(c) for c in clusters)
+        assert cluster_sizes == [2, 3, 4]  # the three groups; singletons excluded
+
 
 # ---------------------------------------------------------------------------
 # pick_canonical tests (HYGN-02)
@@ -263,6 +336,40 @@ class TestMergeCluster:
         # Order-preserving dedup: canonical tags first, then member tags in order
         assert result["merged_tags"] == ["python", "work", "ai", "ml"]
 
+    def test_merge_cluster_with_summary_replaces_content(self) -> None:
+        """Issue #55: a supplied summary becomes merged_content verbatim,
+        replacing the raw line-union entirely."""
+        canonical = {"id": "c1", "content": "line one\nline two", "access_count": 3, "tags": []}
+        members = [
+            {"id": "m1", "content": "line three\nline four", "access_count": 1, "tags": []},
+        ]
+
+        result = merge_cluster(canonical, members, summary="A concise consolidated summary.")
+
+        assert result["merged_content"] == "A concise consolidated summary."
+
+    def test_merge_cluster_with_summary_still_sums_access_and_tags(self) -> None:
+        """Summary only replaces content -- access_count/tags/superseded_ids unaffected."""
+        canonical = {"id": "c1", "content": "A", "access_count": 10, "tags": ["python"]}
+        members = [
+            {"id": "m1", "content": "B", "access_count": 5, "tags": ["work"]},
+        ]
+
+        result = merge_cluster(canonical, members, summary="Summary text")
+
+        assert result["total_access_count"] == 15
+        assert result["merged_tags"] == ["python", "work"]
+        assert result["superseded_ids"] == ["m1"]
+
+    def test_merge_cluster_without_summary_is_unchanged(self) -> None:
+        """Regression guard: omitting summary preserves the exact pre-#55 union behavior."""
+        canonical = {"id": "c1", "content": "line one", "access_count": 1, "tags": []}
+        members = [{"id": "m1", "content": "line two", "access_count": 1, "tags": []}]
+
+        result = merge_cluster(canonical, members)
+
+        assert set(result["merged_content"].split("\n")) == {"line one", "line two"}
+
 
 # ---------------------------------------------------------------------------
 # ConsolidateInput model tests (HYGN-05)
@@ -306,6 +413,15 @@ class TestConsolidateInput:
 
         valid = ConsolidateInput(limit=100)
         assert valid.limit == 100
+
+    def test_summaries_defaults_to_none(self) -> None:
+        """Issue #55: summaries is optional -- dry_run callers don't need it."""
+        inp = ConsolidateInput()
+        assert inp.summaries is None
+
+    def test_summaries_accepts_mapping(self) -> None:
+        inp = ConsolidateInput(dry_run=False, summaries={"canon-1": "a summary"})
+        assert inp.summaries == {"canon-1": "a summary"}
 
 
 # ---------------------------------------------------------------------------
@@ -456,26 +572,77 @@ class TestConsolidateToolIntegration:
 
         from remind_me_mcp.tools import remind_me_consolidate
 
-        result_str = await remind_me_consolidate(ConsolidateInput(dry_run=False, similarity_threshold=0.5))
+        result_str = await remind_me_consolidate(
+            ConsolidateInput(
+                dry_run=False,
+                similarity_threshold=0.5,
+                summaries={id_high: "consolidated: important fact about Python"},
+            )
+        )
         result = json.loads(result_str)
 
         assert result["clusters_merged"] >= 1
         assert result["dry_run"] is False
+        assert result["skipped_no_summary"] == []
 
         # Higher vitality memory should be canonical
         assert id_high in result["canonical_ids"]
 
-        # Canonical access_count = 5 + 3 = 8
+        # Canonical access_count = 5 + 3 = 8, content replaced by the summary
         canonical_row = db_conn_with_vec.execute(
             "SELECT access_count, content FROM memories WHERE id = ?", (id_high,)
         ).fetchone()
         assert canonical_row["access_count"] == 8
+        assert canonical_row["content"] == "consolidated: important fact about Python"
 
         # Lower vitality memory should have superseded_by set
         member_row = db_conn_with_vec.execute(
             "SELECT superseded_by FROM memories WHERE id = ?", (id_low,)
         ).fetchone()
         assert member_row["superseded_by"] == id_high
+
+    @pytest.mark.asyncio
+    async def test_consolidate_tool_auto_merge_skips_cluster_without_summary(
+        self, db_conn_with_vec: sqlite3.Connection, mock_embedder: object, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A found cluster with no matching summaries entry is skipped, not
+        merged with a raw concatenation (issue #55 — the whole point)."""
+        import remind_me_mcp.tools as _tools_mod
+
+        monkeypatch.setattr(_tools_mod, "_embed_and_store", lambda mid, c: True)
+
+        id_high = _insert_memory_with_vec(
+            db_conn_with_vec, mock_embedder,
+            content="important fact about Python",
+            vitality=0.9, access_count=5,
+        )
+        id_low = _insert_memory_with_vec(
+            db_conn_with_vec, mock_embedder,
+            content="important fact about Python",
+            vitality=0.3, access_count=3,
+        )
+
+        from remind_me_mcp.tools import remind_me_consolidate
+
+        result_str = await remind_me_consolidate(
+            ConsolidateInput(dry_run=False, similarity_threshold=0.5)
+        )
+        result = json.loads(result_str)
+
+        assert result["clusters_found"] >= 1
+        assert result["clusters_merged"] == 0
+        assert id_high in result["skipped_no_summary"]
+
+        # Neither memory should have been touched.
+        row_low = db_conn_with_vec.execute(
+            "SELECT superseded_by FROM memories WHERE id = ?", (id_low,)
+        ).fetchone()
+        assert row_low["superseded_by"] is None
+        row_high = db_conn_with_vec.execute(
+            "SELECT content, access_count FROM memories WHERE id = ?", (id_high,)
+        ).fetchone()
+        assert row_high["content"] == "important fact about Python"
+        assert row_high["access_count"] == 5
 
     @pytest.mark.asyncio
     async def test_consolidate_tool_category_filter(
