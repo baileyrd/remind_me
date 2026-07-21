@@ -1023,8 +1023,8 @@ This is a deterministic heuristic, not an LLM planner call — no extra latency 
 | `REMIND_ME_RRF_W_RECENCY` | `1.0` | RRF weight for the recency signal (set `0` for a pure-retrieval profile) |
 | `REMIND_ME_RRF_W_VITALITY` | `1.0` | RRF weight for the vitality signal (set `0` for a pure-retrieval profile) |
 | `REMIND_ME_RRF_W_IDF` | `0.0` | RRF weight for the IDF signal (derived from FTS5's `bm25()` score). Off by default — set a positive value to opt in |
-| `REMIND_ME_RERANK` | *(unset)* | Set to `onnx` to rerank the top search candidates with a cross-encoder |
-| `REMIND_ME_RERANK_MODEL` | `cross-encoder/ms-marco-MiniLM-L6-v2` | HuggingFace cross-encoder repo (must ship `onnx/model.onnx`) |
+| `REMIND_ME_RERANK` | `onnx` | Reranks the top search candidates with a cross-encoder (on by default — bounded to `REMIND_ME_RERANK_TOP_K` candidates, so latency is small and constant). Set to `""` to disable for latency-sensitive deployments |
+| `REMIND_ME_RERANK_MODEL` | `BAAI/bge-reranker-base` | HuggingFace cross-encoder repo (must ship `onnx/model.onnx`) |
 | `REMIND_ME_RERANK_TOP_K` | `20` | How many top RRF candidates the reranker rescores |
 | `REMIND_ME_QUERY_EXPANSION` | *(unset)* | Set to `hyde` to expand queries with a hypothetical answer passage before vector search |
 | `REMIND_ME_HYDE_MODEL` | `llama3.2` | Ollama model that writes the HyDE passage |
@@ -1188,6 +1188,14 @@ remind_me is local-first, single-user, and MCP-native by design — some capabil
 ## Changelog
 
 See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for a per-version feature breakdown with PR references; this section summarizes the same history phase-by-phase.
+
+### 1.7.0 — 2026-07-21
+
+Ships the single most-cited unused retrieval-quality lever flagged in the application capability review: cross-encoder reranking was built, tested, and off by default.
+
+- **Reranking on by default.** `REMIND_ME_RERANK` now defaults to `onnx` instead of unset — rescoring only ever touches the bounded `REMIND_ME_RERANK_TOP_K` (default 20) head, so the added latency is small and constant regardless of result-pool size. Disable with `REMIND_ME_RERANK=""` for latency-sensitive deployments.
+- **Stronger default model.** `REMIND_ME_RERANK_MODEL` swaps from the 2019 `cross-encoder/ms-marco-MiniLM-L6-v2` to `BAAI/bge-reranker-base` (2023) — still small enough for CPU, meaningfully stronger.
+- **Failure caching (PF-01).** The reranker now caches load failures the same way the embedder already does — a missing dependency or failed HuggingFace download is retried only after a cooldown instead of on every single search, now that reranking runs by default for everyone.
 
 ### 1.6.0 — 2026-07-21
 

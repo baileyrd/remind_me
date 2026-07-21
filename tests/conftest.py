@@ -318,6 +318,29 @@ def _reset_ann_index():
 
 
 # ---------------------------------------------------------------------------
+# Reranker (issue #50) — off by default in tests, unlike production
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _no_live_reranker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force RERANK_BACKEND off for every test unless it opts in itself.
+
+    Production defaults reranking on (issue #50) since maybe_rerank() is
+    called unconditionally from memory_search — without this fixture, every
+    test that exercises search would attempt a real HuggingFace Hub network
+    call via CrossEncoderReranker._ensure_loaded(), which is slow/flaky/
+    offline-hostile and breaks the "fully offline and deterministic" test
+    suite invariant. Tests that specifically exercise reranking (see
+    test_reranker.py) already monkeypatch RERANK_BACKEND/_get_reranker
+    themselves, which simply overrides this fixture's patch for that test.
+    """
+    import remind_me_mcp.reranker as reranker_mod
+
+    monkeypatch.setattr(reranker_mod, "RERANK_BACKEND", "")
+
+
+# ---------------------------------------------------------------------------
 # Memory factory
 # ---------------------------------------------------------------------------
 

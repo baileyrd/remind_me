@@ -1,5 +1,16 @@
 # Release Notes
 
+## v1.7.0 — 2026-07-21
+
+Ships the single most-cited unused retrieval-quality lever flagged in the application capability review: cross-encoder reranking (`reranker.py`) was built, tested, and off by default — adoption was effectively zero even though `benchmarks/RESULTS.md` already documented its value clearly.
+
+### Improvements
+
+- **Reranking on by default** — `REMIND_ME_RERANK` now defaults to `"onnx"` instead of unset. Rescoring only ever touches the bounded `REMIND_ME_RERANK_TOP_K` (default 20) head of the RRF-ranked list regardless of how large the underlying result pool is, so the added latency is small and constant. Set `REMIND_ME_RERANK=""` to opt back out for latency-sensitive deployments.
+- **Stronger default cross-encoder** — `REMIND_ME_RERANK_MODEL` swaps from the 2019 `cross-encoder/ms-marco-MiniLM-L6-v2` to `BAAI/bge-reranker-base` (2023), still small enough to run on CPU but meaningfully stronger. Fully overridable via `REMIND_ME_RERANK_MODEL` regardless.
+- **Reranker failure caching (PF-01)** — `CrossEncoderReranker` now caches load failures exactly like the embedder already does: a missing dependency is permanent for the process, and any other failure (no network, no ONNX export for the configured model) is retried only after a cooldown instead of re-attempting a live HuggingFace download on every single search — necessary now that reranking runs for everyone by default, not just users who explicitly opted in.
+- `benchmarks/runner.py`'s `--rerank` flag now explicitly forces the backend on or off, so lever-isolation benchmark runs stay correct regardless of the library's own default.
+
 ## v1.6.0 — 2026-07-21
 
 Closes a retrieval-quality gap: modern embedding models (`nomic-embed-text`, `bge-*`, `e5-*`) are trained with an asymmetric query/passage convention — a search query and an indexed document are expected to carry different instruction prefixes (e.g. `search_query:` vs `search_document:`). remind_me embedded both identically, silently leaving quality on the table for anyone using one of these models via the Ollama backend.

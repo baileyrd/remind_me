@@ -82,6 +82,25 @@ def test_maybe_rerank_disabled_is_passthrough(monkeypatch):
     assert rr.maybe_rerank("q", memories) is memories
 
 
+def test_rerank_backend_defaults_to_onnx():
+    """Issue #50: reranking ships on by default (module import-time default —
+    the per-test conftest override that keeps the suite offline, see
+    _no_live_reranker, only monkeypatches the already-imported attribute)."""
+    import importlib
+    import os
+
+    os.environ.pop("REMIND_ME_RERANK", None)
+    try:
+        importlib.reload(rr)
+        assert rr.RERANK_BACKEND == "onnx"
+    finally:
+        importlib.reload(rr)  # restore RERANK_BACKEND for subsequent tests
+
+
+def test_rerank_model_defaults_to_bge_reranker_base():
+    assert rr.RERANK_MODEL == "BAAI/bge-reranker-base"
+
+
 class _FakeEngine:
     def __init__(self, scorer):
         self._scorer = scorer
@@ -182,6 +201,54 @@ def test_score_omits_token_type_ids_when_graph_lacks_them():
 def test_score_empty_input_returns_empty():
     engine = _stubbed_engine({"input_ids", "attention_mask"})
     assert engine.score("q", []).shape == (0,)
+
+
+# ---------------------------------------------------------------------------
+# PF-01: failure caching, now that reranking is on by default (issue #50)
+# ---------------------------------------------------------------------------
+
+
+class _FakeClock:
+    """Stand-in for the time module with a controllable monotonic() value."""
+
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+def test_reranker_load_failure_is_cached(monkeypatch, tmp_path):
+    """A failed model download isn't retried on every single search."""
+    pytest.importorskip("onnxruntime")
+    import huggingface_hub
+
+    monkeypatch.setattr(rr, "MODEL_DIR", tmp_path / "models")
+    calls = {"n": 0}
+
+    def boom(*args, **kwargs):
+        calls["n"] += 1
+        raise RuntimeError("offline — no HuggingFace access")
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", boom)
+
+    engine = rr.CrossEncoderReranker()
+    assert engine.available is False
+    assert engine.available is False
+    assert calls["n"] == 1  # second check hit the failure cache
+
+    clock = _FakeClock()
+    clock.now = engine._failed_until + 1
+    monkeypatch.setattr(rr, "time", clock)
+    assert engine.available is False
+    assert calls["n"] == 2  # after the TTL, retried
+
+
+def test_reranker_missing_deps_cached_permanently():
+    """An ImportError marks the reranker unavailable for the process."""
+    engine = rr.CrossEncoderReranker()
+    engine._deps_missing = True
+    assert engine.available is False
 
 
 async def test_memory_search_applies_reranker(monkeypatch, db_conn, memory_factory):

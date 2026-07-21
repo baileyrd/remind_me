@@ -5,18 +5,25 @@ RRF fuses *independent* rank lists, so it never reads the query and a candidate
 together. A cross-encoder does: it scores each (query, memory) pair jointly,
 which is far more precise at ordering the handful of candidates that matter.
 This module reranks the head of the RRF-ranked list with an ONNX cross-encoder
-(default: ``cross-encoder/ms-marco-MiniLM-L6-v2``, the reranker sibling of the
-default embedding model — small enough for CPU).
+(default: ``BAAI/bge-reranker-base``, a modern (2023) cross-encoder that's
+meaningfully stronger than the previous 2019 ``ms-marco-MiniLM-L6-v2`` default
+while still small enough to run on CPU).
 
-Off by default. Enable with ``REMIND_ME_RERANK=onnx``. The model downloads from
-HuggingFace Hub on first use and caches in MODEL_DIR, exactly like the embedder.
-Any load or inference failure degrades gracefully to the un-reranked order.
+On by default: only the top ``REMIND_ME_RERANK_TOP_K`` (default 20) RRF
+candidates are ever rescored, so the added latency is bounded and small
+regardless of how large the underlying result pool is. Disable with
+``REMIND_ME_RERANK=""`` for latency-sensitive deployments. The model downloads
+from HuggingFace Hub on first use and caches in MODEL_DIR, exactly like the
+embedder. Any load or inference failure (missing dependencies, no network, no
+ONNX export for the configured model) degrades gracefully to the un-reranked
+order — reranking can never break search, only skip enhancing it.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any
 
 import numpy as np
@@ -25,16 +32,23 @@ from remind_me_mcp.config import MODEL_DIR
 
 log = logging.getLogger("remind_me_mcp.reranker")
 
+AVAILABILITY_FAILURE_TTL = 30.0
+"""Seconds a failed model load stays cached before a retry (PF-01, mirrors
+embeddings.py) — now that reranking is on by default, an offline/no-network
+process must not retry a real HuggingFace download on every single search."""
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-RERANK_BACKEND: str = os.environ.get("REMIND_ME_RERANK", "").lower()
-"""Reranker backend: '' (disabled, the default) or 'onnx' (in-process cross-encoder)."""
+RERANK_BACKEND: str = os.environ.get("REMIND_ME_RERANK", "onnx").lower()
+"""Reranker backend: 'onnx' (in-process cross-encoder, the default) or ''
+(disabled) for latency-sensitive deployments. Rescoring is bounded to the top
+RERANK_TOP_K candidates, so the default-on cost is small and constant
+regardless of result-pool size; any load/inference failure degrades
+gracefully to the un-reranked RRF order."""
 
-RERANK_MODEL: str = os.environ.get(
-    "REMIND_ME_RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L6-v2"
-)
+RERANK_MODEL: str = os.environ.get("REMIND_ME_RERANK_MODEL", "BAAI/bge-reranker-base")
 """HuggingFace repo of the cross-encoder. Must ship onnx/model.onnx + tokenizer.json."""
 
 RERANK_TOP_K: int = int(os.environ.get("REMIND_ME_RERANK_TOP_K", "20"))
@@ -63,11 +77,30 @@ class CrossEncoderReranker:
         self._tokenizer: Any = None
         self._input_names: set[str] = set()
         self._ready = False
+        # Failure caching (PF-01, mirrors embeddings._Embedder): missing
+        # dependencies are permanent for this process; other load failures
+        # (no network, no ONNX export for this model, ...) are retried only
+        # after AVAILABILITY_FAILURE_TTL instead of on every single search —
+        # reranking is on by default now, so an offline process must not
+        # attempt a real HuggingFace download on every call.
+        self._deps_missing = False
+        self._failed_until = 0.0
 
     def _ensure_loaded(self) -> None:
-        """Lazily download and load the ONNX model + tokenizer (same cache as the embedder)."""
+        """Lazily download and load the ONNX model + tokenizer (same cache as the embedder).
+
+        Load failures are cached (PF-01): an ImportError marks the reranker
+        permanently unavailable for this process, while any other failure is
+        only retried after AVAILABILITY_FAILURE_TTL seconds.
+        """
         if self._ready:
             return
+        if self._deps_missing:
+            raise RuntimeError("Reranker dependencies are not installed (cached failure)")
+        if time.monotonic() < self._failed_until:
+            raise RuntimeError(
+                "Reranker model failed to load recently (cached failure; will retry later)"
+            )
         try:
             import onnxruntime as ort
             from huggingface_hub import hf_hub_download
@@ -97,6 +130,7 @@ class CrossEncoderReranker:
             log.info("Reranker model loaded")
 
         except ImportError as e:
+            self._deps_missing = True
             log.warning(
                 "Reranker dependencies not installed (%s). "
                 "Install with: pip install onnxruntime tokenizers huggingface-hub numpy. "
@@ -105,6 +139,7 @@ class CrossEncoderReranker:
             )
             raise
         except Exception as e:  # Broad catch intentional: ONNX Runtime raises non-stdlib exceptions
+            self._failed_until = time.monotonic() + AVAILABILITY_FAILURE_TTL
             log.warning("Failed to load reranker model: %s. Results keep their RRF order.", e)
             raise
 
