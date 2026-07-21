@@ -48,7 +48,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from remind_me_mcp import ann_index
-from remind_me_mcp.config import ANN_MIN_CHUNKS, DB_PATH, EMBEDDING_DIM
+from remind_me_mcp.config import ANN_MIN_CHUNKS, DB_PATH, EMBED_BATCH_SIZE, EMBEDDING_DIM
 from remind_me_mcp.embeddings import _get_embedder, chunk_text
 
 # Over-fetch factor for chunked KNN: a single memory may own several chunk
@@ -1496,12 +1496,18 @@ def _prune_orphan_chunks(db: sqlite3.Connection) -> int:
 def _embed_and_store_rows(rows: list[tuple[int, str]]) -> int:
     """Embed and store sliding-window chunk vectors for several memories at once.
 
-    Each memory's content is split via :func:`chunk_text` into one or more
-    overlapping windows; every window is embedded as its own vector in
-    ``memories_vec`` (auto-assigned rowid) and linked to the parent memory in
-    ``vec_chunks``. All windows across all memories are embedded in a single
-    batched ``embedder.embed()`` call. Any pre-existing chunks for a memory are
-    replaced (so this is safe for updates and re-embeds).
+    Internally batches into groups of at most ``EMBED_BATCH_SIZE`` memories
+    per actual ``embedder.embed()`` call and DB transaction — regardless of
+    how many rows the caller passes in one call. This is the single source
+    of truth for that invariant: every caller (reindex, file import,
+    mempalace/dbs import, sync's pulled-record embedding) gets it for free
+    instead of each having to remember to pre-slice its own input. Defense
+    in depth alongside the hard ``EMBED_FORWARD_BATCH`` ceiling inside
+    ``embedder.embed()`` itself (config.py) — that bounds peak *forward-pass*
+    memory for any caller, but without this, a caller handing over an
+    unbounded number of rows in one call still built one unbounded
+    ``flat_chunks`` list and one unbounded transaction before ever reaching
+    that cap.
 
     Args:
         rows: ``(memory_rowid, content)`` pairs to embed.
@@ -1512,6 +1518,29 @@ def _embed_and_store_rows(rows: list[tuple[int, str]]) -> int:
     embedder = _get_embedder()
     if embedder is None:
         return 0
+    stored = 0
+    for batch_start in range(0, len(rows), EMBED_BATCH_SIZE):
+        batch = rows[batch_start : batch_start + EMBED_BATCH_SIZE]
+        stored += _embed_and_store_batch(embedder, batch)
+    return stored
+
+
+def _embed_and_store_batch(embedder: Any, rows: list[tuple[int, str]]) -> int:
+    """Embed and store one already-size-bounded batch of memories.
+
+    The single-transaction body previously inlined in
+    :func:`_embed_and_store_rows` — split out so that function's batching
+    loop can call it repeatedly without nesting a try/except per iteration
+    at the call site.
+
+    Args:
+        embedder: An already-resolved, available embedder.
+        rows: ``(memory_rowid, content)`` pairs to embed — assumed to already
+            be at most ``EMBED_BATCH_SIZE`` long.
+
+    Returns:
+        The number of memories in this batch that had at least one chunk stored.
+    """
     # Split every memory into chunks, flattening into one batch for embedding.
     plan: list[tuple[int, int, int]] = []  # (memory_rowid, offset, count)
     flat_chunks: list[str] = []
@@ -2181,6 +2210,7 @@ __all__ = [
     "_delete_chunks",
     "_embed_and_store",
     "_embed_and_store_rows",
+    "_embed_and_store_batch",
     "_prune_orphan_chunks",
     "_fuse_query_embedding",
     "_semantic_search",

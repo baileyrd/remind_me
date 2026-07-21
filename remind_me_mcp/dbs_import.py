@@ -47,7 +47,6 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from remind_me_mcp.config import EMBED_BATCH_SIZE
 from remind_me_mcp.db import (
     _embed_and_store_rows,
     _get_db,
@@ -301,8 +300,7 @@ def pull_dbs(
                     batch_ids,
                 ).fetchall():
                     rows_to_embed.append((row["rowid"], content_by_id[row["id"]]))
-        for i in range(0, len(rows_to_embed), EMBED_BATCH_SIZE):
-            _embed_and_store_rows(rows_to_embed[i : i + EMBED_BATCH_SIZE])
+        _embed_and_store_rows(rows_to_embed)
 
     result["created"] = created
     result["updated"] = updated

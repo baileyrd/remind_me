@@ -58,7 +58,6 @@ from typing import TYPE_CHECKING, Any, Protocol
 if TYPE_CHECKING:
     import sqlite3
 
-from remind_me_mcp.config import EMBED_BATCH_SIZE
 from remind_me_mcp.db import (
     _embed_and_store_rows,
     _get_db,
@@ -918,9 +917,10 @@ def _ingest_parsed(
         )
         db.commit()
 
-    # --- Embed OUTSIDE the lock, in batches (PF-03). The rows use the SAME
-    # mem_ids that were INSERTed (BUGF-01); any failure here is healed later
-    # by remind_me_reindex. ---
+    # --- Embed OUTSIDE the lock (PF-03). The rows use the SAME mem_ids that
+    # were INSERTed (BUGF-01); any failure here is healed later by
+    # remind_me_reindex. _embed_and_store_rows batches internally
+    # (EMBED_BATCH_SIZE), so no per-caller batching loop is needed here. ---
     if embed_entries:
         chunk_by_id = {mem_id: chunk for mem_id, chunk, _chunk_meta in embed_entries}
         ids = list(chunk_by_id)
@@ -936,8 +936,7 @@ def _ingest_parsed(
                     batch_ids,
                 ).fetchall():
                     rows_to_embed.append((row["rowid"], chunk_by_id[row["id"]]))
-        for i in range(0, len(rows_to_embed), EMBED_BATCH_SIZE):
-            _embed_and_store_rows(rows_to_embed[i : i + EMBED_BATCH_SIZE])
+        _embed_and_store_rows(rows_to_embed)
 
     return {"status": "ok", "import_id": import_id, **stats}
 

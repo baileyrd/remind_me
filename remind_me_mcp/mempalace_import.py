@@ -32,7 +32,7 @@ import re
 import threading
 from typing import Any
 
-from remind_me_mcp.config import EMBED_BATCH_SIZE, MEMPALACE_PATH
+from remind_me_mcp.config import MEMPALACE_PATH
 from remind_me_mcp.db import _embed_and_store_rows, _get_db, _make_id, _now_iso
 from remind_me_mcp.importer import register_connector
 
@@ -236,8 +236,7 @@ def pull_mempalace(
                     batch_ids,
                 ).fetchall():
                     rows_to_embed.append((row["rowid"], content_by_id[row["id"]]))
-        for i in range(0, len(rows_to_embed), EMBED_BATCH_SIZE):
-            _embed_and_store_rows(rows_to_embed[i : i + EMBED_BATCH_SIZE])
+        _embed_and_store_rows(rows_to_embed)
 
     result["imported"] = len(embed_entries)
     return result
