@@ -1,5 +1,9 @@
 # Daily Backup System (dbs) Integration Review — 2026-07-21
 
+> **Update (same day):** option 1 below has shipped on the dbs side as `dbs
+> export-notes` — no code changes were needed in remind_me itself. See
+> [Status](#status) at the end.
+
 Review of [baileyrd/daily-backup-system](https://github.com/baileyrd/daily-backup-system)
 ("dbs") against `remind_me`, prompted by a request to determine whether the
 two projects should be integrated. dbs's intent is broader than its name
@@ -44,12 +48,18 @@ without new architecture on either side.
 
 ## Where it plugs into remind_me, by effort/fidelity
 
-1. **Export → watched folder (lowest effort).** remind_me's `watcher.py`
-   already polls a directory for auto-ingest. Pointing `dbs export --format
-   markdown` (or `obsidian`) at that directory after each `dbs backup` run
-   needs zero code changes on either side — config only. Freshness is
-   per-backup-cycle; fidelity is flattened text (source, tags, and
-   timestamps become prose rather than structured metadata).
+1. **Export → watched folder (lowest effort). SHIPPED, dbs side only.**
+   remind_me's `watcher.py` already polls a directory for auto-ingest and
+   needed no changes. dbs's zip-only exporters did — `dbs export --format
+   obsidian` produces an archive, and the watcher only reads loose files —
+   so dbs gained a new `dbs export-notes --out-dir DIR` command that unzips
+   the same tested obsidian path into one Markdown file per item,
+   incrementally by default. Point `REMIND_ME_WATCH_DIRS` at that
+   directory and new items auto-ingest on the next poll. Freshness is
+   per-backup-cycle; fidelity is flattened text — dbs's structured fields
+   (source, tags, timestamps) arrive as YAML frontmatter inside each note's
+   body, ingested as plain content rather than structured metadata, until
+   option 3 exists.
 2. **Per-item webhook push (moderate effort).** A small adapter shapes new
    dbs items into calls against remind_me's `POST /ingest` webhook endpoint
    right after each incremental fetch, instead of waiting for a batch
@@ -77,3 +87,20 @@ highlight) instead of a paragraph of text.
 No code has been changed in either repository as part of this review; this
 document exists to record the analysis so implementation can start directly
 from option 1 or 3 above without re-deriving the tradeoffs.
+
+## Status
+
+- **Option 1 — shipped**, entirely in dbs (`dbs export-notes`; see
+  [baileyrd/daily-backup-system docs/remind-me-integration-review-2026-07-21.md](https://github.com/baileyrd/daily-backup-system/blob/main/docs/remind-me-integration-review-2026-07-21.md)
+  for implementation notes and known gaps). remind_me needs only a config
+  change: set `REMIND_ME_WATCH_DIRS` to the directory passed to
+  `dbs export-notes --out-dir`. Verified end-to-end — a real
+  `dbs export-notes` run followed by remind_me's actual
+  `FolderWatcher.scan_once()` against that directory produced a memory row
+  with the item's title/tags/body content intact.
+- **Options 2 and 3 — not started.** Option 3 (a dedicated `dbs` import
+  connector registered in remind_me's import pipeline, preserving
+  structured entities instead of prose) is the one worth reaching for if
+  dbs becomes a primary, ongoing memory source rather than an occasional
+  feed — see the dbs-side doc's BACKLOG entry for why the current
+  option-1 filename bookkeeping is a workaround this would remove entirely.
