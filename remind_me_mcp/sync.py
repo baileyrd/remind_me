@@ -8,11 +8,19 @@ Hub sync:   push local outbox → hub, pull hub changes → local
 Peer sync:  push local outbox → peer, pull peer changes → local
             (peers discovered via Tailscale local API, plus STATIC_PEERS)
 
-Conflict resolution: last-write-wins on updated_at (applied in the
-upsert query). All timestamps are normalized to canonical UTC ISO-8601
-on ingest so string comparison is a correct ordering. This is safe
-because memories are append-dominant — true concurrent updates to the
-same record are rare.
+Conflict resolution: last-write-wins on updated_at for most columns
+(applied in the upsert query), EXCEPT tags and metadata, which are
+field-level merged regardless of which side wins (issue #60) — tags via
+union (dedup, order-preserving, mirroring entity alias merging), metadata
+via a shallow per-key merge where the LWW winner's value wins on key
+collision but keys unique to either side are kept. This closes the common
+case of two devices editing different fields of the same memory between
+sync cycles: previously whichever write arrived second clobbered the
+other's change entirely, not just the field that genuinely conflicted.
+All timestamps are normalized to canonical UTC ISO-8601 on ingest so
+string comparison is a correct ordering. Whole-row LWW is safe for
+genuinely conflicting scalar fields like content because memories are
+append-dominant — true concurrent edits to the same field are rare.
 
 Outbox sends are tracked per remote in the ``sync_sends`` table, so every
 configured hub/peer receives every outbox row. Pulls use a keyset cursor
@@ -427,8 +435,8 @@ class UpsertResult:
     processed_ids: list[str] = field(default_factory=list)
 
 
-def _coerce_json_field(value: Any, default: Any) -> str:
-    """Return a JSON string for a tags/metadata field of unknown shape."""
+def _coerce_json_value(value: Any, default: Any) -> Any:
+    """Parse a tags/metadata field of unknown shape into its Python value."""
     if isinstance(value, str):
         try:
             value = json.loads(value)
@@ -436,16 +444,80 @@ def _coerce_json_field(value: Any, default: Any) -> str:
             value = default
     if value is None:
         value = default
-    return json.dumps(value)
+    return value
+
+
+def _coerce_json_field(value: Any, default: Any) -> str:
+    """Return a JSON string for a tags/metadata field of unknown shape."""
+    return json.dumps(_coerce_json_value(value, default))
+
+
+def _parse_tags_list(value: Any) -> list[str]:
+    """Parse a tags-shaped field into a list of strings, tolerating malformed input."""
+    parsed = _coerce_json_value(value, [])
+    if not isinstance(parsed, list):
+        return []
+    return [t for t in parsed if isinstance(t, str)]
+
+
+def _parse_metadata_dict(value: Any) -> dict[str, Any]:
+    """Parse a metadata-shaped field into a dict, tolerating malformed input."""
+    parsed = _coerce_json_value(value, {})
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def merge_tags(local: Any, incoming: Any) -> list[str]:
+    """Union-merge two tags fields (issue #60): dedup, order-preserving,
+    local first — the same semantics :func:`_upsert_entity_one` already
+    uses for entity aliases. Applied regardless of which side wins LWW, so
+    a tag added on one device is never silently dropped by a conflicting
+    edit to a different field on another device.
+    """
+    return list(dict.fromkeys([*_parse_tags_list(local), *_parse_tags_list(incoming)]))
+
+
+def merge_metadata(local: Any, incoming: Any, *, incoming_wins: bool) -> dict[str, Any]:
+    """Shallow field-level merge of two metadata dicts (issue #60).
+
+    Both sides' keys are kept; on key collision, whichever side is the LWW
+    winner (``incoming_wins``) takes precedence. This is a *shallow* merge —
+    a key present on both sides with a dict/list value does not recurse,
+    the winner's value replaces the loser's wholesale at that key.
+    Deliberately simple: memories' metadata is typically flat per-import
+    bookkeeping (``conversation_id``, ``filename``, ...), not nested
+    structured data that would need a true recursive merge.
+    """
+    winner, loser = (incoming, local) if incoming_wins else (local, incoming)
+    merged = _parse_metadata_dict(loser).copy()
+    merged.update(_parse_metadata_dict(winner))
+    return merged
 
 
 def _upsert_one(db: sqlite3.Connection, rec: dict[str, Any]) -> int | None:
-    """Validate and upsert a single remote record (LWW on updated_at).
+    """Validate and upsert a single remote record.
+
+    Conflict resolution (issue #60): last-write-wins on ``updated_at`` for
+    scalar columns, EXCEPT ``tags``/``metadata``, which are field-level
+    merged via :func:`merge_tags`/:func:`merge_metadata` regardless of
+    which side wins — closing the common case where two devices edit
+    different fields of the same memory between sync cycles (one adds a
+    tag, another edits content) and whichever write arrived second used to
+    clobber the other's change entirely, not just the field that actually
+    conflicted.
+
+    When the incoming record loses LWW but the merge still changes local
+    tags/metadata, a merge-only UPDATE is applied (not bumping
+    ``updated_at`` — the contributing peer's own outbox row propagates its
+    side of the merge, same as :func:`_upsert_entity_one`'s alias-fill
+    branch) and this function still returns ``None``, exactly as if the
+    record had simply lost LWW: content is unchanged, so re-embedding
+    would be wasted work and would risk overwriting the local embedding
+    with the (stale) incoming content's.
 
     Writes every schema column, defaulting fields absent from records sent by
-    older nodes. Returns the memory rowid when the record was applied, or
-    None when it lost last-write-wins. Raises on malformed input (caller
-    isolates the failure).
+    older nodes. Returns the memory rowid when the incoming record won LWW
+    (content may have changed, so the caller should re-embed), or None
+    otherwise. Raises on malformed input (caller isolates the failure).
     """
     if not isinstance(rec, dict):
         raise ValueError(f"record is not an object: {type(rec).__name__}")
@@ -460,84 +532,127 @@ def _upsert_one(db: sqlite3.Connection, rec: dict[str, Any]) -> int | None:
     except ValueError:
         accessed_at = created_at
 
+    mem_id = str(rec["id"])
+
     # Snapshot the outbox high-water mark so we can suppress exactly the echo
     # rows created by this upsert's triggers (SY-05).
     outbox_max = db.execute(
         "SELECT COALESCE(MAX(id), 0) FROM sync_outbox"
     ).fetchone()[0]
 
-    result = db.execute("""
-        INSERT INTO memories
-            (id, content, category, tags, source, metadata,
-             created_at, updated_at, capture_id, node_id, client,
-             accessed_at, access_count, decay_rate, vitality, base_weight,
-             status, memory_type, source_capture_id,
-             subject, predicate, object, superseded_by, deleted_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            content           = excluded.content,
-            category          = excluded.category,
-            tags              = excluded.tags,
-            source            = excluded.source,
-            metadata          = excluded.metadata,
-            updated_at        = excluded.updated_at,
-            capture_id        = excluded.capture_id,
-            node_id           = excluded.node_id,
-            client            = excluded.client,
-            accessed_at       = excluded.accessed_at,
-            access_count      = excluded.access_count,
-            decay_rate        = excluded.decay_rate,
-            vitality          = excluded.vitality,
-            base_weight       = excluded.base_weight,
-            status            = excluded.status,
-            memory_type       = excluded.memory_type,
-            source_capture_id = excluded.source_capture_id,
-            subject           = excluded.subject,
-            predicate         = excluded.predicate,
-            object            = excluded.object,
-            superseded_by     = excluded.superseded_by,
-            deleted_at        = excluded.deleted_at
-        WHERE excluded.updated_at > memories.updated_at
-        RETURNING rowid
-    """, (
-        str(rec["id"]),
-        str(rec["content"]),
-        rec.get("category") or "general",
-        _coerce_json_field(rec.get("tags"), []),
-        rec.get("source") or "manual",
-        _coerce_json_field(rec.get("metadata"), {}),
-        created_at,
-        updated_at,
-        rec.get("capture_id"),
-        rec.get("node_id"),
-        rec.get("client") or "unknown",
-        accessed_at,
-        int(rec.get("access_count") or 0),
-        float(rec.get("decay_rate") or 0.1),
-        float(rec.get("vitality") or 1.0),
-        float(rec.get("base_weight") or 1.0),
-        rec.get("status") or "active",
-        rec.get("memory_type") or "unclassified",
-        rec.get("source_capture_id"),
-        rec.get("subject"),
-        rec.get("predicate"),
-        rec.get("object"),
-        rec.get("superseded_by"),
-        rec.get("deleted_at"),
-    ))
+    local = db.execute(
+        "SELECT tags, metadata, updated_at FROM memories WHERE id = ?", (mem_id,)
+    ).fetchone()
 
-    applied = result.fetchone()
-    if applied is None:
+    incoming_tags = rec.get("tags")
+    incoming_metadata = rec.get("metadata")
+    incoming_wins = local is None or updated_at > local["updated_at"]
+    merged_tags = merge_tags(local["tags"] if local is not None else None, incoming_tags)
+    merged_metadata = merge_metadata(
+        local["metadata"] if local is not None else None,
+        incoming_metadata,
+        incoming_wins=incoming_wins,
+    )
+
+    def _suppress_echo() -> None:
+        # Suppress only the echo rows this upsert's triggers just created —
+        # pending rows from concurrent local edits keep their place in the
+        # outbox (SY-05).
+        db.execute("""
+            UPDATE sync_outbox SET sent_at = ?
+            WHERE memory_id = ? AND id > ? AND sent_at = ''
+        """, (_now_iso(), mem_id, outbox_max))
+
+    if not incoming_wins:
+        # Incoming lost LWW: apply only the merged tags/metadata (if they
+        # actually changed), leaving every other column — including
+        # updated_at and content — untouched.
+        local_tags = _parse_tags_list(local["tags"])
+        local_metadata = _parse_metadata_dict(local["metadata"])
+        if merged_tags != local_tags or merged_metadata != local_metadata:
+            db.execute(
+                "UPDATE memories SET tags = ?, metadata = ? WHERE id = ?",
+                (json.dumps(merged_tags), json.dumps(merged_metadata), mem_id),
+            )
+            _suppress_echo()
         return None
 
-    # Suppress only the echo rows this upsert's triggers just created —
-    # pending rows from concurrent local edits keep their place in the
-    # outbox (SY-05).
-    db.execute("""
-        UPDATE sync_outbox SET sent_at = ?
-        WHERE memory_id = ? AND id > ? AND sent_at = ''
-    """, (_now_iso(), str(rec["id"]), outbox_max))
-    return int(applied[0])
+    if local is None:
+        cur = db.execute("""
+            INSERT INTO memories
+                (id, content, category, tags, source, metadata,
+                 created_at, updated_at, capture_id, node_id, client,
+                 accessed_at, access_count, decay_rate, vitality, base_weight,
+                 status, memory_type, source_capture_id,
+                 subject, predicate, object, superseded_by, deleted_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            mem_id,
+            str(rec["content"]),
+            rec.get("category") or "general",
+            json.dumps(merged_tags),
+            rec.get("source") or "manual",
+            json.dumps(merged_metadata),
+            created_at,
+            updated_at,
+            rec.get("capture_id"),
+            rec.get("node_id"),
+            rec.get("client") or "unknown",
+            accessed_at,
+            int(rec.get("access_count") or 0),
+            float(rec.get("decay_rate") or 0.1),
+            float(rec.get("vitality") or 1.0),
+            float(rec.get("base_weight") or 1.0),
+            rec.get("status") or "active",
+            rec.get("memory_type") or "unclassified",
+            rec.get("source_capture_id"),
+            rec.get("subject"),
+            rec.get("predicate"),
+            rec.get("object"),
+            rec.get("superseded_by"),
+            rec.get("deleted_at"),
+        ))
+        assert cur.lastrowid is not None  # guaranteed by the INSERT above
+        rowid = cur.lastrowid
+    else:
+        result = db.execute("""
+            UPDATE memories SET
+                content = ?, category = ?, tags = ?, source = ?, metadata = ?,
+                updated_at = ?, capture_id = ?, node_id = ?, client = ?,
+                accessed_at = ?, access_count = ?, decay_rate = ?, vitality = ?,
+                base_weight = ?, status = ?, memory_type = ?, source_capture_id = ?,
+                subject = ?, predicate = ?, object = ?, superseded_by = ?, deleted_at = ?
+            WHERE id = ?
+            RETURNING rowid
+        """, (
+            str(rec["content"]),
+            rec.get("category") or "general",
+            json.dumps(merged_tags),
+            rec.get("source") or "manual",
+            json.dumps(merged_metadata),
+            updated_at,
+            rec.get("capture_id"),
+            rec.get("node_id"),
+            rec.get("client") or "unknown",
+            accessed_at,
+            int(rec.get("access_count") or 0),
+            float(rec.get("decay_rate") or 0.1),
+            float(rec.get("vitality") or 1.0),
+            float(rec.get("base_weight") or 1.0),
+            rec.get("status") or "active",
+            rec.get("memory_type") or "unclassified",
+            rec.get("source_capture_id"),
+            rec.get("subject"),
+            rec.get("predicate"),
+            rec.get("object"),
+            rec.get("superseded_by"),
+            rec.get("deleted_at"),
+            mem_id,
+        ))
+        rowid = result.fetchone()[0]
+
+    _suppress_echo()
+    return int(rowid)
 
 
 def _upsert_entity_one(db: sqlite3.Connection, rec: dict[str, Any]) -> bool:

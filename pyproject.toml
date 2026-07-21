@@ -1,6 +1,6 @@
 [project]
 name = "remind-me-mcp"
-version = "1.12.0"
+version = "1.13.0"
 description = "Persistent, searchable memory MCP server for Claude — works across Claude.ai, Claude Code, and Claude Desktop with multi-machine sync."
 readme = "README.md"
 requires-python = ">=3.11"

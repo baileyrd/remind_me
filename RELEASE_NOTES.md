@@ -1,5 +1,18 @@
 # Release Notes
 
+## v1.13.0 — 2026-07-21
+
+Closes a multi-device data-loss gap flagged in the application capability review: `_upsert_one` (`sync.py`) overwrote *every* column on last-write-wins conflict resolution, so if two devices edited different fields of the same memory (one adds a tag, another edits the content) between sync cycles, whichever write arrived second silently clobbered the other's change entirely — not just the conflicting field. Entities already had union-merge semantics for aliases; memories didn't have the equivalent.
+
+### New Features
+
+- **Field-level conflict merge for memory sync** — `_upsert_one` now field-level merges `tags` and `metadata` regardless of which side wins last-write-wins on `updated_at`, falling back to whole-row LWW only for genuinely conflicting scalar fields like `content`:
+  - `tags`: union-merge, dedup, order-preserving (local first) — identical semantics to the existing entity alias merge (`_upsert_entity_one`).
+  - `metadata`: shallow, per-key merge. Both sides' keys are kept; on an actual key collision, the LWW winner's value takes precedence. Deliberately shallow (not recursive) — memory metadata is typically flat per-import bookkeeping, not nested structured data.
+  - A record that loses LWW on `content`/other scalar fields still gets its tags/metadata folded into the local row via a merge-only `UPDATE` that deliberately does **not** bump `updated_at` (mirrors the entity alias-fill precedent — the contributing peer's own outbox row already propagates its side of the merge, so bumping would only cause churn) and does not trigger a needless re-embed (content is unchanged).
+  - Applies uniformly to both hub-pull and peer-pull, since both share the same client-side `sync.py` upsert path.
+  - The hub's own Postgres storage (`hub/main.py`) still does whole-row LWW for now — an explicit, documented scope decision, not an oversight: extending the merge there needs a live Postgres to test against at all (`hub/e2e_test.py` is explicitly outside the pytest suite), and the remaining gap is narrower than the general case — specifically "two pushes racing at the hub before either side pulls."
+
 ## v1.12.0 — 2026-07-21
 
 Closes a ranking gap flagged in the application capability review: every new memory started at a flat `base_weight=1.0` regardless of kind, so a throwaway aside ("it's raining today") competed evenly in ranking with a real decision ("we're migrating to Postgres") until feedback or access patterns accrued enough signal to differentiate them — and the highest-value memories (decisions) are exactly the ones a user is least likely to re-query immediately, so they'd lose the ranking race to frequently-hit trivia before feedback ever kicked in.
