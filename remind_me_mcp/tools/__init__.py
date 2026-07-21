@@ -99,7 +99,7 @@ from remind_me_mcp.server import mcp
 # registering every handler on the shared FastMCP instance. These imports
 # must come after the shared-state imports above so the package namespace is
 # fully populated before any handler can run.
-from remind_me_mcp.tools import admin, capture, crud, entity, lifecycle, search, wiki
+from remind_me_mcp.tools import admin, capture, crud, entity, lifecycle, normalize, search, wiki
 from remind_me_mcp.tools._shared import (
     FTS_SANITIZE_FALLBACK,
     _background_tasks,
@@ -120,6 +120,7 @@ from remind_me_mcp.tools.admin import (
     remind_me_self_update,
     remind_me_server_status,
     remind_me_watch_status,
+    remind_me_webhook_status,
     resource_categories,
     resource_stats,
 )
@@ -148,6 +149,10 @@ from remind_me_mcp.tools.lifecycle import (
     remind_me_reclassify,
     remind_me_reclassify_batch,
     remind_me_vitality_report,
+)
+from remind_me_mcp.tools.normalize import (
+    remind_me_normalize_apply,
+    remind_me_normalize_batch,
 )
 from remind_me_mcp.tools.search import (
     _STRUCTURED_PATTERN,
@@ -208,6 +213,7 @@ __all__ = [
     "remind_me_list_connectors",
     "remind_me_server_status",
     "remind_me_watch_status",
+    "remind_me_webhook_status",
     "remind_me_check_update",
     "remind_me_self_update",
     "remind_me_reclassify",
@@ -217,6 +223,8 @@ __all__ = [
     "remind_me_decompose_batch",
     "remind_me_extract_batch",
     "remind_me_annotate",
+    "remind_me_normalize_batch",
+    "remind_me_normalize_apply",
     "remind_me_entity",
     "remind_me_entity_traverse",
     "remind_me_consolidate",

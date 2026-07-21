@@ -910,6 +910,71 @@ async def test_list_connectors_reflects_third_party_registrations(
 
 
 # ---------------------------------------------------------------------------
+# remind_me_webhook_status tests (Phase 5a)
+# ---------------------------------------------------------------------------
+
+
+async def test_webhook_status_disabled_without_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from remind_me_mcp import webhook_server as _webhook_mod
+    from remind_me_mcp.tools import remind_me_webhook_status
+
+    monkeypatch.setattr(_webhook_mod, "WEBHOOK_SECRET", "")
+    data = json.loads(await remind_me_webhook_status())
+    assert data["enabled"] is False
+    assert "hint" in data
+
+
+async def test_webhook_status_enabled_reports_counters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from remind_me_mcp import webhook_server as _webhook_mod
+    from remind_me_mcp.tools import remind_me_webhook_status
+
+    monkeypatch.setattr(_webhook_mod, "WEBHOOK_SECRET", "test-secret")
+    monkeypatch.setattr(_webhook_mod, "_requests_ingested", 3)
+    monkeypatch.setattr(_webhook_mod, "_requests_skipped", 1)
+    data = json.loads(await remind_me_webhook_status())
+    assert data["enabled"] is True
+    assert data["requests_ingested"] == 3
+    assert data["requests_skipped"] == 1
+
+
+# ---------------------------------------------------------------------------
+# remind_me_normalize_batch / remind_me_normalize_apply tests (Phase 5b)
+# ---------------------------------------------------------------------------
+
+
+async def test_normalize_batch_and_apply_via_tools_package(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """Both normalize tools are reachable from remind_me_mcp.tools (registration)."""
+    from remind_me_mcp.models import NormalizationEntry, NormalizeApplyInput, NormalizeBatchInput
+    from remind_me_mcp.tools import remind_me_normalize_apply, remind_me_normalize_batch
+
+    raw = memory_factory(content="Raw imported content.", source="document_import")
+
+    batch = json.loads(await remind_me_normalize_batch(NormalizeBatchInput()))
+    assert batch["total_unnormalized"] == 1
+    assert batch["memories"][0]["id"] == raw["id"]
+
+    applied = json.loads(
+        await remind_me_normalize_apply(
+            NormalizeApplyInput(
+                normalizations=[
+                    NormalizationEntry(memory_id=raw["id"], question="Q?", summary="S.")
+                ]
+            )
+        )
+    )
+    assert applied["normalized"] == 1
+
+    batch_after = json.loads(await remind_me_normalize_batch(NormalizeBatchInput()))
+    assert batch_after["total_unnormalized"] == 0
+
+
+# ---------------------------------------------------------------------------
 # Resource handler tests
 # ---------------------------------------------------------------------------
 

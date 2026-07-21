@@ -18,8 +18,10 @@ from remind_me_mcp.importer import (
     _extract_messages_from_json,
     _file_hash,
     _filter_messages,
+    _hash_bytes,
     _parse_markdown_chat,
     import_chat_file,
+    import_content,
     register_connector,
 )
 
@@ -942,6 +944,121 @@ def test_extract_graph_records_jsonl() -> None:
 
 def test_extract_graph_records_non_json_suffix_returns_empty() -> None:
     assert _extract_graph_records("whatever", ".md") == []
+
+
+# ---------------------------------------------------------------------------
+# import_content — bytes-based ingestion (Phase 5)
+# ---------------------------------------------------------------------------
+
+
+def test_hash_bytes_matches_file_hash_of_same_bytes(tmp_path: Path) -> None:
+    """_hash_bytes and _file_hash use the same digest/truncation convention."""
+    data = b"identical content for hash comparison"
+    f = tmp_path / "same.txt"
+    f.write_bytes(data)
+    assert _hash_bytes(data) == _file_hash(str(f))
+
+
+def test_import_content_creates_memories(db_conn: sqlite3.Connection) -> None:
+    data = {"chat_messages": [{"sender": "assistant", "content": "Pushed content, hello."}]}
+    result = import_content(
+        content=json.dumps(data).encode("utf-8"),
+        filename="pushed.json",
+        category="test",
+        tags=[],
+        extract_mode="assistant_messages",
+        max_length=10000,
+    )
+    assert result["status"] == "ok"
+    assert result["memories_created"] == 1
+
+    row = db_conn.execute(
+        "SELECT content, source FROM memories WHERE source = 'chat_import'"
+    ).fetchone()
+    assert row["content"] == "Pushed content, hello."
+
+
+def test_import_content_document_kind(db_conn: sqlite3.Connection) -> None:
+    md = "# A Section\n\nSome document content pushed as bytes.\n"
+    result = import_content(
+        content=md.encode("utf-8"),
+        filename="notes.md",
+        category="",
+        tags=[],
+        extract_mode="assistant_messages",
+        max_length=10000,
+        kind="document",
+    )
+    assert result["status"] == "ok"
+    assert result["kind"] == "document"
+
+    row = db_conn.execute(
+        "SELECT category, source FROM memories WHERE source = 'document_import'"
+    ).fetchone()
+    assert row["category"] == "document"
+
+
+def test_import_content_dedups_by_content_hash(db_conn: sqlite3.Connection) -> None:
+    data = {"chat_messages": [{"sender": "assistant", "content": "Dedup me."}]}
+    payload = json.dumps(data).encode("utf-8")
+
+    first = import_content(payload, "same.json", "test", [], "assistant_messages", 10000)
+    assert first["status"] == "ok"
+
+    second = import_content(payload, "same.json", "test", [], "assistant_messages", 10000)
+    assert second["status"] == "skipped"
+    assert second["import_id"] == first["import_id"]
+
+
+def test_import_content_invalid_kind_returns_error(db_conn: sqlite3.Connection) -> None:
+    result = import_content(b"whatever", "f.json", "test", [], "assistant_messages", 10000, kind="bogus")
+    assert result["status"] == "error"
+    assert "invalid kind" in result["reason"]
+
+
+def test_import_content_unsupported_suffix_returns_error(db_conn: sqlite3.Connection) -> None:
+    result = import_content(b"whatever", "f.pdf", "test", [], "assistant_messages", 10000)
+    assert result["status"] == "error"
+    assert "unsupported format" in result["reason"]
+
+
+def test_import_content_document_kind_rejects_json_suffix(db_conn: sqlite3.Connection) -> None:
+    result = import_content(
+        b"{}", "f.json", "test", [], "assistant_messages", 10000, kind="document"
+    )
+    assert result["status"] == "error"
+    assert "document import does not support" in result["reason"]
+
+
+def test_import_content_replaces_invalid_utf8(db_conn: sqlite3.Connection) -> None:
+    """Malformed bytes decode with errors='replace' rather than raising."""
+    result = import_content(
+        b"valid text \xff\xfe more bytes here",
+        "notes.txt",
+        "",
+        [],
+        "assistant_messages",
+        10000,
+    )
+    assert result["status"] == "ok"
+    row = db_conn.execute("SELECT content FROM memories").fetchone()
+    assert "�" in row["content"]
+
+
+def test_import_content_different_filenames_same_content_dedup_by_bytes(
+    db_conn: sqlite3.Connection,
+) -> None:
+    """Dedup keys on content bytes, not filename — two different filenames
+    with byte-identical content still dedup against each other."""
+    data = {"chat_messages": [{"sender": "assistant", "content": "Same bytes, different name."}]}
+    payload = json.dumps(data).encode("utf-8")
+
+    first = import_content(payload, "a.json", "test", [], "assistant_messages", 10000)
+    second = import_content(payload, "b.json", "test", [], "assistant_messages", 10000)
+
+    assert first["status"] == "ok"
+    assert second["status"] == "skipped"
+    assert second["import_id"] == first["import_id"]
 
 
 def test_extract_graph_records_json_non_list_returns_empty() -> None:

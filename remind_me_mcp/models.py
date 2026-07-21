@@ -793,6 +793,71 @@ class ExtractBatchInput(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Ingest-time normalization models (FT-09, Phase 5b)
+# ---------------------------------------------------------------------------
+
+
+class NormalizeBatchInput(BaseModel):
+    """Input for the remind_me_normalize_batch tool: fetch un-normalized imports."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    batch_size: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="Number of un-normalized document/chat import memories to return",
+    )
+
+
+class NormalizationEntry(BaseModel):
+    """A single distilled normalization for one raw imported memory (Phase 5b)."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    memory_id: str = Field(
+        ...,
+        description="The ID of the raw imported memory (document_import/chat_import) being normalized",
+        min_length=1,
+    )
+    question: str = Field(
+        ...,
+        description="The question/topic this content answers (e.g. 'How is the VPN configured?')",
+        min_length=1,
+        max_length=500,
+    )
+    summary: str = Field(
+        ...,
+        description="A concise, distilled answer/summary of the raw content",
+        min_length=1,
+        max_length=10000,
+    )
+    resolution: str | None = Field(
+        default=None,
+        description="Optional resolution/outcome, when the content describes a problem that was resolved",
+        max_length=5000,
+    )
+    refs: list[str] = Field(
+        default_factory=list,
+        description="Optional reference ids/urls/paths supporting this normalization",
+        max_length=20,
+    )
+
+
+class NormalizeApplyInput(BaseModel):
+    """Input for the remind_me_normalize_apply tool: apply normalizations in batch."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    normalizations: list[NormalizationEntry] = Field(
+        ...,
+        description="List of distilled {memory_id, question, summary, resolution?, refs?} normalizations",
+        min_length=1,
+        max_length=50,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Consolidation models (Phase 14 Plan 01)
 # ---------------------------------------------------------------------------
 
@@ -995,6 +1060,9 @@ __all__ = [
     "MemoryAnnotation",
     "AnnotateInput",
     "ExtractBatchInput",
+    "NormalizeBatchInput",
+    "NormalizationEntry",
+    "NormalizeApplyInput",
     "ConsolidateInput",
     "VitalityReportInput",
     "WikiWriteInput",

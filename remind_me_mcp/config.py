@@ -356,6 +356,22 @@ is deferred until a later scan observes the same (mtime, size) signature, so
 partially-written files are never ingested mid-write."""
 
 # ---------------------------------------------------------------------------
+# Push/webhook ingestion (FT-09, Phase 5a)
+# ---------------------------------------------------------------------------
+
+WEBHOOK_PORT = _env_int("REMIND_ME_WEBHOOK_PORT", 8769)
+WEBHOOK_BIND = os.environ.get("REMIND_ME_WEBHOOK_BIND", "127.0.0.1")
+"""Bind address for the webhook ingestion server. Defaults to localhost-only
+(unlike the Tailscale-oriented peer sync server) since a push endpoint writes
+arbitrary content directly into memory — widen it deliberately (e.g. to a
+Tailscale IP or 0.0.0.0 behind a reverse proxy) via REMIND_ME_WEBHOOK_BIND."""
+
+WEBHOOK_SECRET = os.environ.get("REMIND_ME_WEBHOOK_SECRET", "")
+"""Bearer token required on every /ingest request. The webhook server
+refuses to start when this is unset — an unsecured push endpoint would be
+worse than useless."""
+
+# ---------------------------------------------------------------------------
 # Updates
 # ---------------------------------------------------------------------------
 
@@ -413,6 +429,9 @@ __all__ = [
     "WATCH_DIRS",
     "WATCH_INTERVAL",
     "WATCH_GRACE",
+    "WEBHOOK_PORT",
+    "WEBHOOK_BIND",
+    "WEBHOOK_SECRET",
     "AUTO_UPDATE_CHECK",
 ]
 

@@ -60,6 +60,11 @@ async def app_lifespan(app: FastMCP):
     from remind_me_mcp.watcher import start_watcher, stop_watcher
     start_watcher()
 
+    # FT-09/Phase 5a: push/webhook ingestion — start_webhook_server() is a
+    # no-op unless REMIND_ME_WEBHOOK_SECRET is configured.
+    from remind_me_mcp.webhook_server import start_webhook_server, stop_webhook_server
+    start_webhook_server()
+
     # FT-08: LLM Wiki — seed the maintainer schema and reconcile the file-backed
     # index into the DB at startup so external edits (hand edits, git pull) are
     # picked up. Best-effort: a wiki problem must never block server startup.
@@ -74,9 +79,11 @@ async def app_lifespan(app: FastMCP):
     try:
         yield {"db": db}
     finally:
-        # FT-03/SE-07: stop the watcher thread *before* closing the database
-        # connections so an in-flight scan never writes to a closed handle.
+        # FT-03/FT-09/SE-07: stop the watcher and webhook server threads
+        # *before* closing the database connections so an in-flight scan or
+        # request never writes to a closed handle.
         stop_watcher()
+        stop_webhook_server()
         # SE-07: always close every tracked connection, even when the body
         # raised — otherwise file descriptors leak and the WAL is never
         # checkpointed. NOTE: sync/peer threads are daemon threads with no
