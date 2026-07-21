@@ -1625,7 +1625,7 @@ def _embed_and_store_batch(embedder: Any, rows: list[tuple[int, str]]) -> int:
         return 0
     db = _get_db()
     try:
-        vecs = embedder.embed(flat_chunks)
+        vecs = embedder.embed(flat_chunks, role="passage")
         stored = 0
         removed_vec_rowids: list[int] = []
         added_vecs: list[tuple[int, bytes]] = []
@@ -1705,16 +1705,27 @@ def _fuse_query_embedding(embedder, texts: list[str]) -> bytes:
     query plus a HyDE passage), the mean vector blends question-space and
     document-space so candidates near either phrasing rank well.
 
+    ``texts[0]`` is always the literal search query and is embedded with
+    ``role="query"``; any remaining texts (e.g. a HyDE passage) are
+    document-like synthetic text rather than a query, so they're embedded
+    with ``role="passage"`` (query/document embedding prefix asymmetry) —
+    otherwise a query-prefixed model would apply the wrong instruction to
+    half the fused vector's inputs.
+
     Args:
         embedder: Any embedder exposing ``embed(list[str]) -> np.ndarray``.
-        texts: One or more texts to fuse (must be non-empty).
+        texts: One or more texts to fuse (must be non-empty); the first is
+            the query, the rest (if any) are passage-like expansion text.
 
     Returns:
         Raw float32 bytes of the fused vector for sqlite-vec.
     """
     import numpy as np
 
-    vecs = embedder.embed(texts)
+    query_text, *extra_texts = texts
+    vecs = embedder.embed([query_text], role="query")
+    if extra_texts:
+        vecs = np.vstack([vecs, embedder.embed(extra_texts, role="passage")])
     fused = vecs.mean(axis=0)
     norm = float(np.linalg.norm(fused))
     if norm > 1e-9:
@@ -1835,7 +1846,7 @@ def _semantic_search(
         if extra_texts:
             query_bytes = _fuse_query_embedding(embedder, [query, *extra_texts])
         else:
-            query_bytes = embedder.embed_one(query)
+            query_bytes = embedder.embed_one(query, role="query")
         # Filters are applied after the KNN, so over-fetch harder when they
         # can prune candidates (DI-03).
         fanout = _CHUNK_KNN_FANOUT * (4 if (category or tags) else 1)

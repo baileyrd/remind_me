@@ -828,9 +828,9 @@ async def test_reindex_batches_embed_calls(
     call_log: list[list[str]] = []
     original_embed = mock_embedder.embed
 
-    def spy_embed(texts: list[str]):
+    def spy_embed(texts: list[str], *, role="passage"):
         call_log.append(list(texts))
-        return original_embed(texts)
+        return original_embed(texts, role=role)
 
     monkeypatch.setattr(mock_embedder, "embed", spy_embed)
 

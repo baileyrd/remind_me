@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 
@@ -39,6 +39,38 @@ AVAILABILITY_SUCCESS_TTL = 60.0
 """Seconds a successful availability probe stays cached."""
 AVAILABILITY_FAILURE_TTL = 30.0
 """Seconds a failed availability probe / model load stays cached before a retry."""
+
+EmbedRole = Literal["query", "passage"]
+
+# Query/document prefix conventions for embedding-model families that were
+# trained with asymmetric instructions (query-vs-passage embedding
+# asymmetry): searching with an unprefixed query against unprefixed passages
+# still works, but scores noticeably worse than the model's own convention.
+# Matched by substring against the configured model name (lowercased), so
+# both a full HuggingFace/Ollama repo path ("intfloat/e5-base-v2") and a
+# short tag ("e5-large") resolve to the same entry. A model absent from this
+# table (e.g. the ONNX default sentence-transformers/all-MiniLM-L6-v2, which
+# has no such convention) gets no prefix — identical to behavior before this
+# table existed.
+_ROLE_PREFIXES: dict[str, dict[EmbedRole, str]] = {
+    "nomic-embed-text": {"query": "search_query: ", "passage": "search_document: "},
+    "e5-": {"query": "query: ", "passage": "passage: "},
+    # BGE's own convention only instructs the query side; passages are
+    # embedded as-is. See https://huggingface.co/BAAI/bge-large-en-v1.5.
+    "bge-": {
+        "query": "Represent this sentence for searching relevant passages: ",
+        "passage": "",
+    },
+}
+
+
+def _prefix_for(model_name: str, role: EmbedRole) -> str:
+    """Return the query/passage prefix for *model_name*, or "" if none applies."""
+    name = model_name.lower()
+    for key, prefixes in _ROLE_PREFIXES.items():
+        if key in name:
+            return prefixes[role]
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +223,7 @@ class _Embedder:
             )
             raise
 
-    def embed(self, texts: list[str]) -> np.ndarray:
+    def embed(self, texts: list[str], *, role: EmbedRole = "passage") -> np.ndarray:
         """Embed a batch of texts using the ONNX model.
 
         Tokenizes the texts, runs a forward pass through the ONNX session,
@@ -208,6 +240,11 @@ class _Embedder:
         Args:
             texts: List of strings to embed (each truncated to 512 tokens; use
                 chunk_text() upstream to embed longer content as several windows).
+            role: Whether these texts are search queries or indexed passages
+                (query/document embedding prefix asymmetry). Models with a
+                known convention (see ``_ROLE_PREFIXES``) get the matching
+                instruction prefix prepended before tokenizing; other models
+                (e.g. the ONNX default) are unaffected.
 
         Returns:
             Float32 numpy array of shape (N, dim), L2-normalised.
@@ -215,6 +252,9 @@ class _Embedder:
         self._ensure_loaded()
         if not texts:
             return np.empty((0, self.dim), dtype=np.float32)
+        prefix = _prefix_for(self.model_name, role)
+        if prefix:
+            texts = [prefix + t for t in texts]
         batch = max(1, EMBED_FORWARD_BATCH)
         if len(texts) <= batch:
             return self._embed_forward(texts)
@@ -247,7 +287,7 @@ class _Embedder:
         norms = np.linalg.norm(pooled, axis=1, keepdims=True).clip(min=1e-9)
         return (pooled / norms).astype(np.float32)
 
-    def embed_one(self, text: str) -> bytes:
+    def embed_one(self, text: str, *, role: EmbedRole = "passage") -> bytes:
         """Embed a single text and return the vector as raw bytes.
 
         Convenience wrapper around embed() that packs the float32 numpy
@@ -256,12 +296,13 @@ class _Embedder:
 
         Args:
             text: The text to embed.
+            role: See :meth:`embed` — query/passage prefix asymmetry.
 
         Returns:
             Raw bytes of the float32 embedding vector, suitable for
             insertion into a sqlite-vec embedding column.
         """
-        vec = self.embed([text])[0]
+        vec = self.embed([text], role=role)[0]
         return vec.tobytes()
 
     @property
@@ -316,10 +357,21 @@ class OllamaEmbedder:
             AVAILABILITY_SUCCESS_TTL if ok else AVAILABILITY_FAILURE_TTL
         )
 
-    def embed(self, texts: list[str]) -> np.ndarray:
-        """Embed a batch of texts via Ollama, returning L2-normalised float32 vectors."""
+    def embed(self, texts: list[str], *, role: EmbedRole = "passage") -> np.ndarray:
+        """Embed a batch of texts via Ollama, returning L2-normalised float32 vectors.
+
+        Args:
+            texts: The texts to embed.
+            role: Whether these are search queries or indexed passages —
+                see module-level ``_ROLE_PREFIXES`` for the per-model-family
+                instruction prefix this applies (e.g. nomic-embed-text's
+                ``search_query:``/``search_document:`` convention).
+        """
         import httpx
 
+        prefix = _prefix_for(self.model, role)
+        if prefix:
+            texts = [prefix + t for t in texts]
         try:
             resp = httpx.post(
                 f"{self.url}/api/embed",
@@ -345,9 +397,14 @@ class OllamaEmbedder:
         norms = np.linalg.norm(arr, axis=1, keepdims=True).clip(min=1e-9)
         return (arr / norms).astype(np.float32)
 
-    def embed_one(self, text: str) -> bytes:
-        """Embed a single text and return raw float32 bytes for sqlite-vec storage."""
-        return self.embed([text])[0].tobytes()
+    def embed_one(self, text: str, *, role: EmbedRole = "passage") -> bytes:
+        """Embed a single text and return raw float32 bytes for sqlite-vec storage.
+
+        Args:
+            text: The text to embed.
+            role: See :meth:`embed` — query/passage prefix asymmetry.
+        """
+        return self.embed([text], role=role)[0].tobytes()
 
     @property
     def available(self) -> bool:

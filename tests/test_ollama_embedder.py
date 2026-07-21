@@ -39,6 +39,19 @@ def _make_post(returned_dim: int, *, fail: bool = False):
     return _post
 
 
+def _make_recording_post(returned_dim: int):
+    """Like _make_post, but also records the exact `input` texts sent."""
+    sent: list[list[str]] = []
+
+    def _post(url, json=None, timeout=None):  # noqa: A002 - mirror httpx.post signature
+        sent.append(json["input"])
+        n = len(json["input"])
+        embeddings = [[float(i + 1)] * returned_dim for i in range(n)]
+        return _FakeResp({"embeddings": embeddings})
+
+    return _post, sent
+
+
 def test_embed_returns_normalised_batch(monkeypatch):
     monkeypatch.setattr(httpx, "post", _make_post(4))
     e = OllamaEmbedder(model="nomic-embed-text", dim=4)
@@ -55,6 +68,42 @@ def test_embed_one_returns_bytes(monkeypatch):
     raw = e.embed_one("hello")
     assert isinstance(raw, bytes)
     assert len(raw) == 8 * 4  # 8 float32 values
+
+
+def test_embed_applies_query_prefix_for_nomic(monkeypatch):
+    post, sent = _make_recording_post(4)
+    monkeypatch.setattr(httpx, "post", post)
+    e = OllamaEmbedder(model="nomic-embed-text", dim=4)
+
+    e.embed(["hello"], role="query")
+    assert sent == [["search_query: hello"]]
+
+
+def test_embed_applies_passage_prefix_for_nomic(monkeypatch):
+    post, sent = _make_recording_post(4)
+    monkeypatch.setattr(httpx, "post", post)
+    e = OllamaEmbedder(model="nomic-embed-text", dim=4)
+
+    e.embed(["hello"], role="passage")
+    assert sent == [["search_document: hello"]]
+
+
+def test_embed_one_threads_role_for_nomic(monkeypatch):
+    post, sent = _make_recording_post(4)
+    monkeypatch.setattr(httpx, "post", post)
+    e = OllamaEmbedder(model="nomic-embed-text", dim=4)
+
+    e.embed_one("hello", role="query")
+    assert sent == [["search_query: hello"]]
+
+
+def test_embed_no_prefix_for_unknown_model(monkeypatch):
+    post, sent = _make_recording_post(4)
+    monkeypatch.setattr(httpx, "post", post)
+    e = OllamaEmbedder(model="some-custom-model", dim=4)
+
+    e.embed(["hello"], role="query")
+    assert sent == [["hello"]]
 
 
 def test_dim_mismatch_raises(monkeypatch):

@@ -25,8 +25,12 @@ class DeterministicEmbedder:
         """Always available — no model to load."""
         return True
 
-    def embed(self, texts: list[str]) -> np.ndarray:
-        """Return an (N, EMBEDDING_DIM) float32 array of L2-normalised vectors."""
+    def embed(self, texts: list[str], *, role: str = "passage") -> np.ndarray:
+        """Return an (N, EMBEDDING_DIM) float32 array of L2-normalised vectors.
+
+        ``role`` is accepted (query/passage prefix asymmetry) but ignored —
+        this embedder has no real model, so there's no prefix convention to apply.
+        """
         rows: list[np.ndarray] = []
         for text in texts:
             seed = int(hashlib.sha256(text.encode()).hexdigest()[:8], 16)
@@ -38,6 +42,6 @@ class DeterministicEmbedder:
             rows.append(vec)
         return np.stack(rows, axis=0)
 
-    def embed_one(self, text: str) -> bytes:
+    def embed_one(self, text: str, *, role: str = "passage") -> bytes:
         """Embed one text and return raw float32 bytes for sqlite-vec storage."""
-        return self.embed([text])[0].tobytes()
+        return self.embed([text], role=role)[0].tobytes()

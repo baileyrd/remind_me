@@ -156,6 +156,38 @@ def test_fuse_is_normalised_mean(mock_embedder):
     assert np.isclose(np.linalg.norm(fused), 1.0, atol=1e-6)
 
 
+class _RoleRecordingEmbedder:
+    """Records the (texts, role) of every embed() call — asserts nothing itself."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple[str, ...], str]] = []
+
+    def embed(self, texts, *, role="passage"):
+        self.calls.append((tuple(texts), role))
+        return np.ones((len(texts), 4), dtype=np.float32)
+
+    def embed_one(self, text, *, role="passage"):
+        return self.embed([text], role=role)[0].tobytes()
+
+
+def test_fuse_query_embedding_uses_query_role_for_query_only():
+    rec = _RoleRecordingEmbedder()
+    _fuse_query_embedding(rec, ["what city"])
+    assert rec.calls == [(("what city",), "query")]
+
+
+def test_fuse_query_embedding_uses_passage_role_for_extra_texts():
+    """The literal query gets role="query"; any HyDE/extra passages get
+    role="passage" since they're synthetic document-like text, not a query
+    (query/document embedding prefix asymmetry, issue #51)."""
+    rec = _RoleRecordingEmbedder()
+    _fuse_query_embedding(rec, ["what city", "a passage about cities"])
+    assert rec.calls == [
+        (("what city",), "query"),
+        (("a passage about cities",), "passage"),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Retrieval effect — the deterministic headline case
 # ---------------------------------------------------------------------------
