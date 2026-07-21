@@ -1749,6 +1749,99 @@ async def test_feedback_rejects_invalid_signal() -> None:
 
 
 # ---------------------------------------------------------------------------
+# remind_me_feedback with query (issue #54: query-contextual feedback)
+# ---------------------------------------------------------------------------
+
+
+async def test_feedback_with_query_does_not_change_base_weight(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """Feedback carrying a query is contextual-only -- base_weight untouched,
+    unlike the same signal without a query (test_feedback_unhelpful_lowers_base_weight)."""
+    mem = memory_factory(content="Feedback contextual tool test")
+
+    result = await remind_me_feedback(
+        FeedbackInput(memory_id=mem["id"], signal="unhelpful", query="what's my favorite editor")
+    )
+    data = json.loads(result)
+
+    assert data["memory_id"] == mem["id"]
+    row = db_conn.execute(
+        "SELECT base_weight FROM memories WHERE id = ?", (mem["id"],)
+    ).fetchone()
+    assert row["base_weight"] == 1.0
+
+
+async def test_feedback_with_query_logs_memory_feedback_row(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    mem = memory_factory(content="Feedback contextual logging test")
+
+    await remind_me_feedback(
+        FeedbackInput(memory_id=mem["id"], signal="helpful", query="what IDE did I mention")
+    )
+
+    row = db_conn.execute(
+        "SELECT memory_id, query, signal FROM memory_feedback WHERE memory_id = ?",
+        (mem["id"],),
+    ).fetchone()
+    assert row is not None
+    assert row["query"] == "what IDE did I mention"
+    assert row["signal"] == "helpful"
+
+
+async def test_feedback_with_query_not_found(db_conn: sqlite3.Connection) -> None:
+    result = await remind_me_feedback(
+        FeedbackInput(memory_id="nonexistent-id-xyz", signal="helpful", query="anything")
+    )
+    data = json.loads(result)
+    assert "error" in data
+
+
+async def test_memory_delete_cleans_up_feedback_rows(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """Deleting a memory removes its query-contextual feedback log too."""
+    mem = memory_factory(content="Feedback cleanup on delete test")
+    await remind_me_feedback(
+        FeedbackInput(memory_id=mem["id"], signal="helpful", query="some query")
+    )
+    assert db_conn.execute(
+        "SELECT COUNT(*) AS n FROM memory_feedback WHERE memory_id = ?", (mem["id"],)
+    ).fetchone()["n"] == 1
+
+    await memory_delete(MemoryDeleteInput(memory_id=mem["id"]))
+
+    assert db_conn.execute(
+        "SELECT COUNT(*) AS n FROM memory_feedback WHERE memory_id = ?", (mem["id"],)
+    ).fetchone()["n"] == 0
+
+
+async def test_search_applies_query_contextual_feedback(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """End-to-end: helpful feedback on a matching query nudges search ranking up."""
+    mem_a = memory_factory(id="feedback-search-a", content="vpn setup notes alpha")
+    mem_b = memory_factory(id="feedback-search-b", content="vpn setup notes beta")
+
+    # Both match the query equally on keyword overlap; give mem_b strong
+    # contextual feedback for this exact query so it should rank above mem_a
+    # despite otherwise tying.
+    for _ in range(10):
+        await remind_me_feedback(
+            FeedbackInput(memory_id=mem_b["id"], signal="helpful", query="vpn setup notes")
+        )
+
+    raw = await memory_search(
+        MemorySearchInput(query="vpn setup notes", response_format=ResponseFormat.JSON, token_budget=0)
+    )
+    payload = json.loads(raw)
+    ids = [m["id"] for m in payload["memories"]]
+    assert mem_a["id"] in ids and mem_b["id"] in ids
+    assert ids.index(mem_b["id"]) < ids.index(mem_a["id"])
+
+
+# ---------------------------------------------------------------------------
 # Neighbor-aware chunk expansion (include_neighbors)
 # ---------------------------------------------------------------------------
 

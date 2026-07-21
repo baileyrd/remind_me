@@ -21,10 +21,14 @@ Key concepts:
 from __future__ import annotations
 
 import math
+import re
 from datetime import UTC, datetime
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
-from remind_me_mcp.db import _get_db, _now_iso
+from remind_me_mcp.db import _get_db, _make_id, _now_iso
+
+if TYPE_CHECKING:
+    import sqlite3
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -59,6 +63,21 @@ BASE_WEIGHT_MAX: float = 3.0
 
 BASE_WEIGHT_MIN: float = 0.1
 """Floor applied to base_weight after negative ("unhelpful") feedback."""
+
+FEEDBACK_SIMILARITY_THRESHOLD: float = 0.3
+"""Minimum Jaccard token-overlap between the current query and a stored
+feedback event's query before that event counts toward
+:func:`contextual_feedback_adjustment` -- below this, the past query is
+considered a different-enough context that the feedback shouldn't apply
+(gap #6: the whole point is *not* punishing/rewarding an unrelated query)."""
+
+FEEDBACK_ADJUSTMENT_CAP: float = 0.4
+"""Maximum absolute fractional adjustment :func:`apply_feedback_adjustment`
+applies to a memory's ``_rrf_score`` (i.e. at most a +/-40% swing), however
+much matching feedback has accumulated. A multiplicative cap rather than an
+absolute one so it composes safely regardless of RRF fusion mode's score
+scale (rank mode's tiny 1/(k+rank) sums vs. score mode's larger [0, N] sums,
+see retrieval.py)."""
 
 
 # ---------------------------------------------------------------------------
@@ -283,34 +302,59 @@ def record_feedback(
     memory_id: str,
     signal: Literal["helpful", "unhelpful"],
     magnitude: float = FEEDBACK_MAGNITUDE,
+    *,
+    query: str | None = None,
 ) -> float | None:
-    """Record helpful/unhelpful feedback on a memory, adjusting its base_weight.
+    """Record helpful/unhelpful feedback on a memory.
 
     Unlike :func:`record_access` (an unsigned, always-positive reinforcement
-    signal derived from ``access_count``), feedback is a *signed* adjustment
-    to ``base_weight`` -- the multiplicative importance term in
-    :func:`compute_vitality`. ``access_count`` is deliberately untouched: it
-    feeds ``sqrt(access_count + 1)`` and has no sensible "negative access"
-    interpretation, so it cannot represent unhelpful feedback.
+    signal derived from ``access_count``), feedback is a *signed* signal.
+    Two modes, selected by whether *query* is given (gap #6):
+
+    - **No query** (back-compat, unchanged): adjusts ``base_weight`` --
+      the multiplicative importance term in :func:`compute_vitality` --
+      globally, exactly as before this parameter existed. ``access_count``
+      is deliberately untouched: it feeds ``sqrt(access_count + 1)`` and has
+      no sensible "negative access" interpretation.
+    - **With a query**: query-contextual instead of global. A memory can be
+      a poor match for "what's my favorite editor" but a perfect match for
+      "what IDE did I mention last year" -- global demotion would punish the
+      second case for the first's feedback. Logs the event (see
+      :func:`record_contextual_feedback`) instead of touching
+      ``base_weight``; the effect is applied only for future queries
+      similar enough to this one, at ranking time
+      (:func:`apply_feedback_adjustment`). ``base_weight``/``vitality``
+      are unchanged, so the memory's current vitality is returned as-is.
 
     Args:
         memory_id: The text primary key of the memory to record feedback for.
         signal: "helpful" scales base_weight up (capped at BASE_WEIGHT_MAX);
-            "unhelpful" scales it down (floored at BASE_WEIGHT_MIN).
-        magnitude: Fractional adjustment applied to base_weight (0-1).
+            "unhelpful" scales it down (floored at BASE_WEIGHT_MIN). In
+            query-contextual mode, the sign/magnitude are stored for a
+            future similarity-weighted read instead.
+        magnitude: Fractional adjustment (0-1) -- applied to base_weight in
+            global mode, stored as-is for the similarity weighting in
+            query-contextual mode.
+        query: The search query this feedback relates to. When given, this
+            is query-contextual feedback (gap #6) rather than a global
+            base_weight mutation.
 
     Returns:
-        The new vitality value, or None if the memory was not found.
+        The memory's current vitality value, or None if the memory was not found.
     """
     db = _get_db()
 
     row = db.execute(
-        "SELECT access_count, decay_rate, base_weight FROM memories WHERE id = ?",
+        "SELECT access_count, decay_rate, base_weight, vitality FROM memories WHERE id = ?",
         (memory_id,),
     ).fetchone()
 
     if row is None:
         return None
+
+    if query:
+        record_contextual_feedback(db, memory_id, query, signal, magnitude)
+        return row["vitality"]
 
     if signal == "helpful":
         new_base_weight = min(BASE_WEIGHT_MAX, row["base_weight"] * (1 + magnitude))
@@ -340,6 +384,146 @@ def record_feedback(
 
 
 # ---------------------------------------------------------------------------
+# Query-contextual feedback (gap #6)
+# ---------------------------------------------------------------------------
+
+_TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
+
+
+def _tokenize_query(query: str) -> set[str]:
+    """Lowercase, alphanumeric-only tokenization for coarse query clustering.
+
+    Deliberately simple (no stemming/stopwords/embeddings): this only needs
+    to distinguish "similar enough to be the same context" from "a different
+    question," and works identically whether or not semantic search
+    (an embedder) is configured.
+    """
+    return {t for t in _TOKEN_PATTERN.findall(query.lower()) if len(t) > 1}
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    """Jaccard similarity (intersection over union) of two token sets."""
+    if not a or not b:
+        return 0.0
+    union = len(a | b)
+    return len(a & b) / union if union else 0.0
+
+
+def record_contextual_feedback(
+    db: sqlite3.Connection,
+    memory_id: str,
+    query: str,
+    signal: Literal["helpful", "unhelpful"],
+    magnitude: float = FEEDBACK_MAGNITUDE,
+) -> str:
+    """Log one query-contextual feedback event (gap #6).
+
+    Does not touch ``base_weight``/``vitality`` -- the event is read back by
+    :func:`apply_feedback_adjustment` at ranking time, weighted by how
+    similar a *future* query is to this one, rather than baked into a
+    single global mutation. Caller is responsible for confirming the memory
+    exists (:func:`record_feedback` does this via its own lookup).
+
+    Args:
+        db: An open SQLite connection.
+        memory_id: The memory this feedback is about.
+        query: The search query this feedback relates to.
+        signal: "helpful" or "unhelpful".
+        magnitude: Stored as-is for the similarity-weighted read.
+
+    Returns:
+        The new feedback row's id.
+    """
+    feedback_id = _make_id(f"{memory_id}:{query}")
+    tokens = " ".join(sorted(_tokenize_query(query)))
+    now = _now_iso()
+    db.execute(
+        """INSERT INTO memory_feedback
+               (id, memory_id, query, query_tokens, signal, magnitude, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (feedback_id, memory_id, query, tokens, signal, magnitude, now),
+    )
+    db.commit()
+    return feedback_id
+
+
+def contextual_feedback_adjustment(db: sqlite3.Connection, memory_id: str, query: str) -> float:
+    """Sum similarity-weighted feedback for *memory_id* against *query*.
+
+    Each stored feedback event with a Jaccard token overlap at or above
+    :data:`FEEDBACK_SIMILARITY_THRESHOLD` against *query* contributes
+    ``+/-magnitude * similarity`` (helpful/unhelpful); events below the
+    threshold (a different-enough past query) contribute nothing -- this is
+    the mechanism that keeps feedback query-contextual instead of global.
+
+    Args:
+        db: An open SQLite connection.
+        memory_id: The memory to look up feedback for.
+        query: The current search query.
+
+    Returns:
+        The total adjustment, clamped to
+        ``+/-FEEDBACK_ADJUSTMENT_CAP``. ``0.0`` if there's no feedback for
+        this memory, or none of it is similar enough to *query* to count.
+    """
+    rows = db.execute(
+        "SELECT query_tokens, signal, magnitude FROM memory_feedback WHERE memory_id = ?",
+        (memory_id,),
+    ).fetchall()
+    if not rows:
+        return 0.0
+
+    query_tokens = _tokenize_query(query)
+    total = 0.0
+    for row in rows:
+        past_tokens = set(row["query_tokens"].split())
+        similarity = _jaccard(query_tokens, past_tokens)
+        if similarity < FEEDBACK_SIMILARITY_THRESHOLD:
+            continue
+        sign = 1.0 if row["signal"] == "helpful" else -1.0
+        total += sign * row["magnitude"] * similarity
+
+    return max(-FEEDBACK_ADJUSTMENT_CAP, min(FEEDBACK_ADJUSTMENT_CAP, total))
+
+
+def apply_feedback_adjustment(query: str, memories: list[dict]) -> list[dict]:
+    """Nudge each memory's ``_rrf_score`` by its query-contextual feedback, then re-sort.
+
+    Mirrors :func:`reranker.maybe_rerank`'s signature and pipeline position
+    (query first, RRF-ranked memories, returns a reordered list) -- meant to
+    run *before* reranking, so the cross-encoder (when enabled) still has
+    final say over the head; this only perturbs the RRF order feeding into
+    it. A memory with no matching feedback (the common case) is untouched.
+
+    The adjustment is multiplicative (``score * (1 + adjustment)``) rather
+    than additive, so it composes safely regardless of RRF fusion mode's
+    score scale (see :data:`FEEDBACK_ADJUSTMENT_CAP`).
+
+    Args:
+        query: The current search query.
+        memories: RRF-ranked memory dicts (best first), each with an ``id``
+            and (usually) a ``_rrf_score`` key.
+
+    Returns:
+        The same memory dicts, reordered by adjusted score. Memories
+        without a ``_rrf_score`` are treated as ``0.0`` for sorting purposes
+        only (defensive; every real caller sets it via ``rank_rrf``).
+    """
+    if not memories or not query:
+        return memories
+
+    db = _get_db()
+    for mem in memories:
+        adjustment = contextual_feedback_adjustment(db, mem["id"], query)
+        if adjustment:
+            mem["_rrf_score"] = mem.get("_rrf_score", 0.0) * (1 + adjustment)
+            mem["_feedback_adjustment"] = adjustment
+
+    memories.sort(key=lambda m: m.get("_rrf_score", 0.0), reverse=True)
+    return memories
+
+
+# ---------------------------------------------------------------------------
 # Exports
 # ---------------------------------------------------------------------------
 
@@ -349,13 +533,18 @@ __all__ = [
     "BRIDGE_MULTIPLIER",
     "BRIDGE_THRESHOLD",
     "DECAY_RATES",
+    "FEEDBACK_ADJUSTMENT_CAP",
     "FEEDBACK_MAGNITUDE",
+    "FEEDBACK_SIMILARITY_THRESHOLD",
     "VITALITY_FLOOR",
+    "apply_feedback_adjustment",
     "compute_vitality",
+    "contextual_feedback_adjustment",
     "effective_vitality",
     "get_effective_decay_rate",
     "is_dormant",
     "record_access",
     "record_accesses",
+    "record_contextual_feedback",
     "record_feedback",
 ]

@@ -622,6 +622,13 @@ def build_debug_signals(
         signals["semantic_score"] = memory.get("_semantic_score")
         signals["recency_score"] = memory.get("_recency_score")
         signals["vitality_score"] = memory.get("_vitality_score")
+    # Query-contextual feedback (issue #54) only sets this when at least one
+    # stored feedback event was similar enough to the current query to
+    # count; omitted entirely (not None) otherwise, so the common case (no
+    # matching feedback) adds no new keys.
+    feedback_adjustment = memory.get("_feedback_adjustment")
+    if feedback_adjustment is not None:
+        signals["feedback_adjustment"] = feedback_adjustment
     return signals
 
 

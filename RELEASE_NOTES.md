@@ -1,5 +1,17 @@
 # Release Notes
 
+## v1.10.0 — 2026-07-21
+
+Closes the biggest gap in the feedback loop flagged in the application capability review: `record_feedback` (`vitality.py`) always adjusted `base_weight` globally, silently discarding `FeedbackInput`'s `query` field — a memory marked unhelpful for "what's my favorite editor" got demoted for every future query, including an unrelated "what IDE did I mention last year."
+
+### New Features
+
+- **Query-contextual feedback** — `remind_me_feedback` now has two modes, selected by whether `query` is given:
+  - **No `query`** (back-compat, unchanged): the original global `base_weight` mutation.
+  - **With `query`**: query-contextual instead. The event is logged (memory, query, normalized query-token set, signal, magnitude) to a new `memory_feedback` table (schema v17) rather than touching `base_weight`/vitality. At ranking time, a new `vitality.apply_feedback_adjustment` (wired into `memory_search` right before reranking, mirroring `maybe_rerank`'s position in the pipeline) compares the current query against every stored feedback query for each candidate memory using Jaccard token-overlap similarity — no embedder dependency, works identically with or without semantic search configured — and nudges `_rrf_score` by up to ±40% (`FEEDBACK_ADJUSTMENT_CAP`) for matches above `FEEDBACK_SIMILARITY_THRESHOLD` (0.3). A memory with no matching feedback is completely unaffected.
+  - `memory_delete` now also cleans up a memory's `memory_feedback` rows, mirroring the existing `memory_entities` cleanup.
+  - Purely local bookkeeping: no sync outbox trigger, same explicit scope decision as `dbs_imports`/`mempalace_imports` — feedback given on one device doesn't (yet) propagate to others.
+
 ## v1.9.0 — 2026-07-21
 
 Closes a query-routing gap flagged in the application capability review: `choose_rrf_weights` (the `strategy="auto"` heuristic router) routed purely on word count, `?`, and quoted phrases, with no awareness of temporal expressions — even though `temporal-reasoning` is one of the two weakest query categories documented in `benchmarks/RESULTS.md`.
