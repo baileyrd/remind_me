@@ -40,6 +40,7 @@ from remind_me_mcp.db import (
 )
 from remind_me_mcp.exporter import EXPORT_FORMATS, collect_export_records, export_memories, render_export
 from remind_me_mcp.importer import IMPORT_KINDS, import_chat_file, import_directory
+from remind_me_mcp.vitality import DECAY_RATES
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, MutableMapping
@@ -57,6 +58,13 @@ log = logging.getLogger("remind_me_mcp.api")
 # FT-04: entity:NAME / entity:"Full Name" filter token in the search query —
 # parity with the MCP search surface's structured-query syntax.
 _ENTITY_QUERY_PATTERN = re.compile(r'entity:"([^"]+)"|entity:(\S+)')
+
+# Bulk endpoints (issue #16) take an explicit id list rather than a filter —
+# a dashboard selects a batch from a list/search result, then acts on
+# exactly that selection, rather than a filter silently matching more than
+# intended with no preview step. Capped for the same reason ConsolidateInput
+# caps its candidate pool: a bounded worst case per request.
+_MAX_BULK_IDS = 200
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +362,7 @@ def _build_api_app() -> Starlette:
                 "total": total,
                 "count": len(memories),
                 "offset": offset,
+                "limit": limit,
                 "has_more": total > offset + limit,
                 "memories": memories,
             })
@@ -372,6 +381,11 @@ def _build_api_app() -> Starlette:
         entity path. With no free text remaining, matching memories are
         listed newest-first instead of FTS-ranked; an unknown entity yields
         an empty result with a message.
+
+        Paginated (issue #16): ``offset``/``limit`` query params, response
+        carries ``total``/``has_more`` alongside ``count``/``memories`` --
+        parity with ``api_list``, so a client can page through results
+        beyond the ``limit`` cap instead of only ever seeing the head.
         """
         import sqlite3 as _sqlite3
 
@@ -382,6 +396,7 @@ def _build_api_app() -> Starlette:
 
         try:
             limit = min(_int_param(params, "limit", 50), 200)
+            offset = max(_int_param(params, "offset", 0), 0)
         except ValueError as e:
             return _json_err(str(e))
 
@@ -420,7 +435,11 @@ def _build_api_app() -> Starlette:
                 ent = _resolve_entity(db, entity_query)
                 if ent is None:
                     return _json_ok({
+                        "total": 0,
                         "count": 0,
+                        "offset": offset,
+                        "limit": limit,
+                        "has_more": False,
                         "memories": [],
                         "message": f"No entity found matching {entity_query!r}.",
                     })
@@ -435,27 +454,45 @@ def _build_api_app() -> Starlette:
 
             try:
                 if query:
+                    total = db.execute(
+                        f"""SELECT COUNT(*) as cnt FROM memories m
+                           JOIN memories_fts fts ON m.rowid = fts.rowid
+                           WHERE memories_fts MATCH ?{conditions}{entity_conditions}""",
+                        [query, *bindings, *entity_bindings],
+                    ).fetchone()["cnt"]
                     rows = db.execute(
                         f"""SELECT m.* FROM memories m
                            JOIN memories_fts fts ON m.rowid = fts.rowid
                            WHERE memories_fts MATCH ?{conditions}{entity_conditions}
-                           ORDER BY rank LIMIT ?""",
-                        [query, *bindings, *entity_bindings, limit],
+                           ORDER BY rank LIMIT ? OFFSET ?""",
+                        [query, *bindings, *entity_bindings, limit, offset],
                     ).fetchall()
                 else:
                     # entity:-only query — no FTS text left; list the
                     # entity's memories newest-first.
+                    total = db.execute(
+                        f"""SELECT COUNT(*) as cnt FROM memories m
+                           WHERE 1=1{conditions}{entity_conditions}""",
+                        [*bindings, *entity_bindings],
+                    ).fetchone()["cnt"]
                     rows = db.execute(
                         f"""SELECT m.* FROM memories m
                            WHERE 1=1{conditions}{entity_conditions}
-                           ORDER BY m.created_at DESC LIMIT ?""",
-                        [*bindings, *entity_bindings, limit],
+                           ORDER BY m.created_at DESC LIMIT ? OFFSET ?""",
+                        [*bindings, *entity_bindings, limit, offset],
                     ).fetchall()
             except _sqlite3.OperationalError as e:
                 return _json_err(f"Search error: {e}")
 
             memories = [_row_to_dict(r) for r in rows]
-            return _json_ok({"count": len(memories), "memories": memories})
+            return _json_ok({
+                "total": total,
+                "count": len(memories),
+                "offset": offset,
+                "limit": limit,
+                "has_more": total > offset + limit,
+                "memories": memories,
+            })
 
         return await asyncio.to_thread(_work)
 
@@ -714,6 +751,193 @@ def _build_api_app() -> Starlette:
 
         return await asyncio.to_thread(_work)
 
+    async def _bulk_ids_from_body(request: Request) -> tuple[list[str], JSONResponse | None]:
+        """Parse and validate a bulk request body's ``ids`` list.
+
+        Returns ``(ids, None)`` on success or ``([], error_response)`` on
+        validation failure, so callers can ``if err: return err`` uniformly.
+        """
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            return [], _json_err(f"Invalid JSON body: {e}")
+        ids = body.get("ids")
+        if not isinstance(ids, list) or not ids:
+            return [], _json_err("'ids' must be a non-empty array of memory ids")
+        if len(ids) > _MAX_BULK_IDS:
+            return [], _json_err(f"'ids' exceeds the {_MAX_BULK_IDS}-id limit per request")
+        if not all(isinstance(i, str) and i for i in ids):
+            return [], _json_err("'ids' must be an array of non-empty strings")
+        return ids, None
+
+    async def api_bulk_delete(request: Request) -> JSONResponse:
+        """Delete multiple memories by id in one request (issue #16).
+
+        Body: ``{"ids": ["id1", "id2", ...]}`` (max 200). Applies the exact
+        same per-memory logic as ``DELETE /api/memories/{id}`` (chunk vector
+        + ANN cleanup, memory_entities cleanup, soft-delete when sync is
+        configured) to each id independently — one missing id doesn't fail
+        the rest of the batch.
+        """
+        import sqlite3 as _sqlite3
+
+        ids, err = await _bulk_ids_from_body(request)
+        if err is not None:
+            return err
+
+        def _work() -> JSONResponse:
+            import contextlib
+
+            db = _get_db()
+            deleted: list[str] = []
+            not_found: list[str] = []
+            now = _now_iso()
+            for memory_id in ids:
+                row = db.execute(
+                    "SELECT rowid FROM memories WHERE id = ? AND deleted_at IS NULL",
+                    (memory_id,),
+                ).fetchone()
+                if row is None:
+                    not_found.append(memory_id)
+                    continue
+                removed_vec_rowids: list[int] = []
+                with contextlib.suppress(_sqlite3.OperationalError):
+                    removed_vec_rowids = _delete_chunks(db, row[0])
+                db.execute("DELETE FROM memory_entities WHERE memory_id = ?", (memory_id,))
+                if SYNC_ENABLED:
+                    db.execute(
+                        "UPDATE memories SET deleted_at = ?, updated_at = ? WHERE id = ?",
+                        (now, now, memory_id),
+                    )
+                else:
+                    db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+                db.commit()
+                for vec_rowid in removed_vec_rowids:
+                    ann_index.remove_vector(db, vec_rowid)
+                deleted.append(memory_id)
+            return _json_ok({"deleted": deleted, "not_found": not_found})
+
+        return await asyncio.to_thread(_work)
+
+    async def api_bulk_tag(request: Request) -> JSONResponse:
+        """Add, remove, or set tags on multiple memories in one request (issue #16).
+
+        Body: ``{"ids": [...], "tags": ["a", "b"], "mode": "add"}`` (max 200
+        ids). ``mode`` is ``"add"`` (default, union onto each memory's
+        existing tags), ``"remove"`` (drop these tags if present), or
+        ``"set"`` (replace each memory's tags wholesale).
+        """
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            return _json_err(f"Invalid JSON body: {e}")
+
+        ids = body.get("ids")
+        if not isinstance(ids, list) or not ids:
+            return _json_err("'ids' must be a non-empty array of memory ids")
+        if len(ids) > _MAX_BULK_IDS:
+            return _json_err(f"'ids' exceeds the {_MAX_BULK_IDS}-id limit per request")
+        if not all(isinstance(i, str) and i for i in ids):
+            return _json_err("'ids' must be an array of non-empty strings")
+
+        tags = body.get("tags")
+        if not isinstance(tags, list) or not tags or not all(isinstance(t, str) and t for t in tags):
+            return _json_err("'tags' must be a non-empty array of non-empty strings")
+
+        mode = body.get("mode", "add")
+        if mode not in ("add", "remove", "set"):
+            return _json_err("'mode' must be one of: add, remove, set")
+
+        def _work() -> JSONResponse:
+            db = _get_db()
+            updated: list[str] = []
+            not_found: list[str] = []
+            now = _now_iso()
+            for memory_id in ids:
+                row = db.execute(
+                    "SELECT tags FROM memories WHERE id = ? AND deleted_at IS NULL",
+                    (memory_id,),
+                ).fetchone()
+                if row is None:
+                    not_found.append(memory_id)
+                    continue
+                try:
+                    current = json.loads(row["tags"])
+                    if not isinstance(current, list):
+                        current = []
+                except (json.JSONDecodeError, TypeError):
+                    current = []
+                if mode == "set":
+                    new_tags = list(dict.fromkeys(tags))
+                elif mode == "remove":
+                    new_tags = [t for t in current if t not in tags]
+                else:  # "add"
+                    new_tags = list(dict.fromkeys([*current, *tags]))
+                db.execute(
+                    "UPDATE memories SET tags = ?, updated_at = ? WHERE id = ?",
+                    (json.dumps(new_tags), now, memory_id),
+                )
+                updated.append(memory_id)
+            db.commit()
+            return _json_ok({"updated": updated, "not_found": not_found})
+
+        return await asyncio.to_thread(_work)
+
+    async def api_bulk_reclassify(request: Request) -> JSONResponse:
+        """Apply memory_type classifications to multiple memories (issue #16).
+
+        Body: ``{"classifications": [{"memory_id": "...", "memory_type":
+        "..."}, ...]}`` (max 200 entries) — mirrors the
+        ``remind_me_reclassify`` MCP tool exactly: sets each memory's
+        memory_type and its matching decay_rate from ``DECAY_RATES``.
+        """
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            return _json_err(f"Invalid JSON body: {e}")
+
+        classifications = body.get("classifications")
+        if not isinstance(classifications, list) or not classifications:
+            return _json_err("'classifications' must be a non-empty array")
+        if len(classifications) > _MAX_BULK_IDS:
+            return _json_err(f"'classifications' exceeds the {_MAX_BULK_IDS}-entry limit per request")
+        for c in classifications:
+            if not isinstance(c, dict) or not c.get("memory_id") or not c.get("memory_type"):
+                return _json_err(
+                    "each classification must be {'memory_id': str, 'memory_type': str}"
+                )
+
+        def _work() -> JSONResponse:
+            db = _get_db()
+            now = _now_iso()
+            updated = 0
+            not_found: list[str] = []
+            for c in classifications:
+                memory_id = c["memory_id"]
+                memory_type = c["memory_type"]
+                row = db.execute(
+                    "SELECT id FROM memories WHERE id = ? AND deleted_at IS NULL",
+                    (memory_id,),
+                ).fetchone()
+                if row is None:
+                    not_found.append(memory_id)
+                    continue
+                decay_rate = DECAY_RATES.get(memory_type, 0.10)
+                db.execute(
+                    """UPDATE memories SET memory_type = ?, decay_rate = ?, updated_at = ?
+                       WHERE id = ?""",
+                    (memory_type, decay_rate, now, memory_id),
+                )
+                updated += 1
+            db.commit()
+            return _json_ok({
+                "updated": updated,
+                "not_found": not_found,
+                "total": len(classifications),
+            })
+
+        return await asyncio.to_thread(_work)
+
     async def api_import(request: Request) -> JSONResponse:
         """Import a chat export or document file (or directory) into the memory store.
 
@@ -848,6 +1072,9 @@ def _build_api_app() -> Starlette:
         Route("/api/memories", api_list, methods=["GET"]),
         Route("/api/memories", api_add, methods=["POST"]),
         Route("/api/memories/search", api_search),
+        Route("/api/memories/bulk/delete", api_bulk_delete, methods=["POST"]),
+        Route("/api/memories/bulk/tag", api_bulk_tag, methods=["POST"]),
+        Route("/api/memories/bulk/reclassify", api_bulk_reclassify, methods=["POST"]),
         Route("/api/memories/{memory_id}", api_get, methods=["GET"]),
         Route("/api/memories/{memory_id}", api_update, methods=["PUT", "PATCH"]),
         Route("/api/memories/{memory_id}", api_delete, methods=["DELETE"]),

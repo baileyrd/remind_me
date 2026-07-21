@@ -191,18 +191,32 @@ paths:
             type: integer
             default: 50
             maximum: 200
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+            minimum: 0
         - $ref: "#/components/parameters/Category"
         - $ref: "#/components/parameters/Tags"
       responses:
         "200":
-          description: OK. If an `entity:` token doesn't resolve, count is 0 and `message` explains why.
+          description: OK. If an `entity:` token doesn't resolve, total/count are 0 and `message` explains why.
           content:
             application/json:
               schema:
                 type: object
                 properties:
+                  total:
+                    type: integer
                   count:
                     type: integer
+                  offset:
+                    type: integer
+                  limit:
+                    type: integer
+                  has_more:
+                    type: boolean
                   memories:
                     type: array
                     items:
@@ -210,13 +224,166 @@ paths:
                   message:
                     type: string
         "400":
-          description: Missing `q`, invalid `limit`, or malformed FTS5 query syntax.
+          description: Missing `q`, invalid `limit`/`offset`, or malformed FTS5 query syntax.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
         "401":
           $ref: "#/components/responses/Unauthorized"
+
+  /api/memories/bulk/delete:
+    post:
+      operationId: bulkDeleteMemories
+      summary: Delete multiple memories by id in one request
+      description: |
+        Applies the exact same per-memory logic as `DELETE /api/memories/{id}`
+        (chunk vector + ANN cleanup, soft-delete when sync is configured) to
+        each id independently -- a missing id doesn't fail the rest of the
+        batch, it's reported in `not_found` instead. Capped at 200 ids per
+        request; select the batch client-side (from a list/search result)
+        rather than passing a filter, so a request can never silently affect
+        more than the caller explicitly selected.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids]
+              properties:
+                ids:
+                  type: array
+                  items:
+                    type: string
+                  minItems: 1
+                  maxItems: 200
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:
+                    type: array
+                    items:
+                      type: string
+                  not_found:
+                    type: array
+                    items:
+                      type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+
+  /api/memories/bulk/tag:
+    post:
+      operationId: bulkTagMemories
+      summary: Add, remove, or set tags on multiple memories in one request
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids, tags]
+              properties:
+                ids:
+                  type: array
+                  items:
+                    type: string
+                  minItems: 1
+                  maxItems: 200
+                tags:
+                  type: array
+                  items:
+                    type: string
+                  minItems: 1
+                mode:
+                  type: string
+                  enum: [add, remove, set]
+                  default: add
+                  description: >-
+                    add: union onto each memory's existing tags (default).
+                    remove: drop these tags if present. set: replace each
+                    memory's tags wholesale.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  updated:
+                    type: array
+                    items:
+                      type: string
+                  not_found:
+                    type: array
+                    items:
+                      type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+
+  /api/memories/bulk/reclassify:
+    post:
+      operationId: bulkReclassifyMemories
+      summary: Apply memory_type classifications to multiple memories
+      description: |
+        Mirrors the `remind_me_reclassify` MCP tool exactly: sets each
+        memory's `memory_type` and its matching `decay_rate`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [classifications]
+              properties:
+                classifications:
+                  type: array
+                  minItems: 1
+                  maxItems: 200
+                  items:
+                    type: object
+                    required: [memory_id, memory_type]
+                    properties:
+                      memory_id:
+                        type: string
+                      memory_type:
+                        type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  updated:
+                    type: integer
+                  not_found:
+                    type: array
+                    items:
+                      type: string
+                  total:
+                    type: integer
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
 
   /api/memories/{memory_id}:
     parameters:

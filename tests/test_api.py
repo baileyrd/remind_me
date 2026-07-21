@@ -299,6 +299,242 @@ def test_api_delete_not_found(client: TestClient) -> None:
 
 
 # ---------------------------------------------------------------------------
+# POST /api/memories/bulk/delete (issue #16)
+# ---------------------------------------------------------------------------
+
+
+def test_api_bulk_delete_multiple(client: TestClient, memory_factory) -> None:
+    mem1 = memory_factory(content="bulk delete target one")
+    mem2 = memory_factory(content="bulk delete target two")
+
+    response = client.post("/api/memories/bulk/delete", json={"ids": [mem1["id"], mem2["id"]]})
+    assert response.status_code == 200
+    data = response.json()
+    assert set(data["deleted"]) == {mem1["id"], mem2["id"]}
+    assert data["not_found"] == []
+
+    assert client.get(f"/api/memories/{mem1['id']}").status_code == 404
+    assert client.get(f"/api/memories/{mem2['id']}").status_code == 404
+
+
+def test_api_bulk_delete_partial_not_found(client: TestClient, memory_factory) -> None:
+    mem = memory_factory(content="exists for bulk delete")
+    response = client.post(
+        "/api/memories/bulk/delete", json={"ids": [mem["id"], "nonexistent-id"]}
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["deleted"] == [mem["id"]]
+    assert data["not_found"] == ["nonexistent-id"]
+
+
+def test_api_bulk_delete_empty_ids_rejected(client: TestClient) -> None:
+    response = client.post("/api/memories/bulk/delete", json={"ids": []})
+    assert response.status_code == 400
+
+
+def test_api_bulk_delete_missing_ids_rejected(client: TestClient) -> None:
+    response = client.post("/api/memories/bulk/delete", json={})
+    assert response.status_code == 400
+
+
+def test_api_bulk_delete_too_many_ids_rejected(client: TestClient) -> None:
+    response = client.post("/api/memories/bulk/delete", json={"ids": [f"id{i}" for i in range(201)]})
+    assert response.status_code == 400
+
+
+def test_api_bulk_delete_non_string_id_rejected(client: TestClient) -> None:
+    response = client.post("/api/memories/bulk/delete", json={"ids": ["ok-id", 123]})
+    assert response.status_code == 400
+
+
+def test_api_bulk_delete_soft_deletes_when_sync_enabled(
+    client: TestClient, memory_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirrors single-delete: soft delete (tombstone) when sync is configured."""
+    import remind_me_mcp.api as api_mod
+
+    monkeypatch.setattr(api_mod, "SYNC_ENABLED", True)
+    mem = memory_factory(content="bulk soft delete target")
+
+    response = client.post("/api/memories/bulk/delete", json={"ids": [mem["id"]]})
+    assert response.status_code == 200
+    assert response.json()["deleted"] == [mem["id"]]
+
+    # Still present in the DB (tombstoned), just excluded from normal reads.
+    from remind_me_mcp.db import _get_db
+    row = _get_db().execute(
+        "SELECT deleted_at FROM memories WHERE id = ?", (mem["id"],)
+    ).fetchone()
+    assert row["deleted_at"] is not None
+
+
+# ---------------------------------------------------------------------------
+# POST /api/memories/bulk/tag (issue #16)
+# ---------------------------------------------------------------------------
+
+
+def test_api_bulk_tag_add_mode(client: TestClient, memory_factory) -> None:
+    mem1 = memory_factory(content="tag target one", tags=["existing"])
+    mem2 = memory_factory(content="tag target two", tags=[])
+
+    response = client.post(
+        "/api/memories/bulk/tag",
+        json={"ids": [mem1["id"], mem2["id"]], "tags": ["new-tag"]},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert set(data["updated"]) == {mem1["id"], mem2["id"]}
+
+    r1 = client.get(f"/api/memories/{mem1['id']}").json()
+    r2 = client.get(f"/api/memories/{mem2['id']}").json()
+    assert r1["tags"] == ["existing", "new-tag"]
+    assert r2["tags"] == ["new-tag"]
+
+
+def test_api_bulk_tag_set_mode_replaces_wholesale(client: TestClient, memory_factory) -> None:
+    mem = memory_factory(content="tag set target", tags=["old-a", "old-b"])
+    response = client.post(
+        "/api/memories/bulk/tag",
+        json={"ids": [mem["id"]], "tags": ["replacement"], "mode": "set"},
+    )
+    assert response.status_code == 200
+    row = client.get(f"/api/memories/{mem['id']}").json()
+    assert row["tags"] == ["replacement"]
+
+
+def test_api_bulk_tag_remove_mode(client: TestClient, memory_factory) -> None:
+    mem = memory_factory(content="tag remove target", tags=["keep", "drop"])
+    response = client.post(
+        "/api/memories/bulk/tag",
+        json={"ids": [mem["id"]], "tags": ["drop"], "mode": "remove"},
+    )
+    assert response.status_code == 200
+    row = client.get(f"/api/memories/{mem['id']}").json()
+    assert row["tags"] == ["keep"]
+
+
+def test_api_bulk_tag_add_deduplicates(client: TestClient, memory_factory) -> None:
+    mem = memory_factory(content="tag dedup target", tags=["shared"])
+    response = client.post(
+        "/api/memories/bulk/tag",
+        json={"ids": [mem["id"]], "tags": ["shared"]},
+    )
+    assert response.status_code == 200
+    row = client.get(f"/api/memories/{mem['id']}").json()
+    assert row["tags"] == ["shared"]
+
+
+def test_api_bulk_tag_partial_not_found(client: TestClient, memory_factory) -> None:
+    mem = memory_factory(content="tag exists target")
+    response = client.post(
+        "/api/memories/bulk/tag",
+        json={"ids": [mem["id"], "nonexistent-id"], "tags": ["x"]},
+    )
+    data = response.json()
+    assert data["updated"] == [mem["id"]]
+    assert data["not_found"] == ["nonexistent-id"]
+
+
+def test_api_bulk_tag_invalid_mode_rejected(client: TestClient, memory_factory) -> None:
+    mem = memory_factory(content="tag invalid mode target")
+    response = client.post(
+        "/api/memories/bulk/tag",
+        json={"ids": [mem["id"]], "tags": ["x"], "mode": "bogus"},
+    )
+    assert response.status_code == 400
+
+
+def test_api_bulk_tag_empty_tags_rejected(client: TestClient, memory_factory) -> None:
+    mem = memory_factory(content="tag empty target")
+    response = client.post("/api/memories/bulk/tag", json={"ids": [mem["id"]], "tags": []})
+    assert response.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# POST /api/memories/bulk/reclassify (issue #16)
+# ---------------------------------------------------------------------------
+
+
+def test_api_bulk_reclassify_applies_type_and_decay_rate(client: TestClient, memory_factory) -> None:
+    mem = memory_factory(content="reclassify target", memory_type="unclassified")
+    response = client.post(
+        "/api/memories/bulk/reclassify",
+        json={"classifications": [{"memory_id": mem["id"], "memory_type": "decision"}]},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["updated"] == 1
+    assert data["not_found"] == []
+    assert data["total"] == 1
+
+    from remind_me_mcp.vitality import DECAY_RATES
+    row = client.get(f"/api/memories/{mem['id']}").json()
+    assert row["memory_type"] == "decision"
+    assert row["decay_rate"] == DECAY_RATES["decision"]
+
+
+def test_api_bulk_reclassify_multiple_different_types(client: TestClient, memory_factory) -> None:
+    mem1 = memory_factory(content="reclassify multi one")
+    mem2 = memory_factory(content="reclassify multi two")
+    response = client.post(
+        "/api/memories/bulk/reclassify",
+        json={
+            "classifications": [
+                {"memory_id": mem1["id"], "memory_type": "fact"},
+                {"memory_id": mem2["id"], "memory_type": "blocker"},
+            ]
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["updated"] == 2
+
+    r1 = client.get(f"/api/memories/{mem1['id']}").json()
+    r2 = client.get(f"/api/memories/{mem2['id']}").json()
+    assert r1["memory_type"] == "fact"
+    assert r2["memory_type"] == "blocker"
+
+
+def test_api_bulk_reclassify_partial_not_found(client: TestClient, memory_factory) -> None:
+    mem = memory_factory(content="reclassify exists target")
+    response = client.post(
+        "/api/memories/bulk/reclassify",
+        json={
+            "classifications": [
+                {"memory_id": mem["id"], "memory_type": "insight"},
+                {"memory_id": "nonexistent-id", "memory_type": "fact"},
+            ]
+        },
+    )
+    data = response.json()
+    assert data["updated"] == 1
+    assert data["not_found"] == ["nonexistent-id"]
+    assert data["total"] == 2
+
+
+def test_api_bulk_reclassify_empty_rejected(client: TestClient) -> None:
+    response = client.post("/api/memories/bulk/reclassify", json={"classifications": []})
+    assert response.status_code == 400
+
+
+def test_api_bulk_reclassify_malformed_entry_rejected(client: TestClient) -> None:
+    response = client.post(
+        "/api/memories/bulk/reclassify",
+        json={"classifications": [{"memory_id": "abc"}]},  # missing memory_type
+    )
+    assert response.status_code == 400
+
+
+def test_api_bulk_reclassify_requires_auth(client_with_auth: TestClient, memory_factory) -> None:
+    """Bulk routes are covered by the same /api/ auth gate as everything else."""
+    response = client_with_auth.post(
+        "/api/memories/bulk/reclassify",
+        json={"classifications": [{"memory_id": "abc", "memory_type": "fact"}]},
+    )
+    assert response.status_code == 401
+
+
+# ---------------------------------------------------------------------------
 # GET /api/memories/search
 # ---------------------------------------------------------------------------
 
@@ -329,6 +565,59 @@ def test_api_search_no_results(client: TestClient) -> None:
     assert response.status_code == 200
     data = response.json()
     assert data["count"] == 0
+
+
+def test_api_search_pagination(client: TestClient, memory_factory) -> None:
+    """GET /api/memories/search supports limit/offset pagination (issue #16)."""
+    for i in range(5):
+        memory_factory(content=f"paginated search term entry {i}")
+
+    response = client.get("/api/memories/search?q=paginated&limit=2&offset=0")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 5
+    assert data["count"] == 2
+    assert data["offset"] == 0
+    assert data["limit"] == 2
+    assert data["has_more"] is True
+
+    response = client.get("/api/memories/search?q=paginated&limit=2&offset=4")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 1
+    assert data["has_more"] is False
+
+
+def test_api_search_pagination_no_overlap_across_pages(client: TestClient, memory_factory) -> None:
+    """Consecutive pages return disjoint results (a real offset, not just a cap)."""
+    for i in range(4):
+        memory_factory(content=f"pageset unique entry number {i}")
+
+    page1 = client.get("/api/memories/search?q=pageset&limit=2&offset=0").json()
+    page2 = client.get("/api/memories/search?q=pageset&limit=2&offset=2").json()
+    ids1 = {m["id"] for m in page1["memories"]}
+    ids2 = {m["id"] for m in page2["memories"]}
+    assert ids1.isdisjoint(ids2)
+    assert len(ids1 | ids2) == 4
+
+
+def test_api_search_entity_not_found_includes_pagination_fields(client: TestClient) -> None:
+    """The entity-not-found early return still carries the pagination shape."""
+    response = client.get("/api/memories/search", params={"q": "entity:NoSuchEntity"})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 0
+    assert data["has_more"] is False
+    assert "offset" in data
+    assert "limit" in data
+
+
+def test_api_search_default_pagination_fields_present(client: TestClient, memory_factory) -> None:
+    """Every search response carries the standard pagination envelope."""
+    memory_factory(content="a simple searchable memory")
+    response = client.get("/api/memories/search?q=searchable")
+    data = response.json()
+    assert {"total", "count", "offset", "limit", "has_more", "memories"} <= data.keys()
 
 
 def test_api_search_category_filter_applies_before_limit(
