@@ -2553,7 +2553,7 @@ wheels = [
 
 [[package]]
 name = "remind-me-mcp"
-version = "1.18.0"
+version = "1.19.0"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },

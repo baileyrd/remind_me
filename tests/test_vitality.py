@@ -19,6 +19,7 @@ from remind_me_mcp.vitality import (
     BASE_WEIGHT_SOURCE_PRIORS,
     BASE_WEIGHT_TYPE_PRIORS,
     BRIDGE_THRESHOLD,
+    CO_RETRIEVAL_MAX_WEIGHT,
     DECAY_RATES,
     FEEDBACK_ADJUSTMENT_CAP,
     FEEDBACK_MAGNITUDE,
@@ -32,6 +33,7 @@ from remind_me_mcp.vitality import (
     is_dormant,
     record_access,
     record_accesses,
+    record_co_retrieval,
     record_contextual_feedback,
     record_feedback,
     seed_base_weight,
@@ -891,3 +893,98 @@ def test_build_vitality_report_matches_mcp_tool_output(db_conn: sqlite3.Connecti
     tool_data = _json.loads(tool_output)
 
     assert tool_data == report
+
+
+# ---------------------------------------------------------------------------
+# record_co_retrieval (issue #9) — co-retrieval reinforcement
+# ---------------------------------------------------------------------------
+
+
+def test_record_co_retrieval_creates_association(db_conn: sqlite3.Connection) -> None:
+    a = _insert_access_row(db_conn, "co-retrieval-a")
+    b = _insert_access_row(db_conn, "co-retrieval-b")
+
+    touched = record_co_retrieval([a, b])
+
+    assert touched == 1
+    row = db_conn.execute(
+        "SELECT weight FROM memory_associations WHERE memory_id_a = ? AND memory_id_b = ?",
+        tuple(sorted((a, b))),
+    ).fetchone()
+    assert row["weight"] == 1
+
+
+def test_record_co_retrieval_reinforces_on_repeat(db_conn: sqlite3.Connection) -> None:
+    a = _insert_access_row(db_conn, "co-retrieval-reinforce-a")
+    b = _insert_access_row(db_conn, "co-retrieval-reinforce-b")
+
+    record_co_retrieval([a, b])
+    record_co_retrieval([a, b])
+    record_co_retrieval([a, b])
+
+    row = db_conn.execute(
+        "SELECT weight FROM memory_associations WHERE memory_id_a = ? AND memory_id_b = ?",
+        tuple(sorted((a, b))),
+    ).fetchone()
+    assert row["weight"] == 3
+
+
+def test_record_co_retrieval_canonical_pair_order(db_conn: sqlite3.Connection) -> None:
+    """(a, b) and (b, a) reinforce the SAME row, not two separate ones."""
+    a = _insert_access_row(db_conn, "co-retrieval-order-a")
+    b = _insert_access_row(db_conn, "co-retrieval-order-b")
+
+    record_co_retrieval([a, b])
+    record_co_retrieval([b, a])
+
+    count = db_conn.execute("SELECT COUNT(*) FROM memory_associations").fetchone()[0]
+    assert count == 1
+    row = db_conn.execute("SELECT weight FROM memory_associations").fetchone()
+    assert row["weight"] == 2
+
+
+def test_record_co_retrieval_caps_weight(db_conn: sqlite3.Connection) -> None:
+    a = _insert_access_row(db_conn, "co-retrieval-cap-a")
+    b = _insert_access_row(db_conn, "co-retrieval-cap-b")
+
+    for _ in range(CO_RETRIEVAL_MAX_WEIGHT + 10):
+        record_co_retrieval([a, b])
+
+    row = db_conn.execute("SELECT weight FROM memory_associations").fetchone()
+    assert row["weight"] == CO_RETRIEVAL_MAX_WEIGHT
+
+
+def test_record_co_retrieval_single_id_is_noop(db_conn: sqlite3.Connection) -> None:
+    a = _insert_access_row(db_conn, "co-retrieval-single")
+
+    touched = record_co_retrieval([a])
+
+    assert touched == 0
+    assert db_conn.execute("SELECT COUNT(*) FROM memory_associations").fetchone()[0] == 0
+
+
+def test_record_co_retrieval_empty_is_noop() -> None:
+    assert record_co_retrieval([]) == 0
+
+
+def test_record_co_retrieval_creates_all_pairs(db_conn: sqlite3.Connection) -> None:
+    ids = [_insert_access_row(db_conn, f"co-retrieval-triple-{i}") for i in range(3)]
+
+    touched = record_co_retrieval(ids)
+
+    assert touched == 3  # 3 choose 2
+    count = db_conn.execute("SELECT COUNT(*) FROM memory_associations").fetchone()[0]
+    assert count == 3
+
+
+def test_record_co_retrieval_pair_cap_bounds_large_result_sets(
+    db_conn: sqlite3.Connection,
+) -> None:
+    """Only the first _CO_RETRIEVAL_PAIR_CAP (10) ids participate in pairing."""
+    ids = [_insert_access_row(db_conn, f"co-retrieval-large-{i}") for i in range(20)]
+
+    touched = record_co_retrieval(ids)
+
+    assert touched == 45  # 10 choose 2, not 20 choose 2 (190)
+    count = db_conn.execute("SELECT COUNT(*) FROM memory_associations").fetchone()[0]
+    assert count == 45

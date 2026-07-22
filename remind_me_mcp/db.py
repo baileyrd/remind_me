@@ -42,6 +42,11 @@ Current schema versions:
             with, so a changed EMBEDDING_MODEL/EMBEDDING_DIM/EMBEDDING_BACKEND
             can be detected at startup and stale vectors cleared instead of
             silently serving garbage nearest-neighbor results.
+  18 -> 19: memory_associations table (issue #9) for co-retrieval
+            reinforcement -- a bounded, undecayed weight per memory pair
+            that appeared together in a search result set, surfaced only as
+            an opt-in expand_co_retrieval search section (never feeding
+            back into ranking).
 """
 
 from __future__ import annotations
@@ -270,7 +275,7 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 # Current target schema version.  Increment when adding a new migration step.
-_SCHEMA_VERSION = 18
+_SCHEMA_VERSION = 19
 
 
 
@@ -417,6 +422,11 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         _migrate_v17_to_v18(db)
         db.execute("PRAGMA user_version = 18")
         current_version = 18
+
+    if current_version < 19:
+        _migrate_v18_to_v19(db)
+        db.execute("PRAGMA user_version = 19")
+        current_version = 19
 
     db.commit()
 
@@ -1577,6 +1587,41 @@ def _migrate_v17_to_v18(db: sqlite3.Connection) -> None:
             value      TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+    """)
+
+
+def _migrate_v18_to_v19(db: sqlite3.Connection) -> None:
+    """v18 -> v19: memory_associations table for co-retrieval reinforcement (issue #9).
+
+    True ACT-R-style memory reinforces associations *between* items
+    retrieved together, not just each item independently -- ``memory_entities``
+    links a memory to entities it mentions, but nothing captured "these two
+    memories tend to be useful together" from actual search co-occurrence.
+    ``memory_id_a``/``memory_id_b`` are stored in canonical (sorted) order so
+    a pair only ever has one row regardless of retrieval order; ``weight`` is
+    a simple bounded counter (see ``vitality.CO_RETRIEVAL_MAX_WEIGHT``) --
+    deliberately no time-decay in this pass (an explicitly flagged, unresolved
+    design question in the issue -- "a project of its own," not a quick add).
+
+    No sync outbox trigger: purely local usage-pattern bookkeeping, same
+    scope decision as ``memory_feedback`` (v16->v17) -- association strength
+    observed on one device doesn't (yet) propagate to others.
+
+    Args:
+        db: An open SQLite connection.
+    """
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS memory_associations (
+            memory_id_a TEXT NOT NULL,
+            memory_id_b TEXT NOT NULL,
+            weight      INTEGER NOT NULL DEFAULT 1,
+            updated_at  TEXT NOT NULL,
+            PRIMARY KEY (memory_id_a, memory_id_b)
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_associations_a
+            ON memory_associations(memory_id_a);
+        CREATE INDEX IF NOT EXISTS idx_memory_associations_b
+            ON memory_associations(memory_id_b);
     """)
 
 

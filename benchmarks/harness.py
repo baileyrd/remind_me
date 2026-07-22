@@ -82,11 +82,14 @@ class Harness:
 
         self._install_embedder()
 
-        # Neutralize the fire-and-forget access recorder: it mutates vitality of
-        # returned rows and spawns background tasks we'd otherwise have to drain.
+        # Neutralize the fire-and-forget background work remind_me_search spawns
+        # after ranking (access recording + co-retrieval reinforcement, issue
+        # #9 -- both bundled into one background task by _record_envelope_access)
+        # so there's nothing left running when teardown() closes the connection.
         # Retrieval results are unaffected because each query runs on a fresh
         # haystack, so this keeps runs clean and deterministic.
-        self._patch("remind_me_mcp.tools", "record_access", lambda *_a, **_k: None)
+        self._patch("remind_me_mcp.tools", "record_accesses", lambda *_a, **_k: None)
+        self._patch("remind_me_mcp.tools", "record_co_retrieval", lambda *_a, **_k: None)
 
     def teardown(self) -> None:
         """Undo all patches and close the database."""

@@ -203,6 +203,18 @@ class MemorySearchInput(BaseModel):
             "main ranking."
         ),
     )
+    expand_co_retrieval: bool = Field(
+        default=False,
+        description=(
+            "Opt-in co-retrieval expansion: after ranking, append up to 5 "
+            "additional non-superseded memories that have previously appeared "
+            "together with the returned results in past search result sets, "
+            "in a separate related_via_co_retrieval section, ordered by "
+            "association strength. Every search passively reinforces these "
+            "associations regardless of this flag; this only controls whether "
+            "they're surfaced. Does not affect the main ranking."
+        ),
+    )
     strategy: RetrievalStrategy = Field(
         default=RetrievalStrategy.AUTO,
         description=(
