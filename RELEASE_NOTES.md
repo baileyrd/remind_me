@@ -1,5 +1,18 @@
 # Release Notes
 
+## v1.19.0 — 2026-07-22
+
+Closes the last item from the application capability review: true ACT-R-style memory reinforces associations *between* items retrieved together, not just each item independently, but nothing previously captured "these two memories tend to be useful together" — the entity graph links a memory to entities it mentions, not to other memories via search co-occurrence.
+
+This was explicitly flagged in the issue as the most ambitious/speculative item on the list, with real design risk around "how to weight, decay, and avoid runaway feedback loops." Rather than attempt the full design (the issue itself calls that "a project of its own"), this ships a deliberately scoped-down slice that captures the core value while sidestepping both flagged risks entirely.
+
+### New Features
+
+- **`memory_associations` table** — a bounded, undecayed weight per memory pair that appeared together in a search result set (`vitality.record_co_retrieval`, capped at `CO_RETRIEVAL_MAX_WEIGHT`). No time-decay math in this pass — a simple cap avoids unbounded growth without needing to solve decay, which the issue itself flags as an unresolved design question.
+- **`expand_co_retrieval` opt-in search flag** — surfaces up to 5 memories most strongly co-retrieved with the current results, in a separate `related_via_co_retrieval` section (`remind_me_search`), ordered by association strength. Every search passively reinforces associations regardless of this flag; it only controls whether they're surfaced.
+- **Never feeds back into ranking** — this is the design choice that eliminates the "runaway feedback loop" risk entirely rather than mitigating it: search results influence what gets recorded, but recorded associations never influence what future rankings look like, only what gets suggested alongside them, the same posture as the existing `expand_entities`/`include_neighbors` expansions.
+- Fixed a related bug found while testing: the benchmark harness neutralized `record_access` (singular), which doesn't exist on the `tools` module — the actual function is `record_accesses` (plural, batch) — so the intended neutralization silently no-op'd. Harmless before (a single fast background statement), but the new co-retrieval write turned this into an occasional deadlock between the benchmark teardown closing the connection and the background write still in flight. Fixed the target name and also neutralize `record_co_retrieval` in benchmark runs.
+
 ## v1.18.0 — 2026-07-22
 
 Closes a dashboard-visibility gap flagged in the application capability review: the knowledge graph is fully built out server-side (`GET /api/entity`, the `remind_me_entity_traverse` MCP tool's multi-hop relations) but had no dashboard UI at all — a human owner had no way to browse "what does the app know about X and how is it connected" without hand-crafting API calls.

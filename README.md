@@ -286,7 +286,7 @@ The stats view replaces the main content area with summary cards, horizontal bar
 
 | Tool | Description |
 |------|-------------|
-| `remind_me_search` | Hybrid search with RRF rank fusion, auto-routed or pinned ranking `strategy`, token budget, dormant exclusion, structured `subject:`/`predicate:`/`entity:` queries, opt-in `expand_entities` graph expansion, and opt-in `include_neighbors` sibling-chunk expansion |
+| `remind_me_search` | Hybrid search with RRF rank fusion, auto-routed or pinned ranking `strategy`, token budget, dormant exclusion, structured `subject:`/`predicate:`/`entity:` queries, opt-in `expand_entities` graph expansion, opt-in `include_neighbors` sibling-chunk expansion, and opt-in `expand_co_retrieval` co-retrieval expansion |
 | `remind_me_entity` | Look up a knowledge-graph entity by name or alias: canonical record, facts, and linked memories |
 | `remind_me_entity_traverse` | Multi-hop traversal of the typed entity-relation graph (1-3 hops, both directions, optional relation filter) — for questions that require chaining relations, not just co-mention |
 | `remind_me_feedback` | Mark a memory helpful/unhelpful for a search result — a signed signal, distinct from the always-positive reinforcement of a plain access. Without `query`: global `base_weight`/vitality adjustment. With `query`: query-contextual instead — only applies to future searches with a similar query |
@@ -986,6 +986,12 @@ An unresolvable `entity:` filter returns an empty result with a message (no sile
 
 Documents and chat exports are chunked on import (per Markdown section or per message); every chunk from the same file is tagged with a shared `doc_id` and a sequential `chunk_index`. Pass `include_neighbors=true` on `remind_me_search` to append up to 5 additional non-superseded sibling chunks — chunk_index ± 1 within the same `doc_id` — for any result that came from an import, in a separate `related_via_neighbors` section that doesn't affect ranking. This surfaces the surrounding context (a preceding heading, a caveat in the next paragraph) that per-chunk retrieval alone can split apart. Manually added memories (`remind_me_add`, `remind_me_auto_capture`, ...) have no `doc_id`/`chunk_index` and are skipped.
 
+### Co-Retrieval Reinforcement
+
+Every `remind_me_search` call passively reinforces a bounded association weight between memories returned together in the same result set (`memory_associations` table, capped at `vitality.CO_RETRIEVAL_MAX_WEIGHT` = 50, only the first 10 ids of a result set pairing per search regardless of `limit`), regardless of any flag. Pass `expand_co_retrieval=true` to surface the strongest associations: up to 5 additional non-superseded memories that have previously appeared alongside the current results, in a separate `related_via_co_retrieval` section, ordered by association strength.
+
+This deliberately never affects ranking — it's a discovery aid, not a scoring input, the same posture as `expand_entities`/`include_neighbors`. That one-way flow (search results → recorded associations → surfaced as *suggestions*, never as a ranking input) is what avoids the runaway-feedback-loop risk that comes with reinforcement learning on ranking itself, without needing any decay math to counteract it. There's deliberately no time-decay in this pass either — just a simple weight cap — a scoped-down slice of the full "learned association weights" idea, not the complete design.
+
 ### Auto-Routing Retrieval Strategy
 
 `remind_me_search`'s `strategy` parameter picks the RRF weight profile used to fuse keyword and semantic ranking:
@@ -1238,6 +1244,13 @@ remind_me is local-first, single-user, and MCP-native by design — some capabil
 ## Changelog
 
 See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for a per-version feature breakdown with PR references; this section summarizes the same history phase-by-phase.
+
+### 1.19.0 — 2026-07-22
+
+Closes the last item from the application capability review: true ACT-R-style memory reinforces associations *between* items retrieved together, not just each item independently — nothing previously captured "these two memories tend to be useful together." Explicitly flagged as the most speculative item on the list, with real design risk around weighting/decay/runaway feedback loops; shipped a deliberately scoped-down slice instead of the full design.
+
+- **Co-retrieval reinforcement** — a new `memory_associations` table tracks a bounded, undecayed weight per memory pair returned together in a search (`vitality.record_co_retrieval`). New opt-in `expand_co_retrieval` flag on `remind_me_search` surfaces the strongest associations in a `related_via_co_retrieval` section. Every search reinforces associations regardless of the flag; only surfacing is opt-in.
+- **Never affects ranking** — the design choice that eliminates the flagged "runaway feedback loop" risk entirely: recorded associations only ever get *suggested*, never fed back into RRF scoring, same posture as `expand_entities`/`include_neighbors`.
 
 ### 1.18.0 — 2026-07-22
 

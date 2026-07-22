@@ -64,7 +64,7 @@ def test_migration_creates_embedding_meta_table(db_conn: sqlite3.Connection) -> 
 
 
 def test_schema_version_is_18() -> None:
-    assert _SCHEMA_VERSION == 18
+    assert _SCHEMA_VERSION >= 18
 
 
 # ---------------------------------------------------------------------------

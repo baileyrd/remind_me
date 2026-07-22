@@ -162,6 +162,7 @@ from remind_me_mcp.tools.search import (
     _apply_filters,
     _detect_structured_query,
     _envelope_json,
+    _expand_via_co_retrieval,
     _expand_via_entities,
     _expand_via_neighbors,
     _record_envelope_access,
@@ -191,6 +192,7 @@ from remind_me_mcp.vitality import (
     get_effective_decay_rate,
     is_dormant,
     record_accesses,
+    record_co_retrieval,
     record_feedback,
 )
 

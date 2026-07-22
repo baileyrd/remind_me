@@ -375,6 +375,74 @@ def record_accesses(memory_ids: list[str]) -> int:
     return len(updates)
 
 
+# ---------------------------------------------------------------------------
+# Co-retrieval reinforcement (issue #9)
+# ---------------------------------------------------------------------------
+
+CO_RETRIEVAL_MAX_WEIGHT = 50
+"""Hard cap on a memory pair's association weight. The issue flags "how to
+weight, decay, and avoid runaway feedback loops" as the real design risk
+here; a simple bounded counter with no time-decay sidesteps both weighting
+and decay complexity for this pass -- deliberately scoped down from the
+issue's "Large" full design (its own text calls that "a project of its own,
+not a quick add")."""
+
+_CO_RETRIEVAL_PAIR_CAP = 10
+"""Only the first N ids of a result set participate in pairing -- bounds the
+O(n^2) pair count per search (10 choose 2 = 45 pairs) regardless of how
+large the caller's result set is."""
+
+
+def record_co_retrieval(memory_ids: list[str]) -> int:
+    """Reinforce co-retrieval associations between memories returned together.
+
+    True ACT-R-style memory reinforces associations *between* items
+    retrieved together, not just each item independently -- ``memory_entities``
+    links a memory to entities it mentions, not to other memories via search
+    co-occurrence, so nothing previously captured "these two memories tend
+    to be useful together."
+
+    This deliberately never feeds back into RRF ranking/scoring: only
+    ``remind_me_search``'s ``expand_co_retrieval`` surfaces the recorded
+    weights, in a separate ``related_via_co_retrieval`` section outside the
+    ranked results -- the same posture as ``expand_entities``/
+    ``include_neighbors``. That one-way flow (search results -> recorded
+    associations -> surfaced as *suggestions*, never as a ranking input) is
+    what keeps the "runaway feedback loop" the issue explicitly warns about
+    off the table entirely, without needing any decay math to counteract it.
+
+    Args:
+        memory_ids: Ids of memories returned together in one search
+            (already ranked/limited by the caller). Only the first
+            ``_CO_RETRIEVAL_PAIR_CAP`` participate in pairing.
+
+    Returns:
+        The number of association rows created or reinforced (0 if fewer
+        than 2 ids were given).
+    """
+    ids = memory_ids[:_CO_RETRIEVAL_PAIR_CAP]
+    if len(ids) < 2:
+        return 0
+
+    db = _get_db()
+    now = _now_iso()
+    touched = 0
+    for i in range(len(ids)):
+        for j in range(i + 1, len(ids)):
+            a, b = sorted((ids[i], ids[j]))
+            db.execute(
+                """INSERT INTO memory_associations (memory_id_a, memory_id_b, weight, updated_at)
+                   VALUES (?, ?, 1, ?)
+                   ON CONFLICT(memory_id_a, memory_id_b) DO UPDATE SET
+                       weight = MIN(weight + 1, ?),
+                       updated_at = excluded.updated_at""",
+                (a, b, now, CO_RETRIEVAL_MAX_WEIGHT),
+            )
+            touched += 1
+    db.commit()
+    return touched
+
+
 def record_access(memory_id: str) -> float | None:
     """Record an access to a memory, updating its vitality in the database.
 

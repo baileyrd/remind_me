@@ -205,11 +205,29 @@ def _sanitize_fts_query(query: str) -> str:
 
 
 def _record_envelope_access(envelope: dict[str, Any]) -> None:
-    """Record access for an envelope's returned results (fire-and-forget, one
-    batched transaction — PF-02/PF-04)."""
+    """Record access for an envelope's returned results, and reinforce
+    co-retrieval associations between them (issue #9) -- one fire-and-forget
+    background task (PF-02/PF-04).
+
+    Both writes are bundled into a single asyncio.to_thread call rather than
+    two separate ones: they're both cheap, best-effort, order-independent
+    writes against the same connection, and spawning two concurrent
+    background threads per search would only add transient lock-contention
+    risk for no benefit. Co-retrieval reinforcement is unconditional here,
+    unlike expand_co_retrieval's surfacing -- every search passively
+    reinforces associations regardless of whether the caller opts in to
+    seeing them.
+    """
     returned_ids = [m["id"] for m in envelope["memories"]]
-    if returned_ids:
-        _pkg._spawn_task(asyncio.to_thread(_pkg.record_accesses, returned_ids))
+    if not returned_ids:
+        return
+
+    def _work() -> None:
+        _pkg.record_accesses(returned_ids)
+        if len(returned_ids) >= 2:
+            _pkg.record_co_retrieval(returned_ids)
+
+    _pkg._spawn_task(asyncio.to_thread(_work))
 
 
 def _envelope_json(envelope: dict[str, Any], extra: dict[str, Any] | None = None) -> str:
@@ -422,6 +440,97 @@ def _fmt_neighbor_expansion_md(related: list[dict[str, Any]]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Co-retrieval expansion (issue #9, opt-in via expand_co_retrieval)
+# ---------------------------------------------------------------------------
+
+# Maximum number of extra memories appended by co-retrieval expansion. Kept
+# small for the same reason as _ENTITY_EXPANSION_CAP: expansions sit OUTSIDE
+# the token-budget envelope, so the cap (plus the 300-char snippets) is what
+# bounds their response cost.
+_CO_RETRIEVAL_EXPANSION_CAP = 5
+
+
+def _expand_via_co_retrieval(
+    db: sqlite3.Connection,
+    memories: list[dict],
+    cap: int = _CO_RETRIEVAL_EXPANSION_CAP,
+) -> list[dict[str, Any]]:
+    """Collect up to *cap* memories most strongly co-retrieved with the given results.
+
+    Surfaces the ``memory_associations`` weighted-edge signal recorded by
+    ``vitality.record_co_retrieval`` -- memories that have appeared together
+    with the seeds in past search result sets, strongest association first.
+    Purely informational: never affects the main ranking (see
+    ``record_co_retrieval``'s docstring for why that matters).
+
+    Access recording (PF-02): like ``_expand_via_entities``, expanded hits
+    are deliberately NOT recorded -- they are a discovery aid, not direct
+    matches for the user's query.
+
+    Args:
+        db: An open SQLite connection.
+        memories: The main ranked results (the seeds).
+        cap: Maximum number of expansion items to return.
+
+    Returns:
+        List of {id, content_snippet, category, created_at,
+        co_retrieval_weight} dicts, strongest association first; empty when
+        there are no seeds or no recorded associations.
+    """
+    seed_ids = [m["id"] for m in memories]
+    if not seed_ids:
+        return []
+    seed_id_set = set(seed_ids)
+    ph = ",".join("?" * len(seed_ids))
+    rows = db.execute(
+        f"""SELECT other_id, weight, substr(m.content, 1, 300) AS content_snippet,
+                   m.category, m.created_at
+            FROM (
+                SELECT memory_id_b AS other_id, weight FROM memory_associations
+                WHERE memory_id_a IN ({ph})
+                UNION ALL
+                SELECT memory_id_a AS other_id, weight FROM memory_associations
+                WHERE memory_id_b IN ({ph})
+            ) assoc
+            JOIN memories m ON m.id = assoc.other_id
+            WHERE m.superseded_by IS NULL AND m.deleted_at IS NULL
+            ORDER BY assoc.weight DESC, m.created_at DESC""",
+        [*seed_ids, *seed_ids],
+    ).fetchall()
+
+    expanded: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        oid = r["other_id"]
+        if oid in seed_id_set or oid in expanded:
+            continue
+        if len(expanded) >= cap:
+            break
+        expanded[oid] = {
+            "id": oid,
+            "content_snippet": r["content_snippet"],
+            "category": r["category"],
+            "created_at": r["created_at"],
+            "co_retrieval_weight": r["weight"],
+        }
+    return list(expanded.values())
+
+
+def _fmt_co_retrieval_expansion_md(related: list[dict[str, Any]]) -> str:
+    """Render the related_via_co_retrieval section for markdown responses."""
+    lines = [
+        f"**Related via co-retrieval** (frequently retrieved together, max {_CO_RETRIEVAL_EXPANSION_CAP}):"
+    ]
+    for item in related:
+        snippet = " ".join(str(item["content_snippet"]).split())
+        if len(snippet) > 120:
+            snippet = snippet[:120] + "…"
+        lines.append(
+            f"- `{item['id']}` {snippet} _(weight: {item['co_retrieval_weight']})_"
+        )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Tool handler
 # ---------------------------------------------------------------------------
 
@@ -522,12 +631,20 @@ async def memory_search(params: MemorySearchInput) -> str:
             if params.include_neighbors:
                 related_neighbors = _expand_via_neighbors(db, envelope["memories"])
 
+            # Opt-in co-retrieval expansion (issue #9; expanded hits are not
+            # access-recorded — see _expand_via_co_retrieval).
+            related_co_retrieval: list[dict[str, Any]] = []
+            if params.expand_co_retrieval:
+                related_co_retrieval = _expand_via_co_retrieval(db, envelope["memories"])
+
             if params.response_format == ResponseFormat.JSON:
                 extra: dict[str, Any] = {}
                 if params.expand_entities:
                     extra["related_via_entities"] = related
                 if params.include_neighbors:
                     extra["related_via_neighbors"] = related_neighbors
+                if params.expand_co_retrieval:
+                    extra["related_via_co_retrieval"] = related_co_retrieval
                 return _envelope_json(envelope, extra=extra or None)
 
             if not envelope["memories"]:
@@ -543,6 +660,8 @@ async def memory_search(params: MemorySearchInput) -> str:
                 parts.append(_fmt_expansion_md(related))
             if related_neighbors:
                 parts.append(_fmt_neighbor_expansion_md(related_neighbors))
+            if related_co_retrieval:
+                parts.append(_fmt_co_retrieval_expansion_md(related_co_retrieval))
             return _maybe_update_notice("\n---\n".join(parts))
 
         # Structured query detected but no results -- fall through to normal search
@@ -726,6 +845,12 @@ async def memory_search(params: MemorySearchInput) -> str:
     if params.include_neighbors:
         related_neighbors = _expand_via_neighbors(db, envelope["memories"])
 
+    # --- Opt-in co-retrieval expansion (issue #9; expanded hits are not
+    # access-recorded — see _expand_via_co_retrieval) ---
+    related_co_retrieval = []  # also annotated in the structured-path branch above
+    if params.expand_co_retrieval:
+        related_co_retrieval = _expand_via_co_retrieval(db, envelope["memories"])
+
     # --- Attach debug signals if verbose (Phase 6: includes the resolved
     # strategy/weight profile actually used for this search) ---
     if params.verbose:
@@ -747,6 +872,8 @@ async def memory_search(params: MemorySearchInput) -> str:
             extra["related_via_entities"] = related
         if params.include_neighbors:
             extra["related_via_neighbors"] = related_neighbors
+        if params.expand_co_retrieval:
+            extra["related_via_co_retrieval"] = related_co_retrieval
         return _envelope_json(envelope, extra=extra)
 
     if not envelope["memories"]:
@@ -795,6 +922,8 @@ async def memory_search(params: MemorySearchInput) -> str:
         parts.append(_fmt_expansion_md(related))
     if related_neighbors:
         parts.append(_fmt_neighbor_expansion_md(related_neighbors))
+    if related_co_retrieval:
+        parts.append(_fmt_co_retrieval_expansion_md(related_co_retrieval))
 
     # Always append tier breakdown summary line
     parts.append(
