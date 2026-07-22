@@ -25,6 +25,7 @@ from remind_me_mcp.db import (
     _entity_id,
     _entity_profile,
     _link_memory_entity,
+    _list_entities,
     _resolve_entity,
     _upsert_entity,
     _upsert_entity_relation,
@@ -221,6 +222,72 @@ async def test_entity_tool_respects_limit(
 
 def test_entity_profile_returns_none_for_unknown(db_conn: sqlite3.Connection) -> None:
     assert _entity_profile(db_conn, "nobody") is None
+
+
+# ---------------------------------------------------------------------------
+# _list_entities (issue #15: GET /api/entities, dashboard entity browser)
+# ---------------------------------------------------------------------------
+
+
+def test_list_entities_empty(db_conn: sqlite3.Connection) -> None:
+    result = _list_entities(db_conn)
+    assert result["total"] == 0
+    assert result["entities"] == []
+    assert result["has_more"] is False
+
+
+def test_list_entities_orders_by_mention_count_desc(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    mem1 = memory_factory(content="one")
+    mem2 = memory_factory(content="two")
+    mem3 = memory_factory(content="three")
+    _mention(db_conn, mem1["id"], "Tailscale")
+    _mention(db_conn, mem2["id"], "Tailscale")
+    _mention(db_conn, mem3["id"], "Docker")
+
+    result = _list_entities(db_conn)
+
+    assert [e["name"] for e in result["entities"]] == ["Tailscale", "Docker"]
+    assert result["entities"][0]["mention_count"] == 2
+    assert result["entities"][1]["mention_count"] == 1
+
+
+def test_list_entities_ties_break_alphabetically(db_conn: sqlite3.Connection) -> None:
+    _upsert_entity(db_conn, "Zebra")
+    _upsert_entity(db_conn, "Apple")
+    db_conn.commit()
+
+    result = _list_entities(db_conn)
+
+    assert [e["name"] for e in result["entities"]] == ["Apple", "Zebra"]
+
+
+def test_list_entities_deserializes_aliases(db_conn: sqlite3.Connection) -> None:
+    _upsert_entity(db_conn, "Bailey Robertson", None, ["BR", "Bailey"])
+    db_conn.commit()
+
+    result = _list_entities(db_conn)
+
+    assert result["entities"][0]["aliases"] == ["BR", "Bailey"]
+
+
+def test_list_entities_pagination_envelope(db_conn: sqlite3.Connection) -> None:
+    for i in range(5):
+        _upsert_entity(db_conn, f"Entity{i}")
+    db_conn.commit()
+
+    result = _list_entities(db_conn, limit=2, offset=0)
+
+    assert result["total"] == 5
+    assert result["count"] == 2
+    assert result["offset"] == 0
+    assert result["limit"] == 2
+    assert result["has_more"] is True
+
+    last_page = _list_entities(db_conn, limit=2, offset=4)
+    assert last_page["count"] == 1
+    assert last_page["has_more"] is False
 
 
 # ---------------------------------------------------------------------------

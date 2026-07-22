@@ -158,6 +158,42 @@ function useWikiStore() {
   return { pages, status, current, setCurrent, loading, refresh, openPage, search };
 }
 
+function useEntityStore() {
+  const [entities, setEntities] = useState([]);
+  const [total, setTotal] = useState(0);
+  const [current, setCurrent] = useState(null); // {entity, facts, memories, total_linked_memories}
+  const [related, setRelated] = useState([]); // 1-hop traversal entities, self excluded
+  const [loading, setLoading] = useState(true);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await api("/entities?limit=100");
+      setEntities(data.entities || []);
+      setTotal(data.total || 0);
+    } catch (e) { console.error("entities:", e); }
+    setLoading(false);
+  }, []);
+
+  const openEntity = useCallback(async (name) => {
+    setLoading(true);
+    try {
+      const profile = await api("/entity?" + new URLSearchParams({ name }));
+      if (profile.error) { setCurrent(null); setRelated([]); setLoading(false); return; }
+      setCurrent(profile);
+      try {
+        const trav = await api("/entity/traverse?" + new URLSearchParams({ name, hops: "1" }));
+        setRelated(trav.error ? [] : (trav.entities || []).filter(e => e.id !== profile.entity.id));
+      } catch (e) { console.error("entity traverse:", e); setRelated([]); }
+    } catch (e) { console.error("entity:", e); setCurrent(null); setRelated([]); }
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  return { entities, total, current, setCurrent, related, loading, refresh, openEntity };
+}
+
 // --- Icons ---
 const Icons = {
   Search: () => React.createElement("svg", {width:16,height:16,viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:2,strokeLinecap:"round"}, React.createElement("circle",{cx:11,cy:11,r:8}), React.createElement("path",{d:"m21 21-4.35-4.35"})),
@@ -309,6 +345,23 @@ function WikiLinkList({label, items, onNavigate}) {
         key:it.slug, onClick:() => onNavigate(it.slug),
         style:{display:"flex",alignItems:"center",gap:4,padding:"4px 10px",borderRadius:12,border:"1px solid "+theme.border,background:theme.surface,color:theme.textSecondary,fontSize:12,fontFamily:mono,cursor:"pointer"},
       }, React.createElement(Icons.Link), it.title))
+    )
+  );
+}
+
+// --- Entities ---
+// Mirrors WikiLinkList's shape (pill buttons that navigate on click), keyed
+// by entity id/name instead of slug/title — used for the "Related Entities"
+// drill-down built from a 1-hop traversal.
+function EntityLinkList({label, items, onNavigate}) {
+  if (!items || !items.length) return null;
+  return React.createElement("div", {style:{marginTop:16}},
+    React.createElement("div",{style:labelSt}, label),
+    React.createElement("div",{style:{display:"flex",flexWrap:"wrap",gap:6}},
+      items.map(it => React.createElement("button",{
+        key:it.id, onClick:() => onNavigate(it.name),
+        style:{display:"flex",alignItems:"center",gap:4,padding:"4px 10px",borderRadius:12,border:"1px solid "+theme.border,background:theme.surface,color:theme.textSecondary,fontSize:12,fontFamily:mono,cursor:"pointer"},
+      }, React.createElement(Icons.Link), it.name))
     )
   );
 }
@@ -491,6 +544,7 @@ function ImportForm({onComplete, onCancel}) {
 function App() {
   const store = useMemoryStore();
   const wikiStore = useWikiStore();
+  const entityStore = useEntityStore();
   const [view, setView] = useState("browse");
   const [searchQuery, setSearchQuery] = useState("");
   const [filterCategory, setFilterCategory] = useState("");
@@ -502,6 +556,7 @@ function App() {
   const [expandedIds, setExpandedIds] = useState(new Set());
   const [wikiQuery, setWikiQuery] = useState("");
   const [wikiSearchResults, setWikiSearchResults] = useState(null);
+  const [entityQuery, setEntityQuery] = useState("");
   const searchRef = useRef(null);
   const debounceRef = useRef(null);
   const wikiDebounceRef = useRef(null);
@@ -543,11 +598,18 @@ function App() {
   const toggleExpand = id => setExpandedIds(prev => { const n=new Set(prev); n.has(id)?n.delete(id):n.add(id); return n; });
   const handleTagClick = tag => { if (!filterTags.includes(tag)) setFilterTags([...filterTags, tag]); };
   const handleWikiNavigate = slug => { wikiStore.openPage(slug); setWikiQuery(""); setWikiSearchResults(null); };
+  const handleEntityNavigate = name => { entityStore.openEntity(name); setEntityQuery(""); };
 
   const stats = store.stats;
   const vitality = store.vitality;
   const allCategories = Object.keys(stats.categories||{});
   const allTags = Object.keys(stats.tags||{}).sort((a,b)=>(stats.tags[b]||0)-(stats.tags[a]||0));
+  const entityQueryLower = entityQuery.trim().toLowerCase();
+  const filteredEntities = entityQueryLower
+    ? entityStore.entities.filter(e =>
+        e.name.toLowerCase().includes(entityQueryLower) ||
+        (e.aliases||[]).some(a => a.toLowerCase().includes(entityQueryLower)))
+    : entityStore.entities;
 
   return React.createElement("div", {style:{minHeight:"100vh",background:theme.bg,color:theme.text,fontFamily:sans}},
     React.createElement("style",null,"@keyframes spin{to{transform:rotate(360deg)}}"),
@@ -563,7 +625,7 @@ function App() {
       React.createElement("div",{style:{display:"flex",alignItems:"center",gap:8}},
         store.loading && React.createElement("span",{style:{color:theme.textMuted}}, React.createElement(Icons.Loader)),
         React.createElement("div",{style:{display:"flex",background:theme.surface,borderRadius:6,border:"1px solid "+theme.border,overflow:"hidden"}},
-          [["browse","Browse"],["stats","Stats"],["wiki","Wiki"]].map(([v,l])=>React.createElement("button",{key:v,onClick:()=>setView(v),style:{padding:"6px 14px",border:"none",fontSize:12,fontFamily:mono,fontWeight:500,cursor:"pointer",background:view===v?theme.accent:"transparent",color:view===v?"#fff":theme.textSecondary,transition:"all 0.15s"}},
+          [["browse","Browse"],["stats","Stats"],["wiki","Wiki"],["entities","Entities"]].map(([v,l])=>React.createElement("button",{key:v,onClick:()=>setView(v),style:{padding:"6px 14px",border:"none",fontSize:12,fontFamily:mono,fontWeight:500,cursor:"pointer",background:view===v?theme.accent:"transparent",color:view===v?"#fff":theme.textSecondary,transition:"all 0.15s"}},
             l, v==="wiki" && wikiStore.status.pending_compile>0 && React.createElement("span",{style:{marginLeft:6,padding:"1px 6px",borderRadius:8,background:view===v?"rgba(255,255,255,0.25)":theme.warningSubtle,color:view===v?"#fff":theme.warning,fontSize:10,fontWeight:700}}, wikiStore.status.pending_compile)
           ))
         ),
@@ -610,6 +672,25 @@ function App() {
           !wikiStore.loading && (wikiSearchResults||wikiStore.pages).length===0 && React.createElement("div",{style:{fontSize:12,color:theme.textMuted,fontFamily:sans,padding:"8px 10px"}}, wikiQuery ? "No matches." : "The wiki is empty. Ask Claude to run remind_me_wiki_compile.")
         )
       ),
+      view==="entities" && React.createElement("aside",{style:{width:240,borderRight:"1px solid "+theme.border,padding:"20px 16px",flexShrink:0,position:"sticky",top:69,height:"calc(100vh - 69px)",overflowY:"auto"}},
+        React.createElement("div",{style:{position:"relative",marginBottom:16}},
+          React.createElement("div",{style:{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",color:theme.textMuted}}, React.createElement(Icons.Search)),
+          React.createElement("input",{value:entityQuery,onChange:e=>setEntityQuery(e.target.value),placeholder:"Filter entities…",style:{...inputSt,paddingLeft:32,fontSize:13,padding:"7px 10px 7px 32px"}})
+        ),
+        React.createElement("div",{style:{...labelSt,marginBottom:10}}, filteredEntities.length+" of "+entityStore.total+" entit"+(entityStore.total===1?"y":"ies")),
+        React.createElement("div",{style:{display:"flex",flexDirection:"column",gap:2}},
+          filteredEntities.map(e=>React.createElement("button",{
+            key:e.id, onClick:()=>handleEntityNavigate(e.name),
+            style:{display:"flex",alignItems:"center",justifyContent:"space-between",width:"100%",textAlign:"left",padding:"7px 10px",borderRadius:5,border:"none",background:entityStore.current&&entityStore.current.entity.id===e.id?theme.accentSubtle:"transparent",color:entityStore.current&&entityStore.current.entity.id===e.id?theme.accent:theme.textSecondary,fontSize:13,fontFamily:sans,cursor:"pointer",fontWeight:entityStore.current&&entityStore.current.entity.id===e.id?600:400},
+          },
+            React.createElement("span",null, e.name),
+            React.createElement("span",{style:{fontSize:11,fontFamily:mono,opacity:0.7,flexShrink:0,marginLeft:8}}, e.mention_count)
+          )),
+          !entityStore.loading && filteredEntities.length===0 && React.createElement("div",{style:{fontSize:12,color:theme.textMuted,fontFamily:sans,padding:"8px 10px"}},
+            entityQuery ? "No matches." : "No entities yet. They're created automatically when Claude extracts facts via remind_me_decompose or remind_me_annotate."
+          )
+        )
+      ),
       // Main
       React.createElement("main",{style:{flex:1,padding:"20px 24px",minWidth:0}},
         view==="browse" ? React.createElement(React.Fragment,null,
@@ -651,6 +732,46 @@ function App() {
           React.createElement("div",{style:{color:theme.textMuted,marginBottom:12,display:"flex",justifyContent:"center"}}, React.createElement(Icons.Book)),
           React.createElement("div",{style:{fontSize:15,marginBottom:6}}, wikiStore.pages.length===0 ? "The wiki is empty" : "Select a page"),
           React.createElement("div",{style:{fontSize:13}}, wikiStore.pages.length===0 ? "Ask Claude to run remind_me_wiki_compile to synthesise one from your memories." : "Pick a page from the list on the left.")
+        )) :
+        view==="entities" ?
+        // Entity detail view
+        (entityStore.current ? React.createElement("div",null,
+          React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:12}},
+            React.createElement("div",null,
+              React.createElement("h2",{style:{margin:0,fontFamily:sans,fontWeight:700,fontSize:20,letterSpacing:"-0.02em"}}, entityStore.current.entity.name),
+              entityStore.current.entity.kind && React.createElement("span",{style:{fontSize:11,color:theme.textMuted,fontFamily:mono}}, entityStore.current.entity.kind)
+            ),
+            React.createElement("button",{onClick:()=>entityStore.setCurrent(null),style:{background:"none",border:"none",color:theme.textSecondary,fontSize:12,fontFamily:mono,cursor:"pointer",display:"flex",alignItems:"center",gap:4}}, React.createElement(Icons.X), " Close")
+          ),
+          (entityStore.current.entity.aliases||[]).length>0 && React.createElement("div",{style:{marginBottom:12,display:"flex",flexWrap:"wrap",gap:4}},
+            entityStore.current.entity.aliases.map(a=>React.createElement(TagPill,{key:a,tag:a}))
+          ),
+          React.createElement("div",{style:{background:theme.surface,border:"1px solid "+theme.border,borderRadius:8,padding:"20px 24px"}},
+            React.createElement("div",{style:labelSt}, "Facts ("+entityStore.current.facts.length+")"),
+            entityStore.current.facts.length===0 ?
+              React.createElement("div",{style:{fontSize:13,color:theme.textMuted,fontFamily:sans,marginBottom:16}},"No structured facts yet.") :
+              React.createElement("div",{style:{display:"flex",flexDirection:"column",gap:8,marginBottom:16}},
+                entityStore.current.facts.map(f=>React.createElement("div",{key:f.id,style:{fontFamily:mono,fontSize:13,color:theme.text,padding:"8px 10px",background:theme.surfaceActive,borderRadius:5}},
+                  f.subject && f.predicate && f.object ?
+                    React.createElement("span",null, React.createElement("b",null,f.subject)," ",f.predicate," ",React.createElement("b",null,f.object)) :
+                    f.content
+                ))
+              ),
+            React.createElement("div",{style:labelSt}, "Linked Memories ("+entityStore.current.total_linked_memories+")"),
+            entityStore.current.memories.length===0 ?
+              React.createElement("div",{style:{fontSize:13,color:theme.textMuted,fontFamily:sans}},"No linked memories.") :
+              React.createElement("div",{style:{display:"flex",flexDirection:"column",gap:8}},
+                entityStore.current.memories.map(m=>React.createElement("div",{key:m.id,style:{fontSize:13,fontFamily:sans,color:theme.text,padding:"8px 10px",background:theme.surfaceActive,borderRadius:5,lineHeight:1.5}},
+                  React.createElement(CategoryBadge,{category:m.category}),
+                  React.createElement("div",{style:{marginTop:4}}, m.content_snippet)
+                ))
+              ),
+            React.createElement(EntityLinkList,{label:"Related Entities",items:entityStore.related,onNavigate:handleEntityNavigate})
+          )
+        ) : React.createElement("div",{style:{textAlign:"center",padding:"80px 20px",color:theme.textMuted}},
+          React.createElement("div",{style:{color:theme.textMuted,marginBottom:12,display:"flex",justifyContent:"center"}}, React.createElement(Icons.Brain)),
+          React.createElement("div",{style:{fontSize:15,marginBottom:6}}, entityStore.entities.length===0 ? "No entities yet" : "Select an entity"),
+          React.createElement("div",{style:{fontSize:13}}, entityStore.entities.length===0 ? "Entities are created automatically when Claude extracts facts via remind_me_decompose or remind_me_annotate." : "Pick an entity from the list on the left.")
         )) :
         // Stats view
         React.createElement("div",null,

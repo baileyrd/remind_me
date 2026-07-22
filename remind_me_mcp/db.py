@@ -2519,6 +2519,144 @@ def _entity_profile(
     }
 
 
+def _list_entities(
+    db: sqlite3.Connection, *, limit: int = 50, offset: int = 0
+) -> dict[str, Any]:
+    """List entities, most-mentioned first, for the dashboard entity browser (issue #15).
+
+    There's no equivalent MCP tool for this — ``remind_me_entity`` is a
+    lookup-by-name/alias tool, browsing everything by list is a
+    dashboard-only need — so this is used only by ``GET /api/entities``.
+
+    Args:
+        db: An open SQLite connection.
+        limit: Maximum entities to return.
+        offset: Pagination offset.
+
+    Returns:
+        Dict with the standard pagination envelope (``total``/``count``/
+        ``offset``/``limit``/``has_more``, matching ``GET /api/memories``)
+        plus ``entities`` — each with ``id``/``name``/``kind``/``aliases``/
+        ``updated_at``/``mention_count`` (linked-memory count via
+        ``memory_entities``, used to surface the most-referenced entities
+        first rather than an arbitrary or purely alphabetical order).
+    """
+    total = db.execute("SELECT COUNT(*) AS cnt FROM entities").fetchone()["cnt"]
+    rows = db.execute(
+        """SELECT e.id, e.name, e.kind, e.aliases, e.updated_at,
+                  COUNT(me.memory_id) AS mention_count
+           FROM entities e
+           LEFT JOIN memory_entities me ON me.entity_id = e.id
+           GROUP BY e.id
+           ORDER BY mention_count DESC, e.name ASC
+           LIMIT ? OFFSET ?""",
+        (limit, offset),
+    ).fetchall()
+    entities = [_row_to_dict(r) for r in rows]
+    return {
+        "total": total,
+        "count": len(entities),
+        "offset": offset,
+        "limit": limit,
+        "has_more": total > offset + limit,
+        "entities": entities,
+    }
+
+
+# Default cap on relation edges returned by a traversal. Unlike the search
+# expansion caps (which bound response cost against a token budget), this
+# also bounds worst-case query volume across hops -- see EntityTraverseInput.
+_RELATION_TRAVERSAL_CAP = 20
+
+
+def _expand_via_entity_relations(
+    db: sqlite3.Connection,
+    seed_entity_ids: list[str],
+    hops: int = 1,
+    relation: str | None = None,
+    cap: int = _RELATION_TRAVERSAL_CAP,
+) -> list[dict[str, Any]]:
+    """Breadth-first traversal of the typed entity-relation graph.
+
+    Follows ``entity_relations`` edges in both directions (subject->object
+    and object->subject) up to *hops* steps, so a traversal from "Bailey"
+    surfaces both relations Bailey is the subject of and relations naming
+    Bailey as the object. Each hop only queries the *newly* discovered
+    entities from the previous hop (the seed-set stays out of later
+    frontiers), so an edge is never refetched once both its endpoints have
+    already been visited -- this is what makes the walk terminate on cycles
+    without an explicit depth-first "seen" check per edge.
+
+    Shared by the ``remind_me_entity_traverse`` MCP tool
+    (tools/entity.py) and ``GET /api/entity/traverse`` (issue #15).
+
+    Args:
+        db: An open SQLite connection.
+        seed_entity_ids: Entity ids to start the traversal from.
+        hops: Maximum traversal depth (1-3 recommended; larger values are
+            still safe -- bounded by *cap* and the shrinking frontier).
+        relation: Optional exact-match filter on the relation label.
+        cap: Maximum number of edges to return, across all hops.
+
+    Returns:
+        List of {subject_entity_id, subject_name, subject_kind, relation,
+        object_entity_id, object_name, object_kind, hop} dicts, in
+        breadth-first order (hop 1 edges first).
+    """
+    seen_entities: set[str] = set(seed_entity_ids)
+    frontier: set[str] = set(seed_entity_ids)
+    edges: list[dict[str, Any]] = []
+    seen_edge_ids: set[str] = set()
+
+    for hop in range(1, hops + 1):
+        if not frontier or len(edges) >= cap:
+            break
+        placeholders = ",".join("?" * len(frontier))
+        bindings: list[Any] = [*frontier, *frontier]
+        relation_clause = ""
+        if relation:
+            relation_clause = " AND r.relation = ?"
+            bindings.append(relation)
+
+        rows = db.execute(
+            f"""SELECT r.id, r.subject_entity_id, r.relation, r.object_entity_id,
+                       s.name AS subject_name, s.kind AS subject_kind,
+                       o.name AS object_name, o.kind AS object_kind
+                FROM entity_relations r
+                JOIN entities s ON s.id = r.subject_entity_id
+                JOIN entities o ON o.id = r.object_entity_id
+                WHERE (r.subject_entity_id IN ({placeholders})
+                       OR r.object_entity_id IN ({placeholders})){relation_clause}
+                ORDER BY r.created_at""",
+            bindings,
+        ).fetchall()
+
+        next_frontier: set[str] = set()
+        for r in rows:
+            if r["id"] in seen_edge_ids:
+                continue
+            if len(edges) >= cap:
+                break
+            seen_edge_ids.add(r["id"])
+            edges.append({
+                "subject_entity_id": r["subject_entity_id"],
+                "subject_name": r["subject_name"],
+                "subject_kind": r["subject_kind"],
+                "relation": r["relation"],
+                "object_entity_id": r["object_entity_id"],
+                "object_name": r["object_name"],
+                "object_kind": r["object_kind"],
+                "hop": hop,
+            })
+            for nbr in (r["subject_entity_id"], r["object_entity_id"]):
+                if nbr not in seen_entities:
+                    seen_entities.add(nbr)
+                    next_frontier.add(nbr)
+        frontier = next_frontier
+
+    return edges
+
+
 def _supersede_contradicting_facts(
     db: sqlite3.Connection,
     memory_id: str,
@@ -2650,6 +2788,8 @@ __all__ = [
     "_upsert_entity_relation",
     "_resolve_entity",
     "_entity_profile",
+    "_list_entities",
+    "_expand_via_entity_relations",
     "_supersede_contradicting_facts",
     "_row_to_dict",
 ]

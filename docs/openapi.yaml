@@ -576,6 +576,171 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /api/entities:
+    get:
+      operationId: listEntities
+      summary: List entities, most-mentioned first (issue #15)
+      description: |
+        There's no equivalent MCP tool -- `remind_me_entity` is
+        lookup-by-name/alias only -- this is a dashboard-only need, powering
+        the entity browser's list panel.
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+            maximum: 200
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total:
+                    type: integer
+                  count:
+                    type: integer
+                  offset:
+                    type: integer
+                  limit:
+                    type: integer
+                  has_more:
+                    type: boolean
+                  entities:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        name:
+                          type: string
+                        kind:
+                          type: string
+                          nullable: true
+                        aliases:
+                          type: array
+                          items:
+                            type: string
+                        updated_at:
+                          type: string
+                        mention_count:
+                          type: integer
+                          description: Number of linked memories (via memory_entities).
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/entity/traverse:
+    get:
+      operationId: getEntityTraversal
+      summary: Multi-hop traversal of the typed entity-relation graph (issue #15)
+      description: |
+        Mirrors the `remind_me_entity_traverse` MCP tool: follows
+        `entity_relations` edges in both directions from the starting
+        entity, up to `hops` steps. Used by the dashboard's entity detail
+        panel to drill down into related entities.
+      parameters:
+        - name: name
+          in: query
+          required: true
+          description: Starting entity name or alias.
+          schema:
+            type: string
+        - name: hops
+          in: query
+          schema:
+            type: integer
+            default: 1
+            minimum: 1
+            maximum: 3
+        - name: relation
+          in: query
+          description: Optional exact-match filter on the relation label.
+          schema:
+            type: string
+        - name: cap
+          in: query
+          description: Maximum number of edges returned, across all hops.
+          schema:
+            type: integer
+            default: 20
+            maximum: 100
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entity:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      name:
+                        type: string
+                      kind:
+                        type: string
+                        nullable: true
+                  hops:
+                    type: integer
+                  edges:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        subject_entity_id:
+                          type: string
+                        subject_name:
+                          type: string
+                        subject_kind:
+                          type: string
+                          nullable: true
+                        relation:
+                          type: string
+                        object_entity_id:
+                          type: string
+                        object_name:
+                          type: string
+                        object_kind:
+                          type: string
+                          nullable: true
+                        hop:
+                          type: integer
+                  entities:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        name:
+                          type: string
+                        kind:
+                          type: string
+                          nullable: true
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: No entity found matching `name`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /api/wiki:
     get:
       operationId: listWikiPages

@@ -1,5 +1,18 @@
 # Release Notes
 
+## v1.18.0 — 2026-07-22
+
+Closes a dashboard-visibility gap flagged in the application capability review: the knowledge graph is fully built out server-side (`GET /api/entity`, the `remind_me_entity_traverse` MCP tool's multi-hop relations) but had no dashboard UI at all — a human owner had no way to browse "what does the app know about X and how is it connected" without hand-crafting API calls.
+
+### New Features
+
+- **New "Entities" dashboard view** — a clickable entity list (most-mentioned first, with a client-side name/alias filter) plus a detail panel showing an entity's structured facts, linked memories, and a "Related Entities" drill-down built from a 1-hop traversal, mirroring the existing Wiki view's list+detail layout.
+- **`GET /api/entities`** — new paginated REST route listing every entity (most-mentioned first via a `mention_count` computed from `memory_entities`), for the dashboard's entity list. No equivalent MCP tool exists for this — `remind_me_entity` is lookup-by-name/alias only — browsing everything by list is a dashboard-only need.
+- **`GET /api/entity/traverse`** — new REST route exposing the same multi-hop `entity_relations` graph walk as the `remind_me_entity_traverse` MCP tool, for the dashboard's drill-down. The traversal logic (`_expand_via_entity_relations`) was moved from `tools/entity.py` into `db.py` so the MCP tool and the new REST route share one implementation instead of duplicating it — the same pattern already used for `_entity_profile`/`GET /api/entity`.
+- `docs/openapi.yaml` updated with both new routes.
+
+Per the issue's own "Alternatives considered," entity browsing stays a separate dashboard view rather than folding into the Wiki view — they're different data models (curated wiki pages vs. the raw entity/relation graph) and warrant separate UIs, as the issue anticipated.
+
 ## v1.17.0 — 2026-07-22
 
 Closes a dashboard-visibility gap flagged in the application capability review: `remind_me_vitality_report` computes the app's core "memory going stale" model — active/dormant counts, vault health score, vitality-bucket distribution — but none of it was surfaced in the dashboard, only reachable via the MCP tool.
