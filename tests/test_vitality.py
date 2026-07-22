@@ -25,6 +25,7 @@ from remind_me_mcp.vitality import (
     FEEDBACK_SIMILARITY_THRESHOLD,
     VITALITY_FLOOR,
     apply_feedback_adjustment,
+    build_vitality_report,
     compute_vitality,
     contextual_feedback_adjustment,
     get_effective_decay_rate,
@@ -795,3 +796,98 @@ def test_apply_feedback_adjustment_ignores_dissimilar_query(db_conn: sqlite3.Con
 
     assert result[0]["_rrf_score"] == 0.5
     assert "_feedback_adjustment" not in result[0]
+
+
+# ---------------------------------------------------------------------------
+# build_vitality_report (issue #14) — dashboard vitality visualization
+# ---------------------------------------------------------------------------
+
+
+def test_build_vitality_report_empty_store(db_conn: sqlite3.Connection) -> None:
+    report = build_vitality_report(db_conn)
+
+    assert report["total_memories"] == 0
+    assert report["active_count"] == 0
+    assert report["dormant_count"] == 0
+    assert report["average_vitality"] == 0.0
+    assert report["vault_health_score"] == "0%"
+    assert report["decay_distribution"] == {}
+
+
+def test_build_vitality_report_buckets_sum_to_total(db_conn: sqlite3.Connection) -> None:
+    """Every memory lands in exactly one bucket (DI-04: the top bucket is open-ended)."""
+    _insert_access_row(db_conn, "bucket-fresh-1")
+    _insert_access_row(db_conn, "bucket-fresh-2", access_count=5)
+
+    report = build_vitality_report(db_conn)
+
+    assert sum(report["vitality_buckets"].values()) == report["total_memories"] == 2
+    assert set(report["vitality_buckets"]) == {
+        "0.00-0.05",
+        "0.05-0.25",
+        "0.25-0.50",
+        "0.50-0.75",
+        "0.75+",
+    }
+
+
+def test_build_vitality_report_fresh_memories_are_active(db_conn: sqlite3.Connection) -> None:
+    _insert_access_row(db_conn, "active-report-test")
+
+    report = build_vitality_report(db_conn)
+
+    assert report["active_count"] == 1
+    assert report["dormant_count"] == 0
+    assert report["vault_health_score"] == "100%"
+    assert report["vitality_buckets"]["0.75+"] == 1
+
+
+def test_build_vitality_report_dormant_memory_counted(db_conn: sqlite3.Connection) -> None:
+    """A memory decayed far enough in the past is dormant, not active."""
+    from datetime import UTC, datetime, timedelta
+
+    old = (datetime.now(UTC) - timedelta(days=3650)).isoformat()
+    mem_id = _make_id("long-dormant-report-test")
+    db_conn.execute(
+        """INSERT INTO memories (id, content, category, tags, source, metadata,
+           created_at, updated_at, accessed_at, access_count, decay_rate, vitality, base_weight, status, memory_type)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (mem_id, "long dormant report test", "general", "[]", "manual", "{}",
+         old, old, old, 0, 0.1, 1.0, 1.0, "active", "unclassified"),
+    )
+    db_conn.commit()
+
+    report = build_vitality_report(db_conn)
+
+    assert report["dormant_count"] == 1
+    assert report["active_count"] == 0
+    assert report["vitality_buckets"]["0.00-0.05"] == 1
+
+
+def test_build_vitality_report_decay_distribution_by_type(db_conn: sqlite3.Connection) -> None:
+    mem_id = _insert_access_row(db_conn, "decision-report-test")
+    db_conn.execute("UPDATE memories SET memory_type = 'decision' WHERE id = ?", (mem_id,))
+    db_conn.commit()
+
+    report = build_vitality_report(db_conn)
+
+    assert report["decay_distribution"] == {"decision": 1}
+
+
+def test_build_vitality_report_matches_mcp_tool_output(db_conn: sqlite3.Connection) -> None:
+    """The extracted function's shape matches what remind_me_vitality_report returns."""
+    import asyncio
+    import json as _json
+
+    from remind_me_mcp.models import ResponseFormat, VitalityReportInput
+    from remind_me_mcp.tools.lifecycle import remind_me_vitality_report
+
+    _insert_access_row(db_conn, "shared-shape-report-test")
+
+    report = build_vitality_report(db_conn)
+    tool_output = asyncio.run(
+        remind_me_vitality_report(VitalityReportInput(response_format=ResponseFormat.JSON))
+    )
+    tool_data = _json.loads(tool_output)
+
+    assert tool_data == report

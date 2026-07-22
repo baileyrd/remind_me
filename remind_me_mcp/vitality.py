@@ -25,7 +25,7 @@ import re
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal
 
-from remind_me_mcp.db import _get_db, _make_id, _now_iso
+from remind_me_mcp.db import _get_db, _make_id, _now_iso, _row_to_dict
 
 if TYPE_CHECKING:
     import sqlite3
@@ -245,6 +245,77 @@ def effective_vitality(memory: dict, now: datetime | None = None) -> float:
             days = max(0.0, (now - last_dt).total_seconds() / 86400.0)
 
     return compute_vitality(base_weight, access_count, effective_rate, days)
+
+
+def build_vitality_report(db: sqlite3.Connection) -> dict:
+    """Compute the vault vitality report: counts, buckets, and health score.
+
+    Shared by ``remind_me_vitality_report`` (tools/lifecycle.py) and the
+    ``GET /api/vitality`` REST route (issue #14) so the bucket math lives in
+    exactly one place instead of being duplicated between the MCP tool and
+    the dashboard's REST surface.
+
+    Args:
+        db: An open SQLite connection.
+
+    Returns:
+        A dict with ``total_memories``, ``active_count``, ``dormant_count``,
+        ``average_vitality``, ``vault_health_score`` (e.g. ``"82%"``),
+        ``decay_distribution`` (``{memory_type: count}``), and
+        ``vitality_buckets`` (``{bucket_label: count}``).
+    """
+    # Effective (read-time) vitality per memory — the stored column is a
+    # stale at-access snapshot (DI-04).
+    rows = db.execute("SELECT * FROM memories").fetchall()
+    total = len(rows)
+    vitalities = [effective_vitality(_row_to_dict(r)) for r in rows]
+
+    # Core counts (dormancy from effective vitality, not the stored status)
+    dormant_count = sum(1 for v in vitalities if is_dormant(v))
+    active_count = total - dormant_count
+
+    # Average vitality
+    avg_vitality = round(sum(vitalities) / total, 2) if total > 0 else 0.0
+
+    # Decay distribution by memory_type
+    type_rows = db.execute(
+        "SELECT memory_type, COUNT(*) as cnt FROM memories GROUP BY memory_type"
+    ).fetchall()
+    decay_distribution = {r["memory_type"]: r["cnt"] for r in type_rows}
+
+    # Vitality buckets. The top bucket is open-ended: accessed memories exceed
+    # 1.0 (one access -> sqrt(2) ~= 1.41), so a closed bucket would lose them
+    # and the counts wouldn't sum to the total (DI-04).
+    bucket_ranges = [
+        ("0.00-0.05", 0.0, 0.05),
+        ("0.05-0.25", 0.05, 0.25),
+        ("0.25-0.50", 0.25, 0.50),
+        ("0.50-0.75", 0.50, 0.75),
+    ]
+    top_bucket = "0.75+"
+    vitality_buckets: dict[str, int] = {label: 0 for label, _, _ in bucket_ranges}
+    vitality_buckets[top_bucket] = 0
+    for v in vitalities:
+        for label, low, high in bucket_ranges:
+            if low <= v < high:
+                vitality_buckets[label] += 1
+                break
+        else:
+            vitality_buckets[top_bucket] += 1
+
+    # Vault health score
+    health_pct = round(active_count / total * 100) if total > 0 else 0
+    vault_health_score = f"{health_pct}%"
+
+    return {
+        "total_memories": total,
+        "active_count": active_count,
+        "dormant_count": dormant_count,
+        "average_vitality": avg_vitality,
+        "vault_health_score": vault_health_score,
+        "decay_distribution": decay_distribution,
+        "vitality_buckets": vitality_buckets,
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -1,5 +1,15 @@
 # Release Notes
 
+## v1.17.0 — 2026-07-22
+
+Closes a dashboard-visibility gap flagged in the application capability review: `remind_me_vitality_report` computes the app's core "memory going stale" model — active/dormant counts, vault health score, vitality-bucket distribution — but none of it was surfaced in the dashboard, only reachable via the MCP tool.
+
+### New Features
+
+- **`GET /api/vitality`** — new REST route returning the same report as `remind_me_vitality_report` (`total_memories`, `active_count`, `dormant_count`, `average_vitality`, `vault_health_score`, `decay_distribution`, `vitality_buckets`). The bucket/health-score computation was extracted out of the MCP tool into a shared `vitality.build_vitality_report(db)` so the dashboard and Claude always see identical numbers, computed in exactly one place.
+- **Vitality Distribution chart** — new dashboard panel in the Stats view, reusing the existing `BarChart` component (now supporting an optional `preserveOrder` prop so the vitality buckets render in their natural low→high order instead of sorted by count) with a red→green color gradient and a "Vault health X% · N active · M dormant" summary line.
+- `docs/openapi.yaml` updated with the new route.
+
 ## v1.16.0 — 2026-07-21
 
 Closes a silent-degradation gap flagged in the application capability review: changing `REMIND_ME_EMBEDDING_MODEL`/`REMIND_ME_EMBEDDING_DIM`/`REMIND_ME_EMBEDDING_BACKEND` required a manual `remind_me_reindex`, and there was no stored record of which model actually produced the vectors currently in the store — a forgotten reindex after a model change meant KNN silently ran against vectors from a different model's embedding space, producing garbage nearest-neighbor results with no error at all.

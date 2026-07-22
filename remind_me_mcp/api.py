@@ -40,7 +40,7 @@ from remind_me_mcp.db import (
 )
 from remind_me_mcp.exporter import EXPORT_FORMATS, collect_export_records, export_memories, render_export
 from remind_me_mcp.importer import IMPORT_KINDS, import_chat_file, import_directory
-from remind_me_mcp.vitality import DECAY_RATES
+from remind_me_mcp.vitality import DECAY_RATES, build_vitality_report
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, MutableMapping
@@ -316,6 +316,20 @@ def _build_api_app() -> Starlette:
                 "db_path": str(DB_PATH),
                 "db_size_mb": round(DB_PATH.stat().st_size / 1_048_576, 2) if DB_PATH.exists() else 0,
             })
+
+        return await asyncio.to_thread(_work)
+
+    async def api_vitality(request: Request) -> JSONResponse:
+        """Return the vault vitality report (buckets, active/dormant counts, health score).
+
+        Same computation as the `remind_me_vitality_report` MCP tool (issue #14)
+        -- shared via `vitality.build_vitality_report` so the dashboard and
+        Claude see identical numbers.
+        """
+
+        def _work() -> JSONResponse:
+            db = _get_db()
+            return _json_ok(build_vitality_report(db))
 
         return await asyncio.to_thread(_work)
 
@@ -1069,6 +1083,7 @@ def _build_api_app() -> Starlette:
         Route("/", index),
         Route("/health", health),
         Route("/api/stats", api_stats),
+        Route("/api/vitality", api_vitality),
         Route("/api/memories", api_list, methods=["GET"]),
         Route("/api/memories", api_add, methods=["POST"]),
         Route("/api/memories/search", api_search),

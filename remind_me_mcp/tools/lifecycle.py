@@ -14,7 +14,7 @@ from typing import Any
 
 from remind_me_mcp import tools as _pkg
 from remind_me_mcp.consolidation import find_clusters, merge_cluster, pick_canonical
-from remind_me_mcp.db import _now_iso, _row_to_dict
+from remind_me_mcp.db import _now_iso
 from remind_me_mcp.models import (
     ConsolidateInput,
     ReclassifyBatchInput,
@@ -26,10 +26,9 @@ from remind_me_mcp.server import mcp
 from remind_me_mcp.tools._shared import _maybe_update_notice
 from remind_me_mcp.vitality import (
     DECAY_RATES,
+    build_vitality_report,
     compute_vitality,
-    effective_vitality,
     get_effective_decay_rate,
-    is_dormant,
 )
 
 # ---------------------------------------------------------------------------
@@ -61,59 +60,7 @@ async def remind_me_vitality_report(params: VitalityReportInput) -> str:
         str: Vault health report in the requested format (JSON or markdown).
     """
     db = _pkg._get_db()
-
-    # Effective (read-time) vitality per memory — the stored column is a
-    # stale at-access snapshot (DI-04).
-    rows = db.execute("SELECT * FROM memories").fetchall()
-    total = len(rows)
-    vitalities = [effective_vitality(_row_to_dict(r)) for r in rows]
-
-    # Core counts (dormancy from effective vitality, not the stored status)
-    dormant_count = sum(1 for v in vitalities if is_dormant(v))
-    active_count = total - dormant_count
-
-    # Average vitality
-    avg_vitality = round(sum(vitalities) / total, 2) if total > 0 else 0.0
-
-    # Decay distribution by memory_type
-    type_rows = db.execute(
-        "SELECT memory_type, COUNT(*) as cnt FROM memories GROUP BY memory_type"
-    ).fetchall()
-    decay_distribution = {r["memory_type"]: r["cnt"] for r in type_rows}
-
-    # Vitality buckets. The top bucket is open-ended: accessed memories exceed
-    # 1.0 (one access -> sqrt(2) ~= 1.41), so a closed bucket would lose them
-    # and the counts wouldn't sum to the total (DI-04).
-    bucket_ranges = [
-        ("0.00-0.05", 0.0, 0.05),
-        ("0.05-0.25", 0.05, 0.25),
-        ("0.25-0.50", 0.25, 0.50),
-        ("0.50-0.75", 0.50, 0.75),
-    ]
-    top_bucket = "0.75+"
-    vitality_buckets: dict[str, int] = {label: 0 for label, _, _ in bucket_ranges}
-    vitality_buckets[top_bucket] = 0
-    for v in vitalities:
-        for label, low, high in bucket_ranges:
-            if low <= v < high:
-                vitality_buckets[label] += 1
-                break
-        else:
-            vitality_buckets[top_bucket] += 1
-
-    # Vault health score
-    health_pct = round(active_count / total * 100) if total > 0 else 0
-    vault_health_score = f"{health_pct}%"
-
-    data = {
-        "total_memories": total,
-        "active_count": active_count,
-        "dormant_count": dormant_count,
-        "average_vitality": avg_vitality,
-        "vault_health_score": vault_health_score,
-        "decay_distribution": decay_distribution,
-        "vitality_buckets": vitality_buckets,
-    }
+    data = build_vitality_report(db)
 
     if params.response_format == ResponseFormat.JSON:
         return json.dumps(data, indent=2, default=str)
@@ -122,22 +69,22 @@ async def remind_me_vitality_report(params: VitalityReportInput) -> str:
     lines = [
         "## Vault Vitality Report",
         "",
-        f"**Total memories:** {total}",
-        f"**Active:** {active_count}",
-        f"**Dormant:** {dormant_count}",
-        f"**Vault health:** {vault_health_score}",
-        f"**Average vitality:** {avg_vitality:.2f}",
+        f"**Total memories:** {data['total_memories']}",
+        f"**Active:** {data['active_count']}",
+        f"**Dormant:** {data['dormant_count']}",
+        f"**Vault health:** {data['vault_health_score']}",
+        f"**Average vitality:** {data['average_vitality']:.2f}",
         "",
         "### Vitality Distribution",
         "",
     ]
-    for label, count in vitality_buckets.items():
+    for label, count in data["vitality_buckets"].items():
         bar = "#" * min(count, 40)
         lines.append(f"  {label}: {bar} ({count})")
     lines.append("")
     lines.append("### Memory Type Distribution")
     lines.append("")
-    for mtype, count in sorted(decay_distribution.items()):
+    for mtype, count in sorted(data["decay_distribution"].items()):
         lines.append(f"- **{mtype}**: {count}")
 
     return _maybe_update_notice("\n".join(lines))

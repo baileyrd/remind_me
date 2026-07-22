@@ -108,6 +108,55 @@ def test_api_stats_with_data(client: TestClient, memory_factory) -> None:
 
 
 # ---------------------------------------------------------------------------
+# GET /api/vitality
+# ---------------------------------------------------------------------------
+
+
+def test_api_vitality_empty(client: TestClient) -> None:
+    """GET /api/vitality with no memories should return zeroed-out counts."""
+    response = client.get("/api/vitality")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total_memories"] == 0
+    assert data["active_count"] == 0
+    assert data["dormant_count"] == 0
+    assert data["vault_health_score"] == "0%"
+    assert set(data["vitality_buckets"]) == {
+        "0.00-0.05",
+        "0.05-0.25",
+        "0.25-0.50",
+        "0.50-0.75",
+        "0.75+",
+    }
+
+
+def test_api_vitality_with_data(client: TestClient, memory_factory) -> None:
+    """GET /api/vitality reflects fresh memories as active, in the top vitality bucket."""
+    memory_factory(content="Fresh memory one")
+    memory_factory(content="Fresh memory two")
+
+    response = client.get("/api/vitality")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total_memories"] == 2
+    assert data["active_count"] == 2
+    assert data["dormant_count"] == 0
+    assert data["vitality_buckets"]["0.75+"] == 2
+
+
+def test_api_vitality_matches_decay_distribution_by_memory_type(
+    client: TestClient, memory_factory
+) -> None:
+    memory_factory(content="A decision memory", memory_type="decision")
+    memory_factory(content="An action item", memory_type="action_item")
+
+    response = client.get("/api/vitality")
+    data = response.json()
+    assert data["decay_distribution"]["decision"] == 1
+    assert data["decay_distribution"]["action_item"] == 1
+
+
+# ---------------------------------------------------------------------------
 # GET /api/memories (list)
 # ---------------------------------------------------------------------------
 
