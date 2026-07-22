@@ -1817,6 +1817,128 @@ def test_api_entity_requires_auth(client_with_auth: TestClient) -> None:
     assert response.status_code == 401
 
 
+# ---------------------------------------------------------------------------
+# GET /api/entities (issue #15: dashboard entity browser)
+# ---------------------------------------------------------------------------
+
+
+def test_api_entities_empty(client: TestClient, db_conn) -> None:
+    response = client.get("/api/entities")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 0
+    assert data["entities"] == []
+
+
+def test_api_entities_lists_most_mentioned_first(client: TestClient, db_conn, memory_factory) -> None:
+    mem1 = memory_factory(content="Tailscale notes one")
+    mem2 = memory_factory(content="Tailscale notes two")
+    mem3 = memory_factory(content="Docker notes")
+    _api_mention(db_conn, mem1["id"], "Tailscale")
+    _api_mention(db_conn, mem2["id"], "Tailscale")
+    _api_mention(db_conn, mem3["id"], "Docker")
+
+    response = client.get("/api/entities")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 2
+    names = [e["name"] for e in data["entities"]]
+    assert names[0] == "Tailscale"  # 2 mentions beats Docker's 1
+    assert data["entities"][0]["mention_count"] == 2
+    assert data["entities"][1]["mention_count"] == 1
+
+
+def test_api_entities_pagination(client: TestClient, db_conn) -> None:
+    from remind_me_mcp.db import _upsert_entity
+
+    for i in range(5):
+        _upsert_entity(db_conn, f"Entity{i}")
+    db_conn.commit()
+
+    response = client.get("/api/entities", params={"limit": 2, "offset": 0})
+    data = response.json()
+    assert data["total"] == 5
+    assert data["count"] == 2
+    assert data["has_more"] is True
+
+
+def test_api_entities_requires_auth(client_with_auth: TestClient) -> None:
+    response = client_with_auth.get("/api/entities")
+    assert response.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# GET /api/entity/traverse (issue #15: dashboard entity browser drill-down)
+# ---------------------------------------------------------------------------
+
+
+def test_api_entity_traverse_one_hop(client: TestClient, db_conn) -> None:
+    from remind_me_mcp.db import _upsert_entity, _upsert_entity_relation
+
+    bailey = _upsert_entity(db_conn, "Bailey")
+    alex = _upsert_entity(db_conn, "Alex")
+    _upsert_entity_relation(db_conn, bailey, "works_with", alex)
+    db_conn.commit()
+
+    response = client.get("/api/entity/traverse", params={"name": "Bailey"})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["entity"]["name"] == "Bailey"
+    assert data["hops"] == 1
+    assert len(data["edges"]) == 1
+    assert data["edges"][0]["relation"] == "works_with"
+    assert {e["name"] for e in data["entities"]} == {"Bailey", "Alex"}
+
+
+def test_api_entity_traverse_two_hops(client: TestClient, db_conn) -> None:
+    from remind_me_mcp.db import _upsert_entity, _upsert_entity_relation
+
+    bailey = _upsert_entity(db_conn, "Bailey")
+    alex = _upsert_entity(db_conn, "Alex")
+    sam = _upsert_entity(db_conn, "Sam")
+    _upsert_entity_relation(db_conn, bailey, "works_with", alex)
+    _upsert_entity_relation(db_conn, alex, "reports_to", sam)
+    db_conn.commit()
+
+    response = client.get("/api/entity/traverse", params={"name": "Bailey", "hops": 2})
+    data = response.json()
+    assert len(data["edges"]) == 2
+    assert {e["name"] for e in data["entities"]} == {"Bailey", "Alex", "Sam"}
+
+
+def test_api_entity_traverse_relation_filter(client: TestClient, db_conn) -> None:
+    from remind_me_mcp.db import _upsert_entity, _upsert_entity_relation
+
+    bailey = _upsert_entity(db_conn, "Bailey")
+    alex = _upsert_entity(db_conn, "Alex")
+    sam = _upsert_entity(db_conn, "Sam")
+    _upsert_entity_relation(db_conn, bailey, "works_with", alex)
+    _upsert_entity_relation(db_conn, bailey, "reports_to", sam)
+    db_conn.commit()
+
+    response = client.get(
+        "/api/entity/traverse", params={"name": "Bailey", "relation": "reports_to"}
+    )
+    data = response.json()
+    assert len(data["edges"]) == 1
+    assert data["edges"][0]["relation"] == "reports_to"
+
+
+def test_api_entity_traverse_not_found(client: TestClient, db_conn) -> None:
+    response = client.get("/api/entity/traverse", params={"name": "Ghost"})
+    assert response.status_code == 404
+
+
+def test_api_entity_traverse_missing_name(client: TestClient, db_conn) -> None:
+    response = client.get("/api/entity/traverse")
+    assert response.status_code == 400
+
+
+def test_api_entity_traverse_requires_auth(client_with_auth: TestClient) -> None:
+    response = client_with_auth.get("/api/entity/traverse", params={"name": "x"})
+    assert response.status_code == 401
+
+
 def test_api_search_entity_only_lists_linked_memories(
     client: TestClient, db_conn, memory_factory
 ) -> None:

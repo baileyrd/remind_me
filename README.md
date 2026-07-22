@@ -227,6 +227,8 @@ The dashboard is powered by a REST API you can also use directly:
 | `POST` | `/api/import` | Import a chat/document file or directory (JSON body: `{file_path, kind, extract_mode, category, tags, max_length}`; paths must be inside `REMIND_ME_IMPORT_ROOTS`) |
 | `GET` | `/api/export?format=&category=&tags=&file_path=&include_graph=` | Export memories (+ entity graph by default) as JSON/JSONL — streamed as the response body, or written server-side when `file_path` (inside `REMIND_ME_EXPORT_ROOTS`) is given |
 | `GET` | `/api/entity?name=&limit=` | Look up a knowledge-graph entity by name or alias (404 if unknown) |
+| `GET` | `/api/entities?limit=&offset=` | List entities, most-mentioned first, paginated |
+| `GET` | `/api/entity/traverse?name=&hops=&relation=&cap=` | Multi-hop traversal of the typed entity-relation graph (404 if the starting entity is unknown) |
 | `GET` | `/api/wiki` | List every LLM Wiki page (slug, title, summary, updated_at) |
 | `GET` | `/api/wiki/search?q=&limit=` | Full-text search the wiki (title + body), distinct from `/api/memories/search` |
 | `GET` | `/api/wiki/load?token_budget=&include_index=` | Concatenate the whole wiki into one blob (the core LLM-Wiki move) |
@@ -615,8 +617,12 @@ Memories can carry a structured **subject/predicate/object triple** plus links t
 
 `remind_me_entity`/`expand_entities` describe a memory↔entity bipartite graph (entity X is *mentioned in* memory Y). Layered on top of that is a genuine entity↔entity graph: whenever a fact's SPO subject *and* object both resolve to known entities (from that same call's `entities` list, or an earlier annotation), `remind_me_decompose`/`remind_me_annotate` also write a typed **`subject --relation--> object`** edge to `entity_relations` — e.g. `Bailey --works_with--> Alex`. SPO values that don't name a known entity keep working exactly as before: a memory-level triple with no graph edge.
 
-- **`remind_me_entity_traverse`** walks this edge graph breadth-first from a starting entity, up to `hops` (1-3) steps in both directions, with an optional exact-match `relation` filter and a result cap. This answers questions that require chaining relations rather than co-mention — e.g. "who introduced me to the person who recommended this tool" (`Alice --introduced--> Bob`, `Bob --recommended--> tool`).
+- **`remind_me_entity_traverse`** (or `GET /api/entity/traverse?name=&hops=`) walks this edge graph breadth-first from a starting entity, up to `hops` (1-3) steps in both directions, with an optional exact-match `relation` filter and a result cap. This answers questions that require chaining relations rather than co-mention — e.g. "who introduced me to the person who recommended this tool" (`Alice --introduced--> Bob`, `Bob --recommended--> tool`).
 - Relation edges have a **deterministic id** (hash of the subject/relation/object triple, same convergence property as entity ids) and are **immutable** — insert-or-ignore, like memory↔entity links, so re-recording the same triple is a no-op.
+
+### Browsing the graph
+
+The dashboard's **Entities** view is a human-facing browser for the graph: a clickable, most-mentioned-first entity list (backed by `GET /api/entities`) and a detail panel showing an entity's facts, linked memories, and a "Related Entities" drill-down built from a 1-hop traversal — for exploring what the app knows without hand-crafting API calls.
 
 ### Contradiction-based supersession
 
@@ -1232,6 +1238,13 @@ remind_me is local-first, single-user, and MCP-native by design — some capabil
 ## Changelog
 
 See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for a per-version feature breakdown with PR references; this section summarizes the same history phase-by-phase.
+
+### 1.18.0 — 2026-07-22
+
+Closes a dashboard-visibility gap flagged in the application capability review: the knowledge graph is fully built out server-side but had no dashboard UI at all — no way to browse "what does the app know about X and how is it connected" without hand-crafting API calls.
+
+- **New "Entities" dashboard view** — clickable entity list (most-mentioned first) plus a detail panel with facts, linked memories, and a "Related Entities" drill-down, mirroring the Wiki view's list+detail layout.
+- **`GET /api/entities`** (list, paginated) and **`GET /api/entity/traverse`** (multi-hop relation walk) — new REST routes powering the view. The traversal logic moved from `tools/entity.py` into `db.py` so the MCP tool and REST route share one implementation.
 
 ### 1.17.0 — 2026-07-22
 

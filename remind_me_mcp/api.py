@@ -31,7 +31,9 @@ from remind_me_mcp.db import (
     _delete_chunks,
     _embed_and_store,
     _entity_profile,
+    _expand_via_entity_relations,
     _get_db,
+    _list_entities,
     _make_id,
     _normalize_entity_name,
     _now_iso,
@@ -535,6 +537,78 @@ def _build_api_app() -> Starlette:
             if profile is None:
                 return _json_err(f"No entity found matching {name!r}", 404)
             return _json_ok(profile)
+
+        return await asyncio.to_thread(_work)
+
+    async def api_entities(request: Request) -> JSONResponse:
+        """List entities, most-mentioned first, for the dashboard entity browser (issue #15).
+
+        Query parameters: ``limit`` (default 50, capped at 200), ``offset``
+        (default 0). There's no equivalent MCP tool -- ``remind_me_entity``
+        is lookup-by-name/alias only -- this is a dashboard-only need.
+        """
+        params = request.query_params
+        try:
+            limit = min(_int_param(params, "limit", 50), 200)
+            offset = max(_int_param(params, "offset", 0), 0)
+        except ValueError as e:
+            return _json_err(str(e))
+
+        def _work() -> JSONResponse:
+            db = _get_db()
+            return _json_ok(_list_entities(db, limit=limit, offset=offset))
+
+        return await asyncio.to_thread(_work)
+
+    async def api_entity_traverse(request: Request) -> JSONResponse:
+        """Multi-hop traversal of the typed entity-relation graph (issue #15).
+
+        Query parameters: ``name`` (required, starting entity name/alias),
+        ``hops`` (1-3, default 1), ``relation`` (optional exact-match
+        filter), ``cap`` (max edges returned, default 20, capped at 100).
+        Mirrors the remind_me_entity_traverse MCP tool -- used by the
+        dashboard's entity detail panel to drill down into related entities.
+        """
+        params = request.query_params
+        name = (params.get("name") or "").strip()
+        if not name:
+            return _json_err("Missing 'name' parameter")
+        try:
+            hops = min(max(_int_param(params, "hops", 1), 1), 3)
+            cap = min(_int_param(params, "cap", 20), 100)
+        except ValueError as e:
+            return _json_err(str(e))
+        relation = (params.get("relation") or "").strip() or None
+
+        def _work() -> JSONResponse:
+            db = _get_db()
+            seed = _resolve_entity(db, name)
+            if seed is None:
+                return _json_err(f"No entity found matching {name!r}", 404)
+
+            edges = _expand_via_entity_relations(
+                db, [seed["id"]], hops=hops, relation=relation, cap=cap
+            )
+
+            entities: dict[str, dict[str, Any]] = {
+                seed["id"]: {"id": seed["id"], "name": seed["name"], "kind": seed["kind"]}
+            }
+            for e in edges:
+                entities.setdefault(
+                    e["subject_entity_id"],
+                    {"id": e["subject_entity_id"], "name": e["subject_name"], "kind": e["subject_kind"]},
+                )
+                entities.setdefault(
+                    e["object_entity_id"],
+                    {"id": e["object_entity_id"], "name": e["object_name"], "kind": e["object_kind"]},
+                )
+
+            return _json_ok({
+                "entity": {"id": seed["id"], "name": seed["name"], "kind": seed["kind"]},
+                "hops": hops,
+                "edges": edges,
+                "entities": list(entities.values()),
+            })
 
         return await asyncio.to_thread(_work)
 
@@ -1096,6 +1170,8 @@ def _build_api_app() -> Starlette:
         Route("/api/import", api_import, methods=["POST"]),
         Route("/api/export", api_export, methods=["GET"]),
         Route("/api/entity", api_entity, methods=["GET"]),
+        Route("/api/entities", api_entities, methods=["GET"]),
+        Route("/api/entity/traverse", api_entity_traverse, methods=["GET"]),
         # Literal sub-paths must precede /api/wiki/{slug} — Starlette matches
         # routes in registration order, so "search"/"load"/"status" would
         # otherwise be swallowed as a slug (mirrors /api/memories/search's
