@@ -60,6 +60,7 @@ async function api(path, opts = {}) {
 function useMemoryStore() {
   const [memories, setMemories] = useState([]);
   const [stats, setStats] = useState({ total: 0, categories: {}, sources: {}, tags: {} });
+  const [vitality, setVitality] = useState({ vitality_buckets: {}, active_count: 0, dormant_count: 0, vault_health_score: "0%", average_vitality: 0 });
   const [loading, setLoading] = useState(true);
 
   const refresh = useCallback(async (params = {}) => {
@@ -77,6 +78,10 @@ function useMemoryStore() {
       const s = await api("/stats");
       setStats(s);
     } catch (e) { console.error("stats:", e); }
+    try {
+      const v = await api("/vitality");
+      setVitality(v);
+    } catch (e) { console.error("vitality:", e); }
     setLoading(false);
   }, []);
 
@@ -110,7 +115,7 @@ function useMemoryStore() {
 
   useEffect(() => { refresh(); }, [refresh]);
 
-  return { memories, stats, loading, refresh, search, add, update, remove };
+  return { memories, stats, vitality, loading, refresh, search, add, update, remove };
 }
 
 function useWikiStore() {
@@ -236,9 +241,9 @@ function StatCard({label, value, color, icon}) {
   );
 }
 
-function BarChart({data, colorMap}) {
+function BarChart({data, colorMap, preserveOrder}) {
   const max = Math.max(...Object.values(data), 1);
-  const entries = Object.entries(data).sort((a,b)=>b[1]-a[1]);
+  const entries = preserveOrder ? Object.entries(data) : Object.entries(data).sort((a,b)=>b[1]-a[1]);
   return React.createElement("div", {style:{display:"flex",flexDirection:"column",gap:6}},
     entries.map(([label, count]) =>
       React.createElement("div", {key:label, style:{display:"flex",alignItems:"center",gap:8}},
@@ -540,6 +545,7 @@ function App() {
   const handleWikiNavigate = slug => { wikiStore.openPage(slug); setWikiQuery(""); setWikiSearchResults(null); };
 
   const stats = store.stats;
+  const vitality = store.vitality;
   const allCategories = Object.keys(stats.categories||{});
   const allTags = Object.keys(stats.tags||{}).sort((a,b)=>(stats.tags[b]||0)-(stats.tags[a]||0));
 
@@ -664,6 +670,13 @@ function App() {
               React.createElement("h3",{style:{fontFamily:mono,fontSize:13,fontWeight:600,color:theme.textSecondary,marginBottom:16,textTransform:"uppercase",letterSpacing:"0.04em"}},"By Source"),
               React.createElement(BarChart,{data:stats.sources||{},colorMap:{manual:theme.accent,chat_import:"#64748b"}})
             )
+          ),
+          React.createElement("div",{style:{background:theme.surface,border:"1px solid "+theme.border,borderRadius:8,padding:20,marginTop:16}},
+            React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:16}},
+              React.createElement("h3",{style:{fontFamily:mono,fontSize:13,fontWeight:600,color:theme.textSecondary,textTransform:"uppercase",letterSpacing:"0.04em"}},"Vitality Distribution"),
+              React.createElement("span",{style:{fontFamily:mono,fontSize:12,color:theme.textMuted}}, "Vault health "+(vitality.vault_health_score||"0%")+" · "+(vitality.active_count||0)+" active · "+(vitality.dormant_count||0)+" dormant")
+            ),
+            React.createElement(BarChart,{data:vitality.vitality_buckets||{},preserveOrder:true,colorMap:{"0.00-0.05":theme.danger,"0.05-0.25":"#f59e0b","0.25-0.50":"#eab308","0.50-0.75":"#84cc16","0.75+":"#22c55e"}})
           ),
           React.createElement("div",{style:{background:theme.surface,border:"1px solid "+theme.border,borderRadius:8,padding:20,marginTop:16}},
             React.createElement("h3",{style:{fontFamily:mono,fontSize:13,fontWeight:600,color:theme.textSecondary,marginBottom:16,textTransform:"uppercase",letterSpacing:"0.04em"}},"Top Tags"),

@@ -214,6 +214,7 @@ The dashboard is powered by a REST API you can also use directly:
 |--------|----------|-------------|
 | `GET` | `/health` | Liveness probe (no auth) |
 | `GET` | `/api/stats` | Memory statistics, categories, tags, DB info |
+| `GET` | `/api/vitality` | Vault vitality report: active/dormant counts, health score, vitality-bucket distribution |
 | `GET` | `/api/memories?category=&tags=&limit=&offset=` | List memories with filters, paginated (`total`/`count`/`offset`/`limit`/`has_more`) |
 | `GET` | `/api/memories/search?q=&category=&tags=&limit=&offset=` | Full-text search, paginated the same way |
 | `GET` | `/api/memories/{id}` | Get a single memory |
@@ -1231,6 +1232,13 @@ remind_me is local-first, single-user, and MCP-native by design — some capabil
 ## Changelog
 
 See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for a per-version feature breakdown with PR references; this section summarizes the same history phase-by-phase.
+
+### 1.17.0 — 2026-07-22
+
+Closes a dashboard-visibility gap flagged in the application capability review: `remind_me_vitality_report`'s active/dormant counts and vitality-bucket distribution — the app's core "memory going stale" model — were only reachable via the MCP tool, invisible in the dashboard.
+
+- **`GET /api/vitality`** — new REST route, sharing its computation with `remind_me_vitality_report` via a new `vitality.build_vitality_report(db)` so both surfaces report identical numbers.
+- **Vitality Distribution chart** in the dashboard's Stats view, reusing the existing `BarChart` component (now with an optional `preserveOrder` prop for bucket-ordered rather than count-sorted display) plus a vault-health summary line.
 
 ### 1.16.0 — 2026-07-21
 

@@ -80,6 +80,48 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
 
+  /api/vitality:
+    get:
+      operationId: getVitalityReport
+      summary: Vault vitality report -- active/dormant counts, health score, and vitality-bucket distribution
+      description: >-
+        Same computation as the remind_me_vitality_report MCP tool, exposed
+        over REST so the dashboard can render the vitality-bucket chart.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_memories:
+                    type: integer
+                  active_count:
+                    type: integer
+                  dormant_count:
+                    type: integer
+                  average_vitality:
+                    type: number
+                  vault_health_score:
+                    type: string
+                    description: Percentage of active memories, e.g. "82%".
+                  decay_distribution:
+                    type: object
+                    additionalProperties:
+                      type: integer
+                    description: memory_type -> count.
+                  vitality_buckets:
+                    type: object
+                    additionalProperties:
+                      type: integer
+                    description: >-
+                      Vitality-range label (e.g. "0.00-0.05", "0.75+") ->
+                      count. The top bucket is open-ended since accessed
+                      memories can exceed 1.0.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   /api/memories:
     get:
       operationId: listMemories
