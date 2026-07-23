@@ -512,6 +512,38 @@ def test_perform_update_success() -> None:
     assert result.error is None
 
 
+def test_perform_update_reinstalls_detected_extras() -> None:
+    """perform_update re-requests extras whose marker modules are importable,
+    instead of silently dropping them via a bare ``pip install -e .``."""
+
+    def fake_git(*args, repo_path):
+        result = MagicMock()
+        if args[0] == "rev-parse":
+            result.stdout = "abc123\n"
+        elif args[0] == "status":
+            result.stdout = "\n"
+        elif args[0] == "pull":
+            result.stdout = "Updating abc123..def456\n"
+        return result
+
+    fake_pip = MagicMock(return_value=MagicMock(stdout="Successfully installed"))
+
+    def fake_find_spec(name):
+        return object() if name in ("sqlite_vec", "usearch") else None
+
+    with (
+        patch("remind_me_mcp.updater._find_repo_root", return_value=Path("/fake/repo")),
+        patch("remind_me_mcp.updater._run_git", side_effect=fake_git),
+        patch("remind_me_mcp.updater._run_pip", fake_pip),
+        patch("importlib.util.find_spec", side_effect=fake_find_spec),
+        patch("importlib.metadata.version", return_value="1.1.0"),
+    ):
+        result = perform_update()
+
+    assert result.success
+    fake_pip.assert_called_once_with("install", "-e", "/fake/repo[semantic,ann]")
+
+
 # ---------------------------------------------------------------------------
 # pop_update_notice
 # ---------------------------------------------------------------------------

@@ -60,6 +60,39 @@ class UpdateResult:
 
 _PACKAGE_NAME = "remind-me-mcp"
 
+# One import-spec-detectable module per optional-dependencies group in
+# pyproject.toml, used to figure out which extras are currently installed
+# so a reinstall doesn't silently drop them (see _installed_extras).
+_EXTRA_MARKERS = {
+    "semantic": "sqlite_vec",
+    "mempalace": "chromadb",
+    "otel": "opentelemetry.sdk",
+    "ann": "usearch",
+}
+
+
+def _installed_extras() -> list[str]:
+    """Return the optional-dependency extras currently installed, by name.
+
+    ``pip install -e .`` only pulls the base ``dependencies`` list -- it
+    knows nothing about which optional extras (e.g. ``[semantic]``) were
+    installed previously, so a plain reinstall silently drops them. Checking
+    each extra's marker module lets the reinstall step re-request the same
+    extras instead of degrading the running install.
+    """
+    import importlib.util
+
+    def _has(marker: str) -> bool:
+        try:
+            return importlib.util.find_spec(marker) is not None
+        except ModuleNotFoundError:
+            # find_spec raises rather than returning None for a dotted name
+            # (e.g. "opentelemetry.sdk") when the parent package itself
+            # isn't importable.
+            return False
+
+    return [extra for extra, marker in _EXTRA_MARKERS.items() if _has(marker)]
+
 
 def _is_remind_me_repo_root(candidate: Path) -> bool:
     """Return True when *candidate* looks like this package's own repo root.
@@ -384,9 +417,12 @@ def perform_update(force: bool = False) -> UpdateResult:
             error="git pull timed out.",
         )
 
-    # pip install -e .
+    # pip install -e ., re-requesting whichever extras were already installed
+    # so the update doesn't silently drop them (see _installed_extras).
+    extras = _installed_extras()
+    install_target = f"{repo}[{','.join(extras)}]" if extras else str(repo)
     try:
-        pip_result = _run_pip("install", "-e", str(repo))
+        pip_result = _run_pip("install", "-e", install_target)
         pip_output = pip_result.stdout.strip()
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         # The source tree already advanced past previous_commit at this
