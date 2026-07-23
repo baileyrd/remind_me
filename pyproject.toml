@@ -31,6 +31,9 @@ otel = [
 ann = [
     "usearch>=2.9.0",
 ]
+all = [
+    "remind-me-mcp[semantic,mempalace,otel,ann]",
+]
 
 [project.scripts]
 remind-me-mcp = "remind_me_mcp.__main__:main"
