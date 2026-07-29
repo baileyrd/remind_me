@@ -17,8 +17,10 @@ from remind_me_mcp.updater import (
     UpdateResult,
     UpdateStatus,
     _find_repo_root,
+    _find_uv,
     _get_origin_url,
     _is_remind_me_repo_root,
+    _run_pip,
     check_for_update,
     perform_update,
     pop_update_notice,
@@ -739,3 +741,114 @@ async def test_self_update_tool_returns_restart_notice() -> None:
     assert "1.0.0" in result
     assert "1.1.0" in result
     assert "Restart required" in result
+
+
+# ---------------------------------------------------------------------------
+# _find_uv / _run_pip — installer resolution and environment targeting
+# ---------------------------------------------------------------------------
+
+
+def test_find_uv_prefers_path() -> None:
+    """_find_uv returns the PATH hit without probing the filesystem."""
+    with patch("shutil.which", return_value="/usr/bin/uv"):
+        assert _find_uv() == "/usr/bin/uv"
+
+
+def test_find_uv_falls_back_to_local_bin(tmp_path: Path) -> None:
+    """uv installed to ~/.local/bin is found even when absent from PATH.
+
+    This is the exact shape of the failure that broke self-update on a
+    uv-tool-managed server: uv present on disk, invisible to the MCP
+    process's inherited PATH.
+    """
+    uv_path = tmp_path / ".local" / "bin" / "uv"
+    uv_path.parent.mkdir(parents=True)
+    uv_path.touch()
+
+    with (
+        patch("shutil.which", return_value=None),
+        patch("sys.platform", "linux"),
+        patch("pathlib.Path.home", return_value=tmp_path),
+    ):
+        assert _find_uv() == str(uv_path)
+
+
+def test_find_uv_returns_none_when_absent(tmp_path: Path) -> None:
+    """_find_uv reports None rather than guessing when uv isn't installed."""
+    with (
+        patch("shutil.which", return_value=None),
+        patch("pathlib.Path.home", return_value=tmp_path),
+    ):
+        assert _find_uv() is None
+
+
+def test_run_pip_pins_uv_to_running_interpreter() -> None:
+    """`uv pip` must target sys.executable, not the ambient venv.
+
+    Without --python, uv resolves against VIRTUAL_ENV / a discovered
+    .venv, which for a uv-tool install is a different environment
+    entirely -- the update would report success while installing into a
+    directory the server never imports from.
+    """
+    import sys
+
+    with (
+        patch("remind_me_mcp.updater._find_uv", return_value="/opt/uv"),
+        patch("subprocess.run", return_value=MagicMock(stdout="ok")) as run,
+    ):
+        _run_pip("install", "-e", "/repo[semantic]")
+
+    assert run.call_args[0][0] == [
+        "/opt/uv",
+        "pip",
+        "install",
+        "--python",
+        sys.executable,
+        "-e",
+        "/repo[semantic]",
+    ]
+
+
+def test_run_pip_raises_clear_error_when_no_installer() -> None:
+    """No uv and no pip yields an actionable message, not 'No module named pip'."""
+    with (
+        patch("remind_me_mcp.updater._find_uv", return_value=None),
+        patch("importlib.util.find_spec", return_value=None),
+        patch("subprocess.run") as run,
+    ):
+        with pytest.raises(RuntimeError, match="neither 'uv' nor 'pip'"):
+            _run_pip("install", "-e", "/repo")
+
+    run.assert_not_called()
+
+
+def test_run_pip_falls_back_to_module_pip() -> None:
+    """With pip available but no uv, fall back to `python -m pip`."""
+    import sys
+
+    with (
+        patch("remind_me_mcp.updater._find_uv", return_value=None),
+        patch("importlib.util.find_spec", return_value=object()),
+        patch("subprocess.run", return_value=MagicMock(stdout="ok")) as run,
+    ):
+        _run_pip("install", "-e", "/repo")
+
+    assert run.call_args[0][0] == [sys.executable, "-m", "pip", "install", "-e", "/repo"]
+
+
+def test_perform_update_rolls_back_when_no_installer(tmp_path: Path) -> None:
+    """A missing installer must still roll the source tree back (SEC-06)."""
+    with (
+        patch("remind_me_mcp.updater._find_repo_root", return_value=tmp_path),
+        patch("remind_me_mcp.updater._get_origin_url", return_value="https://example/repo.git"),
+        patch("remind_me_mcp.updater._run_git", return_value=MagicMock(stdout="abc123")),
+        patch("remind_me_mcp.updater._installed_extras", return_value=[]),
+        patch("remind_me_mcp.updater._run_pip", side_effect=RuntimeError("boom: no installer")),
+        patch("remind_me_mcp.updater._rollback", return_value=True) as rollback,
+    ):
+        result = perform_update(force=True)
+
+    assert result.success is False
+    assert result.rolled_back is True
+    assert "boom: no installer" in (result.error or "")
+    rollback.assert_called_once()

@@ -179,11 +179,44 @@ def _get_origin_url(repo_path: Path) -> str:
         return ""
 
 
-def _run_pip(*args: str) -> subprocess.CompletedProcess[str]:
-    """Run a pip install command, preferring uv over pip.
+def _find_uv() -> str | None:
+    """Locate the ``uv`` executable, including installs outside ``PATH``.
 
-    Tries ``uv pip`` first (faster, commonly used with modern venvs).
-    Falls back to ``python -m pip`` if uv is not installed.
+    ``shutil.which`` alone is not enough. An MCP server is launched by a
+    client (or a systemd unit), and frequently inherits a minimal ``PATH``
+    that omits ``~/.local/bin`` -- which is exactly where uv's own
+    installer puts it. That matters because a uv-tool-managed install of
+    this package has no ``pip`` at all, so uv is the *only* way to
+    reinstall it; failing to find uv turns a working update into a
+    "No module named pip" dead end.
+
+    Returns:
+        Absolute path to the uv executable, or None if it can't be found.
+    """
+    import shutil
+    import sys
+
+    found = shutil.which("uv")
+    if found:
+        return found
+
+    exe = "uv.exe" if sys.platform == "win32" else "uv"
+    home = Path.home()
+    candidates = (
+        home / ".local" / "bin" / exe,  # uv standalone installer (default)
+        home / ".cargo" / "bin" / exe,  # cargo install uv
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def _run_pip(*args: str) -> subprocess.CompletedProcess[str]:
+    """Run a pip install command against *this server's* environment.
+
+    Prefers ``uv pip`` (faster, and the only option for uv-tool-managed
+    installs), falling back to ``python -m pip``.
 
     Args:
         *args: Pip subcommand and arguments (e.g. ``"install"``, ``"-e"``, ``"."``).
@@ -192,20 +225,36 @@ def _run_pip(*args: str) -> subprocess.CompletedProcess[str]:
         CompletedProcess with captured stdout/stderr.
 
     Raises:
+        RuntimeError: If neither uv nor pip is available to do the install.
         subprocess.TimeoutExpired: If the command takes longer than 120 seconds.
         subprocess.CalledProcessError: If the install command exits with non-zero status.
     """
-    import shutil
+    import importlib.util
     import sys
 
-    uv = shutil.which("uv")
+    uv = _find_uv()
     if uv:
+        # --python pins the target to the interpreter actually running this
+        # server. Without it, `uv pip` resolves against the ambient
+        # VIRTUAL_ENV / discovered .venv, which for a uv-tool-managed install
+        # is a different environment entirely -- the update would report
+        # success while installing somewhere that is never imported.
+        subcommand, *rest = args
         return subprocess.run(
-            [uv, "pip", *args],
+            [uv, "pip", subcommand, "--python", sys.executable, *rest],
             capture_output=True,
             text=True,
             timeout=120,
             check=True,
+        )
+
+    if importlib.util.find_spec("pip") is None:
+        raise RuntimeError(
+            "Cannot reinstall: neither 'uv' nor 'pip' is available. The "
+            f"running interpreter ({sys.executable}) has no pip, which is "
+            "normal for a 'uv tool install' -- but uv was not found on PATH "
+            "or in ~/.local/bin either. Install uv, or make it visible to "
+            "the server process, then retry."
         )
 
     return subprocess.run(
@@ -424,7 +473,7 @@ def perform_update(force: bool = False) -> UpdateResult:
     try:
         pip_result = _run_pip("install", "-e", install_target)
         pip_output = pip_result.stdout.strip()
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError) as exc:
         # The source tree already advanced past previous_commit at this
         # point -- left as-is, the checked-out code and installed package
         # metadata/dependencies would silently diverge (SEC-06). Since the
@@ -434,6 +483,10 @@ def perform_update(force: bool = False) -> UpdateResult:
         rolled_back = _rollback(repo, previous_commit)
         if isinstance(exc, subprocess.TimeoutExpired):
             reason = "pip install timed out."
+        elif isinstance(exc, RuntimeError):
+            # No installer available at all (see _run_pip) -- already a
+            # fully-formed operator-facing message.
+            reason = str(exc)
         else:
             reason = f"pip install failed: {exc.stderr.strip() or exc.stdout.strip()}"
         return UpdateResult(
