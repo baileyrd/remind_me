@@ -68,7 +68,15 @@ ignore = [
 known-first-party = ["remind_me_mcp"]
 
 [tool.mypy]
-python_version = "3.11"
+# python_version is deliberately unset so mypy targets whichever interpreter it
+# runs under. Hardcoding "3.11" broke the 3.12 CI legs: numpy 2.5.1 (the version
+# the lockfile selects for python_full_version >= '3.12') ships stubs using PEP
+# 695 `type X = ...` statements, which mypy rejects outright when told to target
+# 3.11 -- failing before it type-checks any of our code. Pinning to "3.12"
+# instead would trade that for the reverse problem, letting 3.12-only syntax
+# past the 3.11 leg while requires-python still claims >=3.11. The CI matrix
+# already runs both 3.11 and 3.12, so leaving this unset checks each version
+# against its own semantics rather than picking one and mistyping the other.
 # warn_return_any disabled: sqlite3/numpy/json return values propagate as Any
 # through thin wrappers (db.py, embeddings.py, vitality.py); flagging every
 # return adds noise without catching real bugs here.
