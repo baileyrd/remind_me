@@ -1,5 +1,13 @@
 # Release Notes
 
+## v1.19.3 — 2026-07-29
+
+Dependency safety fix. `pyproject.toml` declared `mcp[cli]>=1.0.0` with no upper bound, while both the README's install path and `updater.py`'s self-update run `pip install -e .` — which ignores `uv.lock` and resolves fresh. MCP Python SDK 2.0.0 shipped 2026-07-28 and removes `mcp.server.fastmcp` outright (`FastMCP` became `mcp.server.mcpserver.MCPServer`, with no compatibility alias), so the next `remind_me_self_update` on any node would have installed it and left every module in the package non-importable via `server.py`'s top-level import — taking down MCP stdio, the remote connector, and the dashboard together. Capped to `>=1.28,<2`. The 1.x line is still actively maintained (1.29.0 shipped the same day as 2.0.0), so this costs nothing but a deliberate upgrade decision later.
+
+Also adds `docs/mcp-2.0-migration-plan.md`, which documents the full 1.28 → 2.0 API delta — verified by installing both SDK versions into separate venvs and probing every import site rather than reading changelogs. The short version: the OAuth 2.1 stack, all 44 tool registrations, and the dashboard need no changes; the real work is that transport configuration moved off the mutable `mcp.settings` object (which lost `host`, `port`, `streamable_http_path`, and `transport_security`) into call-time kwargs on `streamable_http_app()`.
+
+Verified: full suite green (1401 passed, 52 skipped) against both the locked 1.28.1 and the 1.29.0 that a fresh `pip install -e .` now resolves to.
+
 ## v1.19.2 — 2026-07-29
 
 CI repair. `main` had been red on every run since at least 2026-07-21, from two unrelated failures that both turned out to be environment drift rather than anything a commit introduced.
