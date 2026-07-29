@@ -6,7 +6,15 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
-    "mcp[cli]>=1.0.0",
+    # Capped below 2.0 deliberately. SDK 2.0 removed `mcp.server.fastmcp`
+    # outright (FastMCP -> mcp.server.mcpserver.MCPServer, no compat alias),
+    # which makes every module in this package non-importable via server.py's
+    # top-level import. Both the documented install path and updater.py's
+    # self-update run `pip install -e .`, which ignores uv.lock and resolves
+    # freely -- so an unbounded specifier means a self-update silently breaks
+    # the server. The 1.x line is still maintained (1.29.0 shipped the same day
+    # as 2.0.0). See docs/mcp-2.0-migration-plan.md before raising this cap.
+    "mcp[cli]>=1.28,<2",
     "pydantic>=2.0.0",
     "httpx>=0.25.0",
     "starlette>=0.40.0",

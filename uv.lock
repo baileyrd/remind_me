@@ -2684,7 +2684,7 @@ requires-dist = [
     { name = "chromadb", marker = "extra == 'mempalace'", specifier = ">=0.5.0" },
     { name = "httpx", specifier = ">=0.25.0" },
     { name = "huggingface-hub", marker = "extra == 'semantic'", specifier = ">=0.20.0" },
-    { name = "mcp", extras = ["cli"], specifier = ">=1.0.0" },
+    { name = "mcp", extras = ["cli"], specifier = ">=1.28,<2" },
     { name = "numpy", specifier = ">=1.24.0" },
     { name = "onnxruntime", marker = "extra == 'semantic'", specifier = ">=1.16.0" },
     { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'otel'", specifier = ">=1.20.0" },
