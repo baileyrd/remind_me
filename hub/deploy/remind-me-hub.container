@@ -1,5 +1,5 @@
-# Podman Quadlet — remind-me sync hub (FastAPI), reachable only on
-# localhost:8765; clients connect through an SSH tunnel.
+# Podman Quadlet — remind-me sync hub (FastAPI), reachable via the host's
+# Tailscale IP. Update the PublishPort IP below if that address changes.
 # Install to ~/.config/containers/systemd/remind-me-hub.container
 # Secrets live in ~/remind-me-hub/hub.env (see hub.env.example).
 [Unit]
@@ -11,7 +11,7 @@ Wants=remind-me-postgres.service
 ContainerName=remind-me-hub
 Image=localhost/remind-me-hub:latest
 Network=remind-me.network
-PublishPort=127.0.0.1:8765:8765
+PublishPort=100.83.168.90:8765:8765
 EnvironmentFile=%h/remind-me-hub/hub.env
 
 [Service]

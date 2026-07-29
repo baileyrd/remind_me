@@ -1,5 +1,9 @@
 # Release Notes
 
+## v1.19.1 — 2026-07-29
+
+Deploy config fix: the hub's Podman Quadlet (`hub/deploy/remind-me-hub.container`) published only on `127.0.0.1:8765`, requiring every client to reach it through an SSH tunnel. Switched `PublishPort` to bind the host's Tailscale IP directly, so clients on the tailnet connect without a tunnel. Verified against the live deployment: pull and push both confirmed working over the new address, hub and local node counts reconciled.
+
 ## v1.19.0 — 2026-07-22
 
 Closes the last item from the application capability review: true ACT-R-style memory reinforces associations *between* items retrieved together, not just each item independently, but nothing previously captured "these two memories tend to be useful together" — the entity graph links a memory to entities it mentions, not to other memories via search co-occurrence.
