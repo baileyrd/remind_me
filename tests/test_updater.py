@@ -815,9 +815,9 @@ def test_run_pip_raises_clear_error_when_no_installer() -> None:
         patch("remind_me_mcp.updater._find_uv", return_value=None),
         patch("importlib.util.find_spec", return_value=None),
         patch("subprocess.run") as run,
+        pytest.raises(RuntimeError, match="neither 'uv' nor 'pip'"),
     ):
-        with pytest.raises(RuntimeError, match="neither 'uv' nor 'pip'"):
-            _run_pip("install", "-e", "/repo")
+        _run_pip("install", "-e", "/repo")
 
     run.assert_not_called()
 
