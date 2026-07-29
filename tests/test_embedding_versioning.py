@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import numpy as np
+import pytest
 
 from remind_me_mcp import ann_index
 from remind_me_mcp.db import (
@@ -197,6 +198,11 @@ def test_reconcile_recreates_a_usable_memories_vec_table(db_conn_with_vec: sqlit
 
 
 def test_reconcile_invalidates_the_ann_index(db_conn_with_vec: sqlite3.Connection) -> None:
+    # get_index() returns None when usearch is missing (documented in ann_index),
+    # so without this guard the assert below fails rather than skips. usearch is
+    # the 'ann' extra, which CI's semantic leg doesn't install -- the rest of this
+    # module only needs sqlite-vec, so the skip is per-test, not module-level.
+    pytest.importorskip("usearch", reason="usearch (the 'ann' extra) not installed")
     db_conn_with_vec.execute(
         "INSERT INTO memories_vec(rowid, embedding) VALUES (?, ?)", (1, _vec(1).tobytes())
     )

@@ -1,5 +1,14 @@
 # Release Notes
 
+## v1.19.2 — 2026-07-29
+
+CI repair. `main` had been red on every run since at least 2026-07-21, from two unrelated failures that both turned out to be environment drift rather than anything a commit introduced.
+
+- **mypy failed on both Python 3.12 legs.** `[tool.mypy] python_version = "3.11"` told mypy to target 3.11, but numpy 2.5.1 — the version the lockfile selects for `python_full_version >= '3.12'` — ships stubs using PEP 695 `type X = ...` statements. mypy rejects that syntax outright when targeting 3.11 and bails before checking any of our code (`Found 1 error in 1 file (errors prevented further checking)`). The 3.11 legs resolve numpy 2.4.6 and were unaffected. Unset `python_version` so mypy targets whichever interpreter it runs under; since the CI matrix already covers 3.11 and 3.12, each version is now checked against its own semantics instead of one being mistyped as the other.
+- **`test_reconcile_invalidates_the_ann_index` failed on both semantic legs.** The test asserts `ann_index.get_index()` is non-None, but that function returns `None` by design when `usearch` isn't installed. `usearch` is the `ann` extra, which CI's semantic leg doesn't install. The test's own docstring cites `tests/test_ann_index.py` as its precedent, and that module guards itself with `pytest.importorskip("usearch", ...)` — this test adopted the `db_conn_with_vec` half of the precedent but not the guard. Added the matching per-test `importorskip` (module-level would wrongly skip the 18 tests here that only need sqlite-vec).
+
+No production code changes — this is config and test-guard only.
+
 ## v1.19.1 — 2026-07-29
 
 Deploy config fix: the hub's Podman Quadlet (`hub/deploy/remind-me-hub.container`) published only on `127.0.0.1:8765`, requiring every client to reach it through an SSH tunnel. Switched `PublishPort` to bind the host's Tailscale IP directly, so clients on the tailnet connect without a tunnel. Verified against the live deployment: pull and push both confirmed working over the new address, hub and local node counts reconciled.
