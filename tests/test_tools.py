@@ -565,8 +565,20 @@ async def test_import_chat_search_round_trip(db_conn: sqlite3.Connection, tmp_pa
 # ---------------------------------------------------------------------------
 
 
-async def test_import_directory(db_conn: sqlite3.Connection, tmp_path: Path) -> None:
-    """Importing a directory with 2 JSON files processes both and creates memories."""
+async def test_import_directory(
+    db_conn_concurrent: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """Importing a directory with 2 JSON files processes both and creates memories.
+
+    Uses db_conn_concurrent, not db_conn, for the same reason as
+    test_import_directory_concurrent below: import_directory fans out over
+    asyncio.to_thread (IMPORT_CONCURRENCY=8), and db_conn hands the *same*
+    sqlite3.Connection to every thread. Two files means only two racing
+    workers, so it passed almost always — but "almost always" is a flake, and
+    it surfaced in CI as `SystemError: <sqlite3.Connection> returned NULL
+    without setting an exception`, the C-level symptom of unserialized
+    cross-thread use of one connection object.
+    """
     # Create two distinct JSON chat files
     for i in range(2):
         data = {

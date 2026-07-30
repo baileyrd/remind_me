@@ -385,9 +385,16 @@ def test_document_reimport_skipped_by_hash(
 
 
 async def test_import_directory_mixed_chat_and_documents(
-    db_conn: sqlite3.Connection, no_embed: None, tmp_path: Path
+    db_conn_concurrent: sqlite3.Connection, no_embed: None, tmp_path: Path
 ) -> None:
-    """A directory with chat exports and notes files routes each file by kind."""
+    """A directory with chat exports and notes files routes each file by kind.
+
+    db_conn_concurrent rather than db_conn: import_directory fans out over
+    asyncio.to_thread and db_conn shares one sqlite3.Connection across every
+    thread, which SQLite does not serialize. Four files here means a wider
+    fan-out than the two-file case that already flaked in CI, so this carries
+    the same latent race even though it has not yet failed.
+    """
     (tmp_path / "chat.json").write_text(
         json.dumps({"chat_messages": [{"sender": "assistant", "content": "JSON answer."}]})
     )
@@ -410,7 +417,9 @@ async def test_import_directory_mixed_chat_and_documents(
 
     sources = {
         r["source"]
-        for r in db_conn.execute("SELECT DISTINCT source FROM memories").fetchall()
+        for r in db_conn_concurrent.execute(
+            "SELECT DISTINCT source FROM memories"
+        ).fetchall()
     }
     assert sources == {"chat_import", DOCUMENT_SOURCE}
 

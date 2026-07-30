@@ -14,6 +14,21 @@ The guard is now a `require_usearch` fixture applied to just the 6 ANN tests tha
 
 Swept the rest of the suite for the same shape: `tests/test_ann_index.py`'s module-level guard is correct (all 13 of its tests genuinely need `usearch`) and `test_openapi_spec.py`'s guards are per-test. No other over-reach.
 
+### Fixed: a latent cross-thread race in two directory-import tests
+
+Making those 14 tests run shifted suite timing enough to expose a pre-existing flake, which failed one CI leg as:
+
+```
+FAILED tests/test_tools.py::test_import_directory
+SystemError: <sqlite3.Connection object> returned NULL without setting an exception
+```
+
+`import_directory` fans out over `asyncio.to_thread` (`IMPORT_CONCURRENCY=8`), but `test_import_directory` used the `db_conn` fixture, which hands the *same* `sqlite3.Connection` object to every thread. SQLite does not serialize cross-thread `execute()`/`commit()` on one connection even with `check_same_thread=False` — the `db_conn_concurrent` fixture's own docstring documents this hazard, and `test_import_directory_concurrent` already existed specifically to avoid it. With only two files the race was narrow enough to pass almost always, which is exactly what made it a flake rather than a failure.
+
+Both affected tests moved to `db_conn_concurrent`: `test_import_directory` (2 files) and `test_import_directory_mixed_chat_and_documents` (4 files, a *wider* fan-out that had not yet failed but carried the same defect). Verified with 12 consecutive stress runs. The single-file and empty-directory cases spawn no concurrent workers and are left on `db_conn`.
+
+The race was pre-existing and independent of this release's other changes; the skip fix only altered timing enough to surface it.
+
 ### Corrected: BACKLOG SY-11 was stale
 
 `BACKLOG.md` SY-11 was marked **todo** and proposed batching `_embed_and_store_rows` by `EMBED_BATCH_SIZE` at the sync apply path's call site. That shipped in commit `1493d4e` (#68) — but resolved the *opposite* way to what the row proposed: instead of pre-slicing at each call site, the batching loop moved **inside** `_embed_and_store_rows`, making it the single source of truth. Every caller (reindex, file import, mempalace/dbs import, sync's pulled-record embedding) now gets the bound for free, and a new caller cannot forget it. Both the `embed()` call and the surrounding transaction are bounded, layered beneath `EMBED_FORWARD_BATCH`'s forward-pass ceiling.
