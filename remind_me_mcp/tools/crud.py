@@ -9,7 +9,6 @@ monkeypatching ``remind_me_mcp.tools.<name>`` keeps working (HY-02).
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import sqlite3
 from typing import Any
@@ -17,7 +16,7 @@ from typing import Any
 from remind_me_mcp import ann_index
 from remind_me_mcp import tools as _pkg
 from remind_me_mcp.config import CLIENT, NODE_ID, SYNC_ENABLED
-from remind_me_mcp.db import _delete_chunks, _make_id, _now_iso, _row_to_dict
+from remind_me_mcp.db import _make_id, _now_iso, _row_to_dict
 from remind_me_mcp.formatting import _fmt_memories, _fmt_memory_md
 from remind_me_mcp.models import (  # noqa: TC001  # FastMCP resolves these annotations at runtime for tool schemas
     MemoryAddInput,
@@ -282,32 +281,12 @@ async def memory_delete(params: MemoryDeleteInput) -> str:
     ).fetchone()
     if row is None:
         return f"Memory `{params.memory_id}` not found."
-    # Remove chunk vectors first — FTS and tags are cleaned by triggers, but
-    # vec_chunks/memories_vec are not, and (for a hard delete) SQLite reuses
-    # freed rowids (DI-01).
-    removed_vec_rowids: list[int] = []
-    with contextlib.suppress(sqlite3.OperationalError):
-        removed_vec_rowids = _delete_chunks(db, row[0])
-    # FT-04: entity mention links have no FK (sync can deliver them out of
-    # order), so clean them up explicitly — mirroring the DI-01 chunk cleanup.
-    # Entities themselves stay; other memories may still mention them.
-    db.execute(
-        "DELETE FROM memory_entities WHERE memory_id = ?", (params.memory_id,)
+    # Derived-row cleanup and the tombstone/hard-delete split both live in
+    # db._purge_memory — see its docstring for why they must not be inlined
+    # per call site.
+    removed_vec_rowids = _pkg._purge_memory(
+        db, params.memory_id, row[0], soft=SYNC_ENABLED, now=_now_iso()
     )
-    # Query-contextual feedback (gap #6) is meaningless once the memory it's
-    # about is gone — a tombstoned memory is excluded from every read path
-    # anyway, so there's nothing left for stored feedback to adjust.
-    db.execute(
-        "DELETE FROM memory_feedback WHERE memory_id = ?", (params.memory_id,)
-    )
-    if SYNC_ENABLED:
-        now = _now_iso()
-        db.execute(
-            "UPDATE memories SET deleted_at = ?, updated_at = ? WHERE id = ?",
-            (now, now, params.memory_id),
-        )
-    else:
-        db.execute("DELETE FROM memories WHERE id = ?", (params.memory_id,))
     db.commit()
     # ANN mutations only after the commit succeeds — see db._delete_chunks.
     for vec_rowid in removed_vec_rowids:

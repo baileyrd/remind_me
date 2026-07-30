@@ -1868,6 +1868,66 @@ def _prune_orphan_chunks(db: sqlite3.Connection) -> int:
     return len(vec_rowids)
 
 
+def _purge_memory(
+    db: sqlite3.Connection,
+    memory_id: str,
+    memory_rowid: int,
+    *,
+    soft: bool,
+    now: str,
+) -> list[int]:
+    """Remove one memory's derived rows and either tombstone or delete it.
+
+    The single source of truth for "delete this memory correctly". The steps
+    are easy to get subtly wrong and were previously copy-pasted across four
+    call sites (the MCP delete tool, two dashboard REST routes, and sync's
+    tombstone compaction) — and had already drifted: the REST routes skipped
+    ``memory_feedback``, so deleting from the dashboard orphaned feedback rows
+    that deleting via MCP cleaned up.
+
+    ``soft`` is an explicit argument rather than read from
+    ``config.SYNC_ENABLED`` here, so each caller keeps its own patchable
+    module-level flag and the behaviour is visible at the call site: a soft
+    delete tombstones the row (``deleted_at``) so the deletion propagates over
+    sync, while a hard delete removes it outright — correct only when there is
+    nothing to propagate to.
+
+    Chunk vectors are removed from SQLite here, but the returned vec_rowids
+    must be handed to :func:`remind_me_mcp.ann_index.remove_vector` by the
+    caller *after* its transaction commits — ANN mutations are not part of the
+    SQL transaction and cannot be rolled back with it.
+
+    Args:
+        db: An open SQLite connection. This function does not commit.
+        memory_id: The memory's public id.
+        memory_rowid: Its SQLite rowid (callers have already looked it up to
+            confirm the row exists and is not already tombstoned).
+        soft: Tombstone rather than delete. Pass ``config.SYNC_ENABLED``.
+        now: Canonical UTC ISO timestamp for the tombstone.
+
+    Returns:
+        The vec_rowids removed, for post-commit ANN cleanup.
+    """
+    removed_vec_rowids: list[int] = []
+    with contextlib.suppress(sqlite3.OperationalError):
+        removed_vec_rowids = _delete_chunks(db, memory_rowid)
+    # FT-04: entity mention links have no FK (sync can deliver them out of
+    # order), so clean them up explicitly. Entities themselves stay — other
+    # memories may still mention them.
+    db.execute("DELETE FROM memory_entities WHERE memory_id = ?", (memory_id,))
+    # Query-contextual feedback (gap #6) is meaningless once its memory is
+    # gone; a tombstoned memory is excluded from every read path anyway.
+    db.execute("DELETE FROM memory_feedback WHERE memory_id = ?", (memory_id,))
+    if soft:
+        db.execute(
+            "UPDATE memories SET deleted_at = ?, updated_at = ? WHERE id = ?",
+            (now, now, memory_id),
+        )
+    else:
+        db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+    return removed_vec_rowids
+
+
 def _embed_and_store_rows(rows: list[tuple[int, str]]) -> int:
     """Embed and store sliding-window chunk vectors for several memories at once.
 
@@ -2820,6 +2880,7 @@ __all__ = [
     "_embed_and_store_rows",
     "_embed_and_store_batch",
     "_prune_orphan_chunks",
+    "_purge_memory",
     "_fuse_query_embedding",
     "_semantic_search",
     "_hydrate_ann_hits",
