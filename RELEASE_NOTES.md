@@ -1,5 +1,28 @@
 # Release Notes
 
+## v1.21.0 — 2026-07-30
+
+New capability: **`remind_me_undo_import`** — roll back a bulk import.
+
+Imports are the one bulk write this server makes, and there was no bulk way to undo one. `remind_me_delete` takes a single id, which is unusable at import scale: a single mempalace run on a live node accounts for 47000 of 49513 memories (95%) and most of a 212 MB database. Removing that by hand meant either 47000 tool calls or raw SQL — and raw SQL is the trap, because it silently orphans everything derived.
+
+### The tool
+
+- **Targets a specific import, not a category.** Each import path records what it created: `mempalace_imports` and `dbs_imports` store a `memory_id` per row, while `chat_imports` keys on `import_id` which the importer stamps onto `memories.doc_id`. The tool follows those links rather than pattern-matching on `category`, which is only approximately right — category and source counts already disagree on this store (47000 vs 46879 + 118 + 3).
+- **Dry run by default.** Reports exactly what would go and changes nothing until `dry_run=false`. Bulk deletion that propagates across every node should be opt-in, not the default path.
+- **Scopable.** `import_id` narrows to one chat import, one dbs source, or a mempalace drawer prefix (so a single wing can be undone without naming every drawer). A scope that matches nothing removes nothing — a typo is inert, never a full-store wipe.
+- **Resumable and bounded.** `limit` (default 500) caps one call so a large undo cannot exceed the MCP call timeout; callers loop until `remaining` is 0. Re-running after completion is a no-op.
+- **Clears the import-tracking rows too.** This is the non-obvious part: import paths skip anything already recorded, so leaving those rows behind would make the same content permanently un-importable. For chat imports the tracking row is per-file, so it is dropped only once none of its chunks survive — a partially-drained import keeps its row and cannot be duplicated by a re-import.
+- **Honest about disk.** On a sync-enabled node this is a soft delete: rows are tombstoned so the removal propagates to every other node, which means space is *not* reclaimed until compaction (`TOMBSTONE_RETENTION_DAYS`, default 180). The tool says so rather than implying the database shrinks.
+
+### Refactor: one delete path instead of five
+
+Deletion goes through `db._purge_memory`, extracted in this release. The steps are easy to get subtly wrong — chunk vectors, the ANN index entry, entity mention links, stored feedback, and the tombstone-vs-hard-delete split — and were copy-pasted across four call sites (the MCP delete tool, two dashboard REST routes, and sync's tombstone compaction). They had already drifted: **both REST routes skipped the `memory_feedback` cleanup** that the MCP tool performed, so deleting from the dashboard orphaned feedback rows. Extracting the helper fixes that inconsistency and means the new tool could not become a fifth divergent copy.
+
+`soft` is an explicit argument rather than read from `config.SYNC_ENABLED` inside the helper, so each caller keeps its own patchable flag and the behaviour is visible at the call site.
+
+Tests: 13 new cases covering dry-run inertness, tombstone vs hard delete, derived-row cleanup, batching and resumability, scoping, the un-importable-tracking-row trap, and that a typo'd scope matches nothing. Full suite 1514 passed / 17 skipped, coverage 90.56%, on all four legs.
+
 ## v1.20.0 — 2026-07-30
 
 Second stale-backlog correction (same shape as SY-10 in v1.19.6), plus a silent test-coverage bug found while verifying it.

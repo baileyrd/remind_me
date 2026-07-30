@@ -12,9 +12,12 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+from typing import Any
 
+from remind_me_mcp import ann_index, config
 from remind_me_mcp import tools as _pkg
-from remind_me_mcp.config import EMBED_BATCH_SIZE
+from remind_me_mcp.config import EMBED_BATCH_SIZE, SYNC_ENABLED
+from remind_me_mcp.db import _now_iso
 from remind_me_mcp.dbs_import import pull_dbs
 from remind_me_mcp.exporter import EXPORT_INLINE_MAX, export_memories
 from remind_me_mcp.importer import import_chat_file, import_directory
@@ -27,6 +30,7 @@ from remind_me_mcp.models import (
     MemoryStatsInput,
     MempalaceImportInput,
     ResponseFormat,
+    UndoImportInput,
 )
 from remind_me_mcp.server import mcp
 from remind_me_mcp.tools._shared import _maybe_update_notice, log
@@ -769,6 +773,208 @@ async def remind_me_watch_status() -> str:
     status = get_watch_status()
     status["pending_wiki_compile"] = wiki.pending_compile_count()
     return json.dumps(status, indent=2)
+
+
+_UNDO_SOURCES = {
+    # kind -> (tracking table, column holding the memory id, scope column)
+    # mempalace/dbs record a memory_id per tracked row. chat_imports has no
+    # memory_id: it keys on import_id, which the importer stamps onto
+    # memories.doc_id, so the join goes the other way.
+    "mempalace": ("mempalace_imports", "memory_id", "drawer_id"),
+    "dbs": ("dbs_imports", "memory_id", "dbs_source"),
+}
+
+
+def _undo_matching_ids(
+    db: Any, kind: str, import_id: str | None
+) -> tuple[list[str], str]:
+    """Resolve the memory ids belonging to an import, plus a human scope label."""
+    if kind == "chat":
+        # doc_id carries the import_id for every chunk of a chat import.
+        if import_id:
+            rows = db.execute(
+                "SELECT id FROM memories WHERE doc_id = ? AND deleted_at IS NULL",
+                (import_id,),
+            ).fetchall()
+            return [r[0] for r in rows], f"chat import {import_id}"
+        rows = db.execute(
+            """SELECT m.id FROM memories m
+               WHERE m.deleted_at IS NULL
+                 AND m.doc_id IN (SELECT import_id FROM chat_imports)"""
+        ).fetchall()
+        return [r[0] for r in rows], "all chat imports"
+
+    table, id_col, scope_col = _UNDO_SOURCES[kind]
+    if import_id:
+        # Prefix match so a mempalace wing (or a dbs source) can be targeted
+        # without naming every drawer.
+        rows = db.execute(
+            f"""SELECT t.{id_col} FROM {table} t
+                JOIN memories m ON m.id = t.{id_col}
+                WHERE m.deleted_at IS NULL AND t.{scope_col} LIKE ?""",  # noqa: S608 — table/col from a fixed literal map
+            (f"{import_id}%",),
+        ).fetchall()
+        return [r[0] for r in rows], f"{kind} scope {import_id!r}"
+    rows = db.execute(
+        f"""SELECT t.{id_col} FROM {table} t
+            JOIN memories m ON m.id = t.{id_col}
+            WHERE m.deleted_at IS NULL"""  # noqa: S608 — table/col from a fixed literal map
+    ).fetchall()
+    return [r[0] for r in rows], f"all {kind} imports"
+
+
+@mcp.tool(
+    name="remind_me_undo_import",
+    annotations={
+        "title": "Undo an Import",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def remind_me_undo_import(params: UndoImportInput) -> str:
+    """Roll back a previous import, removing its memories and its tracking rows.
+
+    Imports are the one bulk write this server makes, and until now there was
+    no bulk way to undo one — ``remind_me_delete`` takes a single id, which is
+    unusable at import scale (a mempalace run can be tens of thousands of
+    records).
+
+    Deletion goes through the same path as ``remind_me_delete``
+    (``db._purge_memory``), so chunk vectors, the ANN index, entity mention
+    links and stored feedback are all cleaned up. A hand-written SQL DELETE
+    would leave every one of those orphaned. On a sync-enabled node this is a
+    soft delete: rows are tombstoned so the removal propagates to every other
+    node, which also means **the space is not reclaimed until tombstones are
+    compacted** (``TOMBSTONE_RETENTION_DAYS``, default 180).
+
+    The import's tracking rows are removed too. That matters: import paths skip
+    work they have already recorded, so leaving those rows behind would make
+    the same content permanently un-importable.
+
+    Defaults to a dry run. Work is resumable — call repeatedly until
+    ``remaining`` is 0.
+
+    Args:
+        params (UndoImportInput): Which import, scope, dry-run flag, batch size.
+
+    Returns:
+        str: JSON — matched/removed/remaining counts, tracking rows removed,
+        vectors removed, and whether this was a soft or hard delete.
+    """
+    db = _pkg._get_db()
+    kind = str(params.import_kind)
+    memory_ids, scope = _undo_matching_ids(db, kind, params.import_id)
+
+    result: dict[str, Any] = {
+        "import_kind": kind,
+        "scope": scope,
+        "matched": len(memory_ids),
+        "dry_run": params.dry_run,
+        "mode": "soft-delete (tombstone, propagates over sync)"
+        if SYNC_ENABLED
+        else "hard delete (sync disabled — nothing to propagate to)",
+    }
+    if params.dry_run:
+        result["removed"] = 0
+        result["remaining"] = len(memory_ids)
+        result["hint"] = (
+            "dry run — nothing changed. Re-run with dry_run=false to remove. "
+            + (
+                "Tombstoned rows keep their content until compaction "
+                f"({config.TOMBSTONE_RETENTION_DAYS} days), so disk use will "
+                "not drop immediately."
+                if SYNC_ENABLED
+                else "Rows are removed outright; run VACUUM to reclaim the file."
+            )
+        )
+        return json.dumps(result, indent=2)
+
+    batch = memory_ids[: params.limit]
+    # Capture doc_ids BEFORE purging: a hard delete removes the rows outright,
+    # so afterwards there is nothing left to read the import_id back from.
+    doc_ids = (
+        [
+            r[0]
+            for r in db.execute(
+                f"SELECT DISTINCT doc_id FROM memories "  # noqa: S608 — placeholders only
+                f"WHERE doc_id IS NOT NULL AND id IN ({','.join('?' * len(batch))})",
+                batch,
+            ).fetchall()
+        ]
+        if kind == "chat" and batch
+        else []
+    )
+
+    now = _now_iso()
+    removed_vec_rowids: list[int] = []
+    removed = 0
+    for memory_id in batch:
+        row = db.execute(
+            "SELECT rowid FROM memories WHERE id = ? AND deleted_at IS NULL",
+            (memory_id,),
+        ).fetchone()
+        if row is None:
+            continue
+        removed_vec_rowids.extend(
+            _pkg._purge_memory(db, memory_id, row[0], soft=SYNC_ENABLED, now=now)
+        )
+        removed += 1
+
+    tracking_removed = _undo_forget_tracking(db, kind, batch, doc_ids)
+    db.commit()
+    # ANN mutations only after the commit succeeds — see db._delete_chunks.
+    for vec_rowid in removed_vec_rowids:
+        ann_index.remove_vector(db, vec_rowid)
+
+    result["removed"] = removed
+    result["remaining"] = max(0, len(memory_ids) - removed)
+    result["tracking_rows_removed"] = tracking_removed
+    result["vectors_removed"] = len(removed_vec_rowids)
+    if result["remaining"]:
+        result["hint"] = "call again to continue — work is resumable"
+    return json.dumps(result, indent=2)
+
+
+def _undo_forget_tracking(
+    db: Any, kind: str, memory_ids: list[str], doc_ids: list[str]
+) -> int:
+    """Drop the import-tracking rows for ids that were just removed.
+
+    Import paths treat a tracked id as "already done" and skip it, so leaving
+    these behind would silently make the same content un-importable forever.
+
+    ``doc_ids`` must be captured *before* the purge — for chat imports the
+    link lives on ``memories.doc_id``, and a hard delete removes those rows,
+    leaving nothing to read the import_id back from afterwards.
+    """
+    if not memory_ids:
+        return 0
+    if kind == "chat":
+        if not doc_ids:
+            return 0
+        # chat_imports rows are per-file, not per-memory: drop an import only
+        # once none of its chunks survive, so a partially-drained import keeps
+        # its tracking row and cannot be duplicated by a re-import.
+        marks = ",".join("?" * len(doc_ids))
+        cur = db.execute(
+            f"""DELETE FROM chat_imports
+                 WHERE import_id IN ({marks})
+                   AND import_id NOT IN (
+                       SELECT doc_id FROM memories
+                        WHERE doc_id IS NOT NULL AND deleted_at IS NULL
+                   )""",  # noqa: S608 — placeholders only
+            doc_ids,
+        )
+        return int(cur.rowcount or 0)
+    table, id_col, _ = _UNDO_SOURCES[kind]
+    marks = ",".join("?" * len(memory_ids))
+    cur = db.execute(
+        f"DELETE FROM {table} WHERE {id_col} IN ({marks})",  # noqa: S608 — table/col from a fixed literal map
+        memory_ids,
+    )
+    return int(cur.rowcount or 0)
 
 
 @mcp.tool(

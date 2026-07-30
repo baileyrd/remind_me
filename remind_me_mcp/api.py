@@ -28,7 +28,6 @@ from remind_me_mcp.config import (
     resolve_api_key,
 )
 from remind_me_mcp.db import (
-    _delete_chunks,
     _embed_and_store,
     _entity_profile,
     _expand_via_entity_relations,
@@ -37,6 +36,7 @@ from remind_me_mcp.db import (
     _make_id,
     _normalize_entity_name,
     _now_iso,
+    _purge_memory,
     _resolve_entity,
     _row_to_dict,
 )
@@ -806,13 +806,10 @@ def _build_api_app() -> Starlette:
         node with sync disabled, this is a plain, immediate delete exactly
         as before. Mirrors remind_me_delete's MCP-tool behavior exactly.
         """
-        import sqlite3 as _sqlite3
 
         memory_id = request.path_params["memory_id"]
 
         def _work() -> JSONResponse:
-            import contextlib
-
             db = _get_db()
             row = db.execute(
                 "SELECT rowid FROM memories WHERE id = ? AND deleted_at IS NULL",
@@ -820,18 +817,9 @@ def _build_api_app() -> Starlette:
             ).fetchone()
             if row is None:
                 return _json_err("Not found", 404)
-            removed_vec_rowids: list[int] = []
-            with contextlib.suppress(_sqlite3.OperationalError):
-                removed_vec_rowids = _delete_chunks(db, row[0])
-            db.execute("DELETE FROM memory_entities WHERE memory_id = ?", (memory_id,))
-            if SYNC_ENABLED:
-                now = _now_iso()
-                db.execute(
-                    "UPDATE memories SET deleted_at = ?, updated_at = ? WHERE id = ?",
-                    (now, now, memory_id),
-                )
-            else:
-                db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+            removed_vec_rowids = _purge_memory(
+                db, memory_id, row[0], soft=SYNC_ENABLED, now=_now_iso()
+            )
             db.commit()
             for vec_rowid in removed_vec_rowids:
                 ann_index.remove_vector(db, vec_rowid)
@@ -867,15 +855,12 @@ def _build_api_app() -> Starlette:
         configured) to each id independently — one missing id doesn't fail
         the rest of the batch.
         """
-        import sqlite3 as _sqlite3
 
         ids, err = await _bulk_ids_from_body(request)
         if err is not None:
             return err
 
         def _work() -> JSONResponse:
-            import contextlib
-
             db = _get_db()
             deleted: list[str] = []
             not_found: list[str] = []
@@ -888,17 +873,9 @@ def _build_api_app() -> Starlette:
                 if row is None:
                     not_found.append(memory_id)
                     continue
-                removed_vec_rowids: list[int] = []
-                with contextlib.suppress(_sqlite3.OperationalError):
-                    removed_vec_rowids = _delete_chunks(db, row[0])
-                db.execute("DELETE FROM memory_entities WHERE memory_id = ?", (memory_id,))
-                if SYNC_ENABLED:
-                    db.execute(
-                        "UPDATE memories SET deleted_at = ?, updated_at = ? WHERE id = ?",
-                        (now, now, memory_id),
-                    )
-                else:
-                    db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+                removed_vec_rowids = _purge_memory(
+                    db, memory_id, row[0], soft=SYNC_ENABLED, now=now
+                )
                 db.commit()
                 for vec_rowid in removed_vec_rowids:
                     ann_index.remove_vector(db, vec_rowid)

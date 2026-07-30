@@ -1125,6 +1125,57 @@ class WikiCompileInput(BaseModel):
     )
 
 
+class UndoImportKind(StrEnum):
+    """Which import-tracking table an undo targets.
+
+    Each import path records what it created, but links back to ``memories``
+    differently: mempalace and dbs store a ``memory_id`` per tracked row, while
+    chat imports key on ``import_id`` and stamp it onto ``memories.doc_id``.
+    """
+
+    MEMPALACE = "mempalace"
+    CHAT = "chat"
+    DBS = "dbs"
+
+
+class UndoImportInput(BaseModel):
+    """Input for remind_me_undo_import: roll back a previous import."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    import_kind: UndoImportKind = Field(
+        ..., description="Which import to undo: mempalace, chat, or dbs."
+    )
+    import_id: str | None = Field(
+        default=None,
+        description=(
+            "Scope to one import run. For 'chat' this is the chat_imports "
+            "import_id; for 'dbs' the dbs_source; for 'mempalace' a drawer_id "
+            "prefix (e.g. a wing name). Omit to target every record from that "
+            "import kind."
+        ),
+    )
+    dry_run: bool = Field(
+        default=True,
+        description=(
+            "When True (the default), report exactly what would be removed and "
+            "change nothing. Pass False to actually delete — this is "
+            "deliberately opt-in because the operation is bulk and, on a "
+            "sync-enabled node, propagates to every other node."
+        ),
+    )
+    limit: int = Field(
+        default=500,
+        ge=1,
+        le=5000,
+        description=(
+            "Maximum memories to remove per call. The work is resumable: call "
+            "repeatedly until 'remaining' reaches 0. Bounded so a large undo "
+            "cannot exceed the MCP call timeout."
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Vitality report model (Phase 11 Plan 03)
 # ---------------------------------------------------------------------------
@@ -1183,4 +1234,6 @@ __all__ = [
     "WikiListInput",
     "WikiLoadInput",
     "WikiCompileInput",
+    "UndoImportKind",
+    "UndoImportInput",
 ]
