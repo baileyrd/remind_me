@@ -3,7 +3,7 @@ The declared package version must match the newest RELEASE_NOTES entry.
 
 This exists because they silently diverged: `pyproject.toml` sat at 1.19.0
 (last set 2026-07-21) while `RELEASE_NOTES.md` accumulated seven entries
-through v1.19.7. Nothing caught it, because nothing compared them.
+beneath it. Nothing caught it, because nothing compared them.
 
 The drift is user-visible rather than cosmetic. `remind_me_mcp.__version__`
 resolves from installed package metadata, which comes from `pyproject.toml`,
@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parent.parent
 PYPROJECT = ROOT / "pyproject.toml"
 RELEASE_NOTES = ROOT / "RELEASE_NOTES.md"
 
-# "## v1.19.7 — 2026-07-30" (em dash) — capture just the version.
+# "## v1.20.0 — 2026-07-30" (em dash) — capture just the version.
 _HEADING = re.compile(r"^##\s+v(?P<version>\d+\.\d+\.\d+)\b", re.MULTILINE)
 
 
