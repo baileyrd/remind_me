@@ -1,5 +1,22 @@
 # Release Notes
 
+## v1.19.5 — 2026-07-30
+
+Completes the sync observability set begun in v1.19.4. SY-12 answered "is my local sync healthy?" and SY-13 made the hub's counts readable; this closes the loop with "does my data actually match the hub?"
+
+### New Features
+
+- **`remind_me_sync_reconcile` (SY-14)** — fetches the hub's `GET /stats`, diffs it against local counts, and returns per-category drift with a **verdict**. Read-only on both sides. Replaces a manual exercise: `psql` on the hub host, local counts gathered separately, two tables diffed by eye.
+  - Verdicts are `in-sync`, `pull-lag`, `node-ahead`, and `fault`. The judgment is the deliverable — the benign case and the real fault differ only by a *sign*, which is easy to skim past when reading two count tables. `node-ahead` (local > hub) is checked first and outranks everything, because it's the only direction meaning this node holds records nothing else has.
+  - **Judged by evidence, not by category names.** The original sketch classified drift by "bulk/immutable categories," which would require hardcoding which categories are expected to be static — fragile, since any category can be written to. Instead, hub-ahead drift keys off *pull freshness*: a recent successful pull means ordinary lag; a stale one (beyond `max(3 × SYNC_INTERVAL, 300s)`) or none at all means the pull isn't running. Identical numbers, different verdict, decided on real evidence.
+  - Local counts deliberately **do not** filter `deleted_at IS NULL`. The hub counts every row and reports tombstones separately, so filtering locally would make a healthy node look permanently behind by exactly its own tombstone count — a false `pull-lag` that never resolves.
+  - Categories are compared as a **union** of both sides, so a bulk import that never reached the hub shows up rather than being silently intersected away. Only drifting categories are listed; agreement is reported as a count.
+  - Degrades with a named cause instead of a stack trace: `unsupported` when the hub predates SY-13 and 404s `/stats` (the state a rolling upgrade passes through, node-first), `unauthorized` on a `SYNC_SECRET` mismatch, `unreachable` on connection failure, and `disabled` without contacting the hub at all.
+
+Tests: 15 new cases covering every verdict and failure mode, including that `node-ahead` outranks a healthy pull (a node can pull fine while its pushes fail), that tombstones don't read as drift, and that a malformed hub payload yields zeros rather than raising. Full suite 1484 passed / 12 skipped, coverage 90.27%.
+
+Verified against the real 2026-07-29 hub-vs-node numbers: correctly returns `pull-lag` with the same three drifting categories (`dialog` +10, `conversation` +6, `homelab` +2) and 5 categories in sync that a manual reconciliation found.
+
 ## v1.19.4 — 2026-07-30
 
 Sync observability. Sync is the most complex and most failure-prone subsystem here, and it was the only one with no status surface — `remind_me_server_status` reported the folder watcher, webhook ingestion, OpenTelemetry, the wiki, and the remote connector, but nothing about sync, and dedicated status tools existed for far simpler subsystems. In practice that meant answering "did that bulk import reach the hub?" or "is the push backlog draining?" required SSH plus hand-written SQL against `sync_outbox` and `psql` inside the hub's Postgres container.
