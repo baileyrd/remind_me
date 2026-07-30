@@ -46,6 +46,14 @@ Suite totals moved because of the skip fix, not because tests were added: 1484 �
 
 Known gap left open deliberately: the `ann` extra is installed by neither CI leg, so `tests/test_ann_index.py` (13 tests) and the 6 ANN tests in `test_chunking.py` still never run in CI — the ANN code path has no automated coverage. Adding a third matrix leg (the `all` extra exists) would close it; that's a CI-cost decision, not a drive-by change.
 
+### Fixed: the declared package version was seven releases stale
+
+`pyproject.toml` still read `version = "1.19.0"`, last set 2026-07-21, while this file accumulated v1.19.1 through v1.19.7. Bumped to **1.19.7** to match.
+
+This was user-visible, not cosmetic. `remind_me_mcp.__version__` resolves from installed package metadata, which comes from `pyproject.toml`, so `remind_me_check_update` and every status surface reported a version seven releases old — including immediately after a successful update, which is precisely when that number is being read to confirm the update worked.
+
+Guarded by `tests/test_version_consistency.py`, which asserts the declared version equals the newest `RELEASE_NOTES` heading, that entries stay in descending order (so "newest" is well defined), and that `__version__` resolves rather than falling back to the `0.0.0-dev` sentinel. Unlike the BACKLOG-drift class of problem — prose that quietly stops being true, which no test can check — this one is a mechanical equality and cheap to enforce. Verified by reverting the version and confirming the guard fails with an actionable message.
+
 ## v1.19.6 — 2026-07-30
 
 Documentation correction, plus a process guard so this class of drift stops recurring. No code changes.
