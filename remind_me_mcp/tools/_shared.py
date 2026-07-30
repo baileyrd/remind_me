@@ -98,3 +98,52 @@ def _maybe_update_notice(response: str) -> str:
     if notice:
         return response + "\n\n---\n" + notice
     return response
+
+
+# ---------------------------------------------------------------------------
+# Contradiction-supersession preview (gap #5 false-positive mitigation)
+# ---------------------------------------------------------------------------
+
+
+def _supersession_preview(
+    db: Any, superseded_ids: list[str], max_len: int = 80
+) -> list[dict[str, str]]:
+    """Fetch a short content preview for each just-superseded memory id.
+
+    db._supersede_contradicting_facts hides an old memory from every real
+    read path (search, entity/subject/predicate lookups) the instant a new
+    fact shares its (subject, predicate) with a different object. That's
+    correct for a genuine contradiction ("I live in Seattle" -> "I moved to
+    Boston") but a false positive for a reused generic (subject, predicate)
+    pair across unrelated facts -- and the old content stays invisible
+    until someone thinks to remind_me_get the bare id a caller might not
+    even notice. Surfacing what got hidden, inline in the same tool
+    response, lets the caller catch a false positive immediately instead of
+    silently losing a memory to a missing search result.
+
+    Args:
+        db: An open SQLite connection.
+        superseded_ids: IDs returned by _supersede_contradicting_facts.
+        max_len: Truncate each preview to this many characters.
+
+    Returns:
+        A list of {"id": ..., "content": ...} dicts, one per id that still
+        resolves to a row (best-effort; a since-deleted row is skipped).
+    """
+    if not superseded_ids:
+        return []
+    placeholders = ",".join("?" for _ in superseded_ids)
+    rows = db.execute(
+        f"SELECT id, content FROM memories WHERE id IN ({placeholders})",
+        superseded_ids,
+    ).fetchall()
+    by_id = {row["id"]: row["content"] for row in rows}
+    previews: list[dict[str, str]] = []
+    for sid in superseded_ids:
+        content = by_id.get(sid)
+        if content is None:
+            continue
+        if len(content) > max_len:
+            content = content[: max_len - 1].rstrip() + "…"
+        previews.append({"id": sid, "content": content})
+    return previews

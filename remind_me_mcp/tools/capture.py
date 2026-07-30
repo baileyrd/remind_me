@@ -424,6 +424,7 @@ async def remind_me_decompose(params: DecomposeInput) -> str:
         "relations_linked": relations_linked,
         "entities_linked": entities_linked,
         "superseded_ids": superseded_ids,
+        "superseded_preview": _pkg._supersession_preview(db, superseded_ids),
     }
     return json.dumps(result)
 
@@ -668,6 +669,7 @@ async def remind_me_annotate(params: AnnotateInput) -> str:
             "entities_linked": linked,
             "relation_linked": relation_linked,
             "superseded_ids": superseded,
+            "superseded_preview": _pkg._supersession_preview(db, superseded),
         })
 
     db.commit()

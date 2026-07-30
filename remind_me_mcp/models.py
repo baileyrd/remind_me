@@ -125,12 +125,27 @@ class MemoryAddInput(BaseModel):
     )
     subject: str | None = Field(
         default=None,
-        description="Structured triple: subject (e.g. 'Bailey') — FT-04",
+        description=(
+            "Structured triple: subject (e.g. 'Bailey') — FT-04. WARNING: "
+            "setting this together with predicate/object checks this triple "
+            "against every OTHER memory sharing the same (subject, predicate) "
+            "— one with a different object is treated as a contradiction and "
+            "silently superseded (hidden from search/entity lookups, though "
+            "still readable via remind_me_get). Correct for genuine "
+            "contradictions ('I live in Seattle' -> 'I moved to Boston'), but "
+            "a false positive if a (subject, predicate) pair is reused across "
+            "unrelated facts. Use a specific predicate per distinct claim, "
+            "never a shared generic one like 'must_always' or 'prefers'."
+        ),
         max_length=200,
     )
     predicate: str | None = Field(
         default=None,
-        description="Structured triple: predicate (e.g. 'prefers') — FT-04",
+        description=(
+            "Structured triple: predicate (e.g. 'prefers') — FT-04. See "
+            "`subject` for the (subject, predicate) contradiction-supersession "
+            "warning."
+        ),
         max_length=200,
     )
     object: str | None = Field(
@@ -335,6 +350,18 @@ class MemoryUpdateInput(BaseModel):
     category: str | None = Field(default=None, max_length=100)
     tags: list[str] | None = Field(default=None, max_length=20)
     metadata: dict[str, Any] | None = Field(default=None)
+    clear_superseded: bool = Field(
+        default=False,
+        description=(
+            "If true, clear this memory's superseded_by flag, un-hiding it "
+            "from search, entity, and subject/predicate lookups. Recovery "
+            "path for a false-positive contradiction-supersession (see "
+            "remind_me_add's subject/predicate warning) — e.g. a reused "
+            "generic (subject, predicate) pair that wrongly superseded an "
+            "unrelated memory. Does not affect the memory that did the "
+            "superseding."
+        ),
+    )
 
 
 class MemoryDeleteInput(BaseModel):
@@ -757,7 +784,13 @@ class AtomicFact(BaseModel):
     )
     subject: str | None = Field(
         default=None,
-        description="Structured triple: subject (e.g. 'Bailey') — FT-04",
+        description=(
+            "Structured triple: subject (e.g. 'Bailey') — FT-04. WARNING: "
+            "same (subject, predicate) as another non-superseded fact with a "
+            "different object silently supersedes (hides) it — see "
+            "MemoryAddInput.subject. Use a specific predicate per distinct "
+            "claim, not a shared generic one."
+        ),
         max_length=200,
     )
     predicate: str | None = Field(
@@ -837,7 +870,15 @@ class MemoryAnnotation(BaseModel):
     memory_id: str = Field(
         ..., description="The ID of the memory to annotate", min_length=1
     )
-    subject: str | None = Field(default=None, max_length=200)
+    subject: str | None = Field(
+        default=None,
+        max_length=200,
+        description=(
+            "WARNING: same (subject, predicate) as another non-superseded "
+            "memory with a different object silently supersedes (hides) it "
+            "— see MemoryAddInput.subject."
+        ),
+    )
     predicate: str | None = Field(default=None, max_length=200)
     object: str | None = Field(default=None, max_length=500)
     entities: list[EntityInput] = Field(
