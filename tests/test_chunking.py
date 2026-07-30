@@ -400,10 +400,24 @@ def test_sync_style_large_unbatched_pull_is_batched_internally(
 # ANN index integration (gap #10) — _semantic_search's ANN/brute-force split
 # ---------------------------------------------------------------------------
 
-usearch = pytest.importorskip("usearch", reason="usearch (the 'ann' extra) not installed")
+@pytest.fixture()
+def require_usearch() -> None:
+    """Skip a single ANN test when the optional 'ann' extra isn't installed.
+
+    Deliberately a fixture rather than a module-level
+    ``pytest.importorskip("usearch")``. That form runs at import time and
+    skips the ENTIRE module, which silently disabled all 14 chunking and
+    batching tests above — including
+    ``test_sync_style_large_unbatched_pull_is_batched_internally``, the
+    regression test for issue #16 — in both CI legs, since neither installs
+    the 'ann' extra ('semantic' does not imply it). Only the ANN tests below
+    need usearch; keep the guard on them.
+    """
+    pytest.importorskip("usearch", reason="usearch (the 'ann' extra) not installed")
 
 
 def test_semantic_search_uses_ann_path_once_over_threshold(
+    require_usearch: None,
     db_conn_with_vec: sqlite3.Connection, mock_embedder, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Lowering ANN_MIN_CHUNKS to 0 forces every search through the ANN path
@@ -432,6 +446,7 @@ def test_semantic_search_uses_ann_path_once_over_threshold(
 
 
 def test_semantic_search_stays_on_brute_force_below_threshold(
+    require_usearch: None,
     db_conn_with_vec: sqlite3.Connection, mock_embedder, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The default (large) threshold means a small test corpus never touches
@@ -454,6 +469,7 @@ def test_semantic_search_stays_on_brute_force_below_threshold(
 
 
 def test_semantic_search_falls_back_to_brute_force_when_ann_returns_none(
+    require_usearch: None,
     db_conn_with_vec: sqlite3.Connection, mock_embedder, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """If the ANN path can't serve a result (unavailable/failed), search still
@@ -473,6 +489,7 @@ def test_semantic_search_falls_back_to_brute_force_when_ann_returns_none(
 
 
 def test_semantic_search_ann_path_respects_category_and_tag_filters(
+    require_usearch: None,
     db_conn_with_vec: sqlite3.Connection, mock_embedder, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Category/tag filters apply identically whether ANN or brute force served
@@ -507,6 +524,7 @@ def test_semantic_search_ann_path_respects_category_and_tag_filters(
 
 
 def test_semantic_search_ann_path_excludes_superseded_memories(
+    require_usearch: None,
     db_conn_with_vec: sqlite3.Connection, mock_embedder, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A superseded memory is excluded from ANN-served results, same as the
@@ -528,6 +546,7 @@ def test_semantic_search_ann_path_excludes_superseded_memories(
 
 
 def test_semantic_search_ann_and_brute_force_agree_on_dedup_and_ranking(
+    require_usearch: None,
     db_conn_with_vec: sqlite3.Connection, mock_embedder, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Same corpus, same query: the ANN path and the brute-force path return

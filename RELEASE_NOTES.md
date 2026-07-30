@@ -1,5 +1,36 @@
 # Release Notes
 
+## v1.19.7 — 2026-07-30
+
+Second stale-backlog correction (same shape as SY-10 in v1.19.6), plus a silent test-coverage bug found while verifying it.
+
+### Fixed: 14 tests were never running in CI
+
+Verifying SY-11 meant checking that its regression test actually passes — and it turned out never to run. `tests/test_chunking.py` had a **module-level** `pytest.importorskip("usearch")` sitting at line 403, ahead of the ANN section. That form executes at import time and skips the *entire module*, and since `usearch` is the `ann` extra — which neither CI leg installs (`semantic` does not imply it) — all **20** tests in the file were skipped in every CI run.
+
+14 of those 20 test chunking and batching and need no `usearch` at all, including `test_sync_style_large_unbatched_pull_is_batched_internally` — the regression test for issue #16, i.e. the guard for the very invariant SY-11 is about. It has been silently inert.
+
+The guard is now a `require_usearch` fixture applied to just the 6 ANN tests that need it. Result: **14 passed / 6 skipped** without the extra (previously 0 passed / 20 skipped), and 20 passed with it. The fixture docstring records why it must not go back to module scope.
+
+Swept the rest of the suite for the same shape: `tests/test_ann_index.py`'s module-level guard is correct (all 13 of its tests genuinely need `usearch`) and `test_openapi_spec.py`'s guards are per-test. No other over-reach.
+
+### Corrected: BACKLOG SY-11 was stale
+
+`BACKLOG.md` SY-11 was marked **todo** and proposed batching `_embed_and_store_rows` by `EMBED_BATCH_SIZE` at the sync apply path's call site. That shipped in commit `1493d4e` (#68) — but resolved the *opposite* way to what the row proposed: instead of pre-slicing at each call site, the batching loop moved **inside** `_embed_and_store_rows`, making it the single source of truth. Every caller (reindex, file import, mempalace/dbs import, sync's pulled-record embedding) now gets the bound for free, and a new caller cannot forget it. Both the `embed()` call and the surrounding transaction are bounded, layered beneath `EMBED_FORWARD_BATCH`'s forward-pass ceiling.
+
+Implementing SY-11 as written would now make things worse — pre-slicing in `sync.py` would duplicate a guarantee the callee already makes, which is exactly what `_embed_and_store_rows`' docstring warns against.
+
+Already covered by `test_sync_style_large_unbatched_pull_is_batched_internally` in `tests/test_chunking.py`, whose docstring cites issue #16 directly and reproduces sync's call shape (more rows than `EMBED_BATCH_SIZE` in a single call), asserting no `embed()` call exceeds the bound.
+
+- **SY-11 marked done**, recording that it was closed the opposite way to the approach it sketched.
+- With this, `BACKLOG.md` has **no `todo` rows remaining**.
+
+Worth noting the pattern: SY-10 and SY-11 were both marked todo while the work had shipped, and in both cases the row's *premise* stayed technically true while ceasing to be a problem — which is why neither looked obviously stale. The `CONTRIBUTING.md` / PR-template guard added in v1.19.6 (update the BACKLOG row in the same PR, including when you solved it differently) exists for exactly this, and would have caught both.
+
+Suite totals moved because of the skip fix, not because tests were added: 1484 → **1498 passed** on the semantic legs, and coverage 90.27% → **90.54%**, since 14 previously-inert tests now exercise real code paths.
+
+Known gap left open deliberately: the `ann` extra is installed by neither CI leg, so `tests/test_ann_index.py` (13 tests) and the 6 ANN tests in `test_chunking.py` still never run in CI — the ANN code path has no automated coverage. Adding a third matrix leg (the `all` extra exists) would close it; that's a CI-cost decision, not a drive-by change.
+
 ## v1.19.6 — 2026-07-30
 
 Documentation correction, plus a process guard so this class of drift stops recurring. No code changes.
