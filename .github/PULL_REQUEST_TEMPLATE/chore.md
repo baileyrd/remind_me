@@ -9,6 +9,7 @@
 - [ ] Medium/High — described below
 
 ## Checklist
+- [ ] `BACKLOG.md` row updated if this closes or invalidates one (say so if you solved it differently)
 - [ ] Tests still pass unmodified (or updated where mechanically necessary)
 - [ ] Lockfile/changelog updated if applicable
 - [ ] No secrets/credentials committed or logged

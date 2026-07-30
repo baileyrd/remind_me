@@ -1,5 +1,20 @@
 # Release Notes
 
+## v1.19.6 — 2026-07-30
+
+Documentation correction, plus a process guard so this class of drift stops recurring. No code changes.
+
+`BACKLOG.md` SY-10 was marked **todo** and stated that a local delete never propagates — that the outbox has INSERT/UPDATE triggers only, so a deleted record survives on the hub and every other node. That has been false since migration **v15→v16** (gap #11), which resolved it a different way than SY-10 proposed: instead of adding a delete trigger, deletion became an UPDATE setting a `deleted_at` tombstone, riding the existing `memories_outbox_au` trigger with no new trigger and no wire-format change.
+
+This was purely a docs bug — the behavior shipped and is covered by 19 tests in `tests/test_tombstones.py`, including `test_deleted_at_rides_the_update_outbox_trigger`. Only the backlog row lied, and it read as authoritative.
+
+It had real operational cost: planning a multi-node cleanup while believing deletes don't propagate leads to deleting the same records separately on every node, rather than soft-deleting once and letting tombstones replicate. Establishing which source was right required reading migration internals.
+
+- **SY-10 marked done**, recording that it was closed by the tombstone column rather than the delete trigger originally sketched.
+- **`ARCHITECTURE.md` gains a "Deletion propagates as a tombstone, not a delete" section** — the mechanism is counter-intuitive and was previously discoverable only from a migration docstring. Covers the consequences that bite: every read path must filter `deleted_at IS NULL`; compaction is purely time-based with no per-peer acknowledgement; `memory_delete` hard-deletes when sync is disabled (nothing to propagate to, and compaction only runs from the sync loop); and cross-node counts must *not* filter `deleted_at`, since the hub counts every row and reports tombstones separately.
+- **A short "sync is observable through tools" section** pointing at `remind_me_sync_status`, the hub's `GET /stats`, and `remind_me_sync_reconcile`, so the default is asking the system rather than reading logs or querying databases by hand.
+- **`CONTRIBUTING.md` workflow step and a checklist item in the feature / bug-fix / chore PR templates**: if a change closes or invalidates a `BACKLOG.md` row, update that row in the same PR — including when it was solved differently than proposed. Cheap to do at the time, expensive to discover later.
+
 ## v1.19.5 — 2026-07-30
 
 Completes the sync observability set begun in v1.19.4. SY-12 answered "is my local sync healthy?" and SY-13 made the hub's counts readable; this closes the loop with "does my data actually match the hub?"

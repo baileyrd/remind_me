@@ -13,6 +13,7 @@ Fixes #
 - [ ] Verified fix locally
 
 ## Checklist
+- [ ] `BACKLOG.md` row updated if this closes or invalidates one (say so if you solved it differently)
 - [ ] No secrets/credentials committed or logged
 - [ ] Diff is focused (no unrelated changes bundled in)
 - [ ] Non-obvious decisions have a "why" comment
