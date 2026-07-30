@@ -1,5 +1,23 @@
 # Release Notes
 
+## v1.19.4 — 2026-07-30
+
+Sync observability. Sync is the most complex and most failure-prone subsystem here, and it was the only one with no status surface — `remind_me_server_status` reported the folder watcher, webhook ingestion, OpenTelemetry, the wiki, and the remote connector, but nothing about sync, and dedicated status tools existed for far simpler subsystems. In practice that meant answering "did that bulk import reach the hub?" or "is the push backlog draining?" required SSH plus hand-written SQL against `sync_outbox` and `psql` inside the hub's Postgres container.
+
+### New Features
+
+- **`remind_me_sync_status` (SY-12)** — node/hub config, the outbox trigger gate, outbox depth, per-remote push/pull watermarks with the most recent error, and tombstone counts split into total vs already past the retention window. Follows the `get_watch_status`/`get_webhook_status` pattern: the logic lives in `sync.py`, the tool is a thin JSON wrapper.
+  - The **drain-rate verdict** is the load-bearing part. A pending count on its own is ambiguous — ten thousand queued rows look identical whether they're draining normally or the push is wedged — so the previous observation is persisted in `sync_flags` and one call now reports `draining` / `stalled` / `growing` / `idle` with a per-minute rate and ETA. The baseline only advances after 30s, so two calls seconds apart can't collapse it into meaningless noise.
+  - A remote that has **never** completed a cycle has no `sync_log` row, so a naive join would hide the single worst failure mode (sync never worked at all). Those remotes are merged into the report from the error map instead, with `ever_contacted: false`.
+  - Disabled sync names the specific missing env vars rather than returning empty counters, matching `watch_status`.
+  - `remind_me_server_status` gains a one-line sync summary with a pointer to the new tool, and flags remotes whose last cycle failed.
+- **Hub `GET /stats` (SY-13)** — the hub previously exposed only `/health` and five `/sync/*` routes, so its own API could not answer how many records it held, and no client (node, dashboard, or connector) could reconcile against it. Returns totals, tombstones, `by_origin_node`, `by_category`, and entity/link/relation counts. Auth-gated via the existing `_require_auth`, since counts and category names leak information about content; `/health` stays unauthenticated and free of aggregate queries so deploy healthchecks stay cheap and keep working when Postgres is down.
+  - `by_origin_node` is the part nothing else can surface: `origin_node` is hub-only and never crosses the sync wire.
+
+Tests: 18 new cases covering every drain verdict, the baseline-interval guard, corrupt-baseline recovery, never-contacted remotes, and tombstone eligibility. The hub route gets static AST checks instead of integration tests — `fastapi`/`psycopg` are deliberately not this package's dependencies, so neither CI leg can import `hub.main`; the checks lock the property most expensive to get wrong, namely that `/stats` is auth-gated while `/health` is not. Full suite 1469 passed / 12 skipped, coverage 90.25%.
+
+Prepares SY-14 (`remind_me_sync_reconcile`), which needs SY-13's endpoint to diff against.
+
 ## v1.19.3 — 2026-07-29
 
 Dependency safety fix. `pyproject.toml` declared `mcp[cli]>=1.0.0` with no upper bound, while both the README's install path and `updater.py`'s self-update run `pip install -e .` — which ignores `uv.lock` and resolves fresh. MCP Python SDK 2.0.0 shipped 2026-07-28 and removes `mcp.server.fastmcp` outright (`FastMCP` became `mcp.server.mcpserver.MCPServer`, with no compatibility alias), so the next `remind_me_self_update` on any node would have installed it and left every module in the package non-importable via `server.py`'s top-level import — taking down MCP stdio, the remote connector, and the dashboard together. Capped to `>=1.28,<2`. The 1.x line is still actively maintained (1.29.0 shipped the same day as 2.0.0), so this costs nothing but a deliberate upgrade decision later.

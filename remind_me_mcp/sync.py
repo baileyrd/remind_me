@@ -987,6 +987,243 @@ def _compact_tombstones(db: sqlite3.Connection) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Status reporting (SY-12)
+# ---------------------------------------------------------------------------
+
+# Per-remote last error, keyed by remote_id ("hub" or a peer's node_id). Only
+# the most recent failure per remote is kept — this is a "what is wrong right
+# now" surface, not a log. Cleared on the next successful cycle for that
+# remote so a recovered remote stops reporting a stale error.
+_last_errors: dict[str, dict[str, str]] = {}
+
+# Minimum gap between drain-rate baseline updates. Without this, two status
+# calls seconds apart would overwrite the baseline with a near-zero elapsed
+# time and report a meaningless rate. Below this threshold the older baseline
+# is kept so the reported rate stays informative.
+_STATUS_PROBE_MIN_SECONDS = 30
+
+
+def _record_error(remote_id: str, exc: BaseException) -> None:
+    """Remember the most recent sync failure for one remote (SY-12)."""
+    _last_errors[remote_id] = {
+        "error": f"{type(exc).__name__}: {exc}",
+        "at": _now_iso(),
+    }
+
+
+def _clear_error(remote_id: str) -> None:
+    """Forget a remote's last error after a successful cycle (SY-12)."""
+    _last_errors.pop(remote_id, None)
+
+
+def _flag(db: sqlite3.Connection, key: str) -> str | None:
+    """Read one ``sync_flags`` value, or None when unset."""
+    row = db.execute("SELECT value FROM sync_flags WHERE key = ?", (key,)).fetchone()
+    return None if row is None else str(row["value"])
+
+
+def _set_flag(db: sqlite3.Connection, key: str, value: str) -> None:
+    """Upsert one ``sync_flags`` value."""
+    db.execute(
+        "INSERT INTO sync_flags (key, value) VALUES (?, ?) "
+        "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+
+
+def _drain_rate(db: sqlite3.Connection, pending: int) -> dict[str, Any]:
+    """Compare the pending count against the last probe to derive direction.
+
+    A single pending count is ambiguous — 10k queued rows look identical
+    whether they are draining normally or the push is wedged. This persists
+    the previous observation in ``sync_flags`` so one call can answer
+    "draining or stuck?" instead of requiring the caller to sample twice and
+    diff by hand.
+
+    The baseline is only advanced once ``_STATUS_PROBE_MIN_SECONDS`` have
+    elapsed, so rapid successive calls still report against a meaningful
+    interval rather than resetting to noise.
+
+    Args:
+        db: An open SQLite connection.
+        pending: The current unsent outbox row count.
+
+    Returns:
+        A dict with ``verdict`` and, when a usable baseline exists,
+        ``per_minute``, ``sampled_over_seconds``, and ``eta_minutes``.
+    """
+    now = datetime.now(UTC)
+    prev_count_raw = _flag(db, "status_probe_pending")
+    prev_at_raw = _flag(db, "status_probe_at")
+
+    def _save() -> None:
+        _set_flag(db, "status_probe_pending", str(pending))
+        _set_flag(db, "status_probe_at", now.isoformat())
+        db.commit()
+
+    if pending == 0:
+        _save()
+        return {"verdict": "idle"}
+
+    if prev_count_raw is None or prev_at_raw is None:
+        _save()
+        return {
+            "verdict": "unknown",
+            "hint": (
+                "no baseline yet — call again in "
+                f"{_STATUS_PROBE_MIN_SECONDS}s to get a drain rate"
+            ),
+        }
+
+    try:
+        prev_count = int(prev_count_raw)
+        elapsed = (now - datetime.fromisoformat(_canon_ts(prev_at_raw))).total_seconds()
+    except (ValueError, TypeError):
+        # Corrupt baseline — reset rather than propagate a parse error out of
+        # a read-only status call.
+        _save()
+        return {"verdict": "unknown", "hint": "baseline reset (unparseable)"}
+
+    if elapsed <= 0:
+        return {"verdict": "unknown", "hint": "baseline is not older than now"}
+
+    drained = prev_count - pending
+    per_minute = round(drained / (elapsed / 60), 1)
+
+    if elapsed >= _STATUS_PROBE_MIN_SECONDS:
+        _save()
+
+    result: dict[str, Any] = {
+        "per_minute": per_minute,
+        "sampled_over_seconds": round(elapsed, 1),
+    }
+    if drained > 0:
+        result["verdict"] = "draining"
+        result["eta_minutes"] = round(pending / per_minute, 1) if per_minute else None
+    elif drained == 0:
+        result["verdict"] = "stalled"
+        result["hint"] = (
+            "pending count unchanged — check reachability of the hub/peers, "
+            "that SYNC_SECRET matches, and the server log for push errors"
+        )
+    else:
+        result["verdict"] = "growing"
+        result["hint"] = "local writes are outpacing the push rate"
+    return result
+
+
+def get_sync_status() -> dict[str, Any]:
+    """Report sync state for the MCP status tools (SY-12).
+
+    Sync is the most failure-prone subsystem here and was the only one with no
+    status surface — diagnosing it previously meant shell access and hand-written
+    SQL against ``sync_outbox``. This is the read-only equivalent of
+    :func:`remind_me_mcp.watcher.get_watch_status`.
+
+    Returns:
+        A JSON-serializable dict: enable/gate flags, per-remote push/pull
+        watermarks, outbox depth with a drain-rate verdict, tombstone counts,
+        and the most recent error per remote. When sync is disabled, includes a
+        configuration hint instead of empty counters.
+    """
+    if not SYNC_ENABLED:
+        missing = [
+            name
+            for name, value in (
+                ("REMIND_ME_NODE_ID", NODE_ID),
+                ("REMIND_ME_HUB_URL", HUB_URL),
+                ("REMIND_ME_SYNC_SECRET", SYNC_SECRET),
+            )
+            if not value
+        ]
+        return {
+            "enabled": False,
+            "node_id": NODE_ID or None,
+            "hub_url": HUB_URL or None,
+            "hint": (
+                "set " + ", ".join(missing) + " to enable sync; the outbox "
+                "triggers stay gated off until then so nothing accumulates"
+            ),
+        }
+
+    db = _get_db()
+
+    (pending,) = db.execute(
+        "SELECT COUNT(*) FROM sync_outbox WHERE sent_at = ''"
+    ).fetchone()
+    (sent,) = db.execute(
+        "SELECT COUNT(*) FROM sync_outbox WHERE sent_at != ''"
+    ).fetchone()
+    (oldest_pending,) = db.execute(
+        "SELECT MIN(created_at) FROM sync_outbox WHERE sent_at = ''"
+    ).fetchone()
+
+    (tombstones,) = db.execute(
+        "SELECT COUNT(*) FROM memories WHERE deleted_at IS NOT NULL"
+    ).fetchone()
+    tombstone_cutoff = (
+        datetime.now(UTC) - timedelta(days=config.TOMBSTONE_RETENTION_DAYS)
+    ).isoformat()
+    (compactable,) = db.execute(
+        "SELECT COUNT(*) FROM memories "
+        "WHERE deleted_at IS NOT NULL AND deleted_at < ?",
+        (tombstone_cutoff,),
+    ).fetchone()
+
+    remotes = [
+        {
+            "remote_id": row["remote_id"],
+            "last_push": row["last_push"],
+            "last_pull": row["last_pull"],
+            # A never-contacted remote sits at the epoch default rather than
+            # NULL, which reads as a stale timestamp unless called out.
+            "ever_contacted": row["last_push"] != _EPOCH or row["last_pull"] != _EPOCH,
+            "last_error": _last_errors.get(row["remote_id"]),
+        }
+        for row in db.execute(
+            "SELECT remote_id, last_push, last_pull FROM sync_log ORDER BY remote_id"
+        ).fetchall()
+    ]
+    # Surface errors for remotes that have never completed a cycle, so a hub
+    # that has failed on every attempt is not silently absent from the report.
+    known = {r["remote_id"] for r in remotes}
+    for remote_id, err in _last_errors.items():
+        if remote_id not in known:
+            remotes.append(
+                {
+                    "remote_id": remote_id,
+                    "last_push": None,
+                    "last_pull": None,
+                    "ever_contacted": False,
+                    "last_error": err,
+                }
+            )
+
+    return {
+        "enabled": True,
+        "node_id": NODE_ID,
+        "hub_url": HUB_URL,
+        "sync_interval_seconds": SYNC_INTERVAL,
+        # The triggers are gated on this flag (SY-07); if it ever disagrees
+        # with `enabled`, local writes are silently not being queued.
+        "outbox_trigger_gate": _flag(db, "sync_enabled"),
+        "outbox": {
+            "pending": pending,
+            "sent": sent,
+            "oldest_pending_at": oldest_pending,
+            "retention_days": config.OUTBOX_RETENTION_DAYS,
+            "drain": _drain_rate(db, pending),
+        },
+        "tombstones": {
+            "total": tombstones,
+            "compactable_now": compactable,
+            "retention_days": config.TOMBSTONE_RETENTION_DAYS,
+        },
+        "remotes": remotes,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Peer discovery
 # ---------------------------------------------------------------------------
 
@@ -1088,12 +1325,16 @@ async def _sync_once() -> None:
                     # Entity relations (Phase 3) — no-op against older remotes.
                     await _pull_entity_relations(client, HUB_URL, "hub")
                     log.info("Hub sync complete")
-                except httpx.ConnectError:
+                    _clear_error("hub")
+                except httpx.ConnectError as e:
                     log.debug("Hub unreachable, skipping")
+                    _record_error("hub", e)
                 except httpx.HTTPStatusError as e:
                     log.warning("Hub sync error: %s", e)
+                    _record_error("hub", e)
                 except Exception as e:
                     log.warning("Hub sync unexpected error: %s", e)
+                    _record_error("hub", e)
 
             # --- Peer sync ---
             peers = await _discover_peers()
@@ -1111,10 +1352,13 @@ async def _sync_once() -> None:
                     # Entity relations (Phase 3) — no-op against older peers.
                     await _pull_entity_relations(client, peer["url"], peer["node_id"])
                     log.info("Peer sync complete: %s", peer["node_id"])
-                except httpx.ConnectError:
+                    _clear_error(peer["node_id"])
+                except httpx.ConnectError as e:
                     log.debug("Peer %s unreachable", peer["node_id"])
+                    _record_error(peer["node_id"], e)
                 except Exception as e:
                     log.warning("Peer sync error (%s): %s", peer["node_id"], e)
+                    _record_error(peer["node_id"], e)
 
         try:
             _prune_outbox(_get_db())
