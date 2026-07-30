@@ -13,7 +13,13 @@
 3. Add tests for non-trivial logic — happy path and at least one failure/boundary case.
    Spikes/prototypes are exempt but should say so in the PR.
 4. Add or update docstrings on any public surface you touched.
-5. Open a PR — pick the template that matches (feature / bug fix / docs / chore).
+5. If your change closes or invalidates a `BACKLOG.md` row, update that row **in the
+   same PR** — including when you solved it a different way than the row proposed
+   (say so, briefly). A stale "todo" that shipped months ago is worse than no entry:
+   it reads as authoritative and sends the next person down the wrong path. This has
+   already cost real time once (SY-10 claimed deletes don't propagate for several
+   releases after v15→v16 made them propagate).
+6. Open a PR — pick the template that matches (feature / bug fix / docs / chore).
 
 ## Code style
 - Explicit over implicit; type hints/annotations always.

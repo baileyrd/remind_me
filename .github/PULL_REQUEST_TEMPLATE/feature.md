@@ -14,6 +14,7 @@
 - [ ] Yes — described below (schema change, public API change, config change)
 
 ## Checklist
+- [ ] `BACKLOG.md` row updated if this closes or invalidates one (say so if you solved it differently)
 - [ ] Docstrings/comments added for new public surface
 - [ ] No secrets/credentials committed or logged
 - [ ] External input validated at the boundary

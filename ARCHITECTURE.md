@@ -47,6 +47,41 @@ picks RRF weights (auto/balanced/keyword_favored/semantic_favored) → FTS5 +
 vector KNN candidates fused → vitality/decay-adjusted ranking → optional
 neighbor-chunk expansion.
 
+### Deletion propagates as a tombstone, not a delete
+
+Worth stating explicitly because the mechanism is counter-intuitive and was
+previously only discoverable from a migration docstring.
+
+The sync outbox is populated by AFTER INSERT and AFTER UPDATE triggers on
+`memories` — there is no delete trigger. A hard `DELETE` therefore produces no
+outbox row at all, so the record would survive on the hub and every other node
+and resurface on the next pull.
+
+Rather than add a delete trigger, deletion is modelled as an **update**: when
+sync is enabled, `memory_delete` sets a `deleted_at` tombstone (v15→v16, gap
+#11), which rides the existing `memories_outbox_au` trigger and propagates
+through the normal path with no wire-format change. Consequences worth knowing:
+
+- Every read path filters `deleted_at IS NULL`. A new query over `memories`
+  that forgets this will surface deleted records.
+- Tombstones are hard-deleted by `sync._compact_tombstones` once older than
+  `TOMBSTONE_RETENTION_DAYS`, purely on time — there is no per-peer
+  acknowledgement, which this single-owner LWW model accepts deliberately.
+- With sync **disabled**, `memory_delete` takes a plain hard-delete fast path;
+  there is nothing to propagate to, and an uncompacted tombstone would linger
+  forever because compaction only runs from the sync loop.
+- Counting rows for cross-node comparison must therefore *not* filter
+  `deleted_at` — the hub counts every row and reports tombstones separately
+  (see `sync.reconcile_with_hub`).
+
+### Sync is observable through tools, not just logs
+
+`remind_me_sync_status` reports local sync health (outbox depth with a
+drain-rate verdict, per-remote watermarks, last error); the hub's auth-gated
+`GET /stats` exposes its own counts; `remind_me_sync_reconcile` diffs the two
+and classifies the drift. Prefer these over reading logs or querying the
+databases by hand.
+
 ## Key decisions
 See [docs/adr/](./docs/adr/) for the record of individual decisions and their tradeoffs.
 
