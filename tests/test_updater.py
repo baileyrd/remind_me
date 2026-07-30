@@ -6,6 +6,7 @@ All subprocess calls are mocked so tests never touch git or pip.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import threading
 from pathlib import Path
@@ -512,6 +513,58 @@ def test_perform_update_success() -> None:
     assert result.success
     assert result.restart_required
     assert result.error is None
+
+
+def test_perform_update_lock_contention(tmp_path: Path) -> None:
+    """A concurrent self-update holding the lock must not be run over.
+
+    Two MCP server processes can share the same repo/venv (one per open
+    client session); without this the second perform_update() call would
+    interleave its own git pull + pip install with the first's instead of
+    being turned away."""
+    import fcntl
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    lock_path = tmp_path / ".git" / "remind_me_update.lock"
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        with patch("remind_me_mcp.updater._find_repo_root", return_value=tmp_path):
+            result = perform_update()
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+    assert not result.success
+    assert "already running" in result.error.lower()
+
+
+def test_perform_update_lock_released_after_success(tmp_path: Path) -> None:
+    """The lock must be released so a later, non-overlapping update can proceed."""
+
+    def fake_git(*args, repo_path):
+        result = MagicMock()
+        if args[0] == "rev-parse":
+            result.stdout = "abc123\n"
+        elif args[0] == "status":
+            result.stdout = "\n"
+        elif args[0] == "pull":
+            result.stdout = "Already up to date.\n"
+        return result
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+
+    with (
+        patch("remind_me_mcp.updater._find_repo_root", return_value=tmp_path),
+        patch("remind_me_mcp.updater._run_git", side_effect=fake_git),
+        patch("remind_me_mcp.updater._run_pip", return_value=MagicMock(stdout="Successfully installed")),
+        patch("importlib.metadata.version", return_value="1.1.0"),
+    ):
+        first = perform_update()
+        second = perform_update()
+
+    assert first.success
+    assert second.success
 
 
 def test_perform_update_reinstalls_detected_extras() -> None:
