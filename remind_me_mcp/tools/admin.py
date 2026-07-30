@@ -807,6 +807,47 @@ async def remind_me_sync_status() -> str:
 
 
 @mcp.tool(
+    name="remind_me_sync_reconcile",
+    annotations={
+        "title": "Reconcile Against Hub",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def remind_me_sync_reconcile() -> str:
+    """Diff this node's record counts against the hub's and classify the drift (SY-14).
+
+    Read-only on both sides — it calls the hub's ``GET /stats`` and compares
+    against local counts. Replaces the manual exercise of running psql on the
+    hub host, gathering local counts separately, and diffing two tables by eye.
+
+    The ``verdict`` is the useful output, because the benign case and the real
+    fault differ only by a sign:
+
+    - ``in-sync`` — no drift
+    - ``pull-lag`` — hub ahead, last pull recent; the ordinary state between
+      cycles
+    - ``node-ahead`` — this node holds records the hub does not, so pushes
+      aren't landing; the direction that means data is at risk
+    - ``fault`` — hub ahead but the last successful pull is stale (or never
+      happened), so it isn't lag
+
+    Returns:
+        str: JSON — verdict with hints, per-category drift (only categories
+        that disagree, plus a count of those that don't), totals, tombstones,
+        entity/link/relation counts, outbox depth, last-pull age, and the hub's
+        per-``origin_node`` breakdown (hub-only, so informational). When the hub
+        can't be reached or is too old to have ``/stats``, returns a status and
+        hint instead of a verdict.
+    """
+    from remind_me_mcp.sync import reconcile_with_hub
+
+    return json.dumps(await reconcile_with_hub(), indent=2)
+
+
+@mcp.tool(
     name="remind_me_webhook_status",
     annotations={
         "title": "Webhook Ingestion Status",

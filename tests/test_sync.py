@@ -2231,3 +2231,335 @@ def test_sync_status_counts_tombstones_and_compaction_eligibility(
     assert tombstones["total"] == 2
     assert tombstones["compactable_now"] == 1
     assert tombstones["retention_days"] == 180
+
+
+# ---------------------------------------------------------------------------
+# reconcile_with_hub (SY-14)
+# ---------------------------------------------------------------------------
+
+
+def hub_stats(
+    *,
+    by_category: dict[str, int] | None = None,
+    tombstones: int = 0,
+    entities: int = 0,
+    memory_entities: int = 0,
+    entity_relations: int = 0,
+    by_origin_node: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    """Build a hub GET /stats payload in the shape hub/main.py returns."""
+    cats = by_category if by_category is not None else {}
+    return {
+        "role": "hub",
+        "memories": {
+            "total": sum(cats.values()),
+            "tombstones": tombstones,
+            "oldest_updated_at": None,
+            "newest_updated_at": None,
+            "by_origin_node": by_origin_node or {},
+            "by_category": cats,
+        },
+        "entities": entities,
+        "memory_entities": memory_entities,
+        "entity_relations": entity_relations,
+        "time": _now_iso(),
+    }
+
+
+def stats_recorder(payload: dict[str, Any]) -> RequestRecorder:
+    return RequestRecorder({"/stats": payload})
+
+
+def _set_last_pull(db: sqlite3.Connection, *, seconds_ago: float | None) -> None:
+    """Record a hub pull watermark; None means never successfully pulled."""
+    at = (
+        _EPOCH_SENTINEL
+        if seconds_ago is None
+        else (datetime.now(UTC) - timedelta(seconds=seconds_ago)).isoformat()
+    )
+    db.execute(
+        "INSERT OR REPLACE INTO sync_log (remote_id, last_push, last_pull) "
+        "VALUES ('hub', ?, ?)",
+        (_now_iso(), at),
+    )
+    db.commit()
+
+
+_EPOCH_SENTINEL = sync._EPOCH
+
+
+@pytest.mark.asyncio
+async def test_reconcile_reports_disabled_without_calling_the_hub(
+    sync_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unconfigured node shouldn't attempt a request at all."""
+    monkeypatch.setattr(sync, "SYNC_ENABLED", False)
+    recorder = stats_recorder(hub_stats())
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_hub(client)
+
+    assert result["status"] == "disabled"
+    assert recorder.requests == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_reports_unsupported_on_a_hub_without_stats(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """A hub predating SY-13 404s /stats — that's an upgrade, not an outage.
+
+    Distinguishing this from 'unreachable' matters during a rolling upgrade,
+    where the node is updated first and lands here.
+    """
+    recorder = RequestRecorder()  # 404s everything unknown
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_hub(client)
+
+    assert result["status"] == "unsupported"
+    assert "SY-13" in result["hint"]
+    assert "verdict" not in result
+
+
+@pytest.mark.asyncio
+async def test_reconcile_reports_unauthorized_on_secret_mismatch(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """401 names the actual cause instead of surfacing a raw HTTP error."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"detail": "unauthorized"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await sync.reconcile_with_hub(client)
+
+    assert result["status"] == "unauthorized"
+    assert "SYNC_SECRET" in result["hint"]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_reports_unreachable_rather_than_raising(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """A read-only diagnostic must never raise out of the tool call."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await sync.reconcile_with_hub(client)
+
+    assert result["status"] == "unreachable"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_in_sync_when_counts_match(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """Matching counts yield in-sync and no drift rows."""
+    insert_memory(sync_db, "m1")
+    insert_memory(sync_db, "m2")
+    _set_last_pull(sync_db, seconds_ago=10)
+    recorder = stats_recorder(hub_stats(by_category={"general": 2}))
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_hub(client)
+
+    assert result["verdict"] == "in-sync"
+    assert result["categories_with_drift"] == []
+    assert result["categories_in_sync"] == 1
+    assert result["memories"] == {"hub": 2, "local": 2, "delta": 0}
+
+
+@pytest.mark.asyncio
+async def test_reconcile_calls_hub_ahead_with_a_recent_pull_pull_lag(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """The benign case: hub ahead, pull recent — ordinary lag between cycles."""
+    insert_memory(sync_db, "m1")
+    _set_last_pull(sync_db, seconds_ago=5)
+    recorder = stats_recorder(hub_stats(by_category={"general": 4}))
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_hub(client)
+
+    assert result["verdict"] == "pull-lag"
+    assert result["categories_with_drift"] == [
+        {"category": "general", "hub": 4, "local": 1, "delta": 3}
+    ]
+    assert "ordinary pull lag" in result["hints"][0]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_calls_hub_ahead_with_a_stale_pull_a_fault(
+    sync_db: sqlite3.Connection, status_enabled: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same drift, stale pull — no longer lag, the pull isn't running.
+
+    This is why the verdict keys off pull freshness rather than a hardcoded
+    list of 'should be static' categories: the numbers are identical to the
+    benign case above and only the evidence differs.
+    """
+    monkeypatch.setattr(sync, "SYNC_INTERVAL", 60)
+    insert_memory(sync_db, "m1")
+    _set_last_pull(sync_db, seconds_ago=4000)
+    recorder = stats_recorder(hub_stats(by_category={"general": 4}))
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_hub(client)
+
+    assert result["verdict"] == "fault"
+    assert "the pull is not running" in result["hints"][0]
+    assert result["last_pull_age_seconds"] == pytest.approx(4000, abs=5)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_calls_hub_ahead_with_no_pull_ever_a_fault(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """Never having pulled is not lag — there's no baseline to lag behind."""
+    insert_memory(sync_db, "m1")
+    _set_last_pull(sync_db, seconds_ago=None)
+    recorder = stats_recorder(hub_stats(by_category={"general": 9}))
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_hub(client)
+
+    assert result["verdict"] == "fault"
+    assert result["last_pull_age_seconds"] is None
+    assert "never been pulled" in result["hints"][0]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_flags_node_ahead_as_the_serious_case(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """Local > hub means pushes aren't landing — data only this node holds."""
+    for i in range(5):
+        insert_memory(sync_db, f"m{i}")
+    _set_last_pull(sync_db, seconds_ago=5)
+    recorder = stats_recorder(hub_stats(by_category={"general": 2}))
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_hub(client)
+
+    assert result["verdict"] == "node-ahead"
+    assert result["categories_with_drift"][0]["delta"] == -3
+    assert "not landing" in result["hints"][0]
+    # The outbox depth is included because it usually explains the cause.
+    assert result["outbox_pending"] == 5
+
+
+@pytest.mark.asyncio
+async def test_reconcile_node_ahead_outranks_a_recent_pull(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """Push failure is checked first — a healthy pull must not mask it.
+
+    A node can be pulling perfectly while its pushes fail; if pull freshness
+    were checked first this would be misreported as benign lag.
+    """
+    insert_memory(sync_db, "only-here")
+    insert_memory(sync_db, "shared")
+    _set_last_pull(sync_db, seconds_ago=1)
+    # Hub is ahead on one category and behind on another.
+    recorder = stats_recorder(hub_stats(by_category={"general": 1, "other": 50}))
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_hub(client)
+
+    assert result["verdict"] == "node-ahead"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_counts_tombstones_on_both_sides_alike(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """Local counts must NOT filter deleted_at, or tombstones read as drift.
+
+    The hub counts every row and reports tombstones separately. Filtering
+    locally would make a healthy node look permanently behind by exactly its
+    own tombstone count — a false 'pull-lag' that never resolves.
+    """
+    insert_memory(sync_db, "alive")
+    insert_memory(sync_db, "gone", deleted_at=_now_iso())
+    _set_last_pull(sync_db, seconds_ago=5)
+    recorder = stats_recorder(hub_stats(by_category={"general": 2}, tombstones=1))
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_hub(client)
+
+    assert result["verdict"] == "in-sync"
+    assert result["memories"]["delta"] == 0
+    assert result["tombstones"] == {"hub": 1, "local": 1, "delta": 0}
+
+
+@pytest.mark.asyncio
+async def test_reconcile_compares_categories_present_on_only_one_side(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """A category missing entirely from one side is the loudest possible drift.
+
+    Intersecting instead of unioning would hide a bulk import that never
+    reached the hub — the exact failure this tool exists to catch.
+    """
+    insert_memory(sync_db, "m1")
+    _set_last_pull(sync_db, seconds_ago=5)
+    recorder = stats_recorder(hub_stats(by_category={"hub_only": 12}))
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_hub(client)
+
+    drift = {c["category"]: c["delta"] for c in result["categories_with_drift"]}
+    assert drift == {"hub_only": 12, "general": -1}
+    assert result["verdict"] == "node-ahead"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_diffs_the_entity_graph_tables_too(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """Entity/link/relation drift is reported alongside memories."""
+    _set_last_pull(sync_db, seconds_ago=5)
+    recorder = stats_recorder(
+        hub_stats(entities=3, memory_entities=7, entity_relations=2)
+    )
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_hub(client)
+
+    assert result["entities"] == {"hub": 3, "local": 0, "delta": 3}
+    assert result["memory_entities"] == {"hub": 7, "local": 0, "delta": 7}
+    assert result["entity_relations"] == {"hub": 2, "local": 0, "delta": 2}
+
+
+@pytest.mark.asyncio
+async def test_reconcile_passes_through_hub_origin_node_breakdown(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """origin_node is hub-only, so it's surfaced verbatim, not diffed."""
+    _set_last_pull(sync_db, seconds_ago=5)
+    recorder = stats_recorder(
+        hub_stats(by_origin_node={"home-lap": 47501, "ai-server": 42})
+    )
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_hub(client)
+
+    assert result["hub_by_origin_node"] == {"home-lap": 47501, "ai-server": 42}
+
+
+@pytest.mark.asyncio
+async def test_reconcile_tolerates_a_malformed_hub_payload(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """Missing keys must not raise — treat absent counts as zero."""
+    _set_last_pull(sync_db, seconds_ago=5)
+    recorder = stats_recorder({"role": "hub"})  # no memories block at all
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_hub(client)
+
+    assert result["status"] == "ok"
+    assert result["memories"] == {"hub": 0, "local": 0, "delta": 0}

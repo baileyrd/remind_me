@@ -1224,6 +1224,244 @@ def get_sync_status() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Hub reconciliation (SY-14)
+# ---------------------------------------------------------------------------
+
+# How stale the last successful pull may be before hub-ahead drift stops being
+# ordinary lag and starts meaning "pull isn't running". Three cycles gives a
+# missed cycle room to recover; the floor keeps very short intervals from
+# producing false faults.
+_PULL_LAG_GRACE_SECONDS = 300
+
+
+def _local_counts(db: sqlite3.Connection) -> dict[str, Any]:
+    """Count local records the same way the hub's /stats does.
+
+    Deliberately does NOT filter ``deleted_at IS NULL``. The hub counts every
+    row and reports tombstones separately, so filtering here would make a
+    healthy node look permanently behind by its own tombstone count — the
+    comparison has to be apples-to-apples, not user-visible-to-total.
+    """
+    (totals,) = db.execute(
+        """
+        SELECT COUNT(*)                                              AS total,
+               SUM(CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END) AS tombstones
+          FROM memories
+        """
+    ).fetchall()
+    by_category = {
+        (row["category"] or "(none)"): row["count"]
+        for row in db.execute(
+            "SELECT COALESCE(NULLIF(category, ''), '(none)') AS category, "
+            "COUNT(*) AS count FROM memories GROUP BY 1"
+        ).fetchall()
+    }
+    counts = {}
+    for table in ("entities", "memory_entities", "entity_relations"):
+        (row,) = db.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchall()
+        counts[table] = row["count"]
+    return {
+        "total": totals["total"] or 0,
+        "tombstones": totals["tombstones"] or 0,
+        "by_category": by_category,
+        **counts,
+    }
+
+
+def _verdict(
+    categories: list[dict[str, Any]], last_pull_age: float | None
+) -> tuple[str, list[str]]:
+    """Classify drift. The judgment is the point — raw deltas are just numbers.
+
+    ``node-ahead`` (local > hub anywhere) is unambiguous: the node holds
+    records the hub does not, so pushes aren't landing. It's checked first
+    because it's the only direction that means data is at risk.
+
+    Hub-ahead drift is the ordinary state of a healthy node between pulls, so
+    it is judged by evidence rather than by guessing which categories "should"
+    be static: if the last successful pull is recent it's lag, and if it's
+    stale the pull is broken.
+
+    Args:
+        categories: Per-category rows with non-zero ``delta`` (hub - local).
+        last_pull_age: Seconds since the last successful hub pull, or None if
+            the hub has never been pulled from.
+
+    Returns:
+        ``(verdict, hints)``.
+    """
+    hints: list[str] = []
+    ahead = [c["category"] for c in categories if c["delta"] < 0]
+    if ahead:
+        hints.append(
+            "this node holds records the hub does not ("
+            + ", ".join(sorted(ahead)[:5])
+            + ") — pushes are not landing; check remind_me_sync_status for a "
+            "stalled outbox or a push error"
+        )
+        return "node-ahead", hints
+
+    if not categories:
+        return "in-sync", hints
+
+    grace = max(3 * SYNC_INTERVAL, _PULL_LAG_GRACE_SECONDS)
+    if last_pull_age is None:
+        hints.append(
+            "the hub has never been pulled from successfully, so this drift is "
+            "not lag — check connectivity and SYNC_SECRET"
+        )
+        return "fault", hints
+    if last_pull_age > grace:
+        hints.append(
+            f"last successful pull was {round(last_pull_age)}s ago (> {grace}s "
+            "grace), so the hub being ahead is not ordinary lag — the pull is "
+            "not running"
+        )
+        return "fault", hints
+
+    hints.append(
+        "the hub is ahead only in categories other nodes are writing to, and "
+        f"the last pull was {round(last_pull_age)}s ago — ordinary pull lag"
+    )
+    return "pull-lag", hints
+
+
+async def reconcile_with_hub(client: httpx.AsyncClient | None = None) -> dict[str, Any]:
+    """Diff this node's record counts against the hub's, with a verdict (SY-14).
+
+    Read-only on both sides. Answers "does my data match the hub?" — previously
+    a manual exercise of running psql on the hub host, pulling local counts
+    separately, and diffing two tables by eye. The subtle part is that the
+    benign case (hub ahead, pull lag) and the real fault (node ahead, push not
+    landing) differ only by a sign, which is easy to skim past; encoding it
+    here means it's decided once, not re-derived per incident.
+
+    Args:
+        client: Optional httpx client, for tests. A new one is created when
+            omitted.
+
+    Returns:
+        A JSON-serializable dict. ``status`` is ``ok`` when the hub answered;
+        otherwise ``disabled`` / ``unreachable`` / ``unsupported`` /
+        ``unauthorized`` / ``error`` with a hint, and no verdict.
+    """
+    if not SYNC_ENABLED:
+        return {
+            "status": "disabled",
+            "hint": "sync is not configured — see remind_me_sync_status",
+        }
+
+    owns_client = client is None
+    client = client or httpx.AsyncClient()
+    try:
+        resp = await client.get(f"{HUB_URL}/stats", headers=HEADERS, timeout=15)
+        if resp.status_code == 404:
+            # A hub predating SY-13 has no /stats. Say so plainly rather than
+            # reporting it as unreachable — the fix is a hub upgrade, and
+            # during a rolling upgrade the node lands here first.
+            return {
+                "status": "unsupported",
+                "hub_url": HUB_URL,
+                "hint": (
+                    "the hub has no GET /stats endpoint (added in SY-13) — "
+                    "upgrade the hub to reconcile"
+                ),
+            }
+        if resp.status_code in (401, 403):
+            return {
+                "status": "unauthorized",
+                "hub_url": HUB_URL,
+                "hint": "the hub rejected our bearer token — SYNC_SECRET mismatch",
+            }
+        resp.raise_for_status()
+        hub = resp.json()
+    except httpx.ConnectError as e:
+        return {"status": "unreachable", "hub_url": HUB_URL, "hint": str(e)}
+    except Exception as e:  # noqa: BLE001 — a status call must never raise
+        return {
+            "status": "error",
+            "hub_url": HUB_URL,
+            "hint": f"{type(e).__name__}: {e}",
+        }
+    finally:
+        if owns_client:
+            await client.aclose()
+
+    db = _get_db()
+    local = _local_counts(db)
+    hub_mem = hub.get("memories", {})
+    hub_categories: dict[str, int] = hub_mem.get("by_category", {}) or {}
+
+    # Union of both sides, so a category present on only one is still compared
+    # (a bulk import missing entirely from the hub would otherwise vanish).
+    categories = []
+    for name in sorted(set(hub_categories) | set(local["by_category"])):
+        hub_n = hub_categories.get(name, 0)
+        local_n = local["by_category"].get(name, 0)
+        if hub_n != local_n:
+            categories.append(
+                {
+                    "category": name,
+                    "hub": hub_n,
+                    "local": local_n,
+                    "delta": hub_n - local_n,
+                }
+            )
+
+    row = db.execute(
+        "SELECT last_pull FROM sync_log WHERE remote_id = 'hub'"
+    ).fetchone()
+    last_pull = row["last_pull"] if row else None
+    last_pull_age: float | None = None
+    if last_pull and last_pull != _EPOCH:
+        try:
+            last_pull_age = (
+                datetime.now(UTC) - datetime.fromisoformat(_canon_ts(last_pull))
+            ).total_seconds()
+        except (ValueError, TypeError):
+            last_pull_age = None
+
+    verdict, hints = _verdict(categories, last_pull_age)
+    (pending,) = db.execute(
+        "SELECT COUNT(*) FROM sync_outbox WHERE sent_at = ''"
+    ).fetchone()
+
+    def _cmp(hub_value: Any, local_value: int) -> dict[str, Any]:
+        hub_n = hub_value if isinstance(hub_value, int) else 0
+        return {"hub": hub_n, "local": local_value, "delta": hub_n - local_value}
+
+    return {
+        "status": "ok",
+        "verdict": verdict,
+        "hints": hints,
+        "node_id": NODE_ID,
+        "hub_url": HUB_URL,
+        "last_pull": last_pull,
+        "last_pull_age_seconds": (
+            round(last_pull_age) if last_pull_age is not None else None
+        ),
+        "outbox_pending": pending,
+        "memories": _cmp(hub_mem.get("total"), local["total"]),
+        "tombstones": _cmp(hub_mem.get("tombstones"), local["tombstones"]),
+        # Only drifting categories are listed; the rest would be noise at ~30
+        # categories, so agreement is reported as a count instead.
+        "categories_with_drift": categories,
+        "categories_in_sync": len(
+            set(hub_categories) | set(local["by_category"])
+        ) - len(categories),
+        "entities": _cmp(hub.get("entities"), local["entities"]),
+        "memory_entities": _cmp(hub.get("memory_entities"), local["memory_entities"]),
+        "entity_relations": _cmp(
+            hub.get("entity_relations"), local["entity_relations"]
+        ),
+        # Hub-side only — origin_node never crosses the wire, so there is no
+        # local equivalent to diff against. Informational: it answers "which
+        # node hasn't pushed".
+        "hub_by_origin_node": hub_mem.get("by_origin_node", {}),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Peer discovery
 # ---------------------------------------------------------------------------
 
