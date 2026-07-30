@@ -8,7 +8,9 @@ check that surfaces a one-shot update notice on the first MCP tool response.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
 import subprocess
 import threading
 from dataclasses import dataclass, field
@@ -267,6 +269,57 @@ def _run_pip(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 # ---------------------------------------------------------------------------
+# Cross-process update lock
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _update_lock(repo: Path):
+    """Best-effort exclusive lock so overlapping self-updates can't race.
+
+    Multiple MCP server processes (e.g. one per open client session) commonly
+    share the same repo/venv. Without this, two concurrent
+    ``perform_update()`` calls can interleave their git pull + pip/uv install
+    steps -- one process's reinstall can land in the middle of another's,
+    leaving the venv's installed metadata out of sync with what either call
+    reported (observed: a call reporting a successful upgrade to a version
+    the venv was never actually left at).
+
+    POSIX-only (``fcntl``) and best-effort throughout: any failure to open
+    the lock file itself (missing repo dir, read-only filesystem, no
+    ``fcntl`` on this platform) falls back to running unlocked rather than
+    blocking an update that would otherwise have worked fine standalone.
+
+    Raises:
+        RuntimeError: if another update currently holds the lock.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+
+    try:
+        fd = os.open(repo / ".git" / "remind_me_update.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        yield
+        return
+
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError(
+                "Another self-update is already running for this repo. "
+                "Wait for it to finish, then retry."
+            ) from None
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+# ---------------------------------------------------------------------------
 # Core logic
 # ---------------------------------------------------------------------------
 
@@ -420,123 +473,137 @@ def perform_update(force: bool = False) -> UpdateResult:
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
         previous_commit = "unknown"
 
-    # Check for dirty working tree
-    if not force:
-        try:
-            status_output = _run_git(
-                "status", "--porcelain", repo_path=repo,
-            ).stdout.strip()
-            if status_output:
+    # Everything below mutates the repo/venv (dirty-tree check through
+    # reinstall) and must run under the cross-process lock -- see
+    # _update_lock's docstring for why (SE-updater-race).
+    try:
+        with _update_lock(repo):
+            # Check for dirty working tree
+            if not force:
+                try:
+                    status_output = _run_git(
+                        "status", "--porcelain", repo_path=repo,
+                    ).stdout.strip()
+                    if status_output:
+                        return UpdateResult(
+                            success=False,
+                            previous_commit=previous_commit,
+                            previous_version=previous_version,
+                            origin_url=origin_url,
+                            error=(
+                                "Working tree has uncommitted changes. "
+                                "Commit or stash them first, or use force=True to override."
+                            ),
+                        )
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+                    return UpdateResult(
+                        success=False,
+                        previous_commit=previous_commit,
+                        previous_version=previous_version,
+                        origin_url=origin_url,
+                        error=f"Failed to check working tree status: {exc}",
+                    )
+
+            # git pull --ff-only
+            try:
+                _run_git("pull", "--ff-only", "origin", "main", repo_path=repo)
+            except subprocess.CalledProcessError as exc:
                 return UpdateResult(
                     success=False,
                     previous_commit=previous_commit,
                     previous_version=previous_version,
                     origin_url=origin_url,
+                    error=f"git pull failed: {exc.stderr.strip() or exc.stdout.strip()}",
+                )
+            except subprocess.TimeoutExpired:
+                return UpdateResult(
+                    success=False,
+                    previous_commit=previous_commit,
+                    previous_version=previous_version,
+                    origin_url=origin_url,
+                    error="git pull timed out.",
+                )
+
+            # pip install -e ., re-requesting whichever extras were already
+            # installed so the update doesn't silently drop them (see
+            # _installed_extras).
+            extras = _installed_extras()
+            install_target = f"{repo}[{','.join(extras)}]" if extras else str(repo)
+            try:
+                pip_result = _run_pip("install", "-e", install_target)
+                pip_output = pip_result.stdout.strip()
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError) as exc:
+                # The source tree already advanced past previous_commit at this
+                # point -- left as-is, the checked-out code and installed package
+                # metadata/dependencies would silently diverge (SEC-06). Since the
+                # dirty-tree check above already guarantees nothing uncommitted
+                # exists to lose, resetting back to previous_commit is safe and
+                # restores a fully consistent state.
+                rolled_back = _rollback(repo, previous_commit)
+                if isinstance(exc, subprocess.TimeoutExpired):
+                    reason = "pip install timed out."
+                elif isinstance(exc, RuntimeError):
+                    # No installer available at all (see _run_pip) -- already a
+                    # fully-formed operator-facing message.
+                    reason = str(exc)
+                else:
+                    reason = f"pip install failed: {exc.stderr.strip() or exc.stdout.strip()}"
+                return UpdateResult(
+                    success=False,
+                    previous_commit=previous_commit,
+                    previous_version=previous_version,
+                    origin_url=origin_url,
+                    rolled_back=rolled_back,
                     error=(
-                        "Working tree has uncommitted changes. "
-                        "Commit or stash them first, or use force=True to override."
+                        f"{reason} "
+                        + (
+                            f"Rolled the source tree back to {previous_commit} -- "
+                            "nothing changed overall."
+                            if rolled_back
+                            else "Automatic rollback ALSO failed -- the source tree "
+                            f"is now ahead of the installed package (still at "
+                            f"{previous_commit}'s dependencies/metadata). Run "
+                            f"'git reset --hard {previous_commit}' manually, then "
+                            "reinstall."
+                        )
                     ),
                 )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+
+            # Get new commit
+            try:
+                new_commit = _run_git(
+                    "rev-parse", "--short", "HEAD", repo_path=repo,
+                ).stdout.strip()
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                new_commit = "unknown"
+
+            # Read new version from metadata (cache may be stale, so re-read)
+            from importlib.metadata import PackageNotFoundError
+            from importlib.metadata import version as _pkg_version
+
+            try:
+                new_version = _pkg_version("remind-me-mcp")
+            except PackageNotFoundError:
+                new_version = "unknown"
+
             return UpdateResult(
-                success=False,
+                success=True,
                 previous_commit=previous_commit,
+                new_commit=new_commit,
                 previous_version=previous_version,
+                new_version=new_version,
+                pip_output=pip_output,
                 origin_url=origin_url,
-                error=f"Failed to check working tree status: {exc}",
+                restart_required=True,
             )
-
-    # git pull --ff-only
-    try:
-        _run_git("pull", "--ff-only", "origin", "main", repo_path=repo)
-    except subprocess.CalledProcessError as exc:
+    except RuntimeError as exc:
         return UpdateResult(
             success=False,
             previous_commit=previous_commit,
             previous_version=previous_version,
             origin_url=origin_url,
-            error=f"git pull failed: {exc.stderr.strip() or exc.stdout.strip()}",
+            error=str(exc),
         )
-    except subprocess.TimeoutExpired:
-        return UpdateResult(
-            success=False,
-            previous_commit=previous_commit,
-            previous_version=previous_version,
-            origin_url=origin_url,
-            error="git pull timed out.",
-        )
-
-    # pip install -e ., re-requesting whichever extras were already installed
-    # so the update doesn't silently drop them (see _installed_extras).
-    extras = _installed_extras()
-    install_target = f"{repo}[{','.join(extras)}]" if extras else str(repo)
-    try:
-        pip_result = _run_pip("install", "-e", install_target)
-        pip_output = pip_result.stdout.strip()
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError) as exc:
-        # The source tree already advanced past previous_commit at this
-        # point -- left as-is, the checked-out code and installed package
-        # metadata/dependencies would silently diverge (SEC-06). Since the
-        # dirty-tree check above already guarantees nothing uncommitted
-        # exists to lose, resetting back to previous_commit is safe and
-        # restores a fully consistent state.
-        rolled_back = _rollback(repo, previous_commit)
-        if isinstance(exc, subprocess.TimeoutExpired):
-            reason = "pip install timed out."
-        elif isinstance(exc, RuntimeError):
-            # No installer available at all (see _run_pip) -- already a
-            # fully-formed operator-facing message.
-            reason = str(exc)
-        else:
-            reason = f"pip install failed: {exc.stderr.strip() or exc.stdout.strip()}"
-        return UpdateResult(
-            success=False,
-            previous_commit=previous_commit,
-            previous_version=previous_version,
-            origin_url=origin_url,
-            rolled_back=rolled_back,
-            error=(
-                f"{reason} "
-                + (
-                    f"Rolled the source tree back to {previous_commit} -- "
-                    "nothing changed overall."
-                    if rolled_back
-                    else "Automatic rollback ALSO failed -- the source tree "
-                    f"is now ahead of the installed package (still at "
-                    f"{previous_commit}'s dependencies/metadata). Run "
-                    f"'git reset --hard {previous_commit}' manually, then "
-                    "reinstall."
-                )
-            ),
-        )
-
-    # Get new commit
-    try:
-        new_commit = _run_git(
-            "rev-parse", "--short", "HEAD", repo_path=repo,
-        ).stdout.strip()
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        new_commit = "unknown"
-
-    # Read new version from metadata (cache may be stale, so re-read)
-    from importlib.metadata import PackageNotFoundError
-    from importlib.metadata import version as _pkg_version
-
-    try:
-        new_version = _pkg_version("remind-me-mcp")
-    except PackageNotFoundError:
-        new_version = "unknown"
-
-    return UpdateResult(
-        success=True,
-        previous_commit=previous_commit,
-        new_commit=new_commit,
-        previous_version=previous_version,
-        new_version=new_version,
-        pip_output=pip_output,
-        origin_url=origin_url,
-        restart_required=True,
-    )
 
 
 def _rollback(repo: Path, previous_commit: str) -> bool:
