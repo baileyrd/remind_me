@@ -23,6 +23,16 @@ Deletion goes through `db._purge_memory`, extracted in this release. The steps a
 
 Tests: 13 new cases covering dry-run inertness, tombstone vs hard delete, derived-row cleanup, batching and resumability, scoping, the un-importable-tracking-row trap, and that a typo'd scope matches nothing. Full suite 1514 passed / 17 skipped, coverage 90.56%, on all four legs.
 
+### Corrected: the v1.20.0 note's claim about tag history
+
+The v1.20.0 entry stated that `v1.1.0` was the repository's only tag and that 59 commits had landed since. Both were wrong, and the correction is marked inline there rather than silently rewritten.
+
+There are **six** tags: `v1.0` and `v1.1` (2026-02-24), `v1.2` (2026-03-05), `v1.1.0` (2026-07-20), and `v1.20.0` / `v1.21.0` (2026-07-30). The real gap from `v1.1.0` was 62 commits.
+
+The error came from running `git tag -l` in a clone that had fetched exactly one tag and reporting that as the repository's state; `git ls-remote --tags` shows all six. Worth recording because the wrong conclusion followed from it: "tagging was correct, then stopped" isn't the story. `v1.1` and `v1.2` both point at commits declaring `1.0.0`, so tag-vs-declared-version drift was the norm, not a recent lapse — `v1.20.0` and `v1.21.0` are the first tags since `v1.1.0` where the two actually agree.
+
+Local state is not remote state. `git tag -l` answers "what has this clone fetched", not "what exists".
+
 ## v1.20.0 — 2026-07-30
 
 Second stale-backlog correction (same shape as SY-10 in v1.19.6), plus a silent test-coverage bug found while verifying it.
@@ -75,7 +85,13 @@ Known gap left open deliberately: the `ann` extra is installed by neither CI leg
 
 This was user-visible, not cosmetic. `remind_me_mcp.__version__` resolves from installed package metadata, which comes from `pyproject.toml`, so `remind_me_check_update` and every status surface reported a version seven releases old — including immediately after a successful update, which is precisely when that number is being read to confirm the update worked.
 
-**This is also the first tagged release since v1.1.0** (`9cc9711`, 2026-07-20). `pyproject.toml` matched that tag exactly at the time, so tagging was correct when done — it simply stopped, and 59 commits landed since. A test cannot reliably guard tags (CI clones are often shallow and may not fetch them), so keeping them current belongs to the release step rather than the suite.
+**This is also the first tag cut since v1.1.0** (`9cc9711`, 2026-07-20), 62 commits back. Earlier tags exist — `v1.0` and `v1.1` (2026-02-24) and `v1.2` (2026-03-05) — so tag names do not sort chronologically here: `v1.2` predates `v1.1.0` by four months.
+
+Tag-vs-declared-version agreement has not historically held either: `v1.1` and `v1.2` both point at commits whose `pyproject.toml` declares `1.0.0`. `v1.1.0` was the exception, matching exactly. So this release is not restarting a lapsed practice so much as establishing one.
+
+A test cannot reliably guard tags — CI clones are often shallow and may not fetch them, making such a check flaky or vacuously passing — so keeping them current belongs to the release step rather than the suite.
+
+> ⚠️ Corrected after publication: this paragraph originally claimed v1.1.0 was the repo's *only* tag and that 59 commits had landed since. Both were wrong. The claim came from `git tag -l` in a clone that had only fetched one tag; `git ls-remote --tags` shows six. Left visible rather than silently rewritten — a release note is a record, and this is the same stale-but-authoritative failure mode the SY-10 and SY-11 corrections in v1.19.6 and v1.20.0 were about.
 
 Guarded by `tests/test_version_consistency.py`, which asserts the declared version equals the newest `RELEASE_NOTES` heading, that entries stay in descending order (so "newest" is well defined), and that `__version__` resolves rather than falling back to the `0.0.0-dev` sentinel. Unlike the BACKLOG-drift class of problem — prose that quietly stops being true, which no test can check — this one is a mechanical equality and cheap to enforce. Verified by reverting the version and confirming the guard fails with an actionable message.
 
