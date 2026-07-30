@@ -52,6 +52,32 @@ def _track_mempalace(db: sqlite3.Connection, drawer_id: str, mem_id: str) -> Non
     db.commit()
 
 
+def _add_untracked_mempalace_memory(
+    db: sqlite3.Connection,
+    mem_id: str,
+    drawer_id: str,
+    *,
+    source: str = "mempalace_import",
+    wing: str = "",
+    room: str = "",
+) -> None:
+    """A mempalace-shaped memory with no row in mempalace_imports.
+
+    Mirrors what pull_mempalace actually stamps (source + metadata) for
+    content that reached the store outside that code path — e.g. a
+    historical bulk load predating the mempalace_imports migration.
+    """
+    now = _now_iso()
+    metadata = json.dumps({"mempalace_drawer_id": drawer_id, "wing": wing, "room": room})
+    db.execute(
+        """INSERT INTO memories (id, content, category, tags, source, metadata,
+                                 created_at, updated_at)
+           VALUES (?, ?, 'mempalace_import', '[]', ?, ?, ?, ?)""",
+        (mem_id, f"content for {mem_id}", source, metadata, now, now),
+    )
+    db.commit()
+
+
 def _track_chat(db: sqlite3.Connection, import_id: str, filename: str) -> None:
     db.execute(
         "INSERT INTO chat_imports (import_id, filename, hash, imported_at) VALUES (?, ?, ?, ?)",
@@ -343,3 +369,97 @@ async def test_already_tombstoned_rows_are_not_rematched(
     again = await _undo(import_kind=UndoImportKind.MEMPALACE)
 
     assert again["matched"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Untracked batches (content with no mempalace_imports row)
+# ---------------------------------------------------------------------------
+
+
+async def test_untracked_opaque_mempalace_content_matches_via_source(
+    db_conn: sqlite3.Connection, hard_delete: None
+) -> None:
+    """Content stamped source='mempalace_import' but never tracked (e.g. a
+    historical bulk load predating the mempalace_imports migration) must
+    still be found — the tracking-table join alone would report 0."""
+    _add_untracked_mempalace_memory(db_conn, "m1", "drawer_x_general_1")
+
+    result = await _undo(import_kind=UndoImportKind.MEMPALACE)
+
+    assert result["matched"] == 1
+
+
+async def test_untracked_native_format_mempalace_content_matches_via_source(
+    db_conn: sqlite3.Connection, hard_delete: None
+) -> None:
+    """Native-frontmatter imports are stamped 'mempalace:<original source>',
+    not the bare 'mempalace_import' — that prefix must match too."""
+    _add_untracked_mempalace_memory(
+        db_conn, "m1", "drawer_x_general_1", source="mempalace:claude_export"
+    )
+
+    result = await _undo(import_kind=UndoImportKind.MEMPALACE)
+
+    assert result["matched"] == 1
+
+
+async def test_untracked_mempalace_content_is_actually_removable(
+    db_conn: sqlite3.Connection, hard_delete: None
+) -> None:
+    """The fallback match must feed the same removal path, not just report."""
+    _add_untracked_mempalace_memory(db_conn, "m1", "drawer_x_general_1")
+
+    result = await _undo(import_kind=UndoImportKind.MEMPALACE, dry_run=False)
+
+    assert result["removed"] == 1
+    assert db_conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+    # Nothing to untrack — this batch was never in mempalace_imports.
+    assert result["tracking_rows_removed"] == 0
+
+    again = await _undo(import_kind=UndoImportKind.MEMPALACE)
+    assert again["matched"] == 0, "must not rematch a tombstoned row"
+
+
+async def test_wing_scope_matches_untracked_content_via_metadata_drawer_id(
+    db_conn: sqlite3.Connection, hard_delete: None
+) -> None:
+    """A wing-prefix scope must reach untracked content too, via
+    metadata.mempalace_drawer_id rather than the tracking table."""
+    _add_untracked_mempalace_memory(db_conn, "keep", "drawer_other_general_1", wing="other")
+    _add_untracked_mempalace_memory(db_conn, "drop", "drawer_rusty_term_general_1", wing="rusty_term")
+
+    result = await _undo(
+        import_kind=UndoImportKind.MEMPALACE,
+        import_id="drawer_rusty_term",
+        dry_run=False,
+    )
+
+    assert result["removed"] == 1
+    remaining = [r[0] for r in db_conn.execute("SELECT id FROM memories").fetchall()]
+    assert remaining == ["keep"]
+
+
+async def test_tracked_and_untracked_matches_are_deduplicated(
+    db_conn: sqlite3.Connection, hard_delete: None
+) -> None:
+    """A memory that is both tracked AND source-matched must be counted once."""
+    _add_untracked_mempalace_memory(db_conn, "m1", "drawer_x_general_1")
+    _track_mempalace(db_conn, "drawer_x_general_1", "m1")
+
+    result = await _undo(import_kind=UndoImportKind.MEMPALACE, dry_run=False)
+
+    assert result["matched"] == 1
+    assert result["removed"] == 1
+
+
+async def test_content_with_unrelated_source_is_not_swept_in(
+    db_conn: sqlite3.Connection, hard_delete: None
+) -> None:
+    """category='mempalace_import' alone must not be enough to match —
+    only the source (what pull_mempalace actually stamps) counts, so
+    unrelated content sharing the category by coincidence stays put."""
+    _add_memory(db_conn, "not_mempalace", category="mempalace_import")  # source='manual'
+
+    result = await _undo(import_kind=UndoImportKind.MEMPALACE)
+
+    assert result["matched"] == 0

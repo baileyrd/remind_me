@@ -785,6 +785,58 @@ _UNDO_SOURCES = {
 }
 
 
+def _undo_matching_ids_mempalace(
+    db: Any, import_id: str | None
+) -> tuple[list[str], str]:
+    """Resolve mempalace memory ids for undo, tolerating untracked batches.
+
+    remind_me_import_mempalace records a (drawer_id -> memory_id) row in
+    mempalace_imports for every drawer it writes, so the tracking-table
+    join below is the precise, preferred signal. But content can also
+    reach the store with a mempalace-shaped source/metadata without ever
+    going through that code path — e.g. a historical bulk load that
+    predates the mempalace_imports migration — leaving that table empty
+    for a batch that is still unambiguously mempalace content: pull_mempalace
+    stamps every write with source 'mempalace_import' (opaque) or
+    'mempalace:<original source>' (native frontmatter), and always carries
+    metadata.mempalace_drawer_id. Union both signals, deduplicated by
+    memory id, so undo covers a batch regardless of which path wrote it.
+    """
+    ids: set[str] = set()
+    if import_id:
+        pattern = f"{import_id}%"
+        rows = db.execute(
+            """SELECT t.memory_id FROM mempalace_imports t
+               JOIN memories m ON m.id = t.memory_id
+               WHERE m.deleted_at IS NULL AND t.drawer_id LIKE ?""",
+            (pattern,),
+        ).fetchall()
+        ids.update(r[0] for r in rows)
+        rows = db.execute(
+            """SELECT id FROM memories
+               WHERE deleted_at IS NULL
+                 AND (source = 'mempalace_import' OR source LIKE 'mempalace:%')
+                 AND json_extract(metadata, '$.mempalace_drawer_id') LIKE ?""",
+            (pattern,),
+        ).fetchall()
+        ids.update(r[0] for r in rows)
+        return sorted(ids), f"mempalace scope {import_id!r}"
+
+    rows = db.execute(
+        """SELECT t.memory_id FROM mempalace_imports t
+           JOIN memories m ON m.id = t.memory_id
+           WHERE m.deleted_at IS NULL"""
+    ).fetchall()
+    ids.update(r[0] for r in rows)
+    rows = db.execute(
+        """SELECT id FROM memories
+           WHERE deleted_at IS NULL
+             AND (source = 'mempalace_import' OR source LIKE 'mempalace:%')"""
+    ).fetchall()
+    ids.update(r[0] for r in rows)
+    return sorted(ids), "all mempalace imports"
+
+
 def _undo_matching_ids(
     db: Any, kind: str, import_id: str | None
 ) -> tuple[list[str], str]:
@@ -804,10 +856,12 @@ def _undo_matching_ids(
         ).fetchall()
         return [r[0] for r in rows], "all chat imports"
 
+    if kind == "mempalace":
+        return _undo_matching_ids_mempalace(db, import_id)
+
     table, id_col, scope_col = _UNDO_SOURCES[kind]
     if import_id:
-        # Prefix match so a mempalace wing (or a dbs source) can be targeted
-        # without naming every drawer.
+        # Prefix match so a dbs source can be targeted without naming every id.
         rows = db.execute(
             f"""SELECT t.{id_col} FROM {table} t
                 JOIN memories m ON m.id = t.{id_col}
