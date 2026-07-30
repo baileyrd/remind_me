@@ -109,6 +109,7 @@ from remind_me_mcp.tools._shared import (
     _maybe_update_notice,
     _public_memory,
     _spawn_task,
+    _supersession_preview,
     log,
 )
 from remind_me_mcp.tools.admin import (

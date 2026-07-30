@@ -105,7 +105,16 @@ async def memory_add(params: MemoryAddInput) -> str:
     await asyncio.to_thread(_pkg._embed_and_store, mem_id, params.content)
     msg = f"✓ Memory stored with id `{mem_id}` in category '{params.category}'."
     if superseded:
-        msg += f" Superseded {len(superseded)} contradicted fact(s): {', '.join(superseded)}."
+        previews = _pkg._supersession_preview(db, superseded)
+        detail = "; ".join(f'`{p["id"]}` was: "{p["content"]}"' for p in previews)
+        msg += (
+            f" Superseded {len(superseded)} contradicted fact(s) sharing subject/predicate "
+            f"({params.subject!r}, {params.predicate!r}) with a different object — {detail}. "
+            "If that's not a real contradiction (e.g. a reused generic subject/predicate "
+            "across unrelated facts), call remind_me_update on the superseded id with "
+            "clear_superseded=true to un-hide it, then re-add this fact with a distinct "
+            "predicate."
+        )
     return _maybe_update_notice(msg)
 
 
@@ -198,7 +207,7 @@ async def memory_get(memory_id: str) -> str:
     },
 )
 async def memory_update(params: MemoryUpdateInput) -> str:
-    """Update an existing memory's content, category, tags, or metadata.
+    """Update an existing memory's content, category, tags, metadata, or clear a false-positive supersession.
 
     Args:
         params (MemoryUpdateInput): The memory ID and fields to update.
@@ -227,6 +236,8 @@ async def memory_update(params: MemoryUpdateInput) -> str:
     if params.metadata is not None:
         sets.append("metadata = ?")
         bindings.append(json.dumps(params.metadata))
+    if params.clear_superseded:
+        sets.append("superseded_by = NULL")
 
     if not sets:
         return "Nothing to update — no fields provided."
@@ -240,7 +251,10 @@ async def memory_update(params: MemoryUpdateInput) -> str:
     # Re-embed if content changed
     if params.content is not None:
         await asyncio.to_thread(_pkg._embed_and_store, params.memory_id, params.content)
-    return f"✓ Memory `{params.memory_id}` updated."
+    msg = f"✓ Memory `{params.memory_id}` updated."
+    if params.clear_superseded:
+        msg += " Cleared superseded_by — visible to search/entity lookups again."
+    return msg
 
 
 @mcp.tool(
