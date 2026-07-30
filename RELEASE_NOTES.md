@@ -1,6 +1,6 @@
 # Release Notes
 
-## v1.19.7 — 2026-07-30
+## v1.20.0 — 2026-07-30
 
 Second stale-backlog correction (same shape as SY-10 in v1.19.6), plus a silent test-coverage bug found while verifying it.
 
@@ -45,6 +45,16 @@ Worth noting the pattern: SY-10 and SY-11 were both marked todo while the work h
 Suite totals moved because of the skip fix, not because tests were added: 1484 → **1498 passed** on the semantic legs, and coverage 90.27% → **90.54%**, since 14 previously-inert tests now exercise real code paths.
 
 Known gap left open deliberately: the `ann` extra is installed by neither CI leg, so `tests/test_ann_index.py` (13 tests) and the 6 ANN tests in `test_chunking.py` still never run in CI — the ANN code path has no automated coverage. Adding a third matrix leg (the `all` extra exists) would close it; that's a CI-cost decision, not a drive-by change.
+
+### Fixed: the declared package version was seven releases stale
+
+`pyproject.toml` still read `version = "1.19.0"`, last set 2026-07-21, while this file accumulated seven entries beneath it. Bumped to **1.20.0** — a minor rather than patch bump, because three new tools shipped since 1.19.0 (`remind_me_sync_status`, `remind_me_sync_reconcile`, and the hub's `GET /stats`).
+
+This was user-visible, not cosmetic. `remind_me_mcp.__version__` resolves from installed package metadata, which comes from `pyproject.toml`, so `remind_me_check_update` and every status surface reported a version seven releases old — including immediately after a successful update, which is precisely when that number is being read to confirm the update worked.
+
+**This is also the first tagged release since v1.1.0** (`9cc9711`, 2026-07-20). `pyproject.toml` matched that tag exactly at the time, so tagging was correct when done — it simply stopped, and 59 commits landed since. A test cannot reliably guard tags (CI clones are often shallow and may not fetch them), so keeping them current belongs to the release step rather than the suite.
+
+Guarded by `tests/test_version_consistency.py`, which asserts the declared version equals the newest `RELEASE_NOTES` heading, that entries stay in descending order (so "newest" is well defined), and that `__version__` resolves rather than falling back to the `0.0.0-dev` sentinel. Unlike the BACKLOG-drift class of problem — prose that quietly stops being true, which no test can check — this one is a mechanical equality and cheap to enforce. Verified by reverting the version and confirming the guard fails with an actionable message.
 
 ## v1.19.6 — 2026-07-30
 
