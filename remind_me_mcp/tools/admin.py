@@ -626,6 +626,25 @@ async def remind_me_server_status() -> str:
             "auto-ingest a notes/docs folder)"
         )
 
+    # Multi-node sync (SY-12)
+    from remind_me_mcp.sync import get_sync_status
+
+    sync = get_sync_status()
+    if sync["enabled"]:
+        outbox = sync["outbox"]
+        drain = outbox["drain"]["verdict"]
+        lines.append(
+            f"\n**Sync:** ✓ Enabled — node `{sync['node_id']}` → {sync['hub_url']}, "
+            f"every {sync['sync_interval_seconds']}s; "
+            f"outbox {outbox['pending']} pending ({drain})"
+        )
+        errored = [r["remote_id"] for r in sync["remotes"] if r["last_error"]]
+        if errored:
+            lines.append(f"_⚠ Last cycle failed for: {', '.join(errored)}_")
+        lines.append("_Details: `remind_me_sync_status`_")
+    else:
+        lines.append(f"\n**Sync:** ✗ Disabled ({sync['hint']})")
+
     # Push/webhook ingestion (FT-09, Phase 5a)
     from remind_me_mcp.webhook_server import get_webhook_status
 
@@ -750,6 +769,41 @@ async def remind_me_watch_status() -> str:
     status = get_watch_status()
     status["pending_wiki_compile"] = wiki.pending_compile_count()
     return json.dumps(status, indent=2)
+
+
+@mcp.tool(
+    name="remind_me_sync_status",
+    annotations={
+        "title": "Sync Status",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def remind_me_sync_status() -> str:
+    """Report multi-node sync state (SY-12): outbox depth, drain rate, watermarks, errors.
+
+    Answers the questions that previously required shell access and hand-written
+    SQL against ``sync_outbox``: is the push backlog draining or wedged, when did
+    each remote last succeed, and what failed most recently.
+
+    The ``outbox.drain`` verdict is the useful part. A pending count alone is
+    ambiguous — thousands of queued rows look identical whether they are
+    draining normally or the push is stuck — so this persists the previous
+    observation and reports direction (``draining`` / ``stalled`` / ``growing``
+    / ``idle``) with a per-minute rate and ETA. The first call establishes a
+    baseline and reports ``unknown``; call again after ~30s for a rate.
+
+    Returns:
+        str: JSON status — node_id, hub URL, sync interval, the outbox trigger
+        gate, outbox depth + drain verdict, tombstone counts (total and
+        compactable now), and per-remote push/pull watermarks with the last
+        error. When sync is disabled, names the missing env vars instead.
+    """
+    from remind_me_mcp.sync import get_sync_status
+
+    return json.dumps(get_sync_status(), indent=2)
 
 
 @mcp.tool(

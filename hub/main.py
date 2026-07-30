@@ -312,6 +312,86 @@ def health() -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# Stats (SY-13)
+# ---------------------------------------------------------------------------
+
+@app.get("/stats", dependencies=[Depends(_require_auth)])
+def stats() -> JSONResponse:
+    """Aggregate record counts, so reconciliation doesn't need shell on this host.
+
+    Before this existed the only way to answer "did that import actually land?"
+    was ``psql`` inside the Postgres container, which no client -- not another
+    node, not the dashboard, not the connector -- could do. That also made
+    automated drift detection impossible, since nothing could be compared
+    against a node.
+
+    Auth-gated rather than public: counts and category names leak information
+    about content, and the ``/sync/*`` routes already establish the precedent.
+    ``/health`` deliberately stays unauthenticated and free of aggregates so
+    deploy healthchecks stay cheap and keep working when Postgres is down.
+
+    ``by_origin_node`` is the interesting half -- ``origin_node`` is hub-only
+    and never crosses the wire, so this is the only place the "which node
+    pushed what" breakdown can be observed at all.
+    """
+    with _connect() as conn:
+        (totals,) = conn.execute(
+            """
+            SELECT COUNT(*)                                            AS total,
+                   COUNT(*) FILTER (WHERE deleted_at IS NOT NULL)      AS tombstones,
+                   MIN(updated_at)                                     AS oldest_updated_at,
+                   MAX(updated_at)                                     AS newest_updated_at
+              FROM memories
+            """
+        ).fetchall()
+        by_origin = conn.execute(
+            """
+            SELECT COALESCE(NULLIF(origin_node, ''), '(unattributed)') AS origin_node,
+                   COUNT(*)                                            AS count
+              FROM memories
+             GROUP BY 1
+             ORDER BY 2 DESC
+            """
+        ).fetchall()
+        by_category = conn.execute(
+            """
+            SELECT COALESCE(NULLIF(category, ''), '(none)') AS category,
+                   COUNT(*)                                 AS count
+              FROM memories
+             GROUP BY 1
+             ORDER BY 2 DESC
+            """
+        ).fetchall()
+        (entities,) = conn.execute("SELECT COUNT(*) AS count FROM entities").fetchall()
+        (links,) = conn.execute(
+            "SELECT COUNT(*) AS count FROM memory_entities"
+        ).fetchall()
+        (relations,) = conn.execute(
+            "SELECT COUNT(*) AS count FROM entity_relations"
+        ).fetchall()
+
+    return JSONResponse(
+        content={
+            "role": "hub",
+            "memories": {
+                "total": totals["total"],
+                "tombstones": totals["tombstones"],
+                "oldest_updated_at": totals["oldest_updated_at"],
+                "newest_updated_at": totals["newest_updated_at"],
+                # Keyed by name so a client can diff against its own counts
+                # without positional assumptions.
+                "by_origin_node": {r["origin_node"]: r["count"] for r in by_origin},
+                "by_category": {r["category"]: r["count"] for r in by_category},
+            },
+            "entities": entities["count"],
+            "memory_entities": links["count"],
+            "entity_relations": relations["count"],
+            "time": datetime.now(UTC).isoformat(),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # Push — record-type dispatch, per-record isolation, LWW
 # ---------------------------------------------------------------------------
 

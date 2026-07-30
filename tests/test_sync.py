@@ -1982,3 +1982,252 @@ async def test_pull_entity_relations_tolerates_old_peer(
     async with mock_client(recorder) as client:
         assert await sync._pull_entity_relations(client, "http://old-peer", "old") == 0
     assert sync_db.execute("SELECT COUNT(*) FROM sync_log").fetchone()[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# get_sync_status (SY-12)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def status_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Present sync as configured — sync.py binds these at import time."""
+    monkeypatch.setattr(sync, "SYNC_ENABLED", True)
+    monkeypatch.setattr(sync, "NODE_ID", "test-node")
+    monkeypatch.setattr(sync, "HUB_URL", "http://hub.example")
+    monkeypatch.setattr(sync, "SYNC_SECRET", "s3cret")
+    monkeypatch.setattr(sync, "SYNC_INTERVAL", 60)
+    sync._last_errors.clear()
+    yield
+    sync._last_errors.clear()
+
+
+def _set_baseline(db: sqlite3.Connection, pending: int, *, seconds_ago: float) -> None:
+    """Plant a drain-rate baseline as though a prior status call had run."""
+    at = (datetime.now(UTC) - timedelta(seconds=seconds_ago)).isoformat()
+    sync._set_flag(db, "status_probe_pending", str(pending))
+    sync._set_flag(db, "status_probe_at", at)
+    db.commit()
+
+
+def test_sync_status_disabled_names_the_missing_env_vars(
+    sync_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Disabled status is actionable: it says which vars to set, like watch_status."""
+    monkeypatch.setattr(sync, "SYNC_ENABLED", False)
+    monkeypatch.setattr(sync, "NODE_ID", "")
+    monkeypatch.setattr(sync, "HUB_URL", "")
+    monkeypatch.setattr(sync, "SYNC_SECRET", "")
+
+    status = sync.get_sync_status()
+
+    assert status["enabled"] is False
+    assert "REMIND_ME_NODE_ID" in status["hint"]
+    assert "REMIND_ME_HUB_URL" in status["hint"]
+    assert "REMIND_ME_SYNC_SECRET" in status["hint"]
+    # No counters when disabled — an empty outbox block would imply sync is
+    # running and simply idle.
+    assert "outbox" not in status
+
+
+def test_sync_status_only_names_the_vars_actually_missing(
+    sync_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A partially-configured node isn't told to set what it already has."""
+    monkeypatch.setattr(sync, "SYNC_ENABLED", False)
+    monkeypatch.setattr(sync, "NODE_ID", "test-node")
+    monkeypatch.setattr(sync, "HUB_URL", "http://hub.example")
+    monkeypatch.setattr(sync, "SYNC_SECRET", "")
+
+    hint = sync.get_sync_status()["hint"]
+
+    assert "REMIND_ME_SYNC_SECRET" in hint
+    assert "REMIND_ME_NODE_ID" not in hint
+    assert "REMIND_ME_HUB_URL" not in hint
+
+
+def test_sync_status_reports_outbox_depth_and_trigger_gate(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """Pending count comes from real trigger-generated rows, and the gate is surfaced."""
+    insert_memory(sync_db, "m1")
+    insert_memory(sync_db, "m2")
+
+    status = sync.get_sync_status()
+
+    assert status["enabled"] is True
+    assert status["node_id"] == "test-node"
+    assert status["outbox"]["pending"] == 2
+    # The triggers are gated on this flag; a mismatch means writes silently
+    # aren't queued, so it's reported rather than assumed.
+    assert status["outbox_trigger_gate"] == "1"
+    assert status["outbox"]["oldest_pending_at"] is not None
+
+
+def test_sync_status_first_call_establishes_baseline_without_guessing(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """With no prior sample the verdict is 'unknown', not a fabricated rate."""
+    insert_memory(sync_db, "m1")
+
+    drain = sync.get_sync_status()["outbox"]["drain"]
+
+    assert drain["verdict"] == "unknown"
+    assert "per_minute" not in drain
+    # The baseline must now exist so the next call can compute a rate.
+    assert sync._flag(sync_db, "status_probe_pending") == "1"
+
+
+def test_sync_status_reports_draining_with_rate_and_eta(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """A falling pending count is the healthy case and gets an ETA."""
+    for i in range(10):
+        insert_memory(sync_db, f"m{i}")
+    _set_baseline(sync_db, 70, seconds_ago=60)
+
+    drain = sync.get_sync_status()["outbox"]["drain"]
+
+    assert drain["verdict"] == "draining"
+    assert drain["per_minute"] == pytest.approx(60.0, rel=0.1)
+    # 10 pending at 60/min, rounded to one decimal minute.
+    assert drain["eta_minutes"] == 0.2
+
+
+def test_sync_status_reports_stalled_when_pending_is_unchanged(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """The failure case this tool exists for: queued rows that aren't moving."""
+    insert_memory(sync_db, "m1")
+    _set_baseline(sync_db, 1, seconds_ago=120)
+
+    drain = sync.get_sync_status()["outbox"]["drain"]
+
+    assert drain["verdict"] == "stalled"
+    assert drain["per_minute"] == 0
+    assert "SYNC_SECRET" in drain["hint"]
+
+
+def test_sync_status_reports_growing_when_writes_outpace_pushes(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """A rising count is distinct from stalled — different cause, different fix."""
+    for i in range(5):
+        insert_memory(sync_db, f"m{i}")
+    _set_baseline(sync_db, 2, seconds_ago=60)
+
+    drain = sync.get_sync_status()["outbox"]["drain"]
+
+    assert drain["verdict"] == "growing"
+    assert drain["per_minute"] < 0
+
+
+def test_sync_status_is_idle_when_outbox_is_empty(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """Empty outbox is 'idle', never 'stalled' — nothing is stuck."""
+    drain = sync.get_sync_status()["outbox"]["drain"]
+
+    assert drain["verdict"] == "idle"
+    assert sync.get_sync_status()["outbox"]["pending"] == 0
+
+
+def test_sync_status_keeps_baseline_within_the_minimum_probe_interval(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """Rapid successive calls must not collapse the baseline into noise.
+
+    Two calls seconds apart would otherwise overwrite the baseline with a
+    near-zero elapsed time, yielding a meaningless rate — the exact trap of
+    sampling a counter twice too quickly.
+    """
+    insert_memory(sync_db, "m1")
+    _set_baseline(sync_db, 50, seconds_ago=5)
+
+    sync.get_sync_status()
+
+    # Baseline still the older one, so the reported interval stays useful.
+    assert sync._flag(sync_db, "status_probe_pending") == "50"
+
+
+def test_sync_status_advances_baseline_past_the_minimum_interval(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """Past the threshold the baseline rolls forward so rates track recent work."""
+    insert_memory(sync_db, "m1")
+    _set_baseline(sync_db, 50, seconds_ago=sync._STATUS_PROBE_MIN_SECONDS + 5)
+
+    sync.get_sync_status()
+
+    assert sync._flag(sync_db, "status_probe_pending") == "1"
+
+
+def test_sync_status_survives_an_unparseable_baseline(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """A corrupt flag resets the baseline rather than raising from a status call."""
+    insert_memory(sync_db, "m1")
+    sync._set_flag(sync_db, "status_probe_pending", "not-a-number")
+    sync._set_flag(sync_db, "status_probe_at", "also-not-a-time")
+    sync_db.commit()
+
+    drain = sync.get_sync_status()["outbox"]["drain"]
+
+    assert drain["verdict"] == "unknown"
+    assert sync._flag(sync_db, "status_probe_pending") == "1"
+
+
+def test_sync_status_surfaces_and_clears_the_last_remote_error(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """Errors are reported per remote and cleared once that remote recovers."""
+    sync_db.execute(
+        "INSERT INTO sync_log (remote_id, last_push, last_pull) VALUES ('hub', ?, ?)",
+        (_now_iso(), _now_iso()),
+    )
+    sync_db.commit()
+    sync._record_error("hub", httpx.ConnectError("connection refused"))
+
+    hub = next(r for r in sync.get_sync_status()["remotes"] if r["remote_id"] == "hub")
+    assert "ConnectError" in hub["last_error"]["error"]
+    assert hub["ever_contacted"] is True
+
+    sync._clear_error("hub")
+
+    hub = next(r for r in sync.get_sync_status()["remotes"] if r["remote_id"] == "hub")
+    assert hub["last_error"] is None
+
+
+def test_sync_status_reports_a_remote_that_never_completed_a_cycle(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """A hub failing on every attempt has no sync_log row — it must still appear.
+
+    Without this, the single most important failure mode (sync never worked at
+    all) would be invisible: no row to join against means no error reported.
+    """
+    sync._record_error("hub", httpx.ConnectError("no route to host"))
+
+    remotes = sync.get_sync_status()["remotes"]
+
+    hub = next(r for r in remotes if r["remote_id"] == "hub")
+    assert hub["ever_contacted"] is False
+    assert hub["last_push"] is None
+    assert "no route to host" in hub["last_error"]["error"]
+
+
+def test_sync_status_counts_tombstones_and_compaction_eligibility(
+    sync_db: sqlite3.Connection, status_enabled: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Tombstones are split into total vs already past the retention window."""
+    monkeypatch.setattr(sync.config, "TOMBSTONE_RETENTION_DAYS", 180)
+    old = (datetime.now(UTC) - timedelta(days=200)).isoformat()
+    insert_memory(sync_db, "fresh", deleted_at=_now_iso())
+    insert_memory(sync_db, "ancient", deleted_at=old)
+    insert_memory(sync_db, "alive")
+
+    tombstones = sync.get_sync_status()["tombstones"]
+
+    assert tombstones["total"] == 2
+    assert tombstones["compactable_now"] == 1
+    assert tombstones["retention_days"] == 180
