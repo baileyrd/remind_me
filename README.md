@@ -657,6 +657,10 @@ Pages are real files on disk — edit them by hand, version them with `git`, syn
 
 A typical session: `remind_me_wiki_compile` → read the brief → write/revise several pages, flag contradictions, add cross-links → `remind_me_wiki_compile(mark_integrated=true)`. To consume the wiki, `remind_me_wiki_load` pulls the whole thing into context (token-budgeted, newest pages first), or `remind_me_wiki_read` / `remind_me_wiki_search` navigate it page by page.
 
+### Page kinds: knowledge pages vs. procedure pages
+
+Most pages are free-form **knowledge pages** — one concept, entity, or project each. The default `SCHEMA.md` also documents a **procedure page** convention for sources that describe a repeatable task (a setup, a fix, a recurring workflow) rather than a fact: a `# Task name` page with `## Steps`, `## Edge cases / branches`, and `## Related` sections, so the next run can follow it directly instead of re-deriving it from raw memories. The schema nudges Claude to decide **patch vs. create** — revise an existing procedure page's steps/edge-cases rather than writing a near-duplicate — the same judgment call `remind_me_wiki_compile` already makes for knowledge pages, just with a task-shaped template. This is a prompt/schema convention only (see `wiki.default_schema()`); there's no separate page-kind column or enforcement — an existing `SCHEMA.md` already seeded on disk keeps whatever it has until you edit it by hand.
+
 ```bash
 # Point the wiki somewhere git-friendly (optional; defaults to ~/.remind-me/wiki)
 export REMIND_ME_WIKI_DIR=~/notes/wiki
@@ -1244,6 +1248,10 @@ remind_me is local-first, single-user, and MCP-native by design — some capabil
 ## Changelog
 
 See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for a per-version feature breakdown with PR references; this section summarizes the same history phase-by-phase.
+
+### 1.23.0 — 2026-07-31
+
+Closes the "worth pursuing" item from the [memU capability review](docs/memu-capability-review-2026-07-31.md): the wiki's default `SCHEMA.md` now documents a **procedure page** convention (steps/edge-cases/branches, plus explicit patch-vs-create guidance) for task-shaped sources, alongside the existing free-form knowledge pages. Prompt/schema-only — `remind_me_wiki_compile` needed no code change since it already embeds the live schema verbatim into its brief.
 
 ### 1.19.0 — 2026-07-22
 
