@@ -45,12 +45,13 @@ is memU's *entire* product rather than one layer of a larger system.
    (`remind_me_import_chat`, watched folders) — nothing that hooks into a
    specific *other* agent's native log format the way memU's host adapters
    do. Claude Code/Desktop are remind_me's only "live" integration, via MCP
-   itself.
+   itself. Tracked as [#109](https://github.com/baileyrd/remind_me/issues/109).
 
 2. **Host auto-detection** — memU's `detect` utility figures out which agent
    host it's running under and what that host supports. remind_me has no
    equivalent; each deployment is configured by hand (env vars, MCP client
-   config) with no runtime environment probing.
+   config) with no runtime environment probing. Tracked as
+   [#110](https://github.com/baileyrd/remind_me/issues/110).
 
 3. **Skill-shaped synthesis with explicit patch-vs-create judgment** —
    memU's write loop makes the calling agent explicitly decide "is this a new
@@ -60,16 +61,19 @@ is memU's *entire* product rather than one layer of a larger system.
    pending memories for Claude to fold in, but there's no dedicated
    patch-vs-create decision step and no procedure-shaped (steps/edge-cases/
    branches) template — remind_me's wiki pages are general knowledge/entity
-   pages, not task-runbook skills.
+   pages, not task-runbook skills. Tracked as
+   [#108](https://github.com/baileyrd/remind_me/issues/108).
 
 4. **npm/JS distribution** — memU ships a JS/TS-consumable package alongside
    Python. remind_me is Python/MCP-only (same gap already flagged in the
-   cognee review re: client SDKs).
+   cognee review re: client SDKs). Tracked as
+   [#111](https://github.com/baileyrd/remind_me/issues/111).
 
 5. **Hosted managed option (memu.so)** — a zero-setup cloud target for teams
    that don't want to self-host. remind_me is self-hosted only (same theme as
    the cognee review's cloud/managed-deploy gap, but memU's version is
-   narrowly a hosted skills wiki rather than general cloud infra).
+   narrowly a hosted skills wiki rather than general cloud infra). Tracked as
+   [#112](https://github.com/baileyrd/remind_me/issues/112).
 
 6. **Extreme minimalism as a design/audit property** — memU advertises its
    core logic as inspectable in ~500 lines with a hard "no LLM calls in the
