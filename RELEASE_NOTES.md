@@ -1,5 +1,36 @@
 # Release Notes
 
+## v1.22.0 — 2026-07-31
+
+Fixes the four sync-observability defects recorded in v1.21.1 (**SY-15** … **SY-18**). Behaviour change and a schema migration (v19 → v20) — not a patch release.
+
+### SY-18: split the sync cursor from the liveness clock
+
+`sync_log` had one column pair doing two jobs: `last_pull`/`last_pull_id` is the keyset resume-cursor over a remote's record stream, and `last_push` was supposed to be a liveness heartbeat but was never written by any code path. The 1.21.1 proposal suggested renaming the cursor columns to `pull_cursor_ts`/`pull_cursor_id`; this codebase's migration history is strictly additive (every prior migration adds a column via a suppressed `ALTER`, never renames or drops — see `_migrate_v8_to_v9` through `_migrate_v19_to_v20`), so the cursor columns were left exactly as-is and three new wall-clock columns were added instead:
+
+- **`last_attempt_at`** — touched before contacting a remote, success or failure. The load-bearing one: with only `last_error` (null in the healthy case), "never tried", "tried and failed silently", and "tried and it worked" were indistinguishable.
+- **`last_push_at`** — touched when `_push_outbox` completes a cycle against a remote, empty batch or not.
+- **`last_pull_at`** — touched when a pull cycle completes, independent of whether the content cursor advanced.
+
+All three are written uniformly for hub and every peer, since `_push_outbox`/`_pull_remote`/`_pull_graph_table` are already parameterized on `remote_id` with no hub-specific branching.
+
+### SY-15: `last_push` reads as "never pushed" — fixed
+
+Direct consequence of SY-18: `_push_outbox` now writes `last_push_at`, so `get_sync_status`'s `remotes[]` entries report a real push time instead of the epoch default. `ever_contacted` is now keyed off `last_attempt_at` rather than a pull/push pair that could never both be populated.
+
+### SY-17: quiet-but-healthy remote read as `fault` — fixed
+
+`reconcile_with_hub`'s verdict now compares wall-clock `last_pull_at` against the grace window instead of the `last_pull` content cursor, so a remote that's contacted every cycle but has nothing new to send no longer looks like a dead pull.
+
+### SY-16: outbox counters measured echo suppression, not push progress — fixed
+
+`pending`/`sent`/`oldest_pending_at` (and the reconcile `outbox_pending`) previously read `sync_outbox.sent_at`, which is only ever set by echo suppression (a pulled-in record's own outbox trigger being cancelled) — never by a successful push. A node that mostly writes its own memories therefore reported `drain: stalled` permanently, regardless of whether pushes were landing. These now derive from `sync_sends` via a new `_pending_to_remote` helper, mirroring `_push_outbox`'s own row-selection exactly: a row stops counting once it's genuinely acked by that remote, or was itself an echo. Each `remotes[]` entry also reports its own per-remote `pending` count.
+
+### Also
+
+- `remotes[]` no longer lists the synthetic `{remote_id}#entities` / `#links` / `#entity_relations` graph-cursor rows `_pull_graph_table` stores internally — those aren't remotes.
+- Schema migration `v19 → v20` (`_migrate_v19_to_v20`, `db.py`): additive only, no backfill (the contact history was never recorded, so there's nothing to backfill from).
+
 ## v1.21.1 — 2026-07-31
 
 Documentation only — no behaviour change. Records four sync-observability defects (**SY-15** … **SY-18**) found while diagnosing an apparent hub outage that turned out to be no outage at all.

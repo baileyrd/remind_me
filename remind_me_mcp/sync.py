@@ -136,6 +136,33 @@ def _decode_payload(raw: str) -> dict[str, Any]:
     return payload
 
 
+def _touch_sync_log(db: sqlite3.Connection, remote_id: str, column: str) -> None:
+    """Upsert a single wall-clock column in ``sync_log`` for *remote_id* to now.
+
+    Used for the liveness columns added in SY-18 (``last_attempt_at``,
+    ``last_push_at``, ``last_pull_at``) — each is touched independently of
+    the others and of the ``last_pull``/``last_pull_id`` resume cursor, so a
+    plain ``ON CONFLICT DO UPDATE`` on just that column leaves everything
+    else on the row untouched (and lets a fresh row take the table's default
+    for every column but this one).
+
+    Args:
+        db: An open SQLite connection.
+        remote_id: The remote this row tracks ("hub" or a peer's node id).
+        column: One of the ``sync_log`` wall-clock columns — always a
+            hardcoded literal from this module, never user input.
+    """
+    db.execute(
+        f"""
+        INSERT INTO sync_log (remote_id, {column})
+        VALUES (?, ?)
+        ON CONFLICT (remote_id) DO UPDATE SET {column} = excluded.{column}
+        """,
+        (remote_id, _now_iso()),
+    )
+    db.commit()
+
+
 async def _push_outbox(client: httpx.AsyncClient, url: str, remote_id: str) -> int:
     """Push outbox rows not yet sent to *remote_id*; mark what it processed.
 
@@ -145,10 +172,17 @@ async def _push_outbox(client: httpx.AsyncClient, url: str, remote_id: str) -> i
     cycle; a count-only remote (legacy hub) marks the whole batch, with a
     warning when the accepted count falls short.
 
+    ``last_attempt_at`` is touched before anything else so it reflects "we
+    tried this cycle" even if the push raises partway through; ``last_push_at``
+    is only touched after the loop completes without error, so the two
+    together distinguish "never tried" / "tried and failed" / "tried and
+    succeeded" (SY-15, SY-18) — a batch of zero rows still counts as success.
+
     Returns:
         The number of outbox rows marked sent to this remote.
     """
     db = _get_db()
+    _touch_sync_log(db, remote_id, "last_attempt_at")
     total_marked = 0
     cursor = 0
 
@@ -212,6 +246,7 @@ async def _push_outbox(client: httpx.AsyncClient, url: str, remote_id: str) -> i
         if len(rows) < BATCH_SIZE:
             break
 
+    _touch_sync_log(db, remote_id, "last_push_at")
     return total_marked
 
 
@@ -292,6 +327,7 @@ async def _pull_remote(client: httpx.AsyncClient, url: str, remote_id: str) -> i
         if len(records) < PULL_PAGE_SIZE:
             break
 
+    _touch_sync_log(db, remote_id, "last_pull_at")
     return total
 
 
@@ -343,6 +379,7 @@ async def _pull_graph_table(
                 "Remote %s does not serve %s (pre-FT-04 peer) — skipping",
                 remote_id, path,
             )
+            _touch_sync_log(db, remote_id, "last_pull_at")
             return total
         resp.raise_for_status()
 
@@ -383,6 +420,7 @@ async def _pull_graph_table(
         if len(records) < PULL_PAGE_SIZE:
             break
 
+    _touch_sync_log(db, remote_id, "last_pull_at")
     return total
 
 
@@ -1112,6 +1150,38 @@ def _drain_rate(db: sqlite3.Connection, pending: int) -> dict[str, Any]:
     return result
 
 
+def _pending_to_remote(db: sqlite3.Connection, remote_id: str) -> tuple[int, str | None]:
+    """Count outbox rows genuinely still owed to *remote_id*, and their oldest.
+
+    Mirrors ``_push_outbox``'s own selection exactly (SY-16): a row stops
+    being pending only once it's recorded in ``sync_sends`` for this remote,
+    or echo-suppressed (``sent_at != ''``, meaning it originated from a pull
+    and was never meant to go back out). The previous approach counted
+    ``sent_at = ''`` alone, which conflated "pushed" with "not an echo" — a
+    node that mostly writes its own memories (so nothing is ever echoed back
+    to it to suppress) read as permanently stalled regardless of whether
+    pushes were succeeding.
+
+    Returns:
+        A ``(pending_count, oldest_pending_created_at)`` pair; the second
+        element is ``None`` when nothing is pending.
+    """
+    where = """
+        o.sent_at = ''
+        AND NOT EXISTS (
+            SELECT 1 FROM sync_sends s
+            WHERE s.remote_id = ? AND s.outbox_id = o.id
+        )
+    """
+    (pending,) = db.execute(
+        f"SELECT COUNT(*) FROM sync_outbox o WHERE {where}", (remote_id,)
+    ).fetchone()
+    (oldest,) = db.execute(
+        f"SELECT MIN(o.created_at) FROM sync_outbox o WHERE {where}", (remote_id,)
+    ).fetchone()
+    return pending, oldest
+
+
 def get_sync_status() -> dict[str, Any]:
     """Report sync state for the MCP status tools (SY-12).
 
@@ -1148,15 +1218,9 @@ def get_sync_status() -> dict[str, Any]:
 
     db = _get_db()
 
-    (pending,) = db.execute(
-        "SELECT COUNT(*) FROM sync_outbox WHERE sent_at = ''"
-    ).fetchone()
-    (sent,) = db.execute(
-        "SELECT COUNT(*) FROM sync_outbox WHERE sent_at != ''"
-    ).fetchone()
-    (oldest_pending,) = db.execute(
-        "SELECT MIN(created_at) FROM sync_outbox WHERE sent_at = ''"
-    ).fetchone()
+    pending, oldest_pending = _pending_to_remote(db, "hub")
+    (total_outbox,) = db.execute("SELECT COUNT(*) FROM sync_outbox").fetchone()
+    sent = total_outbox - pending
 
     (tombstones,) = db.execute(
         "SELECT COUNT(*) FROM memories WHERE deleted_at IS NOT NULL"
@@ -1173,15 +1237,24 @@ def get_sync_status() -> dict[str, Any]:
     remotes = [
         {
             "remote_id": row["remote_id"],
-            "last_push": row["last_push"],
-            "last_pull": row["last_pull"],
+            # Wall-clock contact times (SY-18), not the last_pull content
+            # cursor -- a quiet-but-healthy remote still advances these every
+            # cycle even when it has nothing new to send.
+            "last_attempt_at": row["last_attempt_at"],
+            "last_push_at": row["last_push_at"],
+            "last_pull_at": row["last_pull_at"],
             # A never-contacted remote sits at the epoch default rather than
             # NULL, which reads as a stale timestamp unless called out.
-            "ever_contacted": row["last_push"] != _EPOCH or row["last_pull"] != _EPOCH,
+            "ever_contacted": row["last_attempt_at"] != _EPOCH,
+            "pending": _pending_to_remote(db, row["remote_id"])[0],
             "last_error": _last_errors.get(row["remote_id"]),
         }
+        # Graph-table cursors are stored as synthetic "{remote_id}#{suffix}"
+        # rows in this same table (_pull_graph_table) so they don't collide
+        # with the memory cursor -- exclude them here, they're not remotes.
         for row in db.execute(
-            "SELECT remote_id, last_push, last_pull FROM sync_log ORDER BY remote_id"
+            "SELECT remote_id, last_attempt_at, last_push_at, last_pull_at "
+            "FROM sync_log WHERE remote_id NOT LIKE '%#%' ORDER BY remote_id"
         ).fetchall()
     ]
     # Surface errors for remotes that have never completed a cycle, so a hub
@@ -1192,9 +1265,11 @@ def get_sync_status() -> dict[str, Any]:
             remotes.append(
                 {
                     "remote_id": remote_id,
-                    "last_push": None,
-                    "last_pull": None,
+                    "last_attempt_at": None,
+                    "last_push_at": None,
+                    "last_pull_at": None,
                     "ever_contacted": False,
+                    "pending": _pending_to_remote(db, remote_id)[0],
                     "last_error": err,
                 }
             )
@@ -1284,8 +1359,12 @@ def _verdict(
 
     Args:
         categories: Per-category rows with non-zero ``delta`` (hub - local).
-        last_pull_age: Seconds since the last successful hub pull, or None if
-            the hub has never been pulled from.
+        last_pull_age: Seconds since ``last_pull_at`` — the wall clock of the
+            last successful pull *attempt* against the hub (SY-18), not the
+            content cursor: a quiet-but-healthy hub still updates this every
+            cycle even when it has nothing new to send, so a stale value
+            here means the pull itself has stopped running. None if the hub
+            has never been pulled from.
 
     Returns:
         ``(verdict, hints)``.
@@ -1409,22 +1488,20 @@ async def reconcile_with_hub(client: httpx.AsyncClient | None = None) -> dict[st
             )
 
     row = db.execute(
-        "SELECT last_pull FROM sync_log WHERE remote_id = 'hub'"
+        "SELECT last_pull_at FROM sync_log WHERE remote_id = 'hub'"
     ).fetchone()
-    last_pull = row["last_pull"] if row else None
+    last_pull_at = row["last_pull_at"] if row else None
     last_pull_age: float | None = None
-    if last_pull and last_pull != _EPOCH:
+    if last_pull_at and last_pull_at != _EPOCH:
         try:
             last_pull_age = (
-                datetime.now(UTC) - datetime.fromisoformat(_canon_ts(last_pull))
+                datetime.now(UTC) - datetime.fromisoformat(_canon_ts(last_pull_at))
             ).total_seconds()
         except (ValueError, TypeError):
             last_pull_age = None
 
     verdict, hints = _verdict(categories, last_pull_age)
-    (pending,) = db.execute(
-        "SELECT COUNT(*) FROM sync_outbox WHERE sent_at = ''"
-    ).fetchone()
+    pending, _ = _pending_to_remote(db, "hub")
 
     def _cmp(hub_value: Any, local_value: int) -> dict[str, Any]:
         hub_n = hub_value if isinstance(hub_value, int) else 0
@@ -1436,7 +1513,7 @@ async def reconcile_with_hub(client: httpx.AsyncClient | None = None) -> dict[st
         "hints": hints,
         "node_id": NODE_ID,
         "hub_url": HUB_URL,
-        "last_pull": last_pull,
+        "last_pull_at": last_pull_at,
         "last_pull_age_seconds": (
             round(last_pull_age) if last_pull_age is not None else None
         ),
