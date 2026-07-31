@@ -1,5 +1,24 @@
 # Release Notes
 
+## v1.21.1 — 2026-07-31
+
+Documentation only — no behaviour change. Records four sync-observability defects (**SY-15** … **SY-18**) found while diagnosing an apparent hub outage that turned out to be no outage at all.
+
+### What happened
+
+`remind_me_sync_status` on node `baileyai-connector` reported `drain: stalled`, 57249 pending, 0 sent, and `last_push: 1970-01-01` on every remote — while the hub was reachable and pulls were landing throughout. Every alarm signal was an instrumentation defect. No data was ever at risk.
+
+The cost is real even so. The status surfaces added by SY-12 and SY-14 exist precisely to answer "is sync healthy?", and they currently answer "no" on a healthy node, which trains the reader to ignore them.
+
+- **SY-15** ([#102](https://github.com/baileyrd/remind_me/issues/102)) — `sync_log.last_push` is declared (`db.py:547`) and read (`sync.py:1176`) but written nowhere in the repo, so it is structurally incapable of holding any value but the epoch. It reads as "this node has never once pushed". `ever_contacted` derives from it and is really "ever *pulled*".
+- **SY-16** ([#103](https://github.com/baileyrd/remind_me/issues/103)) — the outbox counters measure echo suppression, not push progress. A successful push records its ack in `sync_sends` (`sync.py:200-204`) and never sets `sent_at`; the only writers of `sent_at` are the four echo-suppression paths. So `pending` (`sent_at = ''`) really means "written locally" and `sent` really means "arrived from a remote", and neither moves when a push succeeds. The `drain` sampler reads the same column, making `stalled` the permanent steady state of any healthy node that writes its own memories — from the one signal built specifically to distinguish a healthy backlog from a wedged push.
+- **SY-17** ([#104](https://github.com/baileyrd/remind_me/issues/104)) — `last_pull` is a keyset cursor over record `updated_at` (`sync.py:264-284`), not a contact time, but is presented as one. It also updates only when a page contained records, so a pull returning nothing new leaves the row untouched — exactly the pulls that prove a remote is reachable. `_verdict` compares this content watermark against wall-clock and returns `fault` ("the pull is not running") for a healthy quiet remote.
+- **SY-18** ([#105](https://github.com/baileyrd/remind_me/issues/105)) — the root cause behind SY-15 and SY-17: `sync_log` has one pair of columns doing two unrelated jobs (resume-cursor and liveness clock) and maintains only the first. The result is that no per-remote record of *when we last successfully communicated* exists anywhere in the system — which is why diagnosis required reading the sync implementation rather than glancing at the status output. Proposes renaming the cursor columns to `pull_cursor_ts`/`pull_cursor_id` and adding true wall-clock `last_pull_at`, `last_push_at`, and `last_attempt_at`.
+
+`last_attempt_at` is the load-bearing addition: with only `last_error` (null in the healthy case), "never attempted", "attempted and succeeded", and "attempted and failed without recording an error" are indistinguishable, and they have different causes and different fixes.
+
+Fix order is SY-18 first — SY-15 and SY-17 collapse into "point the existing reader at the new column" once it lands. SY-16 is independent counter logic.
+
 ## v1.21.0 — 2026-07-30
 
 New capability: **`remind_me_undo_import`** — roll back a bulk import.
