@@ -275,7 +275,7 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 # Current target schema version.  Increment when adding a new migration step.
-_SCHEMA_VERSION = 19
+_SCHEMA_VERSION = 20
 
 
 
@@ -427,6 +427,11 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         _migrate_v18_to_v19(db)
         db.execute("PRAGMA user_version = 19")
         current_version = 19
+
+    if current_version < 20:
+        _migrate_v19_to_v20(db)
+        db.execute("PRAGMA user_version = 20")
+        current_version = 20
 
     db.commit()
 
@@ -1623,6 +1628,39 @@ def _migrate_v18_to_v19(db: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_memory_associations_b
             ON memory_associations(memory_id_b);
     """)
+
+
+def _migrate_v19_to_v20(db: sqlite3.Connection) -> None:
+    """v19 -> v20: split sync_log's cursor from its liveness clock (SY-18).
+
+    ``last_pull``/``last_pull_id`` remain exactly what they were: a keyset
+    resume cursor over pulled records' ``(updated_at, id)``. They are content
+    watermarks, not contact times -- a remote that has nothing new to send
+    never advances them, which is the root cause of SY-17 (a quiet-but-healthy
+    remote reads as "fault"). Rather than rename the cursor columns (this
+    codebase's migrations never rename or drop -- always additive), add three
+    true wall-clock columns instead, written unconditionally on every attempt:
+
+    - ``last_attempt_at``: set before contacting a remote, success or not --
+      the only column that can tell "never tried" apart from "tried and it
+      failed silently" (closes the gap SY-15 left: last_push read as "never
+      pushed" with no way to tell if that was even true).
+    - ``last_push_at``: set when ``_push_outbox`` completes a cycle against a
+      remote (empty batch or not) -- fixes SY-15, where ``last_push`` was
+      declared and read but never written by any code path.
+    - ``last_pull_at``: set when a pull cycle against a remote completes,
+      independent of whether the content cursor advanced -- fixes the write
+      side of SY-17.
+
+    Args:
+        db: An open SQLite connection.
+    """
+    for column in ("last_attempt_at", "last_push_at", "last_pull_at"):
+        with contextlib.suppress(sqlite3.OperationalError):
+            db.execute(
+                f"ALTER TABLE sync_log ADD COLUMN {column} TEXT NOT NULL "
+                "DEFAULT '1970-01-01T00:00:00+00:00'"
+            )
 
 
 def embedding_mismatch_info(db: sqlite3.Connection) -> dict[str, str] | None:

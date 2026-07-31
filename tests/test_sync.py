@@ -178,6 +178,45 @@ async def test_push_outbox_nothing_to_send(sync_db: sqlite3.Connection) -> None:
     assert recorder.requests == []
 
 
+async def test_push_outbox_touches_last_push_at_even_with_nothing_to_send(
+    sync_db: sqlite3.Connection,
+) -> None:
+    """SY-15: last_push_at advances on every completed cycle, empty or not —
+    previously last_push was declared and read but written by no code path,
+    so it could only ever read as "never pushed"."""
+    recorder = RequestRecorder()
+    async with mock_client(recorder) as client:
+        await sync._push_outbox(client, "http://hub", "hub")
+
+    row = sync_db.execute(
+        "SELECT last_attempt_at, last_push_at FROM sync_log WHERE remote_id = 'hub'"
+    ).fetchone()
+    assert row["last_attempt_at"] != sync._EPOCH
+    assert row["last_push_at"] != sync._EPOCH
+
+
+async def test_push_outbox_leaves_last_push_at_stale_on_failure(
+    sync_db: sqlite3.Connection,
+) -> None:
+    """An attempt that raises still records last_attempt_at, but not
+    last_push_at — the two together distinguish "never tried" from "tried
+    and failed" from "tried and succeeded" (SY-15/SY-18)."""
+    insert_memory(sync_db, "mem-1")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "boom"})
+
+    async with mock_client(handler) as client:
+        with pytest.raises(httpx.HTTPStatusError):
+            await sync._push_outbox(client, "http://hub", "hub")
+
+    row = sync_db.execute(
+        "SELECT last_attempt_at, last_push_at FROM sync_log WHERE remote_id = 'hub'"
+    ).fetchone()
+    assert row["last_attempt_at"] != sync._EPOCH
+    assert row["last_push_at"] == sync._EPOCH
+
+
 async def test_push_outbox_batches(
     sync_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -329,8 +368,15 @@ async def test_pull_remote_empty(sync_db: sqlite3.Connection) -> None:
     async with mock_client(recorder) as client:
         count = await sync._pull_remote(client, "http://hub", "hub")
     assert count == 0
-    # No cursor written when nothing was received
-    assert sync_db.execute("SELECT COUNT(*) FROM sync_log").fetchone()[0] == 0
+    # No content-cursor progress when nothing was received...
+    row = sync_db.execute(
+        "SELECT last_pull, last_pull_id, last_pull_at FROM sync_log WHERE remote_id = 'hub'"
+    ).fetchone()
+    assert row["last_pull"] == sync._EPOCH
+    assert row["last_pull_id"] == ""
+    # ...but the wall-clock contact time still advances (SY-17/18): a quiet
+    # hub with nothing new to send is still a hub we successfully reached.
+    assert row["last_pull_at"] != sync._EPOCH
 
 
 def _paging_pull_handler(all_records: list[dict], page_size: int):
@@ -1005,6 +1051,15 @@ def test_v9_schema_objects_exist(sync_db: sqlite3.Connection) -> None:
 
     cols = {r[1] for r in sync_db.execute("PRAGMA table_info(sync_log)").fetchall()}
     assert "last_pull_id" in cols
+
+
+def test_v20_schema_objects_exist(sync_db: sqlite3.Connection) -> None:
+    """SY-18: v20 splits sync_log's resume cursor from its liveness clock.
+
+    last_pull/last_pull_id remain the content cursor; last_attempt_at/
+    last_push_at/last_pull_at are the new wall-clock columns."""
+    cols = {r[1] for r in sync_db.execute("PRAGMA table_info(sync_log)").fetchall()}
+    assert {"last_attempt_at", "last_push_at", "last_pull_at"} <= cols
 
 
 def test_reconcile_disabled_truncates_outbox(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1698,7 +1753,16 @@ async def test_pull_entities_tolerates_pre_ft04_peer(
     async with mock_client(recorder) as client:
         assert await sync._pull_entities(client, "http://old-peer", "old") == 0
         assert await sync._pull_links(client, "http://old-peer", "old") == 0
-    assert sync_db.execute("SELECT COUNT(*) FROM sync_log").fetchone()[0] == 0
+    # No entity-graph cursor rows (the 404 means "doesn't support this"), but
+    # the base remote row still gets its wall-clock contact time touched —
+    # a 404 is still a successful contact with the peer itself.
+    assert sync_db.execute(
+        "SELECT COUNT(*) FROM sync_log WHERE remote_id LIKE '%#%'"
+    ).fetchone()[0] == 0
+    row = sync_db.execute(
+        "SELECT last_pull_at FROM sync_log WHERE remote_id = 'old'"
+    ).fetchone()
+    assert row["last_pull_at"] != sync._EPOCH
 
 
 async def test_two_db_entity_round_trip(
@@ -1981,7 +2045,13 @@ async def test_pull_entity_relations_tolerates_old_peer(
     recorder = RequestRecorder()  # 404s everything but the legacy endpoints
     async with mock_client(recorder) as client:
         assert await sync._pull_entity_relations(client, "http://old-peer", "old") == 0
-    assert sync_db.execute("SELECT COUNT(*) FROM sync_log").fetchone()[0] == 0
+    assert sync_db.execute(
+        "SELECT COUNT(*) FROM sync_log WHERE remote_id LIKE '%#%'"
+    ).fetchone()[0] == 0
+    row = sync_db.execute(
+        "SELECT last_pull_at FROM sync_log WHERE remote_id = 'old'"
+    ).fetchone()
+    assert row["last_pull_at"] != sync._EPOCH
 
 
 # ---------------------------------------------------------------------------
@@ -2062,6 +2132,32 @@ def test_sync_status_reports_outbox_depth_and_trigger_gate(
     # aren't queued, so it's reported rather than assumed.
     assert status["outbox_trigger_gate"] == "1"
     assert status["outbox"]["oldest_pending_at"] is not None
+
+
+async def test_sync_status_pending_drops_to_zero_once_genuinely_pushed(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """SY-16: pending must reflect real push completion (sync_sends), not
+    sent_at — sent_at is only ever set by echo suppression on a pulled-in
+    record, so a node that solely writes its own memories never touches it
+    and previously read as permanently stalled regardless of whether pushes
+    to the hub were actually succeeding."""
+    insert_memory(sync_db, "m1")
+    assert sync.get_sync_status()["outbox"]["pending"] == 1
+
+    recorder = RequestRecorder()
+    async with mock_client(recorder) as client:
+        await sync._push_outbox(client, "http://hub.example", "hub")
+
+    status = sync.get_sync_status()
+    assert status["outbox"]["pending"] == 0
+    assert status["outbox"]["drain"]["verdict"] == "idle"
+    # sent_at itself is untouched by a real push — confirms the fix reads
+    # sync_sends rather than accidentally making _push_outbox set sent_at.
+    (sent_at,) = sync_db.execute(
+        "SELECT sent_at FROM sync_outbox WHERE memory_id = 'm1'"
+    ).fetchone()
+    assert sent_at == ""
 
 
 def test_sync_status_first_call_establishes_baseline_without_guessing(
@@ -2182,8 +2278,9 @@ def test_sync_status_surfaces_and_clears_the_last_remote_error(
 ) -> None:
     """Errors are reported per remote and cleared once that remote recovers."""
     sync_db.execute(
-        "INSERT INTO sync_log (remote_id, last_push, last_pull) VALUES ('hub', ?, ?)",
-        (_now_iso(), _now_iso()),
+        "INSERT INTO sync_log (remote_id, last_attempt_at, last_push_at, last_pull_at) "
+        "VALUES ('hub', ?, ?, ?)",
+        (_now_iso(), _now_iso(), _now_iso()),
     )
     sync_db.commit()
     sync._record_error("hub", httpx.ConnectError("connection refused"))
@@ -2212,7 +2309,7 @@ def test_sync_status_reports_a_remote_that_never_completed_a_cycle(
 
     hub = next(r for r in remotes if r["remote_id"] == "hub")
     assert hub["ever_contacted"] is False
-    assert hub["last_push"] is None
+    assert hub["last_push_at"] is None
     assert "no route to host" in hub["last_error"]["error"]
 
 
@@ -2271,14 +2368,19 @@ def stats_recorder(payload: dict[str, Any]) -> RequestRecorder:
 
 
 def _set_last_pull(db: sqlite3.Connection, *, seconds_ago: float | None) -> None:
-    """Record a hub pull watermark; None means never successfully pulled."""
+    """Record the hub's wall-clock pull-contact time (SY-18's last_pull_at).
+
+    None means never successfully pulled — reconcile's verdict keys off this
+    wall-clock column now, not the last_pull content cursor (SY-17): a quiet
+    hub with nothing new to send still touches last_pull_at every cycle.
+    """
     at = (
         _EPOCH_SENTINEL
         if seconds_ago is None
         else (datetime.now(UTC) - timedelta(seconds=seconds_ago)).isoformat()
     )
     db.execute(
-        "INSERT OR REPLACE INTO sync_log (remote_id, last_push, last_pull) "
+        "INSERT OR REPLACE INTO sync_log (remote_id, last_attempt_at, last_pull_at) "
         "VALUES ('hub', ?, ?)",
         (_now_iso(), at),
     )
