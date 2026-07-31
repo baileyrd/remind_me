@@ -161,8 +161,38 @@ cross-linked so it can be loaded directly into context.
   Dense cross-linking is the point — prefer linking over repeating.
 - Keep pages concise. Distil; do not paste raw conversation.
 
+## Page kinds
+Most pages are **knowledge pages** — a concept, entity, or project, written
+free-form per the conventions above. When a source instead describes a
+*repeatable task* (a procedure the user or an agent will run again — a setup,
+a fix, a recurring workflow), prefer a **procedure page** so the next run can
+follow it directly instead of re-deriving it from raw memories:
+
+```
+# <Task name>
+
+One-sentence summary of what this accomplishes and when to use it.
+
+## Steps
+1. ...
+2. ...
+
+## Edge cases / branches
+- If <condition>, do <X> instead of step N.
+
+## Related
+[[links]] to the pages/entities/tools this procedure touches.
+```
+
+Before creating a new procedure page, decide **patch vs. create**: if an
+existing page already covers this task, revise its `Steps`/`Edge cases`
+in place (e.g. add a newly-discovered branch) rather than writing a near-
+duplicate page. Only create a new page when the source describes a distinct
+task with no existing page.
+
 ## Maintenance workflow (when new sources arrive)
-1. Read each source. Decide which page(s) it belongs to.
+1. Read each source. Decide which page(s) it belongs to, and whether it's a
+   knowledge page or a procedure page (see "Page kinds" above).
 2. Create or update those pages — typically several per source. Revise
    existing summaries rather than appending duplicates.
 3. **Flag contradictions** inline with a `> ⚠️ Contradiction:` blockquote that

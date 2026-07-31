@@ -1,5 +1,18 @@
 # Release Notes
 
+## v1.23.0 — 2026-07-31
+
+Closes [#108](https://github.com/baileyrd/remind_me/issues/108) from the [memU capability review](docs/memu-capability-review-2026-07-31.md): memU's wiki-of-skills product makes the calling agent explicitly decide "patch an existing skill or create a new one" and writes task skills in a steps/edge-cases/branches shape. remind_me's LLM Wiki had no equivalent for task-shaped sources — every page was a free-form knowledge page.
+
+### New Features
+
+- **Procedure page convention** — `wiki.default_schema()` (the `SCHEMA.md` maintainer contract seeded on first use) now documents a second page kind alongside free-form knowledge pages: a **procedure page** template (`# Task name` / `## Steps` / `## Edge cases / branches` / `## Related`) for sources that describe a repeatable task rather than a fact, plus explicit patch-vs-create guidance so a newly-discovered edge case gets folded into an existing procedure page instead of spawning a near-duplicate. Since `remind_me_wiki_compile`'s brief already embeds the live schema text verbatim, this took effect with no change to the compile tool itself — the whole feature is the schema/prompt update.
+- Prompt/documentation-only: no new tables, tools, or wire format. An already-seeded `SCHEMA.md` on disk is unaffected (files are the source of truth) — only brand-new wikis pick up the new convention automatically; existing installs can copy it in by hand.
+
+### Also
+
+- Documented an explicit scope decision on the memU review's remaining two gaps ([#109](https://github.com/baileyrd/remind_me/issues/109) native adapters for other coding-agent hosts, [#110](https://github.com/baileyrd/remind_me/issues/110) host auto-detection) — both evaluated and deferred by design in the README's "Design Scope" section, not overlooked. remind_me's live integration surface stays MCP itself; other file/log sources already have a general path in via the existing importer/watcher/webhook.
+
 ## v1.22.0 — 2026-07-31
 
 Fixes the four sync-observability defects recorded in v1.21.1 (**SY-15** … **SY-18**). Behaviour change and a schema migration (v19 → v20) — not a patch release.

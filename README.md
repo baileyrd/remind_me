@@ -657,6 +657,10 @@ Pages are real files on disk — edit them by hand, version them with `git`, syn
 
 A typical session: `remind_me_wiki_compile` → read the brief → write/revise several pages, flag contradictions, add cross-links → `remind_me_wiki_compile(mark_integrated=true)`. To consume the wiki, `remind_me_wiki_load` pulls the whole thing into context (token-budgeted, newest pages first), or `remind_me_wiki_read` / `remind_me_wiki_search` navigate it page by page.
 
+### Page kinds: knowledge pages vs. procedure pages
+
+Most pages are free-form **knowledge pages** — one concept, entity, or project each. The default `SCHEMA.md` also documents a **procedure page** convention for sources that describe a repeatable task (a setup, a fix, a recurring workflow) rather than a fact: a `# Task name` page with `## Steps`, `## Edge cases / branches`, and `## Related` sections, so the next run can follow it directly instead of re-deriving it from raw memories. The schema nudges Claude to decide **patch vs. create** — revise an existing procedure page's steps/edge-cases rather than writing a near-duplicate — the same judgment call `remind_me_wiki_compile` already makes for knowledge pages, just with a task-shaped template. This is a prompt/schema convention only (see `wiki.default_schema()`); there's no separate page-kind column or enforcement — an existing `SCHEMA.md` already seeded on disk keeps whatever it has until you edit it by hand.
+
 ```bash
 # Point the wiki somewhere git-friendly (optional; defaults to ~/.remind-me/wiki)
 export REMIND_ME_WIKI_DIR=~/notes/wiki
@@ -1240,10 +1244,15 @@ remind_me is local-first, single-user, and MCP-native by design — some capabil
 - **Multi-tenant / cross-agent isolation** — deferred. remind_me is explicitly single-owner by design: one OAuth owner token, one SQLite file per node. Multi-tenancy is an architecture change orthogonal to "personal memory," not a gap in the current design — worth revisiting only if the project's scope deliberately shifts toward shared/team memory infrastructure.
 - **Client SDKs beyond MCP** — no hand-written TS/Rust/etc. SDKs (maintenance surface disproportionate to a single-user local tool whose real client is Claude via MCP). Instead, the existing `GET /api/*` REST surface is published as an [OpenAPI 3.0 spec](docs/openapi.yaml) so any language can generate a thin client for free.
 - **Cloud/managed & serverless hosting** — no managed hosting product. The per-user SQLite node is designed to stay local; the one component that's natural to host centrally (the sync hub) already had a Podman quadlet deploy path, and now also has [Docker Compose, Fly.io, and Railway templates](hub/deploy/) — deliberately still self-hosted, not a one-click managed service.
+- **Native adapters for other coding-agent hosts (Codex, Cursor, OpenClaw, Hermes, ...)** — deferred, and host auto-detection (a `detect`-style utility) along with it, since detection only has something to detect *among* once more than one host adapter exists. remind_me's live integration surface is MCP itself — Claude.ai, Claude Code, and Claude Desktop attach as an MCP server — and any other file/log-based source already has a general path in via the chat-export importer, watched folders, or the webhook endpoint. Building adapters that tail a specific other agent's proprietary, undocumented session-log format is an architecture change orthogonal to "personal memory for Claude clients," not a gap in the current design — it only pays off if the project's scope deliberately shifts toward shared memory infrastructure for arbitrary coding agents. Revisit only if that scope shift happens ([#109](https://github.com/baileyrd/remind_me/issues/109), [#110](https://github.com/baileyrd/remind_me/issues/110)).
 
 ## Changelog
 
 See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for a per-version feature breakdown with PR references; this section summarizes the same history phase-by-phase.
+
+### 1.23.0 — 2026-07-31
+
+Closes the "worth pursuing" item from the [memU capability review](docs/memu-capability-review-2026-07-31.md): the wiki's default `SCHEMA.md` now documents a **procedure page** convention (steps/edge-cases/branches, plus explicit patch-vs-create guidance) for task-shaped sources, alongside the existing free-form knowledge pages. Prompt/schema-only — `remind_me_wiki_compile` needed no code change since it already embeds the live schema verbatim into its brief.
 
 ### 1.19.0 — 2026-07-22
 

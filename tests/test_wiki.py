@@ -212,6 +212,13 @@ def test_schema_seeded_on_first_read(db_conn, wiki_dir: Path) -> None:
     assert (wiki_dir / "SCHEMA.md").exists()
 
 
+def test_default_schema_documents_procedure_page_kind() -> None:
+    text = wiki.default_schema()
+    assert "Page kinds" in text
+    assert "procedure page" in text.lower()
+    assert "patch vs. create" in text.lower()
+
+
 def test_meta_roundtrip(db_conn, wiki_dir: Path) -> None:
     assert wiki.get_meta("k", "default") == "default"
     wiki.set_meta("k", "v")
