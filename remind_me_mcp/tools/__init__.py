@@ -98,6 +98,7 @@ from remind_me_mcp.retrieval import (
     rank_rrf,
 )
 from remind_me_mcp.server import mcp
+from remind_me_mcp.tool_profiles import apply_profile as _apply_profile
 
 # Importing the submodules runs their @mcp.tool/@mcp.resource/@mcp.prompt
 # decorators, registering every handler on the shared FastMCP instance. These
@@ -219,6 +220,18 @@ from remind_me_mcp.vitality import (
     record_co_retrieval,
     record_feedback,
 )
+
+# ---------------------------------------------------------------------------
+# Tool profile
+# ---------------------------------------------------------------------------
+
+# Deliberately the last statement before the exports: every handler above has
+# registered by now, so this is the only point that can see the complete
+# surface and narrow it. A no-op under the default `full` profile. See
+# tool_profiles.py for why this exists (context cost) and what it explicitly
+# does *not* fix (tool-selection accuracy — the tools that actually compete are
+# all in CORE, so no profile can separate them).
+_apply_profile(mcp)
 
 # ---------------------------------------------------------------------------
 # Exports

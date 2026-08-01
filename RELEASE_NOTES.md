@@ -1,5 +1,22 @@
 # Release Notes
 
+## v1.27.0 — 2026-08-01
+
+Reverses a call made in v1.26.0 on bad data. That release documented the tool-profile gate as "evaluated and not built," citing a ~7k-token saving as too small to justify. **That figure was wrong by 2.6x**: it counted only `description` strings and ignored input schemas, which are the larger half of what a client is actually billed for. The real surface is ~21k tokens, and core-only saves ~13.6k.
+
+### New Features
+
+- **`REMIND_ME_TOOL_PROFILE`** — `full` (default, 46 tools, ~21k), `standard` (30, ~14.8k — drops imports/sync/backup/updater/ops), `core` (17, ~7.8k — conversational only). Default `full` means upgrading never narrows an existing deployment. `standard` keeps the maintenance loops so a maintenance pass still works; `core` hides them *and* their prompts, since a prompt sequencing tools the client cannot see is worse than absent.
+- **`remind_me_server_status` reports the surface cost and the active profile.** This is what makes the knob discoverable — nobody goes hunting for an env var to fix a cost they cannot see, which is the same lesson as the v1.25.0 nudges. `remind_me_server_status` is consequently pinned into `core`: a profile you cannot diagnose from inside a session is a trap.
+- **Slimmed `remind_me_search`'s schema** — 1398 → 1136 tokens (~19%). It is simultaneously the hottest tool and the most expensive one, and *no profile can narrow it* because every session needs it, so it is the one place where a saving reaches every deployment regardless of configuration. The flag descriptions narrated response shape ("in a separate `related_via_entities` section", "does not affect the main ranking"); they now describe only the call decision — when to set the flag — and the response-shape detail lives in the README, where it already was.
+
+### Design notes
+
+- **What a profile does not fix.** It was originally proposed as a tool-selection-accuracy fix. It is not one, and the code says so: the tools that genuinely compete — `search`/`list`/`get`/`entity`, all reading as "find things" — are *every one of them in `core`*, so no profile can separate them. v1.26.0's disambiguation handles that. A test asserts the cluster survives every profile, so the distinction cannot quietly erode.
+- **Hidden means gone.** Pruning removes entries from the FastMCP managers, so a hidden tool is unlistable *and* uncallable rather than merely undocumented — no listable/callable split to trip over.
+- **Unknown tools default to the most restricted tier.** Membership is defined by `CORE`/`MAINTENANCE` allow-lists, so a newly added tool cannot smuggle itself into a narrowed surface by existing. A test also asserts every name in those sets is a real registered tool, since a typo would silently drop a working tool from `standard`.
+- An unrecognised `REMIND_ME_TOOL_PROFILE` logs a warning and falls back to `full` — a typo must not silently hide half the surface.
+
 ## v1.26.0 — 2026-08-01
 
 Tool-selection clarity and the feedback loop. The headline is a **changed conclusion**: the planned fix for tool-selection accuracy was a `core`/`full` profile gate hiding the ~18 admin tools. Working through which tools actually compete showed that fix does not address the problem, so it was not built.

@@ -382,6 +382,28 @@ Every LLM-driven maintenance workflow is a *sequence* — a batch tool surfaces 
 
 Every argument is optional (batch size, similarity threshold), so invoking a prompt bare runs the loop with the tool's own defaults. The two loops whose second phase is hard to undo — `compile_wiki`'s watermark advance and `consolidate_duplicates`' merge — put the preview phase first and say why, so the destructive step is never the first thing done.
 
+### Tool profiles (context cost)
+
+The full surface is 46 tools costing **~21k tokens of context in every session**, on every client, whether or not an admin tool is ever touched. For a server whose job is putting memories *into* context that's an awkward ratio — `remind_me_wiki_load` defaults to a 12k budget, so the tool definitions cost ~1.8× an entire wiki load before a single memory is retrieved.
+
+```bash
+REMIND_ME_TOOL_PROFILE=standard remind-me-mcp
+```
+
+| Profile | Tools | Context | Drops |
+|---|---|---|---|
+| `full` *(default)* | 46 | ~21k | nothing — today's behavior |
+| `standard` | 30 | ~14.8k | imports, sync, backup, updater, ops |
+| `core` | 17 | ~7.8k | the above, plus the maintenance loops and their prompts |
+
+- **Default `full` means upgrading never narrows an existing deployment.** Opt in deliberately.
+- **`standard` keeps the maintenance loops**, so a maintenance pass still works. `core` hides them *and* their prompts — a prompt that sequences tools the client can't see is worse than absent.
+- **Hidden means gone**, not merely undocumented: pruned tools are unlistable *and* uncallable, so there's no listable/callable split to trip over.
+- **`remind_me_server_status` survives every profile** and reports the active one plus its measured cost — a profile you can't diagnose from inside a session is a trap, and nobody goes hunting for an env var to fix a cost they can't see.
+- A tool in neither tier is treated as admin, so a newly added tool can't silently smuggle itself into a narrowed surface.
+
+**This is not a fix for tool-selection accuracy**, and it was originally proposed as one. The tools that genuinely compete — `remind_me_search`, `remind_me_list`, `remind_me_get`, `remind_me_entity`, all of which read as "find things" — are *every one of them in `core`*, so no profile can separate them. That confusion is addressed by [disambiguating their descriptions](#server-instructions) instead. Profiles buy context, and only context.
+
 ### Maintenance nudges
 
 The backlog counts (`pending_wiki_compile` and friends) used to live only inside `remind_me_server_status` and `remind_me_watch_status` — tools a conversational session has no reason to call — so a growing queue of un-decomposed captures was invisible in practice. Search and add responses now carry a short nudge naming the deepest backlogs and the prompt that drains each:
@@ -1127,6 +1149,7 @@ Every new memory used to start at a flat `base_weight=1.0` regardless of kind, s
 | `REMIND_ME_WATCH_DIRS` | *(unset)* | Colon-separated directories for the folder watcher to auto-ingest. Empty = watcher disabled. Each directory must lie inside `REMIND_ME_IMPORT_ROOTS` |
 | `REMIND_ME_WATCH_INTERVAL` | `60` | Seconds between folder watcher scan passes |
 | `REMIND_ME_WATCH_GRACE` | `5` | Debounce grace period in seconds — files modified more recently than this are deferred until a scan sees a stable (mtime, size) |
+| `REMIND_ME_TOOL_PROFILE` | `full` | Advertised tool surface: `full` (46 tools, ~21k context), `standard` (30, ~14.8k — drops imports/sync/ops), or `core` (17, ~7.8k — conversational only, also hides the maintenance prompts). An unrecognised value logs a warning and falls back to `full` |
 | `REMIND_ME_MAINTENANCE_NUDGES` | `true` | Whether search/add responses may carry a maintenance-backlog nudge. Set `false` to silence them entirely |
 | `REMIND_ME_MAINTENANCE_NUDGE_INTERVAL` | `3600` | Minimum seconds between nudge *checks*. Bounds cost as well as noise — the backlog COUNTs only run when this has elapsed |
 | `REMIND_ME_MAINTENANCE_NUDGE_THRESHOLD` | `25` | Queue depth a backlog must reach before it's worth mentioning |
@@ -1307,12 +1330,15 @@ remind_me is local-first, single-user, and MCP-native by design — some capabil
 - **Multi-tenant / cross-agent isolation** — deferred. remind_me is explicitly single-owner by design: one OAuth owner token, one SQLite file per node. Multi-tenancy is an architecture change orthogonal to "personal memory," not a gap in the current design — worth revisiting only if the project's scope deliberately shifts toward shared/team memory infrastructure.
 - **Client SDKs beyond MCP** — no hand-written TS/Rust/etc. SDKs (maintenance surface disproportionate to a single-user local tool whose real client is Claude via MCP). Instead, the existing `GET /api/*` REST surface is published as an [OpenAPI 3.0 spec](docs/openapi.yaml) so any language can generate a thin client for free.
 - **Cloud/managed & serverless hosting** — no managed hosting product. The per-user SQLite node is designed to stay local; the one component that's natural to host centrally (the sync hub) already had a Podman quadlet deploy path, and now also has [Docker Compose, Fly.io, and Railway templates](hub/deploy/) — deliberately still self-hosted, not a one-click managed service.
-- **Gating the tool surface behind a profile (`core` vs `full`)** — evaluated and not built. The premise was that 46 tools hurt tool-selection accuracy and that hiding the ~18 admin ones would sharpen it. Measured, hiding every non-core tool would save ~7k tokens of descriptions per session (of ~8.1k total) — real, but it does not address the actual failure. The tools that genuinely compete are `remind_me_search`, `remind_me_list`, `remind_me_get`, and `remind_me_entity`: they all read as "find things," and *every one of them is in the core set a profile would keep*. Hiding admin tools cannot fix a confusion that lives entirely among the tools you keep. The fix that does is disambiguating those four descriptions so each names the neighbour to prefer instead — ~425 tokens, no functionality hidden, no restart to change, no config axis to maintain (done; see `remind_me_search`'s description for the pattern). Revisit gating only if context pressure alone becomes the binding constraint, in which case it should ship default-`full` so nothing silently stops working.
 - **Native adapters for other coding-agent hosts (Codex, Cursor, OpenClaw, Hermes, ...)** — deferred, and host auto-detection (a `detect`-style utility) along with it, since detection only has something to detect *among* once more than one host adapter exists. remind_me's live integration surface is MCP itself — Claude.ai, Claude Code, and Claude Desktop attach as an MCP server — and any other file/log-based source already has a general path in via the chat-export importer, watched folders, or the webhook endpoint. Building adapters that tail a specific other agent's proprietary, undocumented session-log format is an architecture change orthogonal to "personal memory for Claude clients," not a gap in the current design — it only pays off if the project's scope deliberately shifts toward shared memory infrastructure for arbitrary coding agents. Revisit only if that scope shift happens ([#109](https://github.com/baileyrd/remind_me/issues/109), [#110](https://github.com/baileyrd/remind_me/issues/110)).
 
 ## Changelog
 
 See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for a per-version feature breakdown with PR references; this section summarizes the same history phase-by-phase.
+
+### 1.27.0 — 2026-08-01
+
+Reverses v1.26.0's "not built" call on the tool-profile gate, which rested on a token count that was wrong by 2.6x (descriptions only, ignoring input schemas). The real surface is ~21k tokens per session. Adds `REMIND_ME_TOOL_PROFILE` (`full`/`standard`/`core`, default `full`), reports the cost in `remind_me_server_status` so the knob is discoverable, and slims `remind_me_search`'s schema by ~19% — the one saving no profile can deliver, since every session needs that tool. Still not an accuracy fix, and tested to stay honest about that.
 
 ### 1.26.0 — 2026-08-01
 
