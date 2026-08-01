@@ -1722,7 +1722,7 @@ def reset_pull_cursor(
         raise ValueError(f"unknown cursor kind(s): {sorted(unknown)} — expected one of {_CURSOR_KINDS}")
 
     db = _get_db()
-    reset: list[dict[str, str]] = []
+    reset: list[dict[str, Any]] = []
     for kind in kinds:
         cursor_id = _cursor_id(remote_id, kind)
         row = db.execute(

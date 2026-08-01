@@ -36,7 +36,9 @@ from remind_me_mcp.server import mcp
 from remind_me_mcp.tools._shared import _maybe_update_notice, log
 
 try:
-    from chromadb.errors import NotFoundError as ChromaNotFoundError
+    from chromadb.errors import NotFoundError as _ChromaNotFoundError
+
+    ChromaNotFoundError: tuple[type[BaseException], ...] = (_ChromaNotFoundError,)
 except ImportError:
     # chromadb isn't installed -- nothing chromadb-specific can be raised
     # from the mempalace import path below beyond the bare ImportError
@@ -596,7 +598,8 @@ async def remind_me_server_status() -> str:
 
     wd = watchdog.status()
     if wd["enabled"]:
-        note = f" ({wd['calls_in_flight']} in flight)" if wd["calls_in_flight"] > 1 else ""
+        calls_in_flight = int(wd["calls_in_flight"])  # type: ignore[call-overload]
+        note = f" ({calls_in_flight} in flight)" if calls_in_flight > 1 else ""
         lines.append(
             f"**Slow-call watchdog:** ✓ armed at {wd['threshold_seconds']:.0f}s"
             f" — a call stuck past that dumps every thread's stack to stderr{note}"
