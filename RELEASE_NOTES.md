@@ -1,5 +1,28 @@
 # Release Notes
 
+## v1.28.0 — 2026-08-01
+
+A production incident (a stuck query hanging the server, which masked a stuck sync cursor for over an hour) turned into a dozen tracked issues (#119-#130) covering the whole failure chain — not just the two live bugs, but the missing tests, tooling, and process guards that let them go unnoticed for so long.
+
+### Fixed
+
+- **`UNNORMALIZED_WHERE`'s correlated `NOT EXISTS` subquery pegged a CPU core for minutes on a real-size store** (~60K memories), making the server's single-threaded event loop unresponsive to every MCP call. Rewritten as a non-correlated `NOT IN` (SQLite materializes it once via `LIST SUBQUERY` + a bloom filter instead of re-scanning per row) plus a new expression index — 180s+ (never observed to finish) down to 0.01s. `UNANNOTATED_WHERE` was checked against the same failure shape and confirmed already fine (an existing unique index gives it a `SEARCH`, not a `SCAN`).
+- **`remind_me_sync_reconcile` reported `pull-lag` (benign) for over an hour while a pull cursor was actually stuck.** It only checked `last_pull_age` (an attempt timestamp that updates even when nothing new arrives) — never whether the cursor's own content watermark had moved. A keyset cursor can't recover records that sit behind its own watermark (here: a historical gap from before a WSL→Windows node migration), so it kept "succeeding" every cycle while making zero progress. The verdict logic now tracks the watermark itself and reports `fault` once it's provably stalled across repeated attempts — extended to all four sync cursors (memory, entities, links, entity_relations), not just the primary one.
+- **A large outbox backlog could starve pull for the entire time it took to drain.** `_push_outbox` looped until fully drained before `_pull_remote` ever ran, so one transient timeout deep into a big backlog could abort the cycle before pull got a turn — for as long as the backlog persisted. Push is now capped per cycle (`PUSH_BATCHES_PER_CYCLE`); pull always runs every cycle regardless of backlog size.
+- **`check_for_update`/`_get_origin_url` could crash outright on Windows instead of degrading gracefully.** Both caught `FileNotFoundError` for "the git subprocess couldn't even start" (a missing/invalid repo path), but Windows raises `NotADirectoryError` for that case — a sibling of `FileNotFoundError` under `OSError`, not a subclass, so it went uncaught. Widened to `OSError`. Found via 11 pre-existing `test_updater.py` failures on this platform; two more in the same file were genuine test bugs (a POSIX-only `fcntl` test with no Windows equivalent to exercise, now skipped there by design, and a hardcoded `/`-separated path assertion that never matched Windows' native backslashes).
+
+### New Features
+
+- **`remind_me_sync_repair`** — resets a stuck sync cursor (any of the four) to force a full re-pull, through the server's own DB connection. Previously recovering from a stuck cursor meant hand-editing `sync_log` via a second raw SQLite connection to the live database file. Requires `confirm=True` (a full re-pull re-checks everything the remote has and can trigger background re-embedding — real cost, not risk).
+- **A single-instance lock for `--serve-mcp`/combined mode.** Nothing previously stopped two server processes from running against the same DB concurrently — in this incident, an orphaned hung instance plus a fresh launch that failed to bind its port but kept running anyway, both holding open DB connections and background sync threads. Mirrors the PID-file pattern `--serve-ui` already used.
+- **A slow-call watchdog** (`REMIND_ME_SLOW_CALL_SECONDS`, default 30). Arms `faulthandler.dump_traceback_later` around every tool call — a plain `asyncio` timer can't catch a thread stuck in synchronous CPU-bound code (a blocked event loop can't run its own watchdog), which is exactly the failure mode this incident hit. Diagnosing it live required manually installing and running `py-spy`; this dumps every thread's stack to stderr automatically once a call runs long. State (armed/threshold/calls-in-flight) is surfaced in `remind_me_server_status`.
+
+### Process
+
+- A perf-regression test (`EXPLAIN QUERY PLAN` shape, not a timing threshold — deterministic regardless of row count) now guards the two hot maintenance queries against reintroducing a correlated table scan.
+- `start_server.ps1` (local, untracked) now refuses to spawn a second instance instead of silently leaving a bind-failed orphan running, and pins UTF-8 on its log redirect (it was previously inheriting whichever default a given launch path used, garbling roughly half the log).
+- README now recommends a short per-server MCP client timeout (30-60s) — a genuinely stuck call sitting silent for a long default idle timeout is itself what made this incident's diagnosis slow to start.
+
 ## v1.27.0 — 2026-08-01
 
 Reverses a call made in v1.26.0 on bad data. That release documented the tool-profile gate as "evaluated and not built," citing a ~7k-token saving as too small to justify. **That figure was wrong by 2.6x**: it counted only `description` strings and ignored input schemas, which are the larger half of what a client is actually billed for. The real surface is ~21k tokens, and core-only saves ~13.6k.

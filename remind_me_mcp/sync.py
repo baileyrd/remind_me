@@ -65,6 +65,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import sqlite3
+    from collections.abc import Sequence
 
 import httpx
 
@@ -87,6 +88,11 @@ BATCH_SIZE = 200
 PULL_PAGE_SIZE = 500
 # Safety valve so a misbehaving remote cannot trap one cycle forever.
 MAX_PULL_PAGES = 100
+# Caps how much of a large outbox backlog one sync cycle drains, so pull
+# always gets a turn in the same cycle instead of waiting behind an
+# unbounded push loop (issue #124). 10 batches * BATCH_SIZE = up to 2000
+# records pushed per cycle; a bigger backlog just spreads across more cycles.
+PUSH_BATCHES_PER_CYCLE = 10
 
 _EPOCH = "1970-01-01T00:00:00+00:00"
 
@@ -163,7 +169,9 @@ def _touch_sync_log(db: sqlite3.Connection, remote_id: str, column: str) -> None
     db.commit()
 
 
-async def _push_outbox(client: httpx.AsyncClient, url: str, remote_id: str) -> int:
+async def _push_outbox(
+    client: httpx.AsyncClient, url: str, remote_id: str, *, max_batches: int | None = None
+) -> int:
     """Push outbox rows not yet sent to *remote_id*; mark what it processed.
 
     Sends are tracked per remote in ``sync_sends`` so every hub/peer receives
@@ -178,6 +186,15 @@ async def _push_outbox(client: httpx.AsyncClient, url: str, remote_id: str) -> i
     together distinguish "never tried" / "tried and failed" / "tried and
     succeeded" (SY-15, SY-18) — a batch of zero rows still counts as success.
 
+    ``max_batches`` bounds how much of a large backlog one call will drain
+    (issue #124): without it, a big enough outbox lets this loop span the
+    entire sync cycle — and a transient error partway through a long unbroken
+    run aborts ``_sync_once`` before ``_pull_remote`` is ever reached, so pull
+    can starve for as long as the backlog persists. Capping batches per call
+    guarantees pull gets a turn every cycle regardless of backlog size; the
+    outbox selection query naturally resumes from wherever ``sync_sends``
+    left off, so nothing needs an explicit resume cursor across calls.
+
     Returns:
         The number of outbox rows marked sent to this remote.
     """
@@ -185,8 +202,9 @@ async def _push_outbox(client: httpx.AsyncClient, url: str, remote_id: str) -> i
     _touch_sync_log(db, remote_id, "last_attempt_at")
     total_marked = 0
     cursor = 0
+    batches = 0
 
-    while True:
+    while max_batches is None or batches < max_batches:
         rows = db.execute("""
             SELECT id, payload FROM sync_outbox
             WHERE id > ? AND sent_at = ''
@@ -197,6 +215,7 @@ async def _push_outbox(client: httpx.AsyncClient, url: str, remote_id: str) -> i
 
         if not rows:
             break
+        batches += 1
         cursor = rows[-1]["id"]
 
         records = [_decode_payload(r["payload"]) for r in rows]
@@ -1351,8 +1370,46 @@ def _local_counts(db: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
+def _cursor_progress(
+    db: sqlite3.Connection, remote_id: str, watermark: tuple[str, str] | None
+) -> bool:
+    """Has *remote_id*'s pull cursor actually advanced since the last check?
+
+    ``last_pull_at`` alone can't tell a healthy pull apart from a wedged one:
+    a keyset cursor only advances when a page has records to advance it past,
+    so a cursor stuck behind a gap it can never reach forward from (e.g. a
+    historical hole predating the watermark — issue #121) keeps touching
+    ``last_pull_at`` every cycle, "attempted and succeeded," while making zero
+    content progress indefinitely. This persists the previous
+    ``(last_pull, last_pull_id)`` pair in ``sync_flags`` (mirroring
+    ``_drain_rate``'s baseline-in-sync_flags pattern) so a caller can ask "did
+    the cursor move?" instead of only "did we try recently?".
+
+    Args:
+        db: An open SQLite connection.
+        remote_id: The cursor to check — 'hub', 'hub#entities', etc.
+        watermark: The remote's current ``(last_pull, last_pull_id)``, or
+            None if it has never pulled.
+
+    Returns:
+        True if the cursor is unchanged from the last time this was called
+        (i.e. stalled); False if it moved, or if there's no prior baseline to
+        compare against yet.
+    """
+    key = f"reconcile_watermark_{remote_id}"
+    prev_raw = _flag(db, key)
+    current_raw = f"{watermark[0]}|{watermark[1]}" if watermark else ""
+    _set_flag(db, key, current_raw)
+    db.commit()
+    if prev_raw is None:
+        return False  # no baseline yet
+    return prev_raw == current_raw and bool(current_raw)
+
+
 def _verdict(
-    categories: list[dict[str, Any]], last_pull_age: float | None
+    categories: list[dict[str, Any]],
+    last_pull_age: float | None,
+    cursor_stalled: bool = False,
 ) -> tuple[str, list[str]]:
     """Classify drift. The judgment is the point — raw deltas are just numbers.
 
@@ -1373,6 +1430,14 @@ def _verdict(
             cycle even when it has nothing new to send, so a stale value
             here means the pull itself has stopped running. None if the hub
             has never been pulled from.
+        cursor_stalled: True if the pull *cursor* (the content watermark, not
+            just the attempt timestamp) hasn't moved since the last time this
+            was checked, despite drift existing (issue #121). A cursor can be
+            attempted successfully every cycle and still never advance if the
+            gap it needs to close sits behind its own watermark — recent
+            ``last_pull_age`` alone can't tell that apart from ordinary lag,
+            so this is checked independently and wins even when the attempt
+            looks recent.
 
     Returns:
         ``(verdict, hints)``.
@@ -1403,6 +1468,15 @@ def _verdict(
             f"last successful pull was {round(last_pull_age)}s ago (> {grace}s "
             "grace), so the hub being ahead is not ordinary lag — the pull is "
             "not running"
+        )
+        return "fault", hints
+    if cursor_stalled:
+        hints.append(
+            "the pull cursor has not advanced since the last check, even "
+            "though attempts keep succeeding — the gap is likely behind the "
+            "cursor's own watermark (e.g. a historical hole from before this "
+            "node's current identity) and will not close on its own; a full "
+            "re-pull (reset the cursor) is needed"
         )
         return "fault", hints
 
@@ -1496,7 +1570,7 @@ async def reconcile_with_hub(client: httpx.AsyncClient | None = None) -> dict[st
             )
 
     row = db.execute(
-        "SELECT last_pull_at FROM sync_log WHERE remote_id = 'hub'"
+        "SELECT last_pull_at, last_pull, last_pull_id FROM sync_log WHERE remote_id = 'hub'"
     ).fetchone()
     last_pull_at = row["last_pull_at"] if row else None
     last_pull_age: float | None = None
@@ -1508,12 +1582,62 @@ async def reconcile_with_hub(client: httpx.AsyncClient | None = None) -> dict[st
         except (ValueError, TypeError):
             last_pull_age = None
 
-    verdict, hints = _verdict(categories, last_pull_age)
+    watermark = (row["last_pull"], row["last_pull_id"]) if row else None
+    cursor_stalled = bool(categories) and _cursor_progress(db, "hub", watermark)
+
+    verdict, hints = _verdict(categories, last_pull_age, cursor_stalled)
     pending, _ = _pending_to_remote(db, "hub")
 
     def _cmp(hub_value: Any, local_value: int) -> dict[str, Any]:
         hub_n = hub_value if isinstance(hub_value, int) else 0
         return {"hub": hub_n, "local": local_value, "delta": hub_n - local_value}
+
+    def _graph_verdict(
+        cursor_id: str, label: str, hub_value: Any, local_value: int
+    ) -> dict[str, Any] | None:
+        """Same fault-vs-lag diagnosis as the memory cursor, for one entity-
+        graph cursor (issue #123). Returns None when the two sides agree —
+        nothing to diagnose.
+
+        The three graph cursors (``hub#entities``/``hub#links``/
+        ``hub#entity_relations``) each keep their own content watermark
+        (``last_pull``/``last_pull_id``) but share the memory cursor's
+        ``last_pull_at`` wall clock — every pull attempt against the hub
+        touches all four in the same cycle (see ``_pull_graph_table``), so
+        "was this attempted recently" is one shared signal even though "did
+        this specific cursor progress" is not.
+        """
+        hub_n = hub_value if isinstance(hub_value, int) else 0
+        delta = hub_n - local_value
+        if delta == 0:
+            return None
+        fake_categories = [{"category": label, "hub": hub_n, "local": local_value, "delta": delta}]
+        cur = db.execute(
+            "SELECT last_pull, last_pull_id FROM sync_log WHERE remote_id = ?",
+            (cursor_id,),
+        ).fetchone()
+        cur_watermark = (cur["last_pull"], cur["last_pull_id"]) if cur else None
+        stalled = _cursor_progress(db, cursor_id, cur_watermark)
+        v, h = _verdict(fake_categories, last_pull_age, stalled)
+        return {"verdict": v, "hints": h}
+
+    graph_verdicts = {
+        k: v
+        for k, v in {
+            "entities": _graph_verdict(
+                "hub#entities", "entities", hub.get("entities"), local["entities"]
+            ),
+            "memory_entities": _graph_verdict(
+                "hub#links", "memory_entities",
+                hub.get("memory_entities"), local["memory_entities"],
+            ),
+            "entity_relations": _graph_verdict(
+                "hub#entity_relations", "entity_relations",
+                hub.get("entity_relations"), local["entity_relations"],
+            ),
+        }.items()
+        if v is not None
+    }
 
     return {
         "status": "ok",
@@ -1539,11 +1663,90 @@ async def reconcile_with_hub(client: httpx.AsyncClient | None = None) -> dict[st
         "entity_relations": _cmp(
             hub.get("entity_relations"), local["entity_relations"]
         ),
+        # Per-cursor fault-vs-lag diagnosis for the entity graph (issue #123)
+        # — only present for a table whose count actually drifted, mirroring
+        # categories_with_drift's noise-reduction.
+        "graph_verdicts": graph_verdicts,
         # Hub-side only — origin_node never crosses the wire, so there is no
         # local equivalent to diff against. Informational: it answers "which
         # node hasn't pushed".
         "hub_by_origin_node": hub_mem.get("by_origin_node", {}),
     }
+
+
+# Every cursor a remote can independently get stuck on (issue #121/#122):
+# 'memory' is the bare remote_id itself; the rest are the '#'-suffixed
+# entity-graph cursors _pull_graph_table keys its watermark under.
+_CURSOR_KINDS = ("memory", "entities", "links", "entity_relations")
+
+
+def _cursor_id(remote_id: str, kind: str) -> str:
+    return remote_id if kind == "memory" else f"{remote_id}#{kind}"
+
+
+def reset_pull_cursor(
+    remote_id: str, kinds: Sequence[str] | None = None
+) -> dict[str, Any]:
+    """Rewind one or more of *remote_id*'s pull cursors to force a full re-pull.
+
+    A keyset pull cursor only ever moves forward, so it can never recover
+    records that sit *behind* its own watermark — e.g. a historical gap left
+    by a partial restore, or (as happened in production) a node identity
+    change during a migration that stranded older records under a watermark
+    the new identity's cursor had already passed. ``remind_me_sync_reconcile``
+    detects this (a cursor that stops advancing despite drift — issue #121)
+    but had no built-in way to fix it: recovering required hand-editing
+    ``sync_log`` via a second raw SQLite connection to the live DB file
+    (issue #122). This does the same rewind through the server's own
+    connection instead.
+
+    Resetting is safe to run repeatedly and safe against concurrent sync
+    activity: the next cycle's pull just re-walks from an earlier point and
+    idempotently upserts (last-write-wins) whatever it finds, so already-
+    -current local records are simply revisited, not duplicated or lost.
+
+    Args:
+        remote_id: The remote whose cursor(s) to reset — 'hub', or a peer's
+            node_id.
+        kinds: Which cursor(s) to reset, from ``_CURSOR_KINDS``
+            ('memory', 'entities', 'links', 'entity_relations'). Defaults to
+            all four.
+
+    Returns:
+        A dict with the reset cursor ids and their prior watermarks, for the
+        caller to report back.
+    """
+    kinds = tuple(kinds) if kinds else _CURSOR_KINDS
+    unknown = set(kinds) - set(_CURSOR_KINDS)
+    if unknown:
+        raise ValueError(f"unknown cursor kind(s): {sorted(unknown)} — expected one of {_CURSOR_KINDS}")
+
+    db = _get_db()
+    reset: list[dict[str, str]] = []
+    for kind in kinds:
+        cursor_id = _cursor_id(remote_id, kind)
+        row = db.execute(
+            "SELECT last_pull, last_pull_id FROM sync_log WHERE remote_id = ?",
+            (cursor_id,),
+        ).fetchone()
+        before = {
+            "last_pull": row["last_pull"] if row else _EPOCH,
+            "last_pull_id": row["last_pull_id"] if row else "",
+        }
+        db.execute(
+            """
+            INSERT INTO sync_log (remote_id, last_pull, last_pull_id)
+            VALUES (?, ?, '')
+            ON CONFLICT (remote_id) DO UPDATE SET last_pull = excluded.last_pull, last_pull_id = ''
+            """,
+            (cursor_id, _EPOCH),
+        )
+        reset.append({"cursor": cursor_id, "kind": kind, "was": before})
+    db.commit()
+    log.info(
+        "Reset pull cursor(s) for %s: %s", remote_id, [r["cursor"] for r in reset]
+    )
+    return {"remote_id": remote_id, "reset": reset}
 
 
 # ---------------------------------------------------------------------------
@@ -1640,7 +1843,9 @@ async def _sync_once() -> None:
             # --- Hub sync ---
             if HUB_URL:
                 try:
-                    await _push_outbox(client, HUB_URL, "hub")
+                    await _push_outbox(
+                        client, HUB_URL, "hub", max_batches=PUSH_BATCHES_PER_CYCLE
+                    )
                     await _pull_remote(client, HUB_URL, "hub")
                     # Entity graph (FT-04) — no-ops against pre-FT-04 remotes.
                     await _pull_entities(client, HUB_URL, "hub")
@@ -1649,8 +1854,12 @@ async def _sync_once() -> None:
                     await _pull_entity_relations(client, HUB_URL, "hub")
                     log.info("Hub sync complete")
                     _clear_error("hub")
-                except httpx.ConnectError as e:
-                    log.debug("Hub unreachable, skipping")
+                except (httpx.ConnectError, httpx.TimeoutException) as e:
+                    # ConnectTimeout/ReadTimeout etc. are TimeoutException, not
+                    # ConnectError — both are ordinary transient-network
+                    # conditions and belong at the same debug level, not in
+                    # the catch-all "unexpected error" branch below (issue #124).
+                    log.debug("Hub unreachable/timed out, skipping: %s", e)
                     _record_error("hub", e)
                 except httpx.HTTPStatusError as e:
                     log.warning("Hub sync error: %s", e)
@@ -1667,7 +1876,10 @@ async def _sync_once() -> None:
                 if not await _probe_peer(client, peer):
                     continue
                 try:
-                    await _push_outbox(client, peer["url"], peer["node_id"])
+                    await _push_outbox(
+                        client, peer["url"], peer["node_id"],
+                        max_batches=PUSH_BATCHES_PER_CYCLE,
+                    )
                     await _pull_remote(client, peer["url"], peer["node_id"])
                     # Entity graph (FT-04) — no-ops against pre-FT-04 peers.
                     await _pull_entities(client, peer["url"], peer["node_id"])
@@ -1676,8 +1888,8 @@ async def _sync_once() -> None:
                     await _pull_entity_relations(client, peer["url"], peer["node_id"])
                     log.info("Peer sync complete: %s", peer["node_id"])
                     _clear_error(peer["node_id"])
-                except httpx.ConnectError as e:
-                    log.debug("Peer %s unreachable", peer["node_id"])
+                except (httpx.ConnectError, httpx.TimeoutException) as e:
+                    log.debug("Peer %s unreachable/timed out: %s", peer["node_id"], e)
                     _record_error(peer["node_id"], e)
                 except Exception as e:
                     log.warning("Peer sync error (%s): %s", peer["node_id"], e)

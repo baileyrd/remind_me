@@ -160,6 +160,12 @@ If using the Claude in Chrome extension with MCP support, add the same server co
 
 To attach the claude.ai **website** itself, run the server as a remote connector instead — see [Claude.ai Custom Connector (Remote MCP)](#claudeai-custom-connector-remote-mcp).
 
+### 5. Recommended: set a per-server timeout
+
+Most tool calls here finish in well under a second — reads, writes, and status checks are all local SQLite. If a client's default MCP idle timeout is long (some default to 300s), a genuinely stuck call sits silent for the full window before you see anything, turning a fast diagnosis into a slow one. If your client supports a per-server timeout, set it low — 30-60s is plenty of headroom for even a slow embedding call, and a call still running past that is itself a signal something is wrong (an unexpectedly large query, a hung sync attempt, etc.), not normal variance. In Claude Code, this is the `timeout` field (milliseconds) alongside a server's entry in your MCP config, or the `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` environment variable globally.
+
+Independently, `REMIND_ME_SLOW_CALL_SECONDS` (default `30`) arms an in-process watchdog that dumps every thread's stack to stderr if a call runs past that threshold — see `remind_me_server_status` for whether it's currently armed. That is the server-side complement to a short client timeout: the client timeout tells you a call is stuck; the watchdog's stack dump tells you where.
+
 ## Dashboard UI
 
 The server includes a built-in web dashboard for browsing, searching, and managing your memories visually.

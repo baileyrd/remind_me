@@ -189,6 +189,38 @@ def test_stale_disk_index_triggers_rebuild(db_conn_with_vec) -> None:
     assert len(idx) == 2  # rebuilt from memories_vec, not loaded stale from disk
 
 
+def test_corrupt_disk_index_self_heals_instead_of_going_sticky(db_conn_with_vec) -> None:
+    """Regression guard for issue #134.
+
+    The module docstring promises a corrupt index file triggers a full
+    rebuild, but only the size-mismatch case actually did -- a genuine load
+    failure (idx.load() raising, e.g. from a truncated file) used to set the
+    sticky _index_failed flag *and* leave the bad file on disk, so every
+    later process hit the same corrupt file and never got an ANN index
+    again for the life of the DB.
+    """
+    db_conn_with_vec.execute(
+        "INSERT INTO memories_vec(rowid, embedding) VALUES (?, ?)", (1, _vec(1).tobytes())
+    )
+    db_conn_with_vec.commit()
+
+    # A truncated/corrupt file, not merely absent or stale-sized.
+    ann_index._index_path().write_bytes(b"not a real usearch index file")
+
+    idx = ann_index.get_index(db_conn_with_vec)
+
+    # Self-healed: rebuilt from memories_vec rather than going permanently
+    # unavailable.
+    assert idx is not None
+    assert len(idx) == 1
+    assert ann_index._index_failed is False
+    # The bad file must not still be sitting there to break the *next*
+    # process that starts against this DB (save_index() wasn't called, so
+    # its continued absence here means it was actually deleted, not merely
+    # not yet re-written).
+    assert not ann_index._index_path().exists()
+
+
 # ---------------------------------------------------------------------------
 # rebuild_index / status
 # ---------------------------------------------------------------------------

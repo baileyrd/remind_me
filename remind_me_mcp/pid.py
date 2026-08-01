@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
 from remind_me_mcp.config import DB_PATH, PID_FILE
@@ -23,21 +24,27 @@ log = logging.getLogger("remind_me_mcp.pid")
 # ---------------------------------------------------------------------------
 
 
-def _read_pid_file() -> dict[str, Any] | None:
-    """Read the PID file and verify the recorded process is still alive.
+def _read_pid_file(path: Path | None = None) -> dict[str, Any] | None:
+    """Read a PID file and verify the recorded process is still alive.
 
     Checks whether the process listed in the PID file is running via
     os.kill(pid, 0). Removes stale or malformed PID files automatically.
+
+    Args:
+        path: The PID file to read. Defaults to PID_FILE (the UI dashboard's
+            file); pass MCP_PID_FILE for the standalone/combined MCP server's
+            own single-instance lock (issue #126).
 
     Returns:
         The parsed PID file dict (with keys pid, host, port, url,
         started_at) if the server is running, or None if no server is
         running or the PID file is stale/missing/malformed.
     """
-    if not PID_FILE.exists():
+    path = path or PID_FILE
+    if not path.exists():
         return None
     try:
-        data = json.loads(PID_FILE.read_text())
+        data = json.loads(path.read_text())
         pid = data.get("pid")
         # Check if process is actually alive
         if pid:
@@ -46,25 +53,27 @@ def _read_pid_file() -> dict[str, Any] | None:
                 return data
             except OSError:
                 # Process is dead, clean up stale PID file
-                PID_FILE.unlink(missing_ok=True)
+                path.unlink(missing_ok=True)
                 return None
         return None
     except (json.JSONDecodeError, KeyError, TypeError):
-        PID_FILE.unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
         return None
 
 
-def _write_pid_file(host: str, port: int) -> None:
+def _write_pid_file(host: str, port: int, path: Path | None = None) -> None:
     """Write a JSON PID file recording the current process and server address.
 
-    Called immediately after the UI server starts. The file is used by
-    _read_pid_file() and _check_ui_server_health() to detect running instances.
+    Called immediately after a server starts. The file is used by
+    _read_pid_file() (and, for the UI server, _check_ui_server_health()) to
+    detect running instances.
 
     Args:
         host: The hostname or IP address the server is bound to.
         port: The TCP port the server is listening on.
+        path: The PID file to write. Defaults to PID_FILE.
     """
-    PID_FILE.write_text(json.dumps({
+    (path or PID_FILE).write_text(json.dumps({
         "pid": os.getpid(),
         "host": host,
         "port": port,
@@ -73,13 +82,16 @@ def _write_pid_file(host: str, port: int) -> None:
     }, indent=2))
 
 
-def _remove_pid_file() -> None:
-    """Remove the PID file on server shutdown.
+def _remove_pid_file(path: Path | None = None) -> None:
+    """Remove a PID file on server shutdown.
 
     Safe to call even if the file does not exist (missing_ok=True).
     Registered as an atexit handler and SIGTERM/SIGINT handler in __main__.py.
+
+    Args:
+        path: The PID file to remove. Defaults to PID_FILE.
     """
-    PID_FILE.unlink(missing_ok=True)
+    (path or PID_FILE).unlink(missing_ok=True)
 
 
 def _check_ui_server_health(url: str) -> bool:

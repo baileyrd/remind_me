@@ -160,6 +160,9 @@ def test_pull_dbs_picks_up_edited_item(db_conn: sqlite3.Connection, fake_dbs) ->
     first = pull_dbs(db_path=str(fake_dbs))
     assert first["created"] == 1
     old_id = db_conn.execute("SELECT id FROM memories").fetchone()["id"]
+    old_updated_at_before = db_conn.execute(
+        "SELECT updated_at FROM memories WHERE id = ?", (old_id,)
+    ).fetchone()["updated_at"]
 
     conn = sqlite3.connect(str(fake_dbs))
     conn.execute(
@@ -180,6 +183,15 @@ def test_pull_dbs_picks_up_edited_item(db_conn: sqlite3.Connection, fake_dbs) ->
     new_row = next(r for r in rows if r["id"] != old_id)
     assert old_row["superseded_by"] == new_row["id"]
     assert new_row["content"].startswith("Cool Article (edited)")
+
+    # Regression guard for issue #135: supersession must bump updated_at too,
+    # or peer sync (which pulls on `updated_at > cursor`) never re-pulls the
+    # now-superseded row, and the stale content keeps surfacing in search on
+    # every other node forever.
+    old_updated_at_after = db_conn.execute(
+        "SELECT updated_at FROM memories WHERE id = ?", (old_id,)
+    ).fetchone()["updated_at"]
+    assert old_updated_at_after > old_updated_at_before
 
     # dbs_imports now tracks the new memory/hash for this identity.
     tracked = db_conn.execute(

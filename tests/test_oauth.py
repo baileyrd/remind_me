@@ -632,6 +632,56 @@ def test_store_tolerates_missing_and_corrupt_files(tmp_path: Path) -> None:
     assert store.list_clients() == []
 
 
+def test_store_write_is_atomic_no_tmp_file_left_behind(tmp_path: Path) -> None:
+    """Regression guard for issue #131: writes go through a sibling temp
+    file + os.replace, never an in-place truncate. After a successful write
+    only the real state file should exist -- no leftover .tmp artifact."""
+    store = OAuthStateStore(tmp_path / "oauth.json")
+    store.put_client("c1", {"client_name": "Test"})
+
+    files = {p.name for p in tmp_path.iterdir()}
+    assert files == {"oauth.json"}
+    assert store.get_client("c1") == {"client_name": "Test"}
+
+
+def test_store_write_failure_raises_instead_of_silently_persisting_partial_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression guard for issue #131: a failed write must propagate, not
+    log-and-swallow -- otherwise a caller like put_token hands out a token
+    that was never actually persisted, and it fails on its first real use."""
+    from pathlib import Path as RuntimePath
+
+    store = OAuthStateStore(tmp_path / "oauth.json")
+
+    def _boom(self, *a, **kw):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(RuntimePath, "write_text", _boom)
+
+    with pytest.raises(OSError):
+        store.put_token("access_tokens", "tok-a", {"client_id": "c1"})
+
+    # The real state file must be untouched -- no half-written content, and
+    # no leftover temp file from the failed attempt.
+    assert not (tmp_path / "oauth.json").exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_store_write_survives_a_prior_corrupt_file(tmp_path: Path) -> None:
+    """A successful write after a corrupt read must fully replace the bad
+    file, not merge with or append to it (atomic replace, not patch)."""
+    path = tmp_path / "oauth.json"
+    path.write_text("{not json", encoding="utf-8")
+    store = OAuthStateStore(path)
+
+    store.put_client("c1", {"client_name": "Test"})
+
+    assert json.loads(path.read_text(encoding="utf-8"))["clients"]["c1"] == {
+        "client_name": "Test"
+    }
+
+
 def test_store_delete_tokens_for_client(tmp_path: Path) -> None:
     """delete_tokens_for_client drops only the targeted client's tokens."""
     store = OAuthStateStore(tmp_path / "oauth.json")

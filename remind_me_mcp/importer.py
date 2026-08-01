@@ -990,10 +990,18 @@ def import_chat_file(
     if error is not None:
         return error
 
-    # --- Hash dedup BEFORE any parsing/chunking (PF-03) so re-importing an
-    # already-imported file short-circuits immediately, without reading its
-    # full text. ---
-    fhash = _file_hash(file_path)
+    # --- Hash dedup BEFORE any parsing/chunking (PF-03). Read the bytes
+    # once and hash *that* buffer (issue #137): a separate _file_hash(path)
+    # call followed by a separate path.read_text(path) call each open and
+    # read the file independently, so a file that changes between the two
+    # reads (the folder watcher's whole purpose is ingesting in-progress
+    # writes) could hash version A but store version B's content -- the
+    # chat_imports row then permanently blocks A's true content from ever
+    # being correctly re-imported, since its hash matches nothing that
+    # exists. Reading once and reusing the buffer for both the hash and the
+    # decode makes that impossible by construction. ---
+    raw_bytes = path.read_bytes()
+    fhash = _hash_bytes(raw_bytes)
     db = _get_db()
     with _import_lock:
         existing = db.execute(
@@ -1007,7 +1015,7 @@ def import_chat_file(
             "import_id": existing["import_id"],
         }
 
-    raw = path.read_text(encoding="utf-8", errors="replace")
+    raw = raw_bytes.decode("utf-8", errors="replace")
     import_id = _make_id(file_path)
     return _ingest_parsed(
         raw, suffix, path.name, fhash, import_id, category, tags, extract_mode, max_length, kind
@@ -1135,8 +1143,17 @@ async def import_directory(
                     max_length=max_length,
                     kind=kind,
                 )
-            except (json.JSONDecodeError, UnicodeDecodeError, FileNotFoundError, OSError) as e:
-                log.warning("Failed to import %s: %s", f.name, e)
+            except Exception as e:
+                # Was narrowed to (JSONDecodeError, UnicodeDecodeError,
+                # FileNotFoundError, OSError) -- issue #140. Since gather()
+                # below isn't called with return_exceptions=True, anything
+                # outside that list (an embedding-backend network error, a
+                # sqlite3.OperationalError under contention, ...) propagated
+                # out of gather entirely, discarding the *already-committed*
+                # results of every other file in the batch along with it.
+                # Every file gets its own try/except specifically so one
+                # file's unexpected failure can never take the rest down.
+                log.warning("Failed to import %s: %s", f.name, e, exc_info=True)
                 return {"status": "error", "file": f.name, "error": str(e)}
 
     results = list(await asyncio.gather(*[_import_one(f) for f in sorted(files)]))

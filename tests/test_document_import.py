@@ -424,6 +424,54 @@ async def test_import_directory_mixed_chat_and_documents(
     assert sources == {"chat_import", DOCUMENT_SOURCE}
 
 
+async def test_import_directory_one_unexpected_failure_does_not_discard_the_rest(
+    db_conn_concurrent: sqlite3.Connection,
+    no_embed: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard for issue #140.
+
+    _import_one used to catch only (JSONDecodeError, UnicodeDecodeError,
+    FileNotFoundError, OSError), and asyncio.gather() wasn't called with
+    return_exceptions=True -- an unexpected exception type on one file (a
+    network error from the embedding backend, a sqlite3.OperationalError
+    under contention, ...) propagated out of gather entirely, discarding
+    the *already-committed* results of every other file in the batch along
+    with it. A per-file try/except around Exception means one file's
+    unexpected failure surfaces as that file's own error result, and every
+    other file's result is still returned.
+    """
+    import remind_me_mcp.importer as _importer_mod
+
+    (tmp_path / "good_one.md").write_text(NOTES_MD)
+    (tmp_path / "bad.md").write_text(PLAIN_NOTES)
+    (tmp_path / "good_two.md").write_text("# Distinct\n\nCompletely different content.")
+
+    real_import_chat_file = _importer_mod.import_chat_file
+
+    def flaky_import_chat_file(*, file_path, **kwargs):
+        if file_path.endswith("bad.md"):
+            # An exception type outside the old narrow catch list --
+            # simulates the embedding-backend network error case.
+            raise RuntimeError("embedding backend unreachable")
+        return real_import_chat_file(file_path=file_path, **kwargs)
+
+    monkeypatch.setattr(_importer_mod, "import_chat_file", flaky_import_chat_file)
+
+    summary = await import_directory(directory=str(tmp_path))
+
+    assert summary["files_processed"] == 3
+    assert summary["imported"] == 2
+    assert summary["errors"] == 1
+
+    by_file = {d["file"]: d for d in summary["details"]}
+    assert by_file["bad.md"]["status"] == "error"
+    assert "embedding backend unreachable" in by_file["bad.md"]["error"]
+    assert by_file["good_one.md"]["status"] == "ok"
+    assert by_file["good_two.md"]["status"] == "ok"
+
+
 # ---------------------------------------------------------------------------
 # ImportKind model surface + IMPORT_ROOTS enforcement
 # ---------------------------------------------------------------------------

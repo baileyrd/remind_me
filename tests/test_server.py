@@ -65,3 +65,39 @@ def test_mcp_instance_is_traced_fastmcp() -> None:
     from remind_me_mcp.server import _TracedFastMCP, mcp
 
     assert isinstance(mcp, _TracedFastMCP)
+
+
+async def test_call_tool_arms_and_disarms_the_slow_call_watchdog(
+    db_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression guard for issue #128: call_tool is the watchdog's one choke
+    point, matching the OTEL span above it -- every real tool invocation must
+    arm on entry and disarm on exit, success or failure alike."""
+    import remind_me_mcp.server as server_mod
+    import remind_me_mcp.tools  # noqa: F401
+
+    events: list[str] = []
+    monkeypatch.setattr(server_mod.watchdog, "arm", lambda: events.append("arm"))
+    monkeypatch.setattr(server_mod.watchdog, "disarm", lambda: events.append("disarm"))
+
+    await server_mod.mcp.call_tool("remind_me_stats", {"params": {}})
+
+    assert events == ["arm", "disarm"]
+
+
+async def test_call_tool_disarms_the_watchdog_even_on_tool_error(
+    db_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An errored call must still disarm -- otherwise one failing tool call
+    would leave the watchdog permanently armed for the rest of the process."""
+    import remind_me_mcp.server as server_mod
+    import remind_me_mcp.tools  # noqa: F401
+
+    events: list[str] = []
+    monkeypatch.setattr(server_mod.watchdog, "arm", lambda: events.append("arm"))
+    monkeypatch.setattr(server_mod.watchdog, "disarm", lambda: events.append("disarm"))
+
+    with pytest.raises(Exception):  # noqa: B017
+        await server_mod.mcp.call_tool("this_tool_does_not_exist", {})
+
+    assert events == ["arm", "disarm"]

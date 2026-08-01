@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -515,6 +516,12 @@ def test_perform_update_success() -> None:
     assert result.error is None
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="_update_lock is POSIX-only (fcntl) by design -- see its docstring; "
+    "on Windows it falls back to running unlocked, so lock contention is not "
+    "a behavior this platform has to exercise.",
+)
 def test_perform_update_lock_contention(tmp_path: Path) -> None:
     """A concurrent self-update holding the lock must not be run over.
 
@@ -596,7 +603,13 @@ def test_perform_update_reinstalls_detected_extras() -> None:
         result = perform_update()
 
     assert result.success
-    fake_pip.assert_called_once_with("install", "-e", "/fake/repo[semantic,ann]")
+    # str(Path(...)), not a hardcoded '/'-joined literal: the source builds
+    # install_target via an f-string over the repo Path, which renders with
+    # native separators (backslashes on Windows) -- a POSIX-style literal
+    # here would never match on that platform.
+    fake_pip.assert_called_once_with(
+        "install", "-e", f"{Path('/fake/repo')}[semantic,ann]"
+    )
 
 
 # ---------------------------------------------------------------------------

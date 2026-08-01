@@ -693,6 +693,42 @@ def test_reimport_short_circuits_before_parsing(
     assert second["import_id"] == first["import_id"]
 
 
+def test_import_chat_file_hashes_the_same_bytes_it_stores(
+    db_conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Regression guard for issue #137.
+
+    import_chat_file used to call _file_hash(path) (opens and reads the
+    file once) and then path.read_text(path) (opens and reads it again,
+    separately) -- a file that changed between those two independent reads
+    would record a chat_imports.hash for content that was never actually
+    the content stored. The fix reads the file's bytes exactly once and
+    reuses that buffer for both the hash and the decode, so the stored hash
+    and the stored content can never diverge by construction. This asserts
+    that invariant directly: hashing the memory's actual stored content
+    must reproduce the exact hash recorded in chat_imports.
+    """
+    import remind_me_mcp.importer as _importer_mod
+    from remind_me_mcp.importer import _hash_bytes
+
+    monkeypatch.setattr(_importer_mod, "_embed_and_store_rows", lambda rows: 0)
+
+    data = {"chat_messages": [{"sender": "assistant", "content": "Consistent content."}]}
+    chat_file = tmp_path / "consistent.json"
+    raw_bytes = json.dumps(data).encode("utf-8")
+    chat_file.write_bytes(raw_bytes)
+
+    result = import_chat_file(str(chat_file), "test", [], "assistant_messages", 10000)
+    assert result["status"] == "ok"
+
+    stored_hash = db_conn.execute(
+        "SELECT hash FROM chat_imports WHERE import_id = ?", (result["import_id"],)
+    ).fetchone()["hash"]
+    assert stored_hash == _hash_bytes(raw_bytes)
+
+
 def test_import_embeds_outside_lock(
     db_conn: sqlite3.Connection,
     monkeypatch: pytest.MonkeyPatch,

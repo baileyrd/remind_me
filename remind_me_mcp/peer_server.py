@@ -40,6 +40,13 @@ MAX_PULL_LIMIT = 500
 
 
 class PeerHandler(BaseHTTPRequestHandler):
+    # socketserver applies this to the accepted socket via settimeout() --
+    # without it (issue #142), a client that sends a Content-Length header
+    # and then stops writing the body parks self.rfile.read(length) forever.
+    # ThreadingHTTPServer spawns one thread per connection with no cap, so N
+    # such stalled connections permanently occupy N threads that
+    # stop_peer_server's join(timeout) can never reclaim.
+    timeout = 30
 
     def log_message(self, format, *args):
         log.debug(format, *args)

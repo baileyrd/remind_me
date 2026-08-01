@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 from mcp.server.fastmcp import FastMCP
 
+from remind_me_mcp import watchdog
 from remind_me_mcp.config import DB_PATH, SYNC_ENABLED
 from remind_me_mcp.db import _close_db, _get_db
 from remind_me_mcp.telemetry import maybe_span
@@ -42,13 +43,22 @@ class _TracedFastMCP(FastMCP):
     without touching each of the ~40 individually-decorated tool functions.
     ``maybe_span`` is a no-op unless REMIND_ME_OTEL_ENABLED is set, so this
     has no effect (and negligible overhead) by default.
+
+    This is also the choke point for the slow-call watchdog (issue #128,
+    see ``remind_me_mcp.watchdog``): arming/disarming here means a stuck
+    call gets its stack dumped automatically, without needing an operator to
+    already have py-spy installed and know to reach for it.
     """
 
     async def call_tool(
         self, name: str, arguments: dict[str, Any]
     ) -> Sequence[ContentBlock] | dict[str, Any]:
         with maybe_span(f"tool.{name}"):
-            return await super().call_tool(name, arguments)
+            watchdog.arm()
+            try:
+                return await super().call_tool(name, arguments)
+            finally:
+                watchdog.disarm()
 
 
 # ---------------------------------------------------------------------------

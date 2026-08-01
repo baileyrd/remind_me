@@ -170,6 +170,39 @@ async def test_push_outbox_sends_unsent_rows(sync_db: sqlite3.Connection) -> Non
     assert isinstance(body["records"][0]["metadata"], dict)
 
 
+async def test_push_outbox_max_batches_stops_early_and_resumes_next_call(
+    sync_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression guard for issue #124: a capped push must leave the rest
+    genuinely pending (not lost), so a follow-up call finishes the backlog.
+
+    This is what lets ``_sync_once`` bound push to a few batches per cycle —
+    a huge outbox no longer means pull waits behind an unbounded push loop.
+    """
+    monkeypatch.setattr(sync, "BATCH_SIZE", 2)
+    for i in range(5):
+        insert_memory(sync_db, f"mem-{i}")
+
+    recorder = RequestRecorder()
+    async with mock_client(recorder) as client:
+        marked = await sync._push_outbox(client, "http://hub", "hub", max_batches=2)
+
+    assert marked == 4  # 2 batches * BATCH_SIZE(2), the 5th row untouched
+    assert len(recorder.requests) == 2
+
+    pending, _ = sync._pending_to_remote(sync_db, "hub")
+    assert pending == 1
+
+    # A follow-up call (uncapped) picks up exactly the leftover row.
+    recorder2 = RequestRecorder()
+    async with mock_client(recorder2) as client:
+        marked2 = await sync._push_outbox(client, "http://hub", "hub")
+
+    assert marked2 == 1
+    pending_after, _ = sync._pending_to_remote(sync_db, "hub")
+    assert pending_after == 0
+
+
 async def test_push_outbox_nothing_to_send(sync_db: sqlite3.Connection) -> None:
     recorder = RequestRecorder()
     async with mock_client(recorder) as client:
@@ -1307,6 +1340,44 @@ async def test_sync_once_hub_push_and_pull(
     )
 
 
+async def test_sync_once_pulls_even_with_a_backlog_still_remaining(
+    sync_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression guard for issue #124: pull must run every cycle, even when
+    the outbox backlog is too large for one cycle's push cap to drain.
+
+    Before the fix, ``_push_outbox`` looped until the backlog was fully
+    drained (or errored) before ``_pull_remote`` was ever called — so a large
+    enough backlog (or one slow/erroring batch deep into it) could starve
+    pull for as long as the backlog persisted. Capping push per cycle and
+    always reaching pull afterward is the actual fix; this asserts both
+    halves: pull ran, *and* the backlog is provably not fully drained yet.
+    """
+    monkeypatch.setattr(sync, "BATCH_SIZE", 2)
+    monkeypatch.setattr(sync, "PUSH_BATCHES_PER_CYCLE", 1)  # drains 2 of 5 rows
+    for i in range(5):
+        insert_memory(sync_db, f"mem-{i}")
+
+    recorder = RequestRecorder()
+    real_async_client = httpx.AsyncClient
+    monkeypatch.setattr(sync, "HUB_URL", "http://hub")
+    monkeypatch.setattr(sync, "_discover_peers", _no_peers)
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kw: real_async_client(
+            **{**kw, "transport": httpx.MockTransport(recorder)}
+        ),
+    )
+
+    await sync._sync_once()
+
+    paths = [r.url.path for r in recorder.requests]
+    assert "/sync/pull" in paths, "pull must run even though push didn't drain the backlog"
+    pending, _ = sync._pending_to_remote(sync_db, "hub")
+    assert pending == 3, "the push cap must leave the rest of the backlog genuinely pending"
+
+
 async def test_sync_once_prunes_outbox(
     sync_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2422,6 +2493,17 @@ def _set_last_pull(db: sqlite3.Connection, *, seconds_ago: float | None) -> None
     db.commit()
 
 
+def _set_pull_cursor(db: sqlite3.Connection, *, last_pull: str, last_pull_id: str) -> None:
+    """Advance (or freeze) the hub's content watermark independently of
+    ``last_pull_at``, for testing the stalled-cursor detection (issue #121).
+    """
+    db.execute(
+        "UPDATE sync_log SET last_pull = ?, last_pull_id = ? WHERE remote_id = 'hub'",
+        (last_pull, last_pull_id),
+    )
+    db.commit()
+
+
 _EPOCH_SENTINEL = sync._EPOCH
 
 
@@ -2526,6 +2608,41 @@ async def test_reconcile_calls_hub_ahead_with_a_recent_pull_pull_lag(
         {"category": "general", "hub": 4, "local": 1, "delta": 3}
     ]
     assert "ordinary pull lag" in result["hints"][0]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_flags_a_stuck_cursor_as_fault_despite_recent_attempts(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """Regression guard for issue #121: recent attempts aren't recent progress.
+
+    A cursor stuck behind a historical gap keeps touching ``last_pull_at``
+    every cycle (an "attempt" succeeds — there's just nothing new to fetch
+    from its own vantage point), while ``last_pull``/``last_pull_id`` never
+    move. The old verdict logic only looked at ``last_pull_age`` and called
+    this ``pull-lag`` indefinitely. Two reconcile calls with the same
+    watermark and drift, both with a fresh ``last_pull_at``, must now report
+    ``fault`` on the second call once there's a baseline to compare against.
+    """
+    insert_memory(sync_db, "m1")
+    _set_last_pull(sync_db, seconds_ago=5)
+    _set_pull_cursor(sync_db, last_pull="2026-01-01T00:00:00+00:00", last_pull_id="abc")
+    recorder = stats_recorder(hub_stats(by_category={"general": 4}))
+
+    async with mock_client(recorder) as client:
+        first = await sync.reconcile_with_hub(client)
+    assert first["verdict"] == "pull-lag"  # no baseline yet — benefit of the doubt
+
+    # Second call: attempts still look recent, but the watermark is identical.
+    _set_last_pull(sync_db, seconds_ago=5)
+    _set_pull_cursor(sync_db, last_pull="2026-01-01T00:00:00+00:00", last_pull_id="abc")
+
+    async with mock_client(recorder) as client:
+        second = await sync.reconcile_with_hub(client)
+
+    assert second["verdict"] == "fault"
+    assert "has not advanced" in second["hints"][0]
+    assert second["last_pull_age_seconds"] == pytest.approx(5, abs=5)
 
 
 @pytest.mark.asyncio
@@ -2672,6 +2789,55 @@ async def test_reconcile_diffs_the_entity_graph_tables_too(
 
 
 @pytest.mark.asyncio
+async def test_reconcile_omits_graph_verdicts_that_agree(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """Only a drifting graph table gets a verdict — matches categories_with_drift's
+    noise-reduction (no point reporting on the two tables that already match)."""
+    _set_last_pull(sync_db, seconds_ago=5)
+    recorder = stats_recorder(hub_stats(entities=3))
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_hub(client)
+
+    assert set(result["graph_verdicts"]) == {"entities"}
+
+
+@pytest.mark.asyncio
+async def test_reconcile_graph_verdict_flags_a_stuck_link_cursor(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """Regression guard for issue #123: the memory cursor advancing must not
+    hide a stuck entity-graph cursor (hub#links here).
+
+    Each graph table has its own independent watermark, so a memory-only pull
+    catching up doesn't tell you anything about whether hub#links progressed.
+    """
+    _set_last_pull(sync_db, seconds_ago=5)
+    _set_pull_cursor(sync_db, last_pull="2026-01-01T00:00:00+00:00", last_pull_id="m1")
+    sync_db.execute(
+        "INSERT INTO sync_log (remote_id, last_pull, last_pull_id) VALUES "
+        "('hub#links', '2026-01-01T00:00:00+00:00', 'l1')"
+    )
+    sync_db.commit()
+    recorder = stats_recorder(hub_stats(memory_entities=9))
+
+    async with mock_client(recorder) as client:
+        first = await sync.reconcile_with_hub(client)
+    assert first["graph_verdicts"]["memory_entities"]["verdict"] == "pull-lag"
+
+    # Second cycle: last_pull_at (shared) advances, but hub#links's own
+    # watermark is unchanged — no new link records actually arrived.
+    _set_last_pull(sync_db, seconds_ago=2)
+
+    async with mock_client(recorder) as client:
+        second = await sync.reconcile_with_hub(client)
+
+    assert second["graph_verdicts"]["memory_entities"]["verdict"] == "fault"
+    assert "has not advanced" in second["graph_verdicts"]["memory_entities"]["hints"][0]
+
+
+@pytest.mark.asyncio
 async def test_reconcile_passes_through_hub_origin_node_breakdown(
     sync_db: sqlite3.Connection, status_enabled: None
 ) -> None:
@@ -2700,3 +2866,176 @@ async def test_reconcile_tolerates_a_malformed_hub_payload(
 
     assert result["status"] == "ok"
     assert result["memories"] == {"hub": 0, "local": 0, "delta": 0}
+
+
+# ---------------------------------------------------------------------------
+# reset_pull_cursor / remind_me_sync_repair (issue #122)
+# ---------------------------------------------------------------------------
+
+
+def test_reset_pull_cursor_rewinds_all_four_by_default(
+    sync_db: sqlite3.Connection,
+) -> None:
+    """Default scope covers memory plus all three entity-graph cursors."""
+    for cursor_id in ("hub", "hub#entities", "hub#links", "hub#entity_relations"):
+        sync_db.execute(
+            "INSERT INTO sync_log (remote_id, last_pull, last_pull_id) VALUES (?, ?, ?)",
+            (cursor_id, "2026-01-01T00:00:00+00:00", "somewhere"),
+        )
+    sync_db.commit()
+
+    result = sync.reset_pull_cursor("hub")
+
+    assert {r["cursor"] for r in result["reset"]} == {
+        "hub", "hub#entities", "hub#links", "hub#entity_relations",
+    }
+    for cursor_id in ("hub", "hub#entities", "hub#links", "hub#entity_relations"):
+        row = sync_db.execute(
+            "SELECT last_pull, last_pull_id FROM sync_log WHERE remote_id = ?",
+            (cursor_id,),
+        ).fetchone()
+        assert row["last_pull"] == sync._EPOCH
+        assert row["last_pull_id"] == ""
+
+
+def test_reset_pull_cursor_honours_a_narrower_scope(
+    sync_db: sqlite3.Connection,
+) -> None:
+    """A scoped reset must not touch cursors outside the requested kinds."""
+    sync_db.execute(
+        "INSERT INTO sync_log (remote_id, last_pull, last_pull_id) VALUES "
+        "('hub#links', '2026-01-01T00:00:00+00:00', 'l1')"
+    )
+    sync_db.commit()
+
+    sync.reset_pull_cursor("hub", kinds=["links"])
+
+    row = sync_db.execute(
+        "SELECT last_pull, last_pull_id FROM sync_log WHERE remote_id = 'hub#links'"
+    ).fetchone()
+    assert row["last_pull"] == sync._EPOCH
+    # The bare memory cursor was never touched — untouched means no row at all.
+    assert sync_db.execute(
+        "SELECT 1 FROM sync_log WHERE remote_id = 'hub'"
+    ).fetchone() is None
+
+
+def test_reset_pull_cursor_reports_the_prior_watermark(
+    sync_db: sqlite3.Connection,
+) -> None:
+    """The caller (the MCP tool) needs the 'before' state to report what changed."""
+    sync_db.execute(
+        "INSERT INTO sync_log (remote_id, last_pull, last_pull_id) VALUES "
+        "('hub', '2026-01-01T00:00:00+00:00', 'abc')"
+    )
+    sync_db.commit()
+
+    result = sync.reset_pull_cursor("hub", kinds=["memory"])
+
+    entry = result["reset"][0]
+    assert entry["was"] == {"last_pull": "2026-01-01T00:00:00+00:00", "last_pull_id": "abc"}
+
+
+def test_reset_pull_cursor_rejects_an_unknown_kind(sync_db: sqlite3.Connection) -> None:
+    with pytest.raises(ValueError, match="unknown cursor kind"):
+        sync.reset_pull_cursor("hub", kinds=["not-a-real-cursor"])
+
+
+@pytest.mark.asyncio
+async def test_sync_repair_requires_confirm(sync_db: sqlite3.Connection) -> None:
+    """The reset is real work (a full re-pull), so it must not fire on request alone."""
+    from remind_me_mcp.tools.admin import remind_me_sync_repair
+
+    result = await remind_me_sync_repair(remote_id="hub")
+
+    assert "Would reset" in result
+    assert "confirm=True" in result
+    # Nothing was actually touched.
+    assert sync_db.execute("SELECT 1 FROM sync_log WHERE remote_id = 'hub'").fetchone() is None
+
+
+@pytest.mark.asyncio
+async def test_sync_repair_resets_when_confirmed(sync_db: sqlite3.Connection) -> None:
+    from remind_me_mcp.tools.admin import remind_me_sync_repair
+
+    sync_db.execute(
+        "INSERT INTO sync_log (remote_id, last_pull, last_pull_id) VALUES "
+        "('hub', '2026-01-01T00:00:00+00:00', 'abc')"
+    )
+    sync_db.commit()
+
+    result = await remind_me_sync_repair(remote_id="hub", confirm=True)
+
+    assert "Reset 4 cursor(s)" in result
+    assert "was at `2026-01-01T00:00:00+00:00`" in result
+    row = sync_db.execute(
+        "SELECT last_pull FROM sync_log WHERE remote_id = 'hub'"
+    ).fetchone()
+    assert row["last_pull"] == sync._EPOCH
+
+
+@pytest.mark.asyncio
+async def test_sync_repair_rejects_an_unknown_scope(sync_db: sqlite3.Connection) -> None:
+    from remind_me_mcp.tools.admin import remind_me_sync_repair
+
+    result = await remind_me_sync_repair(remote_id="hub", scope="bogus", confirm=True)
+
+    assert "Unknown cursor kind" in result
+
+
+# ---------------------------------------------------------------------------
+# memories_outbox_au scoping (issue #147) — access-tracking updates must not
+# flood the sync outbox
+# ---------------------------------------------------------------------------
+
+
+def test_access_tracking_update_does_not_enqueue_an_outbox_row(
+    sync_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression guard for issue #147.
+
+    vitality.record_accesses bumps accessed_at/access_count/vitality/status
+    on every search hit -- deliberately never updated_at, so the change
+    reads as access metadata, not a content edit. Before this migration,
+    memories_outbox_au fired on every UPDATE regardless, so a 20-result
+    search enqueued 20 full-payload sync_outbox rows that (since LWW
+    compares updated_at) would almost always lose LWW and be discarded on
+    the receiving end anyway -- pure round-trip waste.
+    """
+    from remind_me_mcp import vitality
+
+    # vitality.py does `from remind_me_mcp.db import _get_db`, a separate
+    # name binding from remind_me_mcp.db._get_db -- the sync_db fixture only
+    # patches the latter (plus sync's own), so vitality needs its own patch
+    # here or record_accesses would hit the real on-disk DB instead of the
+    # in-memory one this test inspects.
+    monkeypatch.setattr(vitality, "_get_db", lambda: sync_db)
+
+    insert_memory(sync_db, "m1")
+    sync_db.execute("DELETE FROM sync_outbox")  # clear the insert's own row
+    sync_db.commit()
+
+    vitality.record_accesses(["m1"])
+
+    pending = sync_db.execute("SELECT COUNT(*) FROM sync_outbox").fetchone()[0]
+    assert pending == 0
+
+
+def test_genuine_content_update_still_enqueues_an_outbox_row(
+    sync_db: sqlite3.Connection,
+) -> None:
+    """The scoping in issue #147's fix must not silently break real sync:
+    an update that actually bumps updated_at (every genuine content writer
+    in this codebase does) must still enqueue normally."""
+    insert_memory(sync_db, "m1")
+    sync_db.execute("DELETE FROM sync_outbox")
+    sync_db.commit()
+
+    sync_db.execute(
+        "UPDATE memories SET content = 'edited', updated_at = ? WHERE id = 'm1'",
+        (_now_iso(),),
+    )
+    sync_db.commit()
+
+    pending = sync_db.execute("SELECT COUNT(*) FROM sync_outbox").fetchone()[0]
+    assert pending == 1

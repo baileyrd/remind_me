@@ -99,6 +99,38 @@ def test_write_page_replaces_and_marks_updated(db_conn, wiki_dir: Path) -> None:
     assert "First version" not in text
 
 
+def test_write_page_does_not_delete_a_mid_document_heading(db_conn, wiki_dir: Path) -> None:
+    """Regression guard for issue #132.
+
+    write_page's title-normalisation used to strip the *first H1 anywhere in
+    the document* (a plain re.search under MULTILINE), not just a leading
+    one. A body with prose before its first heading silently lost that
+    heading on every write.
+    """
+    body = "Intro paragraph.\n\n# Section One\n\nDetails."
+    result = wiki.write_page("My Page", body)
+
+    text = (wiki_dir / f"{result['slug']}.md").read_text()
+    assert text.startswith("# My Page")
+    assert "# Section One" in text
+    assert "Intro paragraph." in text
+    assert "Details." in text
+
+
+def test_write_page_replaces_a_genuinely_leading_h1(db_conn, wiki_dir: Path) -> None:
+    """The normal case still works: a body that already opens with an H1
+    matching the desired title is left untouched (no duplicate heading),
+    and one that opens with a *different* H1 has that leading H1 replaced."""
+    result = wiki.write_page("My Page", "# My Page\n\nAlready titled correctly.")
+    text = (wiki_dir / f"{result['slug']}.md").read_text()
+    assert text.count("# My Page") == 1
+
+    result2 = wiki.write_page("Renamed", "# Old Title\n\nBody text.")
+    text2 = (wiki_dir / f"{result2['slug']}.md").read_text()
+    assert text2.startswith("# Renamed")
+    assert "# Old Title" not in text2
+
+
 def test_read_page_links_and_backlinks(db_conn, wiki_dir: Path) -> None:
     wiki.write_page("Networking", "Overview. See [[Tailscale]] for the VPN.")
     wiki.write_page("Tailscale", "A mesh VPN. Part of [[Networking]].")
@@ -145,6 +177,32 @@ def test_reconcile_picks_up_external_edit(db_conn, wiki_dir: Path) -> None:
         "SELECT dst_slug FROM wiki_links WHERE src_slug = 'notes'"
     ).fetchone()
     assert link["dst_slug"] == "tailscale"
+
+
+def test_reconcile_finds_a_hand_created_file_with_spaces_in_its_name(
+    db_conn, wiki_dir: Path
+) -> None:
+    """Regression guard for issue #133.
+
+    _page_files used to key on p.stem.lower() while every lookup path
+    (read_page, delete_page, wikilink resolution) keys on slugify(). A
+    hand-created file like "My Notes.md" indexed under "my notes" (raw
+    lowercased stem) but every lookup for it computed "my-notes" --
+    permanently unreachable despite reconcile() having indexed *something*.
+    """
+    wiki.wiki_dir().mkdir(parents=True, exist_ok=True)
+    (wiki_dir / "My Notes.md").write_text("# My Notes\n\nHand-written content.\n")
+
+    stats = wiki.reconcile()
+    assert stats["indexed"] == 1
+
+    # The indexed slug must match what slugify() (and thus every lookup
+    # path) actually computes for this filename.
+    row = db_conn.execute(
+        "SELECT slug, content FROM wiki_pages WHERE slug = 'my-notes'"
+    ).fetchone()
+    assert row is not None, "page indexed under a slug read_page/delete_page can't reach"
+    assert "Hand-written content" in row["content"]
 
 
 def test_reconcile_drops_deleted_files(db_conn, wiki_dir: Path) -> None:
