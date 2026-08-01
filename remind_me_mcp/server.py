@@ -132,10 +132,70 @@ async def app_lifespan(app: FastMCP):
         _close_db()
 
 # ---------------------------------------------------------------------------
+# Server instructions
+# ---------------------------------------------------------------------------
+
+# Carried in the MCP `initialize` response and surfaced to the model by the
+# client, every session, in every client. Before this existed, the only
+# behavioural guidance was a prose block in the README that the user had to
+# paste into each client's custom instructions by hand — per-client, silently
+# absent wherever it wasn't pasted, and free to drift from the tools it
+# described. Keep it operational and short: it costs context on every session,
+# so it earns its length only by changing what Claude actually does.
+SERVER_INSTRUCTIONS = """\
+remind_me is the user's persistent memory across Claude sessions, clients, and
+machines. Anything stored here is available in future conversations, on their
+other devices, and in their other Claude clients.
+
+## When to retrieve
+
+Call `remind_me_search` before answering whenever the answer depends on
+something only the user's own history establishes — their preferences,
+decisions, projects, people, tools, or past problems and how they were
+resolved. Prefer searching over guessing, and over asking the user to repeat
+context they have already given you.
+
+`remind_me_search` is the entry point: it fuses keyword and semantic matching
+and auto-routes its ranking strategy per query. Use `remind_me_list` only to
+browse a known category or tag — not to find something. For a question about
+one specific person, project, or tool, `remind_me_entity` returns that
+entity's facts and linked memories directly, and `remind_me_entity_traverse`
+chains relations across hops. To load synthesised background instead of raw
+fragments, use `remind_me_wiki_load`.
+
+## When to store
+
+Store durable facts, preferences, decisions, and resolutions with
+`remind_me_add` as they come up — you do not need to be asked each time.
+Prefer one atomic fact per memory, and pass `subject`/`predicate`/`object`
+plus `entities` when the fact concerns a specific person, project, or tool, so
+it joins the knowledge graph instead of sitting as loose prose. Do not store
+secrets, credentials, transient chatter, or anything the user asks you not to
+keep. To persist a whole conversation, `remind_me_auto_capture` stores the
+verbatim dialog and a distilled summary as two linked memories.
+
+## Feedback
+
+`remind_me_feedback` records whether a retrieved memory was actually helpful,
+which tunes future ranking. Send it when a result was clearly useful or
+clearly wrong — not after every search.
+
+## Maintenance
+
+The batch and admin tools (decompose, normalize, extract/annotate, reclassify,
+consolidate, wiki compile, import, sync, backup) are operator workflows, not
+conversational ones. Run them when the user asks, or when a tool response
+nudges you to — not spontaneously. Each multi-step loop also has a matching
+prompt that drives it end to end.
+"""
+
+# ---------------------------------------------------------------------------
 # MCP server instance
 # ---------------------------------------------------------------------------
 
-mcp = _TracedFastMCP("remind_me_mcp", lifespan=app_lifespan)
+mcp = _TracedFastMCP(
+    "remind_me_mcp", instructions=SERVER_INSTRUCTIONS, lifespan=app_lifespan
+)
 
 # ---------------------------------------------------------------------------
 # Exports
@@ -144,4 +204,5 @@ mcp = _TracedFastMCP("remind_me_mcp", lifespan=app_lifespan)
 __all__ = [
     "mcp",
     "app_lifespan",
+    "SERVER_INSTRUCTIONS",
 ]

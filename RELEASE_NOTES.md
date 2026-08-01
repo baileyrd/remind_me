@@ -1,5 +1,21 @@
 # Release Notes
 
+## v1.24.0 — 2026-08-01
+
+remind_me had no in-band channel to tell Claude how to use it. Every behavioural expectation — search before answering, capture what matters, how to drive a maintenance loop — lived in prose the user pasted into each client's custom instructions by hand. That is per-client, silently absent wherever it wasn't pasted, impossible to version alongside the tools it describes, and it fails without any error anywhere. This release moves that knowledge into the server.
+
+### New Features
+
+- **Server instructions** — `SERVER_INSTRUCTIONS` (`server.py`) is now passed to the `FastMCP` constructor, so it ships in the MCP `initialize` response and the client surfaces it to Claude automatically, in every session and every client. It covers when to retrieve (and that `remind_me_search` is the entry point, not `remind_me_list`), when to store (with `subject`/`predicate`/`object` + `entities` so a fact joins the graph rather than sitting as loose prose), when to send `remind_me_feedback`, and that the batch/admin tools are operator workflows not to be run spontaneously. Deliberately kept short — it costs context in every session, so it earns its length only by changing what Claude actually does; a test caps it at 4000 characters.
+- **Six MCP prompts for the maintenance loops** — `decompose_facts`, `normalize_imports`, `backfill_graph`, `classify_memories`, `compile_wiki`, and `consolidate_duplicates` (`tools/prompts.py`). Each drives one multi-step loop end to end; clients surface them as user-invocable workflows (`/mcp__remind-me__compile_wiki` in Claude Code). The tools were always there — what was missing was the sequencing, which existed only in the README and the operator's head.
+- Both two-phase loops present their preview phase first and explain why: `compile_wiki`'s `mark_integrated=true` advances the watermark past sources whether or not they were actually written into a page, and `consolidate_duplicates`' merge is not reversible through the tool. Tests assert the ordering rather than trusting the prose to stay correct.
+
+### Notes
+
+- Prompt arguments are annotated `str` and interpolated into the prompt text rather than coerced to `int`/`float`: MCP delivers prompt arguments as strings, and the underlying tool's pydantic model already does the real validation. Every argument is optional, so a bare invocation runs the loop with the tool's own defaults.
+- Additive only — no schema migration, no tool signature change, no wire-format change. Existing clients that ignore prompts and instructions behave exactly as before.
+- Corrects a stale README count along the way: the tool table read "43 tools" while 46 were actually registered.
+
 ## v1.23.0 — 2026-07-31
 
 Closes [#108](https://github.com/baileyrd/remind_me/issues/108) from the [memU capability review](docs/memu-capability-review-2026-07-31.md): memU's wiki-of-skills product makes the calling agent explicitly decide "patch an existing skill or create a new one" and writes task skills in a steps/edge-cases/branches shape. remind_me's LLM Wiki had no equivalent for task-shaped sources — every page was a free-form knowledge page.
