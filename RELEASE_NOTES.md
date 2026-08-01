@@ -1,5 +1,27 @@
 # Release Notes
 
+## v1.25.0 — 2026-08-01
+
+Two signals that existed but never reached anyone. v1.24.0 gave the server a voice (instructions + prompts); this release makes it say the things only it can know.
+
+### New Features
+
+- **Maintenance nudges** — the backlog counts lived only inside `remind_me_server_status` and `remind_me_watch_status`, tools a conversational session has no reason to call, so a growing queue of un-decomposed captures or un-compiled memories was invisible in practice. Search and add responses now carry a short nudge naming the deepest backlogs and the prompt that drains each, reusing the one-shot piggyback idiom `updater.pop_update_notice` already established.
+- **Capture health** — `remind_me_auto_capture` only runs when the user has pasted the opt-in instruction into their client, and nothing distinguished "capture is working" from "the instruction was never pasted": both present as an absence. `remind_me_server_status` now reports capture count and last capture time, and names the opt-in explicitly when there are none. Deliberately *reported, not nudged about* — capture is opt-in by design, so a vault with none is a legitimate configuration rather than a backlog to nag about.
+- New `remind_me_mcp/maintenance.py` owns both, plus the `WHERE` clause defining each queue.
+
+### Design notes
+
+- **One definition per queue.** `maintenance.py` owns the pending-work `WHERE` clauses and the batch tools (`capture.py`, `normalize.py`) import them from there, inverting the dependency rather than duplicating. A second copy would let the count Claude is nudged about drift from the batch the corresponding tool actually returns — the precise inconsistency that makes a nudge untrustworthy. A test asserts the tools and the nudge share the same object, not merely equal strings.
+- **Throttled before the query, not after.** At most one *check* per `REMIND_ME_MAINTENANCE_NUDGE_INTERVAL` (default 1h), and the timer is claimed *before* the COUNTs run — so an empty vault costs the same as a busy one and the hot path never pays for repeated counting. The cost of that choice is skipping one nudge window on a vault that just crossed the threshold; the benefit is that `remind_me_search` stays free.
+- **Markdown paths only.** The nudge is prose; appending it to a JSON envelope would make the response unparseable, and nothing in the tool layer would catch that. Wired exactly like the pre-existing update notice, with a test that parses a JSON search result to prove it.
+- **Threshold of 25**, not 1: a handful of pending items is the normal steady state of a system in use, and nudging on every one would train the reader to ignore nudges.
+- Both helpers swallow their own errors — a diagnostic must never be the reason a search fails.
+
+### Also
+
+- `tests/conftest.py` resets the nudge throttle before every test. The throttle is module-level state, so without this whether a given test sees a nudge would depend on collection order — a CI-only flake waiting to happen. Verified by running the full suite with a cold throttle on every test: no existing assertion is perturbed.
+
 ## v1.24.0 — 2026-08-01
 
 remind_me had no in-band channel to tell Claude how to use it. Every behavioural expectation — search before answering, capture what matters, how to drive a maintenance loop — lived in prose the user pasted into each client's custom instructions by hand. That is per-client, silently absent wherever it wasn't pasted, impossible to version alongside the tools it describes, and it fails without any error anywhere. This release moves that knowledge into the server.

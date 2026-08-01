@@ -382,6 +382,35 @@ Every LLM-driven maintenance workflow is a *sequence* — a batch tool surfaces 
 
 Every argument is optional (batch size, similarity threshold), so invoking a prompt bare runs the loop with the tool's own defaults. The two loops whose second phase is hard to undo — `compile_wiki`'s watermark advance and `consolidate_duplicates`' merge — put the preview phase first and say why, so the destructive step is never the first thing done.
 
+### Maintenance nudges
+
+The backlog counts (`pending_wiki_compile` and friends) used to live only inside `remind_me_server_status` and `remind_me_watch_status` — tools a conversational session has no reason to call — so a growing queue of un-decomposed captures was invisible in practice. Search and add responses now carry a short nudge naming the deepest backlogs and the prompt that drains each:
+
+```
+---
+**Maintenance pending** — run when convenient:
+- 143 memories with no entity/triple annotation → `backfill_graph` prompt
+- 38 memories not folded into the wiki → `compile_wiki` prompt
+```
+
+- **Throttled** — at most one *check* per `REMIND_ME_MAINTENANCE_NUDGE_INTERVAL` (default 1h). The timer is claimed *before* the counts are queried, so the hot path pays one clock comparison and nothing else in between; a quiet vault costs the same as a busy one.
+- **Thresholded** — a queue must reach `REMIND_ME_MAINTENANCE_NUDGE_THRESHOLD` (default 25) to be mentioned. A handful of pending items is the normal steady state of a system in use, and nudging at 1 would just train the reader to ignore nudges.
+- **Markdown paths only** — the nudge is prose, and appending it to a JSON envelope would make the response unparseable. Same wiring as the pre-existing update notice.
+- **One definition per queue** — `remind_me_mcp/maintenance.py` owns the `WHERE` clauses, and the batch tools import them from there. A second copy would let the count Claude is nudged about drift from the batch the tool actually returns.
+- Silence them with `REMIND_ME_MAINTENANCE_NUDGES=false`.
+
+### Capture health
+
+`remind_me_auto_capture` only runs if you've added the [capture instruction](#auto-capture-persisting-full-conversations) to your client, so "never configured" and "configured but nothing captured yet" both used to present as pure silence — nothing anywhere distinguished them. `remind_me_server_status` now reports capture count and the last capture time, and says so explicitly when there are none:
+
+```
+**Conversation capture:** none recorded — `remind_me_auto_capture` is opt-in; add the
+capture instruction to your client's custom instructions (see the README) if you
+expected captures here
+```
+
+This is deliberately **reported, not nudged about**: capture is opt-in by design, so a vault with none is a legitimate configuration rather than a backlog to nag about.
+
 ### Server instructions
 
 The server sends **instructions** in its MCP `initialize` response — guidance the client surfaces to Claude automatically, in every session and every client. It covers when to search before answering, when to store a fact (and to include `subject`/`predicate`/`object` + `entities` so it joins the graph), when to send feedback, and that batch/admin tools are operator workflows rather than conversational ones.
@@ -1089,6 +1118,9 @@ Every new memory used to start at a flat `base_weight=1.0` regardless of kind, s
 | `REMIND_ME_WATCH_DIRS` | *(unset)* | Colon-separated directories for the folder watcher to auto-ingest. Empty = watcher disabled. Each directory must lie inside `REMIND_ME_IMPORT_ROOTS` |
 | `REMIND_ME_WATCH_INTERVAL` | `60` | Seconds between folder watcher scan passes |
 | `REMIND_ME_WATCH_GRACE` | `5` | Debounce grace period in seconds — files modified more recently than this are deferred until a scan sees a stable (mtime, size) |
+| `REMIND_ME_MAINTENANCE_NUDGES` | `true` | Whether search/add responses may carry a maintenance-backlog nudge. Set `false` to silence them entirely |
+| `REMIND_ME_MAINTENANCE_NUDGE_INTERVAL` | `3600` | Minimum seconds between nudge *checks*. Bounds cost as well as noise — the backlog COUNTs only run when this has elapsed |
+| `REMIND_ME_MAINTENANCE_NUDGE_THRESHOLD` | `25` | Queue depth a backlog must reach before it's worth mentioning |
 | `REMIND_ME_WEBHOOK_SECRET` | *(unset)* | Bearer token for the push/webhook ingestion server. Empty = disabled — the server refuses to start without it |
 | `REMIND_ME_WEBHOOK_PORT` | `8769` | Port for the push/webhook ingestion server |
 | `REMIND_ME_WEBHOOK_BIND` | `127.0.0.1` | Bind address for the push/webhook ingestion server. Widen deliberately (e.g. a Tailscale IP) since it writes arbitrary pushed content directly into memory |
@@ -1270,6 +1302,10 @@ remind_me is local-first, single-user, and MCP-native by design — some capabil
 ## Changelog
 
 See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for a per-version feature breakdown with PR references; this section summarizes the same history phase-by-phase.
+
+### 1.25.0 — 2026-08-01
+
+Makes two existing-but-unreachable signals visible. **Maintenance nudges** move the backlog counts off `remind_me_server_status` (which a conversational session never calls) onto search/add responses — throttled, thresholded, markdown-only, with `maintenance.py` owning one `WHERE` clause per queue so the nudge and the batch tool can't disagree. **Capture health** makes "auto-capture was never configured" a visible state in `remind_me_server_status` instead of something inferred from silence.
 
 ### 1.24.0 — 2026-08-01
 

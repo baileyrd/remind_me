@@ -100,6 +100,43 @@ def _maybe_update_notice(response: str) -> str:
     return response
 
 
+def _maybe_maintenance_notice(response: str) -> str:
+    """Append a throttled maintenance nudge to a *markdown* response.
+
+    The backlog counts previously lived only in ``remind_me_server_status`` and
+    ``remind_me_watch_status`` — tools a conversational session never calls, so
+    a growing queue of un-decomposed captures was invisible in practice. This
+    piggybacks the signal onto responses Claude actually reads, the same idiom
+    :func:`_maybe_update_notice` already uses for update notices.
+
+    Callers must apply this only on markdown return paths. The JSON paths go
+    through ``_envelope_json``, and appending prose to a JSON document would
+    make it unparseable — which is why the existing update notice is wired the
+    same way.
+
+    Args:
+        response: The original markdown tool response.
+
+    Returns:
+        The response, possibly with an appended nudge. Never raises: a
+        diagnostic must not be the thing that breaks a search.
+    """
+    try:
+        # Deferred import: resolving through the package namespace at call time
+        # keeps the tests' `tools._get_db` monkeypatch effective (HY-02), and
+        # importing the package at module scope here would be circular.
+        from remind_me_mcp import tools as _pkg
+        from remind_me_mcp.maintenance import maybe_maintenance_notice
+
+        notice = maybe_maintenance_notice(_pkg._get_db())
+    except Exception:  # noqa: BLE001 — a nudge never breaks its host response
+        log.debug("Maintenance notice failed", exc_info=True)
+        return response
+    if notice:
+        return response + "\n\n---\n" + notice
+    return response
+
+
 # ---------------------------------------------------------------------------
 # Contradiction-supersession preview (gap #5 false-positive mitigation)
 # ---------------------------------------------------------------------------

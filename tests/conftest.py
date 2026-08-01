@@ -463,3 +463,24 @@ def sample_chat_md(tmp_path: Path) -> Path:
     p = tmp_path / "chat_export.md"
     p.write_text(content)
     return p
+
+
+# ---------------------------------------------------------------------------
+# Maintenance nudge throttle
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def reset_maintenance_throttle() -> None:
+    """Give every test a cold maintenance-nudge throttle.
+
+    The throttle is module-level state shared across the whole session, so
+    without this the first test to trigger a nudge check claims the window for
+    every test that follows — and whether a given test sees a nudge appended to
+    a markdown response would depend on collection order. That is exactly the
+    kind of flake that shows up only in CI, so pin it here rather than leaving
+    it to chance.
+    """
+    from remind_me_mcp import maintenance
+
+    maintenance.reset_nudge_throttle()

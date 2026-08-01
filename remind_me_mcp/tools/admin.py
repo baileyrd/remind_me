@@ -527,6 +527,11 @@ async def remind_me_server_status() -> str:
 
     Use this to verify the system is operational or to get the dashboard URL.
 
+    Also reports conversation-capture health (whether `remind_me_auto_capture`
+    has ever run, and when it last did) and the depth of every maintenance
+    queue, so an unconfigured capture instruction or a growing backlog is
+    visible here rather than having to be inferred from an absence.
+
     Returns:
         str: Status information about running instances.
     """
@@ -611,6 +616,40 @@ async def remind_me_server_status() -> str:
             )
     else:
         lines.append("\n**Semantic search:** ✗ Unavailable (install onnxruntime, tokenizers, huggingface-hub, numpy, sqlite-vec)")
+
+    # Conversation capture health.
+    #
+    # remind_me_auto_capture only runs when the user has pasted the opt-in
+    # instruction into their client, so "never configured" and "configured but
+    # nothing captured yet" previously both presented as pure silence — there
+    # was no surface anywhere that distinguished them. Deliberately reported,
+    # not nudged about: capture is opt-in by design, so a vault with none is a
+    # legitimate configuration rather than a backlog to nag about.
+    from remind_me_mcp.maintenance import capture_health, pending_counts
+
+    cap = capture_health(_pkg._get_db())
+    if cap["ever_captured"]:
+        lines.append(
+            f"\n**Conversation capture:** ✓ {cap['captures']} capture(s) — "
+            f"last: {cap['last_capture_at']}"
+        )
+    else:
+        lines.append(
+            "\n**Conversation capture:** none recorded — `remind_me_auto_capture` "
+            "is opt-in; add the capture instruction to your client's custom "
+            "instructions (see the README) if you expected captures here"
+        )
+
+    # Maintenance backlogs. Same counts the throttled nudge uses, so this and
+    # the nudge can never disagree.
+    pending_queues = {k: v for k, v in pending_counts(_pkg._get_db()).items() if v}
+    if pending_queues:
+        summary = ", ".join(
+            f"{v} {k.replace('_', ' ')}" for k, v in sorted(pending_queues.items())
+        )
+        lines.append(f"**Maintenance pending:** {summary}")
+    else:
+        lines.append("**Maintenance pending:** nothing — every queue is drained")
 
     # Folder watcher (FT-03)
     from remind_me_mcp.watcher import get_watch_status
