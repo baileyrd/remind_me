@@ -460,6 +460,41 @@ async def test_pull_remote_stuck_cursor_stops(
     assert len(recorder.requests) <= 3
 
 
+async def test_pull_remote_touches_last_pull_at_on_mid_drain_error(
+    sync_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A later page erroring out mid-backlog must not hide the earlier pages'
+    real progress: last_pull_at should reflect them, not stay at _EPOCH."""
+    monkeypatch.setattr(sync, "PULL_PAGE_SIZE", 2)
+    ts1 = "2026-06-01T00:00:00+00:00"
+    page1 = [
+        make_record("rec-a", "a", created_at=ts1, updated_at=ts1),
+        make_record("rec-b", "b", created_at=ts1, updated_at=ts1),
+    ]
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(200, json={"records": page1, "count": 2})
+        return httpx.Response(500, json={"error": "boom"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(httpx.HTTPStatusError):
+            await sync._pull_remote(client, "http://hub", "hub")
+
+    assert len(calls) == 2
+    # First page's records and cursor progress landed despite the later error.
+    got = sync_db.execute("SELECT id FROM memories ORDER BY id").fetchall()
+    assert [r["id"] for r in got] == ["rec-a", "rec-b"]
+    log_row = sync_db.execute(
+        "SELECT last_pull, last_pull_id, last_pull_at FROM sync_log WHERE remote_id = 'hub'"
+    ).fetchone()
+    assert log_row["last_pull"] == ts1
+    assert log_row["last_pull_id"] == "rec-b"
+    assert log_row["last_pull_at"] != sync._EPOCH
+
+
 # ---------------------------------------------------------------------------
 # _upsert_records — conflict resolution (SY-03)
 # ---------------------------------------------------------------------------

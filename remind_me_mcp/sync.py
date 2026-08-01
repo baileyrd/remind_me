@@ -318,6 +318,11 @@ async def _pull_remote(client: httpx.AsyncClient, url: str, remote_id: str) -> i
                 last_pull_id = excluded.last_pull_id
         """, (remote_id, since, since_id))
         db.commit()
+        # Touched per-page, not just after a clean drain: a mid-drain error on
+        # a later page (e.g. a timeout deep into a large backlog) would
+        # otherwise leave this at its old value forever, even though the
+        # pages before the error landed real records (SY-18 regression).
+        _touch_sync_log(db, remote_id, "last_pull_at")
 
         log.debug(
             "Pulled %d records from %s, upserted %d (failed %d)",
@@ -411,6 +416,9 @@ async def _pull_graph_table(
                 last_pull_id = excluded.last_pull_id
         """, (cursor_id, since, since_id))
         db.commit()
+        # Touched per-page — see _pull_remote for why a clean-drain-only touch
+        # hides real progress when a later page errors out mid-backlog.
+        _touch_sync_log(db, remote_id, "last_pull_at")
 
         log.debug(
             "Pulled %d %s records from %s, applied %d (failed %d)",
