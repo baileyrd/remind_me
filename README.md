@@ -365,7 +365,28 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_check_update` | Check if a newer version is available on origin/main |
 | `remind_me_self_update` | Pull latest changes from origin and reinstall the package |
 
-43 tools + 4 resources (`memory://stats`, `memory://categories`, `wiki://schema`, `wiki://index`).
+46 tools + 6 prompts + 4 resources (`memory://stats`, `memory://categories`, `wiki://schema`, `wiki://index`).
+
+### Prompts: the maintenance loops as one-shot workflows
+
+Every LLM-driven maintenance workflow is a *sequence* — a batch tool surfaces work, Claude does the reasoning, an apply tool writes it back, and some loops then advance a watermark. The tools have always been there, but the sequencing lived only in this README, so running a loop meant remembering both the tool names and their order. Each loop is now also an **MCP prompt**, which clients surface as a user-invocable workflow (in Claude Code, `/mcp__remind-me__<name>`):
+
+| Prompt | Drives |
+|---|---|
+| `decompose_facts` | `remind_me_decompose_batch` → `remind_me_decompose` |
+| `normalize_imports` | `remind_me_normalize_batch` → `remind_me_normalize_apply` |
+| `backfill_graph` | `remind_me_extract_batch` → `remind_me_annotate` |
+| `classify_memories` | `remind_me_reclassify_batch` → `remind_me_reclassify` |
+| `compile_wiki` | `remind_me_wiki_compile` → `remind_me_wiki_write` ×N → `mark_integrated=true` |
+| `consolidate_duplicates` | `remind_me_consolidate` dry run → merge with LLM-authored summaries |
+
+Every argument is optional (batch size, similarity threshold), so invoking a prompt bare runs the loop with the tool's own defaults. The two loops whose second phase is hard to undo — `compile_wiki`'s watermark advance and `consolidate_duplicates`' merge — put the preview phase first and say why, so the destructive step is never the first thing done.
+
+### Server instructions
+
+The server sends **instructions** in its MCP `initialize` response — guidance the client surfaces to Claude automatically, in every session and every client. It covers when to search before answering, when to store a fact (and to include `subject`/`predicate`/`object` + `entities` so it joins the graph), when to send feedback, and that batch/admin tools are operator workflows rather than conversational ones.
+
+This used to be prose you pasted into each client's custom instructions by hand — which was per-client, silently absent wherever you forgot, and free to drift from the tools it described. It now ships with the server and is versioned alongside them (`SERVER_INSTRUCTIONS` in `remind_me_mcp/server.py`).
 
 ### Auto-Capture: Persisting Full Conversations
 
@@ -376,7 +397,7 @@ The `remind_me_auto_capture` tool stores **two linked memories** from each conve
 
 Both memories share a `capture_id` in their metadata, so you can retrieve them together with `remind_me_get_capture`.
 
-**To use automatically**, add this to your Claude Desktop or Claude.ai custom instructions:
+The [server instructions](#server-instructions) already tell Claude to store durable facts as they come up, with no per-client setup. Capturing the *whole* conversation at the end of every session is a stronger, more opinionated behavior, so it stays opt-in — add this to your Claude Desktop or Claude.ai custom instructions if you want it:
 
 ```
 At the end of every conversation, use the remind_me_auto_capture tool to save:
@@ -1249,6 +1270,10 @@ remind_me is local-first, single-user, and MCP-native by design — some capabil
 ## Changelog
 
 See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for a per-version feature breakdown with PR references; this section summarizes the same history phase-by-phase.
+
+### 1.24.0 — 2026-08-01
+
+Closes the gap that made remind_me's behaviour depend on prose the user pasted into each client by hand: the server now ships **instructions** in its MCP `initialize` response (when to retrieve, when to store, when to send feedback, and that batch tools are operator workflows), and exposes the six multi-step maintenance loops as **MCP prompts** so their sequencing lives in the server rather than the README. Additive only — no schema, tool-signature, or wire-format change.
 
 ### 1.23.0 — 2026-07-31
 

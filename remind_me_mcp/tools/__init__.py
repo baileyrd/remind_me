@@ -15,6 +15,7 @@ Formerly a single ~2000-line module; split into submodules (HY-02):
   - ``lifecycle`` — vitality_report / reclassify(+batch) / consolidate
   - ``wiki``      — LLM Wiki: page read/write/list/search/load/delete + compile (FT-08)
   - ``admin``     — stats / reindex / server_status / updates / imports / resources
+  - ``prompts``   — MCP prompts driving the multi-step maintenance loops
 
 Import compatibility: every name the old ``remind_me_mcp.tools`` module
 exposed (public and underscore-prefixed) is re-exported here, so both
@@ -98,11 +99,21 @@ from remind_me_mcp.retrieval import (
 )
 from remind_me_mcp.server import mcp
 
-# Importing the submodules runs their @mcp.tool/@mcp.resource decorators,
-# registering every handler on the shared FastMCP instance. These imports
-# must come after the shared-state imports above so the package namespace is
-# fully populated before any handler can run.
-from remind_me_mcp.tools import admin, capture, crud, entity, lifecycle, normalize, search, wiki
+# Importing the submodules runs their @mcp.tool/@mcp.resource/@mcp.prompt
+# decorators, registering every handler on the shared FastMCP instance. These
+# imports must come after the shared-state imports above so the package
+# namespace is fully populated before any handler can run.
+from remind_me_mcp.tools import (
+    admin,
+    capture,
+    crud,
+    entity,
+    lifecycle,
+    normalize,
+    prompts,
+    search,
+    wiki,
+)
 from remind_me_mcp.tools._shared import (
     FTS_SANITIZE_FALLBACK,
     _background_tasks,
@@ -161,6 +172,14 @@ from remind_me_mcp.tools.lifecycle import (
 from remind_me_mcp.tools.normalize import (
     remind_me_normalize_apply,
     remind_me_normalize_batch,
+)
+from remind_me_mcp.tools.prompts import (
+    backfill_graph,
+    classify_memories,
+    compile_wiki,
+    consolidate_duplicates,
+    decompose_facts,
+    normalize_imports,
 )
 from remind_me_mcp.tools.search import (
     _STRUCTURED_PATTERN,
@@ -254,4 +273,10 @@ __all__ = [
     "resource_categories",
     "resource_wiki_schema",
     "resource_wiki_index",
+    "decompose_facts",
+    "normalize_imports",
+    "backfill_graph",
+    "classify_memories",
+    "compile_wiki",
+    "consolidate_duplicates",
 ]
