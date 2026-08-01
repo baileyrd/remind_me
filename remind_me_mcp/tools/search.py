@@ -33,7 +33,12 @@ from remind_me_mcp.retrieval import (
     resolve_strategy_weights,
 )
 from remind_me_mcp.server import mcp
-from remind_me_mcp.tools._shared import _maybe_update_notice, _public_memory, log
+from remind_me_mcp.tools._shared import (
+    _maybe_maintenance_notice,
+    _maybe_update_notice,
+    _public_memory,
+    log,
+)
 from remind_me_mcp.vitality import effective_vitality, is_dormant
 
 # ---------------------------------------------------------------------------
@@ -662,7 +667,7 @@ async def memory_search(params: MemorySearchInput) -> str:
                 parts.append(_fmt_neighbor_expansion_md(related_neighbors))
             if related_co_retrieval:
                 parts.append(_fmt_co_retrieval_expansion_md(related_co_retrieval))
-            return _maybe_update_notice("\n---\n".join(parts))
+            return _maybe_maintenance_notice(_maybe_update_notice("\n---\n".join(parts)))
 
         # Structured query detected but no results -- fall through to normal search
         # Strip structured prefixes from query before passing to FTS
@@ -933,7 +938,7 @@ async def memory_search(params: MemorySearchInput) -> str:
         f"| {dormant_excluded} dormant excluded_"
     )
 
-    return _maybe_update_notice("\n---\n".join(parts))
+    return _maybe_maintenance_notice(_maybe_update_notice("\n---\n".join(parts)))
 
 
 # ---------------------------------------------------------------------------

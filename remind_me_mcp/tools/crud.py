@@ -25,7 +25,7 @@ from remind_me_mcp.models import (  # noqa: TC001  # FastMCP resolves these anno
     MemoryUpdateInput,
 )
 from remind_me_mcp.server import mcp
-from remind_me_mcp.tools._shared import _maybe_update_notice, log
+from remind_me_mcp.tools._shared import _maybe_maintenance_notice, _maybe_update_notice, log
 from remind_me_mcp.vitality import seed_base_weight
 
 
@@ -115,7 +115,7 @@ async def memory_add(params: MemoryAddInput) -> str:
             "clear_superseded=true to un-hide it, then re-add this fact with a distinct "
             "predicate."
         )
-    return _maybe_update_notice(msg)
+    return _maybe_maintenance_notice(_maybe_update_notice(msg))
 
 
 @mcp.tool(

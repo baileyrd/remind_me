@@ -27,6 +27,7 @@ import json
 from remind_me_mcp import tools as _pkg
 from remind_me_mcp.config import CLIENT, NODE_ID
 from remind_me_mcp.db import _make_id, _now_iso
+from remind_me_mcp.maintenance import UNNORMALIZED_WHERE
 from remind_me_mcp.models import (  # noqa: TC001  # FastMCP resolves these annotations at runtime for tool schemas
     NormalizeApplyInput,
     NormalizeBatchInput,
@@ -36,17 +37,11 @@ from remind_me_mcp.server import mcp
 NORMALIZED_CATEGORY = "normalized"
 """``memories.category`` assigned to memories created by remind_me_normalize_apply."""
 
-# Raw imports eligible for normalization: not superseded, from the file
-# import pipeline (document_import/chat_import — FT-02), and not already
-# normalized (no existing memory points back at it via normalized_from).
-_UNNORMALIZED_WHERE = """
-    m.superseded_by IS NULL
-    AND m.deleted_at IS NULL
-    AND m.source IN ('document_import', 'chat_import')
-    AND NOT EXISTS (
-        SELECT 1 FROM memories n WHERE json_extract(n.metadata, '$.normalized_from') = m.id
-    )
-"""
+# Defined in maintenance.py, not here: the maintenance nudge counts this same
+# queue, and a second copy of the clause would let the count Claude is shown
+# drift from the batch this tool actually returns. Re-bound under the old
+# private name so existing importers and monkeypatches keep working.
+_UNNORMALIZED_WHERE = UNNORMALIZED_WHERE
 
 
 @mcp.tool(

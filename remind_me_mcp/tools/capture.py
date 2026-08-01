@@ -17,6 +17,7 @@ from remind_me_mcp import tools as _pkg
 from remind_me_mcp.config import CLIENT, NODE_ID
 from remind_me_mcp.db import _make_id, _now_iso, _row_to_dict
 from remind_me_mcp.formatting import _fmt_memory_md
+from remind_me_mcp.maintenance import UNANNOTATED_WHERE, UNDECOMPOSED_WHERE
 from remind_me_mcp.models import (  # noqa: TC001  # FastMCP resolves these annotations at runtime for tool schemas
     AnnotateInput,
     AutoCaptureInput,
@@ -454,27 +455,20 @@ async def remind_me_decompose_batch(params: DecomposeBatchInput) -> str:
     """
     db = _pkg._get_db()
 
-    # Count total undecomposed captures
+    # Count total undecomposed captures. The clause is shared with the
+    # maintenance nudge (maintenance.UNDECOMPOSED_WHERE) so the backlog Claude
+    # is nudged about is exactly the backlog this tool would hand back.
     total_row = db.execute(
-        """SELECT COUNT(*) as cnt FROM memories m
-           WHERE m.capture_id IS NOT NULL
-             AND m.source_capture_id IS NULL
-             AND NOT EXISTS (
-                 SELECT 1 FROM memories c WHERE c.source_capture_id = m.capture_id
-             )""",
+        f"SELECT COUNT(*) as cnt FROM memories m WHERE {UNDECOMPOSED_WHERE}"  # noqa: S608 — module constant, no user input
     ).fetchone()
     total_undecomposed = total_row["cnt"]
 
     # Fetch batch
     rows = db.execute(
-        """SELECT id, substr(content, 1, 500) as content_snippet, category, tags, capture_id
+        f"""SELECT id, substr(content, 1, 500) as content_snippet, category, tags, capture_id
            FROM memories m
-           WHERE m.capture_id IS NOT NULL
-             AND m.source_capture_id IS NULL
-             AND NOT EXISTS (
-                 SELECT 1 FROM memories c WHERE c.source_capture_id = m.capture_id
-             )
-           LIMIT ?""",
+           WHERE {UNDECOMPOSED_WHERE}
+           LIMIT ?""",  # noqa: S608 — module constant, no user input
         (params.batch_size,),
     ).fetchall()
 
@@ -505,19 +499,11 @@ async def remind_me_decompose_batch(params: DecomposeBatchInput) -> str:
 # Entity & relation extraction tools (FT-04)
 # ---------------------------------------------------------------------------
 
-# Memories eligible for entity/SPO annotation: not superseded, not raw
-# verbatim dialogs (annotate the summary/facts instead), and not yet
-# annotated — no SPO triple AND no entity mentions. A category='fact' row
-# that already has SPO is excluded by the subject/predicate/object check.
-_UNANNOTATED_WHERE = """
-    m.superseded_by IS NULL
-    AND m.deleted_at IS NULL
-    AND m.category != 'dialog'
-    AND m.subject IS NULL AND m.predicate IS NULL AND m.object IS NULL
-    AND NOT EXISTS (
-        SELECT 1 FROM memory_entities me WHERE me.memory_id = m.id
-    )
-"""
+# Defined in maintenance.py, not here: the maintenance nudge counts this same
+# queue, and a second copy of the clause would let the count Claude is shown
+# drift from the batch this tool actually returns. Re-bound under the old
+# private name so existing importers and monkeypatches keep working.
+_UNANNOTATED_WHERE = UNANNOTATED_WHERE
 
 
 @mcp.tool(
