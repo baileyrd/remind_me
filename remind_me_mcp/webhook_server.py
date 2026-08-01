@@ -51,6 +51,13 @@ _ERROR_HISTORY = 10
 
 
 class WebhookHandler(BaseHTTPRequestHandler):
+    # See peer_server.PeerHandler.timeout (issue #142) -- without this,
+    # socketserver never applies a socket timeout, so a client that sends a
+    # Content-Length header and stops writing the body parks the handler
+    # thread in self.rfile.read(length) forever. Reachable pre-auth here:
+    # the 401 branch still calls _drain_body() first, which is that same
+    # blocking read.
+    timeout = 30
 
     def log_message(self, format, *args):
         log.debug(format, *args)
@@ -126,16 +133,29 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": error})
             return
 
-        with maybe_span("webhook.ingest", filename=payload["filename"]):
-            result = import_content(
-                content=payload["content"].encode("utf-8"),
-                filename=payload["filename"],
-                category=payload.get("category", "chat_import"),
-                tags=payload.get("tags", []),
-                extract_mode=payload.get("extract_mode", "assistant_messages"),
-                max_length=payload.get("max_length", 10000),
-                kind=payload.get("kind", "auto"),
-            )
+        try:
+            with maybe_span("webhook.ingest", filename=payload["filename"]):
+                result = import_content(
+                    content=payload["content"].encode("utf-8"),
+                    filename=payload["filename"],
+                    category=payload.get("category", "chat_import"),
+                    tags=payload.get("tags", []),
+                    extract_mode=payload.get("extract_mode", "assistant_messages"),
+                    max_length=payload.get("max_length", 10000),
+                    kind=payload.get("kind", "auto"),
+                )
+        except Exception as e:
+            # issue #141: an uncaught exception here previously escaped to
+            # socketserver's default handling -- no HTTP response at all
+            # (the client sees a connection reset, not a 5xx), and
+            # _record_result was never called, so the failure was
+            # completely invisible in remind_me_webhook_status. A push
+            # failure must be visible in both places, same as every other
+            # error path in this handler.
+            log.warning("Webhook ingest failed for %s", payload.get("filename"), exc_info=True)
+            _record_result("errored", str(e))
+            self._send_json(500, {"error": "internal error processing ingest"})
+            return
 
         status = result.get("status")
         if status in ("ok", "skipped"):

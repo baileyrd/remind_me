@@ -95,18 +95,31 @@ def _mempalace_connector(
 register_connector("mempalace", _mempalace_connector)
 
 
-def _open_collection() -> Any:
-    """Open MemPalace's ChromaDB collection read-only.
+def _open_collection() -> tuple[Any, Any]:
+    """Open MemPalace's ChromaDB collection.
 
     Raises ImportError if chromadb isn't installed, FileNotFoundError if no
     palace exists at MEMPALACE_PATH.
+
+    Note: despite this module treating the access as read-only, chromadb's
+    PersistentClient will create or migrate the on-disk store on open if its
+    layout/version doesn't already match what this chromadb version expects
+    -- "read-only" describes intent (this module never calls an add/update/
+    delete method), not a guarantee chromadb itself enforces.
+
+    Returns:
+        ``(client, collection)`` -- the caller owns the client and must
+        close it (issue #146: a client opens its own SQLite handle and
+        background threads that nothing previously closed, leaking one per
+        call; on Windows the retained file handle can also block MemPalace's
+        own store from compacting or being deleted while it's alive).
     """
     import chromadb  # optional dependency (extras: mempalace)
 
     if not MEMPALACE_PATH.exists():
         raise FileNotFoundError(f"No MemPalace store found at {MEMPALACE_PATH}")
     client = chromadb.PersistentClient(path=str(MEMPALACE_PATH))
-    return client.get_collection(COLLECTION_NAME)
+    return client, client.get_collection(COLLECTION_NAME)
 
 
 def pull_mempalace(
@@ -135,51 +148,65 @@ def pull_mempalace(
     elif room:
         where = {"room": room}
 
-    collection = _open_collection()
-    got = collection.get(where=where, limit=limit, offset=offset, include=["documents", "metadatas"])
+    client, collection = _open_collection()
+    try:
+        got = collection.get(
+            where=where, limit=limit, offset=offset, include=["documents", "metadatas"]
+        )
+    finally:
+        client.close()
     drawer_ids: list[str] = got["ids"]
     documents: list[str] = got["documents"]
     metadatas: list[dict[str, Any]] = got["metadatas"]
 
     db = _get_db()
     fetched = len(drawer_ids)
-    already: set[str] = set()
-    if drawer_ids:
-        placeholders = ",".join("?" for _ in drawer_ids)
-        rows = db.execute(
-            f"SELECT drawer_id FROM mempalace_imports WHERE drawer_id IN ({placeholders})",
-            drawer_ids,
-        ).fetchall()
-        already = {row["drawer_id"] for row in rows}
-
-    to_import = [
-        (did, doc or "", meta or {})
-        for did, doc, meta in zip(drawer_ids, documents, metadatas, strict=True)
-        if did not in already
-    ]
-    native_count = sum(1 for _, doc, _ in to_import if _parse_frontmatter(doc))
-
-    result: dict[str, Any] = {
-        "wing": wing or None,
-        "room": room or None,
-        "fetched": fetched,
-        "already_imported": len(already),
-        "to_import": len(to_import),
-        "native_format": native_count,
-        "opaque_format": len(to_import) - native_count,
-        "offset": offset,
-        "limit": limit,
-        "has_more": fetched == limit,
-    }
-    if dry_run:
-        result["imported"] = 0
-        return result
-
     extra_tags = tags or []
     now = _now_iso()
     embed_entries: list[tuple[str, str]] = []
 
+    # issue #136 (mirrors dbs_import.py's SEC-10 fix): the dedup lookup and
+    # the created/updated writes below share one lock acquisition. Reading
+    # "already imported" outside the lock let two concurrent/retried calls
+    # both observe "not yet imported" for the same drawer before either had
+    # written it -- with _make_id's wall-clock-salted ids, each call minted
+    # a *different* memory id and both INSERT OR IGNOREs succeeded, leaving
+    # a permanent orphan duplicate memory that mempalace_imports'
+    # (drawer_id) row -- INSERT OR IGNORE, so only the first writer's row
+    # survives -- never caught on the tracking side.
     with _import_lock:
+        already: set[str] = set()
+        if drawer_ids:
+            placeholders = ",".join("?" for _ in drawer_ids)
+            rows = db.execute(
+                f"SELECT drawer_id FROM mempalace_imports WHERE drawer_id IN ({placeholders})",
+                drawer_ids,
+            ).fetchall()
+            already = {row["drawer_id"] for row in rows}
+
+        to_import = [
+            (did, doc or "", meta or {})
+            for did, doc, meta in zip(drawer_ids, documents, metadatas, strict=True)
+            if did not in already
+        ]
+        native_count = sum(1 for _, doc, _ in to_import if _parse_frontmatter(doc))
+
+        result: dict[str, Any] = {
+            "wing": wing or None,
+            "room": room or None,
+            "fetched": fetched,
+            "already_imported": len(already),
+            "to_import": len(to_import),
+            "native_format": native_count,
+            "opaque_format": len(to_import) - native_count,
+            "offset": offset,
+            "limit": limit,
+            "has_more": fetched == limit,
+        }
+        if dry_run:
+            result["imported"] = 0
+            return result
+
         for drawer_id, doc, meta in to_import:
             parsed = _parse_frontmatter(doc)
             wing_val = meta.get("wing", wing) or ""

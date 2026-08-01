@@ -52,6 +52,7 @@ import hmac
 import html
 import json
 import logging
+import os
 import secrets
 import threading
 import time
@@ -151,13 +152,34 @@ class OAuthStateStore:
         return {key: dict(raw.get(key) or {}) for key in _EMPTY_STATE}
 
     def _write(self, state: dict[str, dict[str, Any]]) -> None:
-        """Persist state with 0600 permissions (token-file conventions, SE-01)."""
+        """Persist state with 0600 permissions (token-file conventions, SE-01).
+
+        Writes to a sibling temp file and ``os.replace``s it into place
+        (atomic on both POSIX and Windows) instead of truncating ``self.path``
+        in place. An in-place write left a crash or power loss mid-write as a
+        truncated/invalid JSON file; ``_read`` treats any unparseable file as
+        *empty* state, so the very next write (e.g. the next ``put_token``)
+        would have persisted that empty state over the corruption --
+        permanently deleting every registered client and issued token from a
+        single interrupted write. ``os.replace`` guarantees a reader (or a
+        crash) only ever sees the old complete file or the new complete file,
+        never a partial one.
+
+        Raises:
+            OSError: if the write genuinely fails (disk full, permissions,
+                etc.) -- propagated rather than swallowed, so a caller like
+                ``put_token`` cannot report success (and hand out a token)
+                for a write that never actually landed.
+        """
+        tmp_path = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
         try:
-            self.path.touch(mode=0o600, exist_ok=True)
-            self.path.chmod(0o600)
-            self.path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
-        except OSError as exc:
-            log.error("Could not persist OAuth state at %s: %s", self.path, exc)
+            tmp_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+            tmp_path.chmod(0o600)
+            os.replace(tmp_path, self.path)
+        except OSError:
+            tmp_path.unlink(missing_ok=True)
+            log.error("Could not persist OAuth state at %s", self.path, exc_info=True)
+            raise
 
     # -- clients ------------------------------------------------------------
 

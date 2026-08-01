@@ -54,6 +54,11 @@ MEMORY_DIR = Path(os.environ.get("REMIND_ME_MCP_DIR", "~/.remind-me")).expanduse
 DB_PATH = MEMORY_DIR / "memory.db"
 IMPORT_LOG = MEMORY_DIR / "import_log.json"
 PID_FILE = MEMORY_DIR / "server.pid"
+# Separate from PID_FILE (which only ever tracked the UI dashboard server):
+# nothing previously stopped two `--serve-mcp` processes from running
+# against the same DB file concurrently — each with its own sync thread,
+# watcher, etc. racing the other (issue #126).
+MCP_PID_FILE = MEMORY_DIR / "mcp_server.pid"
 
 # Ensure the memory directory exists on import
 MEMORY_DIR.mkdir(parents=True, exist_ok=True)
@@ -487,6 +492,7 @@ __all__ = [
     "DB_PATH",
     "IMPORT_LOG",
     "PID_FILE",
+    "MCP_PID_FILE",
     "WIKI_DIR",
     "WIKI_LOAD_TOKEN_BUDGET",
     "MEMPALACE_PATH",

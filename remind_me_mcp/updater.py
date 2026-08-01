@@ -177,7 +177,12 @@ def _get_origin_url(repo_path: Path) -> str:
             timeout=10,
             check=True,
         ).stdout.strip()
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        # OSError (not just FileNotFoundError): an invalid cwd raises
+        # FileNotFoundError on POSIX but NotADirectoryError on Windows --
+        # siblings under OSError, not a subclass relationship, so narrowly
+        # catching FileNotFoundError alone let this raise uncaught on
+        # Windows whenever repo_path didn't exist.
         return ""
 
 
@@ -350,7 +355,10 @@ def check_for_update() -> UpdateStatus:
 
     try:
         _run_git("fetch", "origin", "--quiet", repo_path=repo)
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        # OSError, not just FileNotFoundError -- see _get_origin_url's note:
+        # an invalid repo_path raises NotADirectoryError on Windows, which
+        # FileNotFoundError alone does not catch.
         return UpdateStatus(
             installed_version=__version__,
             local_commit="",

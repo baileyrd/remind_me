@@ -267,9 +267,15 @@ def pull_dbs(
                 _link_memory_entity(db, mem_id, tag_entity_id, now=now)
 
             if prior is not None:
+                # updated_at must move too (issue #135), mirroring
+                # watcher._supersede_import: peer sync pulls on
+                # `updated_at > cursor`, so a supersession that leaves
+                # updated_at untouched is invisible to every other node's
+                # pull -- the stale, now-superseded memory keeps surfacing
+                # in search on every device except the one that imported.
                 db.execute(
-                    "UPDATE memories SET superseded_by = ? WHERE id = ?",
-                    (mem_id, prior["memory_id"]),
+                    "UPDATE memories SET superseded_by = ?, updated_at = ? WHERE id = ?",
+                    (mem_id, now, prior["memory_id"]),
                 )
                 updated += 1
             else:

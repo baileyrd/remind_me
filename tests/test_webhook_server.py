@@ -87,6 +87,21 @@ def chat_payload(**overrides) -> dict:
     return base
 
 
+def test_webhook_handler_declares_a_socket_timeout() -> None:
+    """Regression guard for issue #142.
+
+    socketserver only calls settimeout() on the accepted socket when the
+    handler class declares a `timeout` class attribute -- BaseHTTPRequestHandler
+    defaults it to None (no timeout), which lets a client that sends a
+    Content-Length header and never finishes the body park the handler
+    thread in self.rfile.read(length) forever. Reachable pre-auth here: the
+    401 branch still calls _drain_body() first, which is that same
+    blocking read.
+    """
+    assert webhook_server.WebhookHandler.timeout is not None
+    assert webhook_server.WebhookHandler.timeout > 0
+
+
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
@@ -202,6 +217,33 @@ def test_ingest_updates_status_counters(webhook_url: str) -> None:
     assert status["requests_ingested"] == 1
     assert status["requests_skipped"] == 1
     assert status["requests_errored"] == 0
+
+
+def test_ingest_unexpected_exception_returns_500_and_is_recorded(
+    webhook_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression guard for issue #141.
+
+    do_POST previously had no exception guard around import_content: an
+    uncaught error escaped to socketserver's default handling (no HTTP
+    response at all -- the client saw a connection reset, not a 5xx) and
+    _record_result was never called, so the failure was completely invisible
+    in remind_me_webhook_status. A genuinely unexpected failure must now
+    produce an actual HTTP response and show up in the status counters,
+    exactly like every other error path in this handler.
+    """
+    def boom(*a, **kw):
+        raise RuntimeError("embedding backend unreachable")
+
+    monkeypatch.setattr(webhook_server, "import_content", boom)
+
+    resp = httpx.post(f"{webhook_url}/ingest", json=chat_payload(), headers=AUTH)
+
+    assert resp.status_code == 500
+
+    status = webhook_server.get_webhook_status()
+    assert status["requests_errored"] == 1
+    assert status["requests_ingested"] == 0
 
 
 # ---------------------------------------------------------------------------

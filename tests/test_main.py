@@ -245,6 +245,7 @@ def test_serve_mcp_standalone(monkeypatch: pytest.MonkeyPatch) -> None:
     on the installed SDK); the bind address must go through mcp.settings.
     """
     calls: list[dict] = []
+    monkeypatch.setattr(main_mod, "_acquire_mcp_lock", lambda host, port: None)
     monkeypatch.setattr(main_mod.mcp, "run", lambda *a, **kw: calls.append(kw))
     monkeypatch.setattr(main_mod.mcp.settings, "host", "sentinel-host")
     monkeypatch.setattr(main_mod.mcp.settings, "port", -1)
@@ -261,6 +262,7 @@ def test_serve_mcp_default_host_port(monkeypatch: pytest.MonkeyPatch) -> None:
     from remind_me_mcp.config import MCP_HTTP_HOST, MCP_HTTP_PORT
 
     calls: list[dict] = []
+    monkeypatch.setattr(main_mod, "_acquire_mcp_lock", lambda host, port: None)
     monkeypatch.setattr(main_mod.mcp, "run", lambda *a, **kw: calls.append(kw))
     monkeypatch.setattr(main_mod.mcp.settings, "host", "sentinel-host")
     monkeypatch.setattr(main_mod.mcp.settings, "port", -1)
@@ -270,6 +272,96 @@ def test_serve_mcp_default_host_port(monkeypatch: pytest.MonkeyPatch) -> None:
     assert calls == [{"transport": "streamable-http"}]
     assert main_mod.mcp.settings.host == MCP_HTTP_HOST
     assert main_mod.mcp.settings.port == MCP_HTTP_PORT
+
+
+# ---------------------------------------------------------------------------
+# _acquire_mcp_lock — single-instance guard for --serve-mcp (issue #126)
+# ---------------------------------------------------------------------------
+
+
+def test_acquire_mcp_lock_refuses_when_already_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live PID under MCP_PID_FILE must exit 1 before any heavy startup runs."""
+    monkeypatch.setattr(
+        main_mod,
+        "_read_pid_file",
+        lambda path=None: {"pid": 4242, "started_at": "2026-01-01T00:00:00+00:00"},
+    )
+    monkeypatch.setattr(
+        main_mod, "_write_pid_file", lambda *a, **kw: pytest.fail("must not write a new PID file")
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        main_mod._acquire_mcp_lock("127.0.0.1", 8767)
+    assert excinfo.value.code == 1
+
+
+def test_acquire_mcp_lock_writes_pid_and_registers_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No existing instance: writes the PID file and registers signal cleanup."""
+    from remind_me_mcp.config import MCP_PID_FILE
+
+    pid_writes: list[tuple] = []
+    handlers: dict[int, Any] = {}
+    monkeypatch.setattr(main_mod, "_read_pid_file", lambda path=None: None)
+    monkeypatch.setattr(
+        main_mod,
+        "_write_pid_file",
+        lambda host, port, path=None: pid_writes.append((host, port, path)),
+    )
+    monkeypatch.setattr(signal, "signal", lambda signum, handler: handlers.setdefault(signum, handler))
+    monkeypatch.setattr("atexit.register", lambda fn, *a: None)
+
+    main_mod._acquire_mcp_lock("127.0.0.1", 8767)
+
+    assert pid_writes == [("127.0.0.1", 8767, MCP_PID_FILE)]
+    assert signal.SIGTERM in handlers
+    assert signal.SIGINT in handlers
+
+
+def test_acquire_mcp_lock_signal_handler_cleans_pid(monkeypatch: pytest.MonkeyPatch) -> None:
+    from remind_me_mcp.config import MCP_PID_FILE
+
+    removed: list[Any] = []
+    handlers: dict[int, Any] = {}
+    monkeypatch.setattr(main_mod, "_read_pid_file", lambda path=None: None)
+    monkeypatch.setattr(main_mod, "_write_pid_file", lambda *a, **kw: None)
+    monkeypatch.setattr(main_mod, "_remove_pid_file", lambda path=None: removed.append(path))
+    monkeypatch.setattr(signal, "signal", lambda signum, handler: handlers.setdefault(signum, handler))
+    monkeypatch.setattr("atexit.register", lambda fn, *a: None)
+
+    main_mod._acquire_mcp_lock("127.0.0.1", 8767)
+
+    with pytest.raises(SystemExit) as excinfo:
+        handlers[signal.SIGTERM](signal.SIGTERM, None)
+    assert excinfo.value.code == 0
+    assert removed == [MCP_PID_FILE]
+
+
+def test_acquire_mcp_lock_uses_its_own_pid_file_not_the_ui_dashboards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MCP_PID_FILE must be distinct from PID_FILE (issue #126): otherwise a
+    running dashboard would falsely block --serve-mcp from starting, and
+    vice versa — the two are independent processes with independent
+    lifecycles."""
+    from remind_me_mcp.config import MCP_PID_FILE, PID_FILE
+
+    assert MCP_PID_FILE != PID_FILE
+
+    seen_paths: list[Any] = []
+    monkeypatch.setattr(
+        main_mod, "_read_pid_file", lambda path=None: seen_paths.append(path) or None
+    )
+    monkeypatch.setattr(main_mod, "_write_pid_file", lambda *a, **kw: None)
+    monkeypatch.setattr(signal, "signal", lambda signum, handler: None)
+    monkeypatch.setattr("atexit.register", lambda fn, *a: None)
+
+    main_mod._acquire_mcp_lock("127.0.0.1", 8767)
+
+    assert seen_paths == [MCP_PID_FILE]
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +471,7 @@ def test_run_combined_mounts_mcp_and_dashboard(monkeypatch: pytest.MonkeyPatch) 
     import remind_me_mcp.config as cfg
 
     uvicorn_calls: list[dict] = []
+    monkeypatch.setattr(main_mod, "_acquire_mcp_lock", lambda host, port: None)
     monkeypatch.setattr(cfg, "MCP_HTTP_SECRET", "s3cret")
     monkeypatch.setattr(uvicorn, "run", lambda app, **kw: uvicorn_calls.append({"app": app, **kw}))
 
@@ -401,6 +494,7 @@ def test_run_combined_bearer_auth_rejects_unauthorized(monkeypatch: pytest.Monke
     import remind_me_mcp.config as cfg
 
     captured: list[Any] = []
+    monkeypatch.setattr(main_mod, "_acquire_mcp_lock", lambda host, port: None)
     monkeypatch.setattr(cfg, "MCP_HTTP_SECRET", "s3cret")
     monkeypatch.setattr(uvicorn, "run", lambda app, **kw: captured.append(app))
 

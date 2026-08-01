@@ -85,6 +85,48 @@ def test_pending_counts_survives_a_broken_database() -> None:
     broken.close()
 
 
+def test_unnormalized_and_unannotated_queries_use_an_index_seek(
+    db_conn: sqlite3.Connection,
+) -> None:
+    """Regression guard for the correlated-subquery hang (issue #120).
+
+    ``UNNORMALIZED_WHERE`` used to spell its "not already normalized" check as
+    a correlated ``NOT EXISTS`` over ``json_extract(metadata, ...)``. With no
+    usable index, SQLite resolved it as a per-row table SCAN instead of a
+    SEARCH — invisible on the handful of rows any of these tests seed, but an
+    O(n*m) hang on a real ~60K-row store that pegged a CPU core for minutes.
+
+    ``EXPLAIN QUERY PLAN`` catches the plan *shape* regardless of row count,
+    so this fails immediately if either WHERE clause regresses back to a
+    non-indexed correlated scan, without needing to seed thousands of rows.
+    A ``SCAN`` is only acceptable when it runs *once* to materialize a
+    non-correlated ``LIST SUBQUERY`` (the ``NOT IN`` rewrite's one-time set
+    build) rather than once per outer row under a ``CORRELATED`` subquery.
+    """
+    for where in (maintenance.UNNORMALIZED_WHERE, maintenance.UNANNOTATED_WHERE):
+        plan = db_conn.execute(
+            f"EXPLAIN QUERY PLAN SELECT COUNT(*) FROM memories m WHERE {where}"
+        ).fetchall()
+        by_id = {row[0]: row for row in plan}
+
+        def _is_under_correlated_subquery(node_id: int, by_id: dict = by_id) -> bool:
+            node = by_id.get(node_id)
+            while node is not None:
+                if "CORRELATED" in node[3].upper():
+                    return True
+                node = by_id.get(node[1])
+            return False
+
+        for row in plan:
+            detail = row[3].upper()
+            if detail.startswith("SCAN") and _is_under_correlated_subquery(row[1]):
+                pytest.fail(
+                    f"{where.strip()[:40]!r} resolved to a per-row table scan "
+                    f"under a correlated subquery — this is the O(n*m) shape "
+                    f"that caused issue #120: {detail}"
+                )
+
+
 def test_batch_tool_and_nudge_share_one_queue_definition() -> None:
     """The tools import their WHERE clauses from maintenance, not copies of them.
 
@@ -231,6 +273,40 @@ async def test_status_reports_maintenance_backlogs(db_conn: sqlite3.Connection) 
     _add_unclassified(db_conn, 4)
     populated = await remind_me_server_status()
     assert "unclassified memories" in populated
+
+
+# ---------------------------------------------------------------------------
+# Slow-call watchdog surfaced in status (#128)
+# ---------------------------------------------------------------------------
+
+
+async def test_status_reports_watchdog_armed(
+    db_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from remind_me_mcp import watchdog
+
+    monkeypatch.setattr(
+        watchdog,
+        "status",
+        lambda: {"enabled": True, "threshold_seconds": 30.0, "calls_in_flight": 1},
+    )
+    result = await remind_me_server_status()
+    assert "Slow-call watchdog:** ✓ armed at 30s" in result
+
+
+async def test_status_reports_watchdog_disabled(
+    db_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from remind_me_mcp import watchdog
+
+    monkeypatch.setattr(
+        watchdog,
+        "status",
+        lambda: {"enabled": False, "threshold_seconds": 0.0, "calls_in_flight": 0},
+    )
+    result = await remind_me_server_status()
+    assert "Slow-call watchdog:** ✗ disabled" in result
+    assert "REMIND_ME_SLOW_CALL_SECONDS" in result
 
 
 # ---------------------------------------------------------------------------

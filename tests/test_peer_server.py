@@ -119,6 +119,63 @@ def test_missing_secret_rejected(peer_url: str) -> None:
     assert resp.status_code == 401
 
 
+def test_peer_handler_declares_a_socket_timeout() -> None:
+    """Regression guard for issue #142: this is the actual fix.
+
+    socketserver only calls settimeout() on the accepted socket when the
+    handler class declares a `timeout` class attribute -- BaseHTTPRequestHandler
+    defaults it to None (no timeout). Asserted directly (not just exercised
+    functionally below) so reverting the attribute fails this test even if
+    a test's own setup happened to monkeypatch a timeout back in.
+    """
+    import remind_me_mcp.peer_server as peer_server_mod
+
+    assert peer_server_mod.PeerHandler.timeout is not None
+    assert peer_server_mod.PeerHandler.timeout > 0
+
+
+def test_slow_client_connection_is_eventually_closed_not_parked_forever(
+    peer_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mechanism sanity check for issue #142's fix: confirms that setting
+    `timeout` genuinely makes socketserver close a stalled connection,
+    rather than assuming settimeout() behaves as documented. Uses a short
+    timeout (monkeypatched) so the test itself stays fast rather than
+    waiting out the real 30s default -- the *presence* of the fix is
+    covered by test_peer_handler_declares_a_socket_timeout above, since
+    this monkeypatch would otherwise make the test pass even on a revert.
+    """
+    import socket
+    from urllib.parse import urlparse
+
+    import remind_me_mcp.peer_server as peer_server_mod
+
+    monkeypatch.setattr(peer_server_mod.PeerHandler, "timeout", 1)
+
+    parsed = urlparse(peer_url)
+    sock = socket.create_connection((parsed.hostname, parsed.port), timeout=10)
+    try:
+        # Announce a body, then never send it -- exactly the slowloris shape.
+        request = (
+            "POST /sync/push HTTP/1.1\r\n"
+            f"Host: {parsed.hostname}\r\n"
+            "Authorization: Bearer test-secret\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: 10000\r\n"
+            "\r\n"
+        )
+        sock.sendall(request.encode())
+
+        # With the timeout wired up, the server closes the connection once
+        # its own (short, monkeypatched) socket timeout elapses -- recv()
+        # returns b"" (EOF) rather than blocking forever.
+        sock.settimeout(5)
+        data = sock.recv(1024)
+        assert data == b""
+    finally:
+        sock.close()
+
+
 def test_wrong_secret_rejected(peer_url: str) -> None:
     resp = httpx.get(
         f"{peer_url}/health", headers={"Authorization": "Bearer wrong"}

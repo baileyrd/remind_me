@@ -81,19 +81,61 @@ def _job():
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000  # noqa: N806
     JobObjectExtendedLimitInformation = 9  # noqa: N806
     k32 = ctypes.windll.kernel32
+
+    # restype/argtypes must be declared explicitly (issue #138): ctypes
+    # defaults an undeclared restype to c_int, which truncates/sign-extends
+    # the 64-bit HANDLE CreateJobObjectW actually returns on 64-bit Python --
+    # the stored _job_handle could silently be wrong. SetInformationJobObject
+    # returns a BOOL (0 on failure); without argtypes/restype declared,
+    # ctypes can't marshal the call correctly either, and either way the
+    # return value was never checked, so a failed job-object setup was
+    # invisible.
+    k32.CreateJobObjectW.restype = wintypes.HANDLE
+    k32.CreateJobObjectW.argtypes = (wintypes.LPVOID, wintypes.LPCWSTR)
+    k32.SetInformationJobObject.restype = wintypes.BOOL
+    k32.SetInformationJobObject.argtypes = (
+        wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD,
+    )
+
     h = k32.CreateJobObjectW(None, None)
+    if not h:
+        log.warning(
+            "CreateJobObjectW failed (GetLastError=%d) -- sidecars will not "
+            "be killed automatically if this process exits abnormally",
+            ctypes.GetLastError(),
+        )
+        return None
+
     info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
     info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-    k32.SetInformationJobObject(h, JobObjectExtendedLimitInformation,
-                                ctypes.byref(info), ctypes.sizeof(info))
+    ok = k32.SetInformationJobObject(
+        h, JobObjectExtendedLimitInformation, ctypes.byref(info), ctypes.sizeof(info)
+    )
+    if not ok:
+        log.warning(
+            "SetInformationJobObject failed (GetLastError=%d) -- "
+            "KILL_ON_JOB_CLOSE not set; sidecars may outlive this process",
+            ctypes.GetLastError(),
+        )
     _job_handle = h
     return h
 
 
 def _spawn(name: str, cmd: list[str], env: dict | None = None) -> None:
     prev = _procs.get(name)
-    if prev is not None and prev.poll() is None:
-        return  # still starting up / running
+    if prev is not None:
+        if prev.poll() is None:
+            return  # still starting up / running
+        # Exited since the last check (issue #139): reap it and close its
+        # stderr pipe now. Without this, a persistently-failing sidecar
+        # (bad SSH key, unreachable host) leaks one zombie process (POSIX)
+        # or pipe handle + dead drain thread (Windows) every time
+        # ensure_sidecars respawns it -- which happens every SYNC_INTERVAL,
+        # forever, for as long as the misconfiguration persists.
+        prev.wait()
+        if prev.stderr is not None:
+            prev.stderr.close()
+        _procs.pop(name, None)
     # Claude Desktop launches MCP servers with a minimal env. Windows OpenSSH
     # exits 255 with no output if ProgramData is unset, so repair the basics.
     full_env = dict(os.environ if env is None else env)
@@ -108,14 +150,38 @@ def _spawn(name: str, cmd: list[str], env: dict | None = None) -> None:
     )
 
     def _drain(p=proc, n=name):
-        for line in iter(p.stderr.readline, b""):
-            log.info("Sidecar %s stderr: %s", n, line.decode(errors="replace").rstrip())
+        try:
+            for line in iter(p.stderr.readline, b""):
+                log.info("Sidecar %s stderr: %s", n, line.decode(errors="replace").rstrip())
+        finally:
+            # Closed here too (not just on the next _spawn's reap), so the
+            # pipe handle doesn't sit open for the whole gap between this
+            # process dying and the next ensure_sidecars tick noticing.
+            p.stderr.close()
 
     import threading
     threading.Thread(target=_drain, daemon=True, name=f"sidecar-{name}-stderr").start()
     if sys.platform == "win32":
         import ctypes
-        ctypes.windll.kernel32.AssignProcessToJobObject(_job(), int(proc._handle))
+        from ctypes import wintypes
+
+        job = _job()
+        if job is not None:
+            k32 = ctypes.windll.kernel32
+            k32.AssignProcessToJobObject.restype = wintypes.BOOL
+            k32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+            if not k32.AssignProcessToJobObject(job, int(proc._handle)):
+                # Most commonly: this process is already inside a job object
+                # without JOB_OBJECT_LIMIT_BREAKAWAY_OK (issue #138) -- the
+                # sidecar starts fine but won't be force-killed if this
+                # server exits abnormally. Previously silent either way.
+                log.warning(
+                    "AssignProcessToJobObject failed for sidecar %s "
+                    "(GetLastError=%d) -- it will not be auto-killed if "
+                    "this process exits abnormally",
+                    name,
+                    ctypes.GetLastError(),
+                )
     _procs[name] = proc
     log.info("Sidecar %s started (pid %d)", name, proc.pid)
 

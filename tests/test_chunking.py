@@ -277,6 +277,52 @@ def test_failed_embed_rolls_back_chunk_deletes(
     assert after == before
 
 
+class _NetworkFailureEmbedder:
+    """Stands in for OllamaEmbedder losing its backend mid-batch: embed()
+    raises an httpx error rather than returning bad vectors."""
+
+    def embed(self, texts, *, role="passage"):
+        import httpx
+
+        raise httpx.ConnectError("Ollama backend unreachable")
+
+    def embed_one(self, text, *, role="passage"):
+        return self.embed([text], role=role)
+
+
+def test_embed_network_failure_is_caught_not_propagated(
+    db_conn_with_vec: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression guard for issue #143.
+
+    _embed_and_store_batch's except clauses only covered
+    (sqlite3.DatabaseError, sqlite3.InterfaceError) and (ValueError,
+    TypeError) -- not httpx errors from a network-backed embedder
+    (OllamaEmbedder). A backend restart mid-import (the availability cache
+    still reports the embedder as live for a while after it actually went
+    down) raised uncaught out of a boundary explicitly documented as
+    "any failure here is healed later by remind_me_reindex".
+    """
+    import remind_me_mcp.db as db_mod
+
+    content = "network failure test memory with enough text to embed"
+    mem_id = _insert_memory(db_conn_with_vec, content)
+    rowid = db_conn_with_vec.execute(
+        "SELECT rowid FROM memories WHERE id = ?", (mem_id,)
+    ).fetchone()[0]
+
+    monkeypatch.setattr(db_mod, "_get_embedder", lambda: _NetworkFailureEmbedder())
+
+    # Must return 0 (gracefully contained), not raise httpx.ConnectError.
+    assert _embed_and_store_rows([(rowid, content)]) == 0
+
+    # No partial/uncommitted chunk rows left behind either.
+    count = db_conn_with_vec.execute(
+        "SELECT COUNT(*) FROM vec_chunks WHERE memory_rowid = ?", (rowid,)
+    ).fetchone()[0]
+    assert count == 0
+
+
 # ---------------------------------------------------------------------------
 # Internal batching (issue #16): _embed_and_store_rows must never hand an
 # unbounded number of rows to one embed()/transaction, regardless of how

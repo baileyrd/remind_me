@@ -35,6 +35,16 @@ from remind_me_mcp.models import (
 from remind_me_mcp.server import mcp
 from remind_me_mcp.tools._shared import _maybe_update_notice, log
 
+try:
+    from chromadb.errors import NotFoundError as _ChromaNotFoundError
+
+    ChromaNotFoundError: tuple[type[BaseException], ...] = (_ChromaNotFoundError,)
+except ImportError:
+    # chromadb isn't installed -- nothing chromadb-specific can be raised
+    # from the mempalace import path below beyond the bare ImportError
+    # already handled there.
+    ChromaNotFoundError = ()
+
 
 @mcp.tool(
     name="remind_me_import_chat",
@@ -72,6 +82,14 @@ async def memory_import_chat(params: ChatImportInput) -> str:
         )
     except FileNotFoundError:
         return json.dumps({"status": "error", "error": f"File not found: {params.file_path}"})
+    except OSError as e:
+        # issue #144: FileNotFoundError alone missed PermissionError (a
+        # file locked by OneDrive sync/an AV scan/an open editor -- common
+        # on Windows), IsADirectoryError, and NotADirectoryError, all of
+        # which escaped as a raw traceback out of the tool call instead of
+        # this clean error response.
+        log.error("Import file access error for %s: %s", params.file_path, e)
+        return json.dumps({"status": "error", "error": f"Could not read file: {e}"})
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
         log.error("Import parse error for %s: %s", params.file_path, e)
         return json.dumps({"status": "error", "error": f"Failed to parse file: {e}"})
@@ -169,6 +187,13 @@ async def memory_import_mempalace(params: MempalaceImportInput) -> str:
         })
     except FileNotFoundError as e:
         return json.dumps({"status": "error", "error": str(e)})
+    except ChromaNotFoundError as e:
+        # issue #144: _open_collection's client.get_collection() raises
+        # chromadb's own NotFoundError for a store that exists but has no
+        # 'remind_me_import' collection yet (e.g. an empty/fresh palace) --
+        # previously past both the ImportError and FileNotFoundError
+        # handlers, escaping as a raw traceback.
+        return json.dumps({"status": "error", "error": f"MemPalace collection not found: {e}"})
 
 
 @mcp.tool(
@@ -565,6 +590,25 @@ async def remind_me_server_status() -> str:
         lines.append("**Backups:** none yet — run `remind_me_backup` to create one")
 
     lines.append("\n**MCP (stdio):** ✓ Active (this connection)")
+
+    # Slow-call watchdog (issue #128) — a stuck call (e.g. a runaway SQL
+    # query pegging a CPU core) previously had no visible symptom besides
+    # "the MCP call timed out" with nothing in the server explaining why.
+    from remind_me_mcp import watchdog
+
+    wd = watchdog.status()
+    if wd["enabled"]:
+        calls_in_flight = int(wd["calls_in_flight"])  # type: ignore[call-overload]
+        note = f" ({calls_in_flight} in flight)" if calls_in_flight > 1 else ""
+        lines.append(
+            f"**Slow-call watchdog:** ✓ armed at {wd['threshold_seconds']:.0f}s"
+            f" — a call stuck past that dumps every thread's stack to stderr{note}"
+        )
+    else:
+        lines.append(
+            "**Slow-call watchdog:** ✗ disabled "
+            "(set REMIND_ME_SLOW_CALL_SECONDS to enable, e.g. 30)"
+        )
 
     # Tool-surface cost. The full surface runs ~21k tokens of context in every
     # session on every client, whether or not an admin tool is ever touched --
@@ -1165,6 +1209,88 @@ async def remind_me_sync_reconcile() -> str:
     from remind_me_mcp.sync import reconcile_with_hub
 
     return json.dumps(await reconcile_with_hub(), indent=2)
+
+
+@mcp.tool(
+    name="remind_me_sync_repair",
+    annotations={
+        "title": "Repair a Stuck Sync Cursor",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def remind_me_sync_repair(
+    remote_id: str = "hub", scope: str = "all", confirm: bool = False
+) -> str:
+    """Reset a remote's pull cursor(s) to force a full historical re-pull.
+
+    A keyset pull cursor only ever advances forward, so it can never recover
+    records that sit *behind* its own watermark — e.g. a historical gap left
+    by a partial restore, or a node identity change during a migration. When
+    ``remind_me_sync_reconcile`` reports a ``fault`` with "the pull cursor has
+    not advanced" (or a ``graph_verdicts`` entry with the same hint), this is
+    the fix: it rewinds the affected cursor(s) so the next sync cycle re-walks
+    further back and idempotently upserts (last-write-wins) whatever it finds
+    — already-current local records are simply revisited, never duplicated
+    or lost. Previously this required hand-editing the ``sync_log`` table via
+    a second raw SQLite connection to the live database file.
+
+    The cost is real, not risk: a full re-pull re-fetches and re-checks
+    everything the hub has (thousands of records for an established vault),
+    and can trigger re-embedding of previously-unembedded content in the
+    background sync thread. Nothing is deleted or overwritten destructively
+    — this only rewinds a bookkeeping cursor — but because of that cost it
+    requires an explicit ``confirm=True`` rather than running on request
+    alone.
+
+    Args:
+        remote_id: The remote whose cursor(s) to reset — 'hub' (default), or
+            a peer's node_id (see remind_me_sync_status for known remotes).
+        scope: Which cursor(s) to reset: 'all' (default), or a comma-
+            separated subset of 'memory', 'entities', 'links',
+            'entity_relations'.
+        confirm: Must be True to actually perform the reset. Defaults to
+            False, which returns a description of what would happen instead.
+
+    Returns:
+        str: Markdown summary of the cursor(s) reset and their prior
+        watermarks, or (when confirm=False) a description of what would be
+        reset and why confirmation is required.
+    """
+    from remind_me_mcp.sync import _CURSOR_KINDS, reset_pull_cursor
+
+    kinds = _CURSOR_KINDS if scope == "all" else tuple(s.strip() for s in scope.split(","))
+    unknown = set(kinds) - set(_CURSOR_KINDS)
+    if unknown:
+        return (
+            f"**Unknown cursor kind(s):** {sorted(unknown)} — expected 'all' "
+            f"or a comma-separated subset of {_CURSOR_KINDS}"
+        )
+
+    if not confirm:
+        return (
+            f"**Would reset** {len(kinds)} cursor(s) for `{remote_id}`: "
+            f"{', '.join(kinds)}.\n\n"
+            "This forces a full historical re-pull from the hub/peer next "
+            "sync cycle — safe (idempotent, nothing is deleted), but it will "
+            "re-check every record the remote has and may trigger background "
+            "re-embedding. Call again with `confirm=True` to proceed."
+        )
+
+    result = reset_pull_cursor(remote_id, kinds)
+    lines = [f"## Reset {len(result['reset'])} cursor(s) for `{remote_id}`\n"]
+    for r in result["reset"]:
+        lines.append(
+            f"- `{r['cursor']}` — was at `{r['was']['last_pull']}` "
+            f"(id `{r['was']['last_pull_id'] or '(none)'}`), now epoch"
+        )
+    lines.append(
+        "\nThe next sync cycle (within `SYNC_INTERVAL` seconds) will re-walk "
+        "from these points. Check `remind_me_sync_status` afterward."
+    )
+    return "\n".join(lines)
 
 
 @mcp.tool(

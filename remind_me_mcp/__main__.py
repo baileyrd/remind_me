@@ -31,6 +31,7 @@ from remind_me_mcp.api import _build_api_app
 from remind_me_mcp.config import (
     MCP_HTTP_HOST,
     MCP_HTTP_PORT,
+    MCP_PID_FILE,
     REMOTE_MCP,
     REMOTE_MCP_HOST,
     REMOTE_MCP_PORT,
@@ -53,6 +54,50 @@ if TYPE_CHECKING:
 log = logging.getLogger("remind_me_mcp.__main__")
 
 __all__ = ["main"]
+
+
+def _acquire_mcp_lock(host: str, port: int) -> None:
+    """Refuse to start a second MCP server process against the same DB (issue #126).
+
+    Nothing previously stopped two ``--serve-mcp``/combined processes from
+    running concurrently against the same SQLite file — each with its own
+    sync thread, folder watcher, etc. racing the other. In production this
+    happened by accident: a fresh launch failed to bind its port (another
+    instance already held it) but kept running anyway as an orphan, still
+    holding an open DB connection and background threads. This closes that
+    gap the same way ``--serve-ui`` already guards itself, via
+    :data:`MCP_PID_FILE` — a liveness check (``os.kill(pid, 0)``), not an
+    HTTP health probe, since the whole point is to catch this *before* the
+    heavy startup (DB open, sync thread, wiki reconcile) that a hung
+    duplicate would otherwise still perform.
+
+    Exits the process with a clear message if another instance is alive;
+    otherwise writes the PID file and registers cleanup on exit/signal.
+
+    Args:
+        host: The MCP HTTP bind host, recorded for diagnostics only.
+        port: The MCP HTTP bind port, recorded for diagnostics only.
+    """
+    existing = _read_pid_file(MCP_PID_FILE)
+    if existing:
+        log.error(
+            "An MCP server is already running (PID %d, started %s). "
+            "Stop it first — running two instances against the same "
+            "database is not supported.",
+            existing["pid"],
+            existing.get("started_at", "unknown"),
+        )
+        sys.exit(1)
+
+    _write_pid_file(host, port, MCP_PID_FILE)
+    atexit.register(_remove_pid_file, MCP_PID_FILE)
+
+    def _signal_handler(signum, frame):
+        _remove_pid_file(MCP_PID_FILE)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
 
 
 def _build_combined_app() -> tuple[Starlette, str]:
@@ -124,6 +169,7 @@ def _run_combined(args) -> None:
     from remind_me_mcp import config as cfg
     from remind_me_mcp.remote import redact_token
 
+    _acquire_mcp_lock(args.ui_host, args.ui_port)
     combined, secret = _build_combined_app()
 
     log.info(
@@ -406,6 +452,7 @@ def main() -> None:
 
     # -- MCP HTTP standalone mode --
     if args.serve_mcp:
+        _acquire_mcp_lock(args.mcp_host, args.mcp_port)
         log.info("Starting MCP HTTP transport on %s:%d", args.mcp_host, args.mcp_port)
         # SE-03: FastMCP.run() accepts no host/port kwargs (TypeError on the
         # installed SDK); the bind address comes from mcp.settings instead.

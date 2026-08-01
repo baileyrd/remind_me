@@ -268,12 +268,22 @@ def pending_compile_count() -> int:
 
 
 def _page_files() -> dict[str, Path]:
-    """Map slug -> path for every content page on disk (reserved files excluded)."""
+    """Map slug -> path for every content page on disk (reserved files excluded).
+
+    Keyed by ``slugify(p.stem)``, not just ``p.stem.lower()`` (issue #133):
+    every lookup path (read_page, delete_page, wikilink resolution) resolves
+    a title/slug through slugify(), which does more than lowercase (it also
+    collapses spaces/punctuation to hyphens). A hand-created or git-pulled
+    file like "My Notes.md" indexed under the raw lowercased stem
+    ("my notes") was invisible to a lookup for "my-notes" -- silently
+    unreachable, and a write would fork a second file instead of updating
+    the original.
+    """
     out: dict[str, Path] = {}
     for p in sorted(wiki_dir().glob("*.md")):
         if p.name in (INDEX_FILE, LOG_FILE, SCHEMA_FILE):
             continue
-        out[p.stem.lower()] = p
+        out[slugify(p.stem)] = p
     return out
 
 
@@ -390,10 +400,21 @@ def write_page(title: str, content: str, *, log_note: str | None = None) -> dict
         raise ValueError(f"'{slug}' is a reserved system page and cannot be written directly")
 
     body = content.strip("\n")
-    existing_title = _extract_title(body, slug)
-    if not _H1_RE.search(body) or existing_title != title:
-        # Ensure the file opens with the canonical title.
-        body = re.sub(_H1_RE, "", body, count=1).strip("\n") if _H1_RE.search(body) else body
+    # match() (not search()) anchors to position 0: only a *leading* H1 is
+    # ever treated as "the existing title" here. _H1_RE.search() (used by
+    # _extract_title's general read-time heuristic) finds the first H1
+    # anywhere in the document -- fine for reading, but using it to decide
+    # what to strip previously deleted the first H1 in the *body* even when
+    # it was a real mid-document heading following leading prose, e.g.
+    # "Intro.\n\n# Section One\n\nDetails." silently lost "# Section One"
+    # (issue #132).
+    leading = _H1_RE.match(body)
+    if leading is None or leading.group(1).strip() != title:
+        # Ensure the file opens with the canonical title. Only strip the
+        # match if it was genuinely leading -- never touch a heading that
+        # follows other content.
+        if leading is not None:
+            body = body[leading.end():].strip("\n")
         body = f"# {title}\n\n{body}".rstrip() + "\n"
     else:
         body = body + "\n"

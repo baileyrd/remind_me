@@ -60,6 +60,8 @@ import threading
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import httpx
+
 from remind_me_mcp import ann_index
 from remind_me_mcp.config import (
     ANN_MIN_CHUNKS,
@@ -275,7 +277,7 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 # Current target schema version.  Increment when adding a new migration step.
-_SCHEMA_VERSION = 20
+_SCHEMA_VERSION = 22
 
 
 
@@ -432,6 +434,16 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         _migrate_v19_to_v20(db)
         db.execute("PRAGMA user_version = 20")
         current_version = 20
+
+    if current_version < 21:
+        _migrate_v20_to_v21(db)
+        db.execute("PRAGMA user_version = 21")
+        current_version = 21
+
+    if current_version < 22:
+        _migrate_v21_to_v22(db)
+        db.execute("PRAGMA user_version = 22")
+        current_version = 22
 
     db.commit()
 
@@ -1663,6 +1675,67 @@ def _migrate_v19_to_v20(db: sqlite3.Connection) -> None:
             )
 
 
+def _migrate_v20_to_v21(db: sqlite3.Connection) -> None:
+    """v20 -> v21: index the ``normalized_from`` JSON pointer on memories.
+
+    ``maintenance.pending_counts`` (surfaced by ``remind_me_server_status``)
+    counts unnormalized imports with a correlated ``NOT EXISTS`` subquery
+    that matches ``json_extract(n.metadata, '$.normalized_from') = m.id`` for
+    every candidate row. Without an index on that expression, SQLite has no
+    choice but to re-scan and re-parse the whole ``memories`` table for each
+    candidate -- on a store with tens of thousands of rows this is a
+    multi-minute, single-core-pegging table scan that made the status tool
+    (and anything else that calls ``pending_counts``) hang indefinitely.
+
+    Args:
+        db: An open SQLite connection.
+    """
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_memories_normalized_from "
+        "ON memories(json_extract(metadata, '$.normalized_from'))"
+    )
+
+
+def _migrate_v21_to_v22(db: sqlite3.Connection) -> None:
+    """v21 -> v22: stop syncing access-tracking-only updates (issue #147).
+
+    ``vitality.record_accesses``/``record_access`` bump ``accessed_at``/
+    ``access_count``/``vitality``/``status`` on every search hit --
+    deliberately *not* ``updated_at``, so the change reads as access
+    metadata, not a content edit (``record_feedback``'s ``base_weight``
+    adjustment follows the same convention). Before this migration,
+    ``memories_outbox_au`` fired on every UPDATE regardless, so a 20-result
+    search enqueued 20 full-payload ``sync_outbox`` rows -- and because LWW
+    conflict resolution on the receiving side compares ``updated_at``, a
+    row whose ``updated_at`` didn't advance essentially always loses LWW
+    against the peer's own (same-or-newer) copy and gets discarded on
+    arrival. So this was pure round-trip waste on both ends, not a
+    functional change: nothing that previously synced successfully stops
+    syncing once this is scoped out.
+
+    Adds ``AND NEW.updated_at IS NOT OLD.updated_at`` to the existing
+    ``sync_enabled`` gate so only genuine content changes (which do bump
+    ``updated_at``, per every writer in this codebase -- watcher.py,
+    dbs_import.py, sync.py's own upsert, ...) enter the outbox.
+
+    Args:
+        db: An open SQLite connection.
+    """
+    payload = _outbox_payload_sql("NEW.")
+    db.executescript(f"""
+        DROP TRIGGER IF EXISTS memories_outbox_au;
+
+        CREATE TRIGGER IF NOT EXISTS memories_outbox_au
+        AFTER UPDATE ON memories
+        WHEN COALESCE((SELECT value FROM sync_flags WHERE key = 'sync_enabled'), '0') = '1'
+             AND NEW.updated_at IS NOT OLD.updated_at
+        BEGIN
+            INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+            VALUES (NEW.id, 'update', {payload}, {_SQL_NOW_ISO});
+        END;
+    """)
+
+
 def embedding_mismatch_info(db: sqlite3.Connection) -> dict[str, str] | None:
     """Read-only check: do the stored vectors' model/dim/backend differ from
     the currently configured ``EMBEDDING_MODEL``/``EMBEDDING_DIM``/
@@ -2073,6 +2146,19 @@ def _embed_and_store_batch(embedder: Any, rows: list[tuple[int, str]]) -> int:
         return 0
     except (ValueError, TypeError) as e:
         log.warning("Embedding computation failed: %s", e)
+        with contextlib.suppress(sqlite3.Error):
+            db.rollback()  # PF-05: see above
+        return 0
+    except httpx.HTTPError as e:
+        # issue #143: a network-backed embedder (OllamaEmbedder) can raise
+        # httpx errors (ConnectError, ReadTimeout, HTTPStatusError, ...) --
+        # a plain ValueError/TypeError catch doesn't cover them, so a
+        # backend restart mid-import (the availability cache still reports
+        # the embedder as live for up to AVAILABILITY_SUCCESS_TTL after it
+        # actually went down) propagated uncaught out of this "any failure
+        # here is healed later by remind_me_reindex" boundary instead of
+        # actually being contained by it.
+        log.warning("Embedding request failed: %s", e)
         with contextlib.suppress(sqlite3.Error):
             db.rollback()  # PF-05: see above
         return 0

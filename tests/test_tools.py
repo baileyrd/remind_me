@@ -1208,6 +1208,33 @@ async def test_memory_import_chat_file_not_found(
     assert "not found" in result["error"].lower()
 
 
+async def test_memory_import_chat_permission_error_returns_json_not_traceback(
+    db_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression guard for issue #144.
+
+    memory_import_chat only caught FileNotFoundError -- a PermissionError
+    (a file locked by OneDrive sync, an AV scan, or an open editor handle;
+    common on Windows) escaped as a raw traceback out of the tool call
+    instead of this same clean JSON error response.
+    """
+    import remind_me_mcp.tools.admin as _admin_mod
+
+    chat_file = tmp_path / "locked.json"
+    chat_file.write_text('{"chat_messages": []}')
+    params = ChatImportInput(file_path=str(chat_file))
+
+    def raise_permission_error(*a, **kw):
+        raise PermissionError(f"[Errno 13] Permission denied: '{chat_file}'")
+
+    monkeypatch.setattr(_admin_mod, "import_chat_file", raise_permission_error)
+
+    result_str = await memory_import_chat(params)
+    result = json.loads(result_str)  # must not raise -- a clean error, not a traceback
+    assert result["status"] == "error"
+    assert "permission" in result["error"].lower()
+
+
 # ---------------------------------------------------------------------------
 # Regression tests — BUGF-01, BUGF-02, DATA-02
 # ---------------------------------------------------------------------------

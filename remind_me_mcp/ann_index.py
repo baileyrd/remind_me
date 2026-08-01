@@ -113,18 +113,38 @@ def get_index(db: sqlite3.Connection) -> Any | None:
             return _index
         try:
             path = _index_path()
+            idx = None
             if path.exists():
-                idx = _new_index()
-                idx.load(str(path))
-                (count,) = db.execute("SELECT COUNT(*) FROM memories_vec").fetchone()
-                if len(idx) != count:
-                    log.info(
-                        "ANN index stale (%d indexed vs %d in memories_vec) — rebuilding",
-                        len(idx),
-                        count,
+                try:
+                    candidate = _new_index()
+                    candidate.load(str(path))
+                except Exception:
+                    # A load failure (truncated file from an unclean shutdown
+                    # mid-save_index, a dimension change the loader doesn't
+                    # tolerate, etc.) used to set the sticky _index_failed
+                    # flag and leave the bad file in place -- every later
+                    # process hit the same corrupt file and never got an ANN
+                    # index again. Delete it and fall through to a rebuild
+                    # instead, matching the size-mismatch branch below, which
+                    # already self-heals (issue #134).
+                    log.warning(
+                        "ANN index file at %s is unreadable — deleting and "
+                        "rebuilding from memories_vec",
+                        path,
+                        exc_info=True,
                     )
-                    idx = _build_from_db(db)
-            else:
+                    path.unlink(missing_ok=True)
+                else:
+                    (count,) = db.execute("SELECT COUNT(*) FROM memories_vec").fetchone()
+                    if len(candidate) != count:
+                        log.info(
+                            "ANN index stale (%d indexed vs %d in memories_vec) — rebuilding",
+                            len(candidate),
+                            count,
+                        )
+                    else:
+                        idx = candidate
+            if idx is None:
                 idx = _build_from_db(db)
         except Exception:
             log.warning(

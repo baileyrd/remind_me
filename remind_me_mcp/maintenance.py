@@ -98,12 +98,21 @@ UNANNOTATED_WHERE = """
 # Raw imports eligible for normalization: not superseded, from the file
 # import pipeline (document_import/chat_import — FT-02), and not already
 # normalized (no existing memory points back at it via normalized_from).
+#
+# Written as NOT IN over a non-correlated subquery rather than a correlated
+# NOT EXISTS: with tens of thousands of rows, a correlated subquery forces
+# SQLite to re-scan the normalized_from index once per candidate row (even
+# with idx_memories_normalized_from in place it's a per-row SCAN, not a
+# SEEK), which pegs a core for minutes. The NOT IN form lets SQLite
+# materialize the id set once (LIST SUBQUERY + bloom filter) and probe it
+# per row instead — same result, ~1000x faster on this table size.
 UNNORMALIZED_WHERE = """
     m.superseded_by IS NULL
     AND m.deleted_at IS NULL
     AND m.source IN ('document_import', 'chat_import')
-    AND NOT EXISTS (
-        SELECT 1 FROM memories n WHERE json_extract(n.metadata, '$.normalized_from') = m.id
+    AND m.id NOT IN (
+        SELECT json_extract(metadata, '$.normalized_from') FROM memories
+        WHERE json_extract(metadata, '$.normalized_from') IS NOT NULL
     )
 """
 
