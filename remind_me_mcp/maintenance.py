@@ -201,8 +201,28 @@ def capture_health(db: sqlite3.Connection) -> dict[str, object]:
 # Throttled nudge
 # ---------------------------------------------------------------------------
 
-_last_check_at: float = 0.0
+# Named throttle timers. Keyed rather than a single global because the
+# maintenance nudge and the feedback hint are independent advisories with
+# different cadences, and one claiming the slot must not silence the other.
+_last_check_at: dict[str, float] = {}
 _check_lock = threading.Lock()
+
+
+def _due(name: str, interval: int) -> bool:
+    """Claim the throttle slot for *name*, returning whether it was due.
+
+    Claiming happens here rather than at the caller's success path on purpose:
+    it bounds how often the *work behind* the check runs, not just how often a
+    notice is emitted. See :func:`maybe_maintenance_notice` for why that
+    matters on the search hot path.
+    """
+    now = time.monotonic()
+    with _check_lock:
+        last = _last_check_at.get(name, 0.0)
+        if last and (now - last) < interval:
+            return False
+        _last_check_at[name] = now
+        return True
 
 # Human-readable label per queue, used to build the nudge line.
 _LABELS = {
@@ -218,10 +238,9 @@ _QUEUE_PROMPTS["pending_wiki_compile"] = "compile_wiki"
 
 
 def reset_nudge_throttle() -> None:
-    """Clear the throttle so the next call re-checks. Used by tests."""
-    global _last_check_at
+    """Clear every throttle timer so the next call re-checks. Used by tests."""
     with _check_lock:
-        _last_check_at = 0.0
+        _last_check_at.clear()
 
 
 def maybe_maintenance_notice(db: sqlite3.Connection) -> str | None:
@@ -240,17 +259,13 @@ def maybe_maintenance_notice(db: sqlite3.Connection) -> str | None:
         drains each, or None when nudges are disabled, throttled, or nothing
         has crossed the threshold.
     """
-    global _last_check_at
     if not NUDGES_ENABLED:
         return None
 
-    now = time.monotonic()
-    with _check_lock:
-        if _last_check_at and (now - _last_check_at) < NUDGE_INTERVAL:
-            return None
-        # Claim the slot before querying: on a vault with nothing pending this
-        # is what keeps the COUNTs from running on every single search.
-        _last_check_at = now
+    # Claiming the slot before querying is what keeps the COUNTs from running
+    # on every single search when there is nothing pending.
+    if not _due("maintenance", NUDGE_INTERVAL):
+        return None
 
     counts = pending_counts(db)
     backlogs = sorted(
@@ -269,10 +284,48 @@ def maybe_maintenance_notice(db: sqlite3.Connection) -> str | None:
     return "\n".join(lines)
 
 
+FEEDBACK_HINT_INTERVAL = _env_int("REMIND_ME_FEEDBACK_HINT_INTERVAL", 7200)
+"""Minimum seconds between feedback hints on search responses.
+
+Longer than the maintenance interval by default: a maintenance backlog is a
+task to do, whereas this is a standing affordance, and a standing affordance
+repeated too often is just wallpaper.
+"""
+
+
+def maybe_feedback_hint() -> str | None:
+    """Return an occasional reminder that search results can be rated.
+
+    ``remind_me_feedback`` tunes ranking, but nothing in a normal session ever
+    asks for it, so the signal it depends on effectively never arrives and the
+    query-contextual ranking path stays untrained. Surfacing the affordance
+    where the memory ids actually are — on a search result — is the cheapest
+    way to close that loop.
+
+    Throttled on its own timer and deliberately worded toward the
+    query-contextual form, which is the mode worth having: a global adjustment
+    penalises a memory for every future query, not just this kind of question.
+
+    Returns:
+        A one-line markdown hint, or None when disabled or throttled.
+    """
+    if not NUDGES_ENABLED:
+        return None
+    if not _due("feedback", FEEDBACK_HINT_INTERVAL):
+        return None
+    return (
+        "_If one of these was clearly right or clearly wrong, "
+        "`remind_me_feedback(memory_id=..., signal=..., query=...)` tunes future "
+        "ranking. Pass `query` so the signal stays scoped to this kind of question._"
+    )
+
+
 __all__ = [
     "NUDGES_ENABLED",
     "NUDGE_INTERVAL",
     "NUDGE_THRESHOLD",
+    "FEEDBACK_HINT_INTERVAL",
+    "maybe_feedback_hint",
     "UNDECOMPOSED_WHERE",
     "UNANNOTATED_WHERE",
     "UNNORMALIZED_WHERE",

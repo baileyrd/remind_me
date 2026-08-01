@@ -35,7 +35,13 @@ from remind_me_mcp.server import mcp
     },
 )
 async def remind_me_entity(params: EntityLookupInput) -> str:
-    """Look up a knowledge-graph entity by name or alias and return everything known about it.
+    """Everything known about ONE named thing — a person, project, tool, org, or place.
+
+    Use this when the question is squarely about a named entity you can name
+    ("what do I know about Alex?", "what's the story with the Titan project?").
+    Use `remind_me_search` instead for topic questions, for anything you cannot
+    name exactly, or when the entity may not be in the graph — this returns 404
+    on an unknown name rather than falling back to a search.
 
     Resolution is case/whitespace-insensitive: the canonical name is tried
     first (deterministic-id lookup), then aliases. The payload contains the

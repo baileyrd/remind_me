@@ -255,7 +255,14 @@ class FeedbackInput(BaseModel):
     )
     query: str | None = Field(
         default=None,
-        description="Optional: the search query this feedback relates to (for future audit/reporting)",
+        description=(
+            "The search query this memory was retrieved for. Strongly preferred: "
+            "passing it makes the signal query-contextual, so it only affects future "
+            "searches similar to this one. Omitting it applies a GLOBAL adjustment to "
+            "the memory's ranking weight for every future query, which is rarely what "
+            "you want — demoting a memory for one question then penalises it for "
+            "unrelated ones."
+        ),
         max_length=500,
     )
 

@@ -399,6 +399,15 @@ The backlog counts (`pending_wiki_compile` and friends) used to live only inside
 - **One definition per queue** — `remind_me_mcp/maintenance.py` owns the `WHERE` clauses, and the batch tools import them from there. A second copy would let the count Claude is nudged about drift from the batch the tool actually returns.
 - Silence them with `REMIND_ME_MAINTENANCE_NUDGES=false`.
 
+### Closing the feedback loop
+
+`remind_me_feedback` tunes ranking, but nothing in a normal session ever asked for it, so the signal it depends on effectively never arrived. Two changes:
+
+- The `query` parameter's description used to read *"for future audit/reporting"* — which is not what it does. Passing `query` switches the whole mechanism to query-contextual (the signal only affects future searches similar to this one); omitting it applies a **global** weight change that penalises the memory for every future query. A caller who believed the old description would reasonably omit it, which is a plain reason the query-contextual path stayed untrained. Now described accurately.
+- Search responses carry an occasional hint pointing at the query-contextual form, throttled on its own timer (`REMIND_ME_FEEDBACK_HINT_INTERVAL`, default 2h).
+
+A search response shows **at most one** advisory: a maintenance backlog is concrete work to do, so it outranks the standing feedback affordance. Stacking both would start training the reader to skip the tail of every search — the exact failure mode both signals exist to avoid.
+
 ### Capture health
 
 `remind_me_auto_capture` only runs if you've added the [capture instruction](#auto-capture-persisting-full-conversations) to your client, so "never configured" and "configured but nothing captured yet" both used to present as pure silence — nothing anywhere distinguished them. `remind_me_server_status` now reports capture count and the last capture time, and says so explicitly when there are none:
@@ -1121,6 +1130,7 @@ Every new memory used to start at a flat `base_weight=1.0` regardless of kind, s
 | `REMIND_ME_MAINTENANCE_NUDGES` | `true` | Whether search/add responses may carry a maintenance-backlog nudge. Set `false` to silence them entirely |
 | `REMIND_ME_MAINTENANCE_NUDGE_INTERVAL` | `3600` | Minimum seconds between nudge *checks*. Bounds cost as well as noise — the backlog COUNTs only run when this has elapsed |
 | `REMIND_ME_MAINTENANCE_NUDGE_THRESHOLD` | `25` | Queue depth a backlog must reach before it's worth mentioning |
+| `REMIND_ME_FEEDBACK_HINT_INTERVAL` | `7200` | Minimum seconds between feedback hints on search responses. Longer than the maintenance interval by default — a standing affordance repeated too often is wallpaper. Also silenced by `REMIND_ME_MAINTENANCE_NUDGES=false` |
 | `REMIND_ME_WEBHOOK_SECRET` | *(unset)* | Bearer token for the push/webhook ingestion server. Empty = disabled — the server refuses to start without it |
 | `REMIND_ME_WEBHOOK_PORT` | `8769` | Port for the push/webhook ingestion server |
 | `REMIND_ME_WEBHOOK_BIND` | `127.0.0.1` | Bind address for the push/webhook ingestion server. Widen deliberately (e.g. a Tailscale IP) since it writes arbitrary pushed content directly into memory |
@@ -1297,11 +1307,16 @@ remind_me is local-first, single-user, and MCP-native by design — some capabil
 - **Multi-tenant / cross-agent isolation** — deferred. remind_me is explicitly single-owner by design: one OAuth owner token, one SQLite file per node. Multi-tenancy is an architecture change orthogonal to "personal memory," not a gap in the current design — worth revisiting only if the project's scope deliberately shifts toward shared/team memory infrastructure.
 - **Client SDKs beyond MCP** — no hand-written TS/Rust/etc. SDKs (maintenance surface disproportionate to a single-user local tool whose real client is Claude via MCP). Instead, the existing `GET /api/*` REST surface is published as an [OpenAPI 3.0 spec](docs/openapi.yaml) so any language can generate a thin client for free.
 - **Cloud/managed & serverless hosting** — no managed hosting product. The per-user SQLite node is designed to stay local; the one component that's natural to host centrally (the sync hub) already had a Podman quadlet deploy path, and now also has [Docker Compose, Fly.io, and Railway templates](hub/deploy/) — deliberately still self-hosted, not a one-click managed service.
+- **Gating the tool surface behind a profile (`core` vs `full`)** — evaluated and not built. The premise was that 46 tools hurt tool-selection accuracy and that hiding the ~18 admin ones would sharpen it. Measured, hiding every non-core tool would save ~7k tokens of descriptions per session (of ~8.1k total) — real, but it does not address the actual failure. The tools that genuinely compete are `remind_me_search`, `remind_me_list`, `remind_me_get`, and `remind_me_entity`: they all read as "find things," and *every one of them is in the core set a profile would keep*. Hiding admin tools cannot fix a confusion that lives entirely among the tools you keep. The fix that does is disambiguating those four descriptions so each names the neighbour to prefer instead — ~425 tokens, no functionality hidden, no restart to change, no config axis to maintain (done; see `remind_me_search`'s description for the pattern). Revisit gating only if context pressure alone becomes the binding constraint, in which case it should ship default-`full` so nothing silently stops working.
 - **Native adapters for other coding-agent hosts (Codex, Cursor, OpenClaw, Hermes, ...)** — deferred, and host auto-detection (a `detect`-style utility) along with it, since detection only has something to detect *among* once more than one host adapter exists. remind_me's live integration surface is MCP itself — Claude.ai, Claude Code, and Claude Desktop attach as an MCP server — and any other file/log-based source already has a general path in via the chat-export importer, watched folders, or the webhook endpoint. Building adapters that tail a specific other agent's proprietary, undocumented session-log format is an architecture change orthogonal to "personal memory for Claude clients," not a gap in the current design — it only pays off if the project's scope deliberately shifts toward shared memory infrastructure for arbitrary coding agents. Revisit only if that scope shift happens ([#109](https://github.com/baileyrd/remind_me/issues/109), [#110](https://github.com/baileyrd/remind_me/issues/110)).
 
 ## Changelog
 
 See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for a per-version feature breakdown with PR references; this section summarizes the same history phase-by-phase.
+
+### 1.26.0 — 2026-08-01
+
+Tool-selection clarity and the feedback loop. Disambiguates the four tools that all read as "find things" (`search`/`list`/`get`/`entity`) so each names the neighbour to prefer, and **drops the planned `core`/`full` profile gate** — those four are all in the core set a profile would keep, so hiding admin tools cannot fix the confusion (see [Design Scope](#design-scope) for the measured trade-off). Also fixes `remind_me_feedback`'s `query` parameter, which was described as being "for audit/reporting" when it actually switches the signal from global to query-contextual — a mechanical reason that path stayed untrained.
 
 ### 1.25.0 — 2026-08-01
 

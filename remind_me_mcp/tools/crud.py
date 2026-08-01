@@ -129,7 +129,17 @@ async def memory_add(params: MemoryAddInput) -> str:
     },
 )
 async def memory_list(params: MemoryListInput) -> str:
-    """List memories with optional filtering by category, tags, or source. Results are paginated.
+    """Browse memories by category, tag, or source — NOT a way to find things by topic.
+
+    This applies filters and paginates; it does no relevance ranking whatsoever,
+    so results are effectively arbitrary rows that happen to match the filter.
+    Use it to enumerate a known slice ("show me everything tagged `work`",
+    "how many memories are in `preference`").
+
+    Use `remind_me_search` instead whenever the question is about *content* —
+    what the user thinks, decided, prefers, or ran into. Searching for a topic
+    with this tool returns rows that matched a filter, not rows that answer the
+    question.
 
     Args:
         params (MemoryListInput): Filters and pagination.
@@ -179,7 +189,10 @@ async def memory_list(params: MemoryListInput) -> str:
     },
 )
 async def memory_get(memory_id: str) -> str:
-    """Retrieve a single memory by its ID.
+    """Fetch one memory whose exact ID you already have.
+
+    Only useful when a previous result handed you the id. If you are trying to
+    *find* a memory, use `remind_me_search` — ids are not guessable.
 
     Args:
         memory_id (str): The memory ID.
