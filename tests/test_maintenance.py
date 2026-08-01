@@ -231,3 +231,135 @@ async def test_status_reports_maintenance_backlogs(db_conn: sqlite3.Connection) 
     _add_unclassified(db_conn, 4)
     populated = await remind_me_server_status()
     assert "unclassified memories" in populated
+
+
+# ---------------------------------------------------------------------------
+# Feedback hint (#6)
+# ---------------------------------------------------------------------------
+
+
+def test_feedback_hint_steers_toward_the_query_contextual_form() -> None:
+    """The global form penalises a memory for every future query, not just this one.
+
+    Nothing in a session ever asks for feedback, so if the hint is going to
+    appear at all it should point at the mode actually worth having.
+    """
+    hint = maintenance.maybe_feedback_hint()
+    assert hint is not None
+    assert "remind_me_feedback" in hint
+    assert "query" in hint
+
+
+def test_feedback_hint_is_throttled() -> None:
+    assert maintenance.maybe_feedback_hint() is not None
+    assert maintenance.maybe_feedback_hint() is None
+
+
+def test_feedback_hint_respects_the_disable_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(maintenance, "NUDGES_ENABLED", False)
+    assert maintenance.maybe_feedback_hint() is None
+
+
+def test_throttles_are_independent(db_conn: sqlite3.Connection) -> None:
+    """One advisory claiming its slot must not silence the other."""
+    _add_unclassified(db_conn, maintenance.NUDGE_THRESHOLD)
+    assert maintenance.maybe_maintenance_notice(db_conn) is not None
+    # The maintenance timer is now claimed; feedback runs on its own timer.
+    assert maintenance.maybe_feedback_hint() is not None
+
+
+@pytest.mark.asyncio
+async def test_search_shows_at_most_one_advisory(db_conn: sqlite3.Connection) -> None:
+    """Stacking both would train the reader to skip the tail of every search."""
+    _add_unclassified(db_conn, maintenance.NUDGE_THRESHOLD, content="quarterly budget")
+    result = await memory_search(
+        MemorySearchInput(query="budget", response_format=ResponseFormat.MARKDOWN)
+    )
+    assert "Maintenance pending" in result
+    assert "remind_me_feedback" not in result
+
+
+@pytest.mark.asyncio
+async def test_search_falls_back_to_the_feedback_hint(db_conn: sqlite3.Connection) -> None:
+    """With no backlog to report, the standing affordance gets the slot."""
+    db_conn.execute(
+        "INSERT INTO memories (id, content, category, tags, source, metadata, "
+        "memory_type, created_at, updated_at) "
+        "VALUES (?, 'quarterly budget planning', 'note', '[]', 'test', '{}', 'fact', ?, ?)",
+        (_make_id("solo"), _now_iso(), _now_iso()),
+    )
+    db_conn.commit()
+    result = await memory_search(
+        MemorySearchInput(query="budget", response_format=ResponseFormat.MARKDOWN)
+    )
+    assert "Maintenance pending" not in result
+    assert "remind_me_feedback" in result
+
+
+@pytest.mark.asyncio
+async def test_json_search_carries_no_advisory_either(db_conn: sqlite3.Connection) -> None:
+    """The JSON envelope must stay parseable no matter which advisory is due."""
+    db_conn.execute(
+        "INSERT INTO memories (id, content, category, tags, source, metadata, "
+        "memory_type, created_at, updated_at) "
+        "VALUES (?, 'quarterly budget planning', 'note', '[]', 'test', '{}', 'fact', ?, ?)",
+        (_make_id("solo-json"), _now_iso(), _now_iso()),
+    )
+    db_conn.commit()
+    result = await memory_search(
+        MemorySearchInput(query="budget", response_format=ResponseFormat.JSON)
+    )
+    json.loads(result)
+    assert "remind_me_feedback" not in result
+
+
+# ---------------------------------------------------------------------------
+# Tool-description disambiguation (#5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_overlapping_finder_tools_point_at_each_other() -> None:
+    """search/list/get/entity all read as "find things"; the descriptions must
+    say which is which, since that confusion sits entirely inside the tools a
+    conversational session keeps — hiding admin tools would not touch it.
+    """
+    from remind_me_mcp.server import mcp
+
+    by_name = {t.name: (t.description or "") for t in await mcp.list_tools()}
+
+    # Each overlapping tool must name the neighbour to prefer instead.
+    assert "remind_me_search" in by_name["remind_me_list"]
+    assert "remind_me_search" in by_name["remind_me_get"]
+    assert "remind_me_search" in by_name["remind_me_entity"]
+    # ...and search must mark itself as the default entry point.
+    assert "remind_me_list" in by_name["remind_me_search"]
+
+
+@pytest.mark.asyncio
+async def test_list_is_marked_as_browsing_not_finding() -> None:
+    """The most dangerous of the cluster: it does no relevance ranking at all,
+    but its old description read like a perfectly good way to find things.
+    """
+    from remind_me_mcp.server import mcp
+
+    desc = next(
+        t.description or "" for t in await mcp.list_tools() if t.name == "remind_me_list"
+    ).lower()
+    assert "no relevance ranking" in desc
+
+
+def test_feedback_query_field_describes_its_real_effect() -> None:
+    """It previously read "for future audit/reporting", which is not what it does.
+
+    Passing `query` switches the whole mechanism to query-contextual; a caller
+    who believed the old description would reasonably omit it, which is a plain
+    reason the query-contextual path never got exercised.
+    """
+    from remind_me_mcp.models import FeedbackInput
+
+    desc = FeedbackInput.model_fields["query"].description or ""
+    assert "audit" not in desc.lower()
+    assert "global" in desc.lower()

@@ -34,8 +34,7 @@ from remind_me_mcp.retrieval import (
 )
 from remind_me_mcp.server import mcp
 from remind_me_mcp.tools._shared import (
-    _maybe_maintenance_notice,
-    _maybe_update_notice,
+    _maybe_search_notices,
     _public_memory,
     log,
 )
@@ -551,13 +550,23 @@ def _fmt_co_retrieval_expansion_md(related: list[dict[str, Any]]) -> str:
     },
 )
 async def memory_search(params: MemorySearchInput) -> str:
-    """Hybrid search across all stored memories. Combines FTS5 keyword matching with semantic vector similarity.
+    """THE way to find anything by topic — start here for any content question.
 
-    If semantic search is available (embedding model loaded), results from both are merged
-    and deduplicated, with keyword matches boosted. Falls back to FTS5-only if embeddings
-    are unavailable.
+    Hybrid retrieval: FTS5 keyword matching fused with semantic vector similarity
+    via RRF, auto-routing its ranking strategy to the shape of the query. Use it
+    for anything about what the user thinks, decided, prefers, or ran into, even
+    when you don't know their exact wording — that is what the semantic tier is
+    for. Falls back to keyword-only when embeddings are unavailable.
+
+    Prefer this over the neighbouring lookup tools unless one clearly applies:
+    `remind_me_list` only filters and paginates (no ranking — browsing, not
+    finding), `remind_me_get` needs an id you already hold, and
+    `remind_me_entity` needs the canonical name of one specific person, project,
+    or tool. When in doubt between any of them, search.
 
     Supports FTS5 query syntax for keyword search: AND, OR, NOT, "exact phrase", prefix*.
+    Structured `subject:`/`predicate:`/`entity:"..."` prefixes route to indexed
+    lookups instead of the ranking pipeline.
 
     Args:
         params (MemorySearchInput): Search query and optional filters.
@@ -667,7 +676,7 @@ async def memory_search(params: MemorySearchInput) -> str:
                 parts.append(_fmt_neighbor_expansion_md(related_neighbors))
             if related_co_retrieval:
                 parts.append(_fmt_co_retrieval_expansion_md(related_co_retrieval))
-            return _maybe_maintenance_notice(_maybe_update_notice("\n---\n".join(parts)))
+            return _maybe_search_notices("\n---\n".join(parts))
 
         # Structured query detected but no results -- fall through to normal search
         # Strip structured prefixes from query before passing to FTS
@@ -938,7 +947,7 @@ async def memory_search(params: MemorySearchInput) -> str:
         f"| {dormant_excluded} dormant excluded_"
     )
 
-    return _maybe_maintenance_notice(_maybe_update_notice("\n---\n".join(parts)))
+    return _maybe_search_notices("\n---\n".join(parts))
 
 
 # ---------------------------------------------------------------------------

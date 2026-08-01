@@ -1,5 +1,24 @@
 # Release Notes
 
+## v1.26.0 — 2026-08-01
+
+Tool-selection clarity and the feedback loop. The headline is a **changed conclusion**: the planned fix for tool-selection accuracy was a `core`/`full` profile gate hiding the ~18 admin tools. Working through which tools actually compete showed that fix does not address the problem, so it was not built.
+
+### Fixed
+
+- **`remind_me_feedback`'s `query` parameter was misdescribed** as *"Optional: the search query this feedback relates to (for future audit/reporting)"*. It is not for audit — passing it switches the entire mechanism to query-contextual (the signal only nudges future searches similar to this one), while omitting it applies a **global** `base_weight` change that penalises the memory for every future query. A caller who believed the old description would reasonably omit it, which is a plain, mechanical reason the query-contextual ranking path stayed untrained. This is a schema fix, so it reaches every client with no code change on their side.
+
+### New Features
+
+- **Disambiguated the overlapping retrieval tools.** `remind_me_search`, `remind_me_list`, `remind_me_get`, and `remind_me_entity` all read as "find things," and each described only what it does in isolation — nothing said which to prefer or when. Each now names the neighbour to reach for instead. `remind_me_list` gets the sharpest correction: it does *no relevance ranking at all*, but its old one-liner ("List memories with optional filtering…") read like a perfectly good way to find something by topic.
+- **Occasional feedback hint on search responses**, throttled on its own timer (`REMIND_ME_FEEDBACK_HINT_INTERVAL`, default 2h) and worded toward the query-contextual form.
+- A search response now carries **at most one** advisory. A maintenance backlog is concrete work to do, so it outranks the standing feedback affordance; stacking both would train the reader to skip the tail of every search, which is what both signals exist to avoid.
+
+### Design notes
+
+- **Why the profile gate was dropped.** Measured, hiding every non-core tool saves ~7k of ~8.1k tokens of tool descriptions per session — a real number. But the tools that actually compete are `search`/`list`/`get`/`entity`, and *all four are in the core set a profile would keep*. Hiding admin tools cannot fix a confusion that lives entirely among the tools you keep. Disambiguation costs ~425 tokens, hides nothing, needs no restart to change, and adds no permanent config axis. Recorded in the README's "Design Scope" with the numbers, so the call is revisitable rather than folklore — and if context pressure alone ever becomes binding, a gate should ship default-`full` so nothing silently stops working.
+- The nudge throttle generalised from one global timer to named timers, so the maintenance nudge and the feedback hint cannot silence each other by claiming the same slot.
+
 ## v1.25.0 — 2026-08-01
 
 Two signals that existed but never reached anyone. v1.24.0 gave the server a voice (instructions + prompts); this release makes it say the things only it can know.

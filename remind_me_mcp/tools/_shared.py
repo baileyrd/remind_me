@@ -137,6 +137,40 @@ def _maybe_maintenance_notice(response: str) -> str:
     return response
 
 
+def _maybe_search_notices(response: str) -> str:
+    """Append **at most one** advisory to a markdown search response.
+
+    Search is the busiest response in the system and the one Claude reads most
+    closely, which makes it both the best place to put an advisory and the
+    easiest place to ruin with clutter. A maintenance backlog is concrete work
+    to do, so it outranks the standing feedback affordance; stacking both onto
+    one result would start training the reader to skip the tail of every
+    search, which is the failure mode both signals exist to avoid.
+
+    Markdown paths only, for the same reason as
+    :func:`_maybe_maintenance_notice` — the JSON envelope must stay parseable.
+
+    Args:
+        response: The original markdown search response.
+
+    Returns:
+        The response with an update notice (if any) plus at most one advisory.
+        Never raises.
+    """
+    out = _maybe_update_notice(response)
+    try:
+        from remind_me_mcp import tools as _pkg
+        from remind_me_mcp.maintenance import maybe_feedback_hint, maybe_maintenance_notice
+
+        notice = maybe_maintenance_notice(_pkg._get_db()) or maybe_feedback_hint()
+    except Exception:  # noqa: BLE001 — an advisory never breaks its host response
+        log.debug("Search notices failed", exc_info=True)
+        return out
+    if notice:
+        return out + "\n\n---\n" + notice
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Contradiction-supersession preview (gap #5 false-positive mitigation)
 # ---------------------------------------------------------------------------
