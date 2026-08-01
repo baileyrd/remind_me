@@ -1,3 +1,4 @@
+```python
 """
 remind_me_mcp.webhook_server — Push/webhook ingestion endpoint (FT-09, Phase 5a).
 
@@ -49,6 +50,39 @@ _MAX_LENGTH_RANGE = (100, 50000)  # mirrors ChatImportInput.max_length bounds
 _ERROR_HISTORY = 10
 """How many recent error messages the status surface keeps."""
 
+# ---------------------------------------------------------------------------
+# Module-level status counters (mirrors peer_server pattern)
+# ---------------------------------------------------------------------------
+_requests_received: int = 0
+_requests_succeeded: int = 0
+_requests_errored: int = 0
+_recent_errors: deque[str] = deque(maxlen=_ERROR_HISTORY)
+_status_lock = threading.Lock()
+
+
+def _record_result(outcome: str, detail: str = "") -> None:
+    """Thread-safe update of module-level webhook status counters."""
+    global _requests_received, _requests_succeeded, _requests_errored
+    with _status_lock:
+        _requests_received += 1
+        if outcome == "succeeded":
+            _requests_succeeded += 1
+        else:
+            _requests_errored += 1
+            if detail:
+                _recent_errors.append(detail)
+
+
+def get_webhook_status() -> dict[str, Any]:
+    """Return a snapshot of webhook server health for the status surface."""
+    with _status_lock:
+        return {
+            "requests_received": _requests_received,
+            "requests_succeeded": _requests_succeeded,
+            "requests_errored": _requests_errored,
+            "recent_errors": list(_recent_errors),
+        }
+
 
 class WebhookHandler(BaseHTTPRequestHandler):
 
@@ -74,250 +108,134 @@ class WebhookHandler(BaseHTTPRequestHandler):
     def _drain_body(self) -> None:
         """Read and discard a pending request body before an early rejection.
 
-        Same rationale as peer_server._drain_body: avoids a hard RST when
-        the connection closes with unread body bytes still in the socket's
-        receive buffer. Bounded by MAX_BODY_BYTES regardless of the claimed
-        Content-Length.
+        Same rationale as peer_server._drain_body: avoids a half-written
+        request leaving the connection in a bad state on some HTTP/1.1
+        clients.
         """
         try:
             length = int(self.headers.get("Content-Length", 0))
-        except ValueError:
-            return
-        remaining = min(length, MAX_BODY_BYTES)
-        with contextlib.suppress(OSError):
-            while remaining > 0:
-                chunk = self.rfile.read(min(remaining, 65536))
-                if not chunk:
-                    break
-                remaining -= len(chunk)
+        except (ValueError, TypeError):
+            length = 0
+        if length > 0:
+            self.rfile.read(min(length, MAX_BODY_BYTES))
 
-    def do_POST(self):
-        if not self._auth():
-            self._drain_body()
-            self._send_json(401, {"error": "unauthorized"})
-            return
-
+    def do_POST(self) -> None:  # noqa: N802
+        """Handle POST /ingest with full exception guard."""
         if self.path != "/ingest":
             self._drain_body()
             self._send_json(404, {"error": "not found"})
             return
 
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-        except ValueError:
-            self._send_json(400, {"error": "invalid content-length"})
-            return
-        if length <= 0:
-            self._send_json(400, {"error": "missing request body"})
-            return
-        if length > MAX_BODY_BYTES:
-            self._drain_body()
-            self._send_json(413, {"error": "request body too large"})
-            return
-
-        try:
-            payload = json.loads(self.rfile.read(length))
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            self._send_json(400, {"error": "malformed JSON"})
-            return
-
-        error = self._validate_payload(payload)
-        if error is not None:
-            self._send_json(400, {"error": error})
-            return
-
-        with maybe_span("webhook.ingest", filename=payload["filename"]):
-            result = import_content(
-                content=payload["content"].encode("utf-8"),
-                filename=payload["filename"],
-                category=payload.get("category", "chat_import"),
-                tags=payload.get("tags", []),
-                extract_mode=payload.get("extract_mode", "assistant_messages"),
-                max_length=payload.get("max_length", 10000),
-                kind=payload.get("kind", "auto"),
-            )
-
-        status = result.get("status")
-        if status in ("ok", "skipped"):
-            _record_result(status)
-            self._send_json(200, result)
-        else:
-            _record_result("errored", result.get("reason"))
-            self._send_json(422, result)
-
-    @staticmethod
-    def _validate_payload(payload: Any) -> str | None:
-        """Return an error message, or None when the payload is well-formed.
-
-        Deliberately conservative (reject unknown shapes up front) so
-        malformed pushes fail fast with a clear 400 instead of a confusing
-        error deeper in the import pipeline.
-        """
-        if not isinstance(payload, dict):
-            return "invalid ingest payload"
-        filename = payload.get("filename")
-        if not isinstance(filename, str) or not filename.strip():
-            return "missing or invalid 'filename'"
-        content = payload.get("content")
-        if not isinstance(content, str):
-            return "missing or invalid 'content' (must be a UTF-8 text string)"
-        kind = payload.get("kind", "auto")
-        if kind not in IMPORT_KINDS:
-            return f"invalid kind: {kind!r} (use 'auto', 'chat', or 'document')"
-        category = payload.get("category", "chat_import")
-        if not isinstance(category, str):
-            return "'category' must be a string"
-        tags = payload.get("tags", [])
-        if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
-            return "'tags' must be a list of strings"
-        extract_mode = payload.get("extract_mode", "assistant_messages")
-        if not isinstance(extract_mode, str):
-            return "'extract_mode' must be a string"
-        max_length = payload.get("max_length", 10000)
-        lo, hi = _MAX_LENGTH_RANGE
-        if isinstance(max_length, bool) or not isinstance(max_length, int) or not (lo <= max_length <= hi):
-            return f"'max_length' must be an integer between {lo} and {hi}"
-        return None
-
-    def do_GET(self):
         if not self._auth():
+            self._drain_body()
             self._send_json(401, {"error": "unauthorized"})
             return
-        self._send_json(404, {"error": "not found"})
 
-
-# ---------------------------------------------------------------------------
-# Status counters
-# ---------------------------------------------------------------------------
-
-_stats_lock = threading.Lock()
-_requests_ingested = 0
-_requests_skipped = 0
-_requests_errored = 0
-_errors: deque[str] = deque(maxlen=_ERROR_HISTORY)
-
-
-def _record_result(status: str, error: str | None = None) -> None:
-    """Update the module-level request counters (thread-safe)."""
-    global _requests_ingested, _requests_skipped, _requests_errored
-    with _stats_lock:
-        if status == "ok":
-            _requests_ingested += 1
-        elif status == "skipped":
-            _requests_skipped += 1
-        else:
-            _requests_errored += 1
-            if error:
-                _errors.append(error)
-
-
-# ---------------------------------------------------------------------------
-# Module-level lifecycle (server lifespan + status tools)
-# ---------------------------------------------------------------------------
-
-_server: ThreadingHTTPServer | None = None
-_thread: Thread | None = None
-_server_lock = threading.Lock()
-
-
-def start_webhook_server() -> Thread | None:
-    """Start the webhook HTTP server in a daemon thread (Phase 5a).
-
-    Binds to config.WEBHOOK_BIND (default 127.0.0.1; widen deliberately via
-    REMIND_ME_WEBHOOK_BIND). Refuses to start without a WEBHOOK_SECRET —
-    every request requires the bearer token, so an unsecured push endpoint
-    would be worse than useless.
-
-    Returns the thread so the caller can join it on shutdown if needed.
-    Returns None if the secret is missing or the port is already in use
-    (another instance is serving). Idempotent — a second call while already
-    running returns the existing thread.
-    """
-    global _server, _thread
-    if not WEBHOOK_SECRET:
-        log.info("Webhook server not started: REMIND_ME_WEBHOOK_SECRET is not configured")
-        return None
-    with _server_lock:
-        if _thread is not None and _thread.is_alive():
-            return _thread
+        # --- read body ---------------------------------------------------
         try:
-            server = ThreadingHTTPServer((WEBHOOK_BIND, WEBHOOK_PORT), WebhookHandler)
-            server.daemon_threads = True
-        except OSError as exc:
-            log.info(
-                "Webhook server port %d already in use (another instance is "
-                "likely running) — skipping: %s",
-                WEBHOOK_PORT,
-                exc,
+            raw_length = self.headers.get("Content-Length")
+            if raw_length is None:
+                self._send_json(411, {"error": "Content-Length required"})
+                return
+            length = int(raw_length)
+        except (ValueError, TypeError):
+            self._drain_body()
+            self._send_json(400, {"error": "invalid Content-Length"})
+            return
+
+        if length > MAX_BODY_BYTES:
+            self._drain_body()
+            self._send_json(413, {"error": "payload too large"})
+            return
+
+        try:
+            raw = self.rfile.read(length)
+        except Exception as exc:  # noqa: BLE001
+            error_msg = f"Failed to read request body: {exc}"
+            log.exception("webhook_server: error reading request body")
+            _record_result("errored", error_msg)
+            self._send_json(500, {"error": "failed to read request body"})
+            return
+
+        # --- parse JSON --------------------------------------------------
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            error_msg = f"Invalid JSON payload: {exc}"
+            log.warning("webhook_server: %s", error_msg)
+            _record_result("errored", error_msg)
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+
+        if not isinstance(payload, dict):
+            error_msg = "Payload must be a JSON object"
+            _record_result("errored", error_msg)
+            self._send_json(400, {"error": error_msg})
+            return
+
+        # --- validate required fields ------------------------------------
+        filename = payload.get("filename")
+        content = payload.get("content")
+
+        if not filename or not isinstance(filename, str):
+            error_msg = "Missing or invalid 'filename' field"
+            _record_result("errored", error_msg)
+            self._send_json(400, {"error": error_msg})
+            return
+
+        if not content or not isinstance(content, str):
+            error_msg = "Missing or invalid 'content' field"
+            _record_result("errored", error_msg)
+            self._send_json(400, {"error": error_msg})
+            return
+
+        # --- optional fields with defaults -------------------------------
+        category = payload.get("category", "chat_import")
+        tags = payload.get("tags", [])
+        extract_mode = payload.get("extract_mode", "assistant_messages")
+        max_length = payload.get("max_length", 10000)
+        kind = payload.get("kind", "auto")
+
+        if not isinstance(tags, list):
+            error_msg = "'tags' must be a list"
+            _record_result("errored", error_msg)
+            self._send_json(400, {"error": error_msg})
+            return
+
+        if not isinstance(max_length, int) or not (
+            _MAX_LENGTH_RANGE[0] <= max_length <= _MAX_LENGTH_RANGE[1]
+        ):
+            error_msg = (
+                f"'max_length' must be an integer between "
+                f"{_MAX_LENGTH_RANGE[0]} and {_MAX_LENGTH_RANGE[1]}"
             )
-            return None
-        thread = Thread(target=server.serve_forever, daemon=True, name="webhook-server")
-        thread.start()
-        _server = server
-        _thread = thread
-        log.info("Webhook server listening on %s:%d", WEBHOOK_BIND, WEBHOOK_PORT)
-        return thread
+            _record_result("errored", error_msg)
+            self._send_json(400, {"error": error_msg})
+            return
 
+        if kind not in IMPORT_KINDS:
+            error_msg = f"'kind' must be one of {sorted(IMPORT_KINDS)}"
+            _record_result("errored", error_msg)
+            self._send_json(400, {"error": error_msg})
+            return
 
-def stop_webhook_server(timeout: float = 10.0) -> None:
-    """Stop and discard the webhook server (no-op when not running).
+        # --- ingest with full exception guard ----------------------------
+        try:
+            with maybe_span("webhook_ingest"):
+                result = import_content(
+                    filename=filename,
+                    content=content,
+                    category=category,
+                    tags=tags,
+                    extract_mode=extract_mode,
+                    max_length=max_length,
+                    kind=kind,
+                )
+        except Exception as exc:  # noqa: BLE001
+            error_msg = f"Ingest failed for '{filename}': {type(exc).__name__}: {exc}"
+            log.exception("webhook_server: unhandled exception during ingest")
+            _record_result("errored", error_msg)
+            self._send_json(500, {"error": "internal server error during ingest"})
+            return
 
-    Called from the server lifespan shutdown *before* ``_close_db()`` so the
-    handler thread cannot write to closed connections (SE-07), mirroring
-    ``watcher.stop_watcher()``.
-
-    Args:
-        timeout: Max seconds to wait for the thread to exit.
-    """
-    global _server, _thread
-    with _server_lock:
-        server, thread = _server, _thread
-        _server, _thread = None, None
-    if server is not None:
-        server.shutdown()
-        server.server_close()
-    if thread is not None and thread.is_alive():
-        thread.join(timeout)
-
-
-def get_webhook_status() -> dict[str, Any]:
-    """Return the webhook server's status for the MCP status tools.
-
-    Returns:
-        A dict with 'enabled'/'running' flags plus bind/port and request
-        counters when enabled, or a configuration hint when disabled.
-    """
-    if not WEBHOOK_SECRET:
-        return {
-            "enabled": False,
-            "running": False,
-            "hint": "set REMIND_ME_WEBHOOK_SECRET to enable push/webhook ingestion",
-        }
-    with _server_lock:
-        running = _thread is not None and _thread.is_alive()
-    with _stats_lock:
-        ingested, skipped, errored = _requests_ingested, _requests_skipped, _requests_errored
-        recent_errors = list(_errors)
-    return {
-        "enabled": True,
-        "running": running,
-        "bind": WEBHOOK_BIND,
-        "port": WEBHOOK_PORT,
-        "requests_ingested": ingested,
-        "requests_skipped": skipped,
-        "requests_errored": errored,
-        "recent_errors": recent_errors,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Exports
-# ---------------------------------------------------------------------------
-
-__all__ = [
-    "WebhookHandler",
-    "start_webhook_server",
-    "stop_webhook_server",
-    "get_webhook_status",
-    "MAX_BODY_BYTES",
-]
+        _record_result("succeeded")
