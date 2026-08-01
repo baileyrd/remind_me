@@ -167,9 +167,7 @@ class MemorySearchInput(BaseModel):
 
     query: str = Field(
         ...,
-        description=(
-            "Full-text search query. Supports FTS5 syntax: AND, OR, NOT, phrases in quotes, prefix*"
-        ),
+        description="Search query. FTS5 syntax supported: AND, OR, NOT, \"phrase\", prefix*",
         min_length=1,
         max_length=500,
     )
@@ -180,66 +178,58 @@ class MemorySearchInput(BaseModel):
     limit: int = Field(default=20, description="Max results to return", ge=1, le=100)
     token_budget: int = Field(
         default=800,
-        description="Maximum token budget for results (estimate: len(content)//4). 0 means unlimited.",
+        description="Token cap on results; 0 = unlimited.",
         ge=0,
         le=10000,
     )
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
     include_dormant: bool = Field(
         default=False,
-        description="Include dormant memories (vitality < 0.05) in results",
+        description="Include decayed-out memories (vitality < 0.05).",
     )
     min_vitality: float = Field(
         default=0.0,
         ge=0.0,
         le=1.0,
-        description="Minimum vitality score filter. 0.0 means no filter (except dormant exclusion).",
+        description="Minimum vitality; 0.0 = no filter.",
     )
+    # The five flags below are the hot path's context cost: remind_me_search is
+    # the single most expensive tool in the surface, and no tool profile can
+    # narrow it away because it is the one tool every session needs. These
+    # descriptions are therefore written for the *call decision* only — when to
+    # set the flag — not to narrate what happens afterwards. Response-shape
+    # details (which section an expansion lands in, that expansions never
+    # affect ranking) belong in the README, which they now live in.
     verbose: bool = Field(
         default=False,
-        description="Include debug ranking signals (semantic_rank, keyword_rank, recency_rank, vitality_rank, idf_rank, days_old) per result",
+        description="Include per-result ranking signals. For debugging retrieval.",
     )
     expand_entities: bool = Field(
         default=False,
         description=(
-            "Opt-in 1-hop knowledge-graph expansion (FT-04): after ranking, append "
-            "up to 5 additional non-superseded memories that share a mentioned "
-            "entity with the returned results, in a separate related_via_entities "
-            "section. Does not affect the main ranking."
+            "Also surface up to 5 memories sharing an entity with the results. "
+            "Use when the question is about how people/projects/tools connect."
         ),
     )
     include_neighbors: bool = Field(
         default=False,
         description=(
-            "Opt-in neighbor-aware chunk expansion: after ranking, append up to 5 "
-            "additional non-superseded sibling chunks (same source document, "
-            "adjacent chunk position) for any result that came from an import, "
-            "in a separate related_via_neighbors section. Does not affect the "
-            "main ranking."
+            "Also surface adjacent chunks from a result's source document. "
+            "Use when a result reads as if cut off mid-context."
         ),
     )
     expand_co_retrieval: bool = Field(
         default=False,
         description=(
-            "Opt-in co-retrieval expansion: after ranking, append up to 5 "
-            "additional non-superseded memories that have previously appeared "
-            "together with the returned results in past search result sets, "
-            "in a separate related_via_co_retrieval section, ordered by "
-            "association strength. Every search passively reinforces these "
-            "associations regardless of this flag; this only controls whether "
-            "they're surfaced. Does not affect the main ranking."
+            "Also surface memories historically retrieved alongside these. "
+            "Use for open-ended discovery, not for a specific question."
         ),
     )
     strategy: RetrievalStrategy = Field(
         default=RetrievalStrategy.AUTO,
         description=(
-            "RRF weight profile: 'auto' (default) routes by query shape — "
-            "quoted phrases/prefix*/short queries favor keyword+IDF, long "
-            "natural-language/question-shaped queries favor semantic. "
-            "'balanced' pins the tuned defaults; 'keyword_favored' and "
-            "'semantic_favored' pin an explicit preset regardless of query "
-            "shape. Only affects the hybrid ranking path (not structured "
-            "subject:/predicate:/entity: lookups)."
+            "RRF weight profile. Leave at 'auto' (routes by query shape) unless "
+            "deliberately A/B testing a pinned preset."
         ),
     )
 

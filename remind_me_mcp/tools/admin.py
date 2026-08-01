@@ -566,6 +566,27 @@ async def remind_me_server_status() -> str:
 
     lines.append("\n**MCP (stdio):** ✓ Active (this connection)")
 
+    # Tool-surface cost. The full surface runs ~21k tokens of context in every
+    # session on every client, whether or not an admin tool is ever touched --
+    # about 1.8x what a whole `remind_me_wiki_load` costs. Surfacing the number
+    # here is what makes the profile knob discoverable at all; nobody goes
+    # looking for an env var to solve a cost they cannot see.
+    from remind_me_mcp import tool_profiles
+
+    n_tools, approx_tokens = tool_profiles.surface_cost(mcp)
+    if tool_profiles.TOOL_PROFILE == "full":
+        lines.append(
+            f"**Tool surface:** {n_tools} tools, ~{approx_tokens // 1000}k tokens of context "
+            f"per session (profile `full`). Set `REMIND_ME_TOOL_PROFILE=standard` "
+            f"(drops imports/sync/ops) or `core` (conversational only) to reclaim context."
+        )
+    else:
+        lines.append(
+            f"**Tool surface:** {n_tools} tools, ~{approx_tokens // 1000}k tokens of context "
+            f"per session (profile `{tool_profiles.TOOL_PROFILE}` — a narrowed surface; "
+            f"unset `REMIND_ME_TOOL_PROFILE` for all tools)."
+        )
+
     # Embedding status — the availability probe may hit the network (PF-01).
     embedder = await asyncio.to_thread(_get_embedder)
     if embedder is not None:
