@@ -109,7 +109,7 @@ def test_unnormalized_and_unannotated_queries_use_an_index_seek(
         ).fetchall()
         by_id = {row[0]: row for row in plan}
 
-        def _is_under_correlated_subquery(node_id: int) -> bool:
+        def _is_under_correlated_subquery(node_id: int, by_id: dict = by_id) -> bool:
             node = by_id.get(node_id)
             while node is not None:
                 if "CORRELATED" in node[3].upper():

@@ -8,7 +8,6 @@ these tests skip outright when not running on win32.
 
 from __future__ import annotations
 
-import subprocess
 import sys
 
 import pytest

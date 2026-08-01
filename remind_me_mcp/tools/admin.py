@@ -35,6 +35,14 @@ from remind_me_mcp.models import (
 from remind_me_mcp.server import mcp
 from remind_me_mcp.tools._shared import _maybe_update_notice, log
 
+try:
+    from chromadb.errors import NotFoundError as ChromaNotFoundError
+except ImportError:
+    # chromadb isn't installed -- nothing chromadb-specific can be raised
+    # from the mempalace import path below beyond the bare ImportError
+    # already handled there.
+    ChromaNotFoundError = ()
+
 
 @mcp.tool(
     name="remind_me_import_chat",
@@ -159,13 +167,6 @@ async def memory_import_mempalace(params: MempalaceImportInput) -> str:
         higher offset if true).
     """
     try:
-        from chromadb.errors import NotFoundError as _ChromaNotFoundError
-    except ImportError:
-        # chromadb isn't installed -- nothing chromadb-specific can be
-        # raised below beyond the bare ImportError already handled.
-        _ChromaNotFoundError = ()
-
-    try:
         result = await asyncio.to_thread(
             pull_mempalace,
             wing=params.wing,
@@ -184,7 +185,7 @@ async def memory_import_mempalace(params: MempalaceImportInput) -> str:
         })
     except FileNotFoundError as e:
         return json.dumps({"status": "error", "error": str(e)})
-    except _ChromaNotFoundError as e:
+    except ChromaNotFoundError as e:
         # issue #144: _open_collection's client.get_collection() raises
         # chromadb's own NotFoundError for a store that exists but has no
         # 'remind_me_import' collection yet (e.g. an empty/fresh palace) --

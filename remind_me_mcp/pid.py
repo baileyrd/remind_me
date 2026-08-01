@@ -11,11 +11,13 @@ from __future__ import annotations
 import json
 import logging
 import os
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from remind_me_mcp.config import DB_PATH, PID_FILE
 from remind_me_mcp.db import _now_iso
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 log = logging.getLogger("remind_me_mcp.pid")
 
