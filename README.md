@@ -648,6 +648,10 @@ For a single-user app where one SQLite file holds someone's entire memory store,
   ```
   Validates the backup (`PRAGMA integrity_check` plus a sanity check that it's actually a remind-me database) before touching anything, and snapshots the *current* database first so a bad restore is itself recoverable. Refuses to run while an MCP server is holding the lock on this database. `--restore` accepts either a bare filename (resolved against the backups directory) or a full path to any valid backup file.
 
+## Encryption at Rest
+
+Optional, opt-in, off by default. Setting `REMIND_ME_DB_ENCRYPTION_KEY` (requires `pip install remind-me-mcp[encryption]`) encrypts `memory.db` and its backups at rest via [SQLCipher](https://www.zetetic.net/sqlcipher/). Not for every user or install — see [ARCHITECTURE.md's "Encryption at rest" design note](ARCHITECTURE.md#encryption-at-rest-is-opt-in-not-default-issue-184) for the full rationale, what is and isn't covered, and the v1 adoption story (encryption must be enabled before an install's first run; there's no in-place re-encryption of an existing plaintext database yet).
+
 ## Importing Chats & Documents
 
 The import tools (`remind_me_import_chat`, `remind_me_import_directory`, `POST /api/import`) share one pipeline: hash-based deduplication (re-importing the same file content is a no-op), batched embedding, and a `kind` parameter that controls parsing.
@@ -1349,6 +1353,7 @@ Every new memory used to start at a flat `base_weight=1.0` regardless of kind, s
 | `REMIND_ME_EMBEDDING_BACKEND` | `onnx` | Embedding backend: `onnx` (in-process) or `ollama` (local daemon) |
 | `REMIND_ME_EMBEDDING_DIM` | `384` | Embedding dimension — must match the model (nomic-embed-text=768, bge-m3=1024). Changing it requires recreating the vector table + `remind_me_reindex` |
 | `REMIND_ME_BACKUP_RETENTION_COUNT` | `10` | Number of backup files (manual + pre-migration) kept under `MEMORY_DIR/backups/`; oldest pruned after each new backup |
+| `REMIND_ME_DB_ENCRYPTION_KEY` | *(unset)* | SQLCipher passphrase for encryption at rest — see [Encryption at Rest](#encryption-at-rest). Requires the `encryption` extra (`pip install remind-me-mcp[encryption]`); unset (default) leaves `memory.db`/backups exactly as before this option existed. Never logged |
 | `REMIND_ME_OLLAMA_URL` | `http://localhost:11434` | Ollama daemon URL (when backend is `ollama`) |
 | `REMIND_ME_OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Ollama embedding model name. Query/passage instruction prefixes (e.g. `search_query:`/`search_document:`) are applied automatically for known model families (`nomic-embed-text`, `bge-*`, `e5-*`) — see `embeddings._ROLE_PREFIXES` |
 | `REMIND_ME_EMBED_CHUNK_CHARS` | `1600` | Character window size for sliding-window embedding of long content |

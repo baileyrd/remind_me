@@ -86,6 +86,7 @@ from remind_me_mcp import ann_index
 from remind_me_mcp.config import (
     ANALYTICS_RETENTION_DAYS,
     ANN_MIN_CHUNKS,
+    DB_ENCRYPTION_KEY,
     DB_PATH,
     EMBED_BATCH_SIZE,
     EMBEDDING_BACKEND,
@@ -115,6 +116,151 @@ _schema_ready = False
 _db_generation = 0
 
 
+def _quote_sql_string(value: str) -> str:
+    """Escape *value* for embedding in a single-quoted SQL string literal.
+
+    Doubling every embedded ``'`` is SQLite's own (and standard SQL's)
+    complete escape for a quoted string literal -- there is no other
+    special character reachable from inside single quotes (no backslash
+    escapes, no comment/statement terminators), so this is a full escape,
+    not a partial mitigation. Needed by :func:`_open_db_connection` because
+    PRAGMA statements do not accept bound (``?``) parameters in sqlite3's C
+    API -- verified directly: ``PRAGMA key = ?`` raises
+    ``OperationalError: near "?": syntax error`` -- which is normally how a
+    value like an encryption key would be passed safely.
+    """
+    return value.replace("'", "''")
+
+
+def _open_db_connection(path: str, *, timeout: float = 10, readonly: bool = False) -> sqlite3.Connection:
+    """Open a connection to *path*, transparently encrypted when
+    ``config.DB_ENCRYPTION_KEY`` is set (issue #184).
+
+    Single choke point for opening *this project's own* database file (as
+    opposed to an in-memory test fixture or an unrelated third-party SQLite
+    file such as a `dbs` import source -- see ARCHITECTURE.md's "Encryption
+    at rest" section for the full list of call sites and why each is or
+    isn't routed through here), shared by :func:`_get_db` and
+    ``backup.py``'s backup-destination and restore-validation connections,
+    so the SQLCipher key-activation pragma is written in exactly one place
+    rather than risking drift across call sites.
+
+    With ``DB_ENCRYPTION_KEY`` unset (the default), this is byte-identical
+    to the plain ``sqlite3.connect(...)`` call it replaces: the encrypted
+    branch below is never imported, never reached, never executed.
+
+    When set, opens via the optional ``sqlcipher3`` package instead and
+    issues ``PRAGMA key = '<escaped key>'`` as the very first statement on
+    the connection, before any other pragma or query -- SQLCipher only
+    decrypts pages correctly if the key pragma is the first thing sent.
+    The returned object is API-compatible with ``sqlite3.Connection``
+    (``execute``, ``row_factory``, ``backup()``, ``enable_load_extension()``
+    all behave the same) but is **not** an ``isinstance`` of it: sqlcipher3
+    is a separately-compiled fork of the sqlite3 C extension, so its
+    ``Connection``/exception classes are disjoint from the stdlib's rather
+    than subclasses. See the ARCHITECTURE.md note for the consequence (some
+    ``except sqlite3.OperationalError``-style handlers elsewhere in this
+    codebase will not catch the sqlcipher3 equivalent when encryption is
+    enabled -- a documented, known v1 limitation, not fixed everywhere in
+    this change).
+
+    Args:
+        path: Filesystem path to the database file (or a ``file:`` URI when
+            *readonly* is True).
+        timeout: Passed through to the underlying ``connect()`` (ignored for
+            *readonly*, which never writes and so never waits on a lock).
+        readonly: Open via ``file:{path}?mode=ro`` instead of a normal
+            read-write connection (mirrors how ``backup.py`` already opened
+            its validation connection before this change).
+
+    Raises:
+        RuntimeError: if ``DB_ENCRYPTION_KEY`` is set but the ``sqlcipher3``
+            package (the ``encryption`` extra) is not installed.
+    """
+    if not DB_ENCRYPTION_KEY:
+        if readonly:
+            return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        return sqlite3.connect(path, timeout=timeout, check_same_thread=False)
+
+    try:
+        from sqlcipher3 import dbapi2 as sqlcipher
+    except ImportError as e:
+        raise RuntimeError(
+            "REMIND_ME_DB_ENCRYPTION_KEY is set but the optional 'sqlcipher3-wheels' "
+            "dependency is not installed. Install it with "
+            "`pip install remind-me-mcp[encryption]`, or unset "
+            "REMIND_ME_DB_ENCRYPTION_KEY to use an unencrypted database."
+        ) from e
+
+    if readonly:
+        conn = sqlcipher.connect(f"file:{path}?mode=ro", uri=True)
+    else:
+        conn = sqlcipher.connect(path, timeout=timeout, check_same_thread=False)
+    conn.execute(f"PRAGMA key = '{_quote_sql_string(DB_ENCRYPTION_KEY)}'")
+    # sqlcipher3.dbapi2.Connection is API-compatible with sqlite3.Connection
+    # (execute/row_factory/backup()/enable_load_extension() all verified to
+    # behave the same, see this function's docstring) but is a genuinely
+    # distinct type, not a subclass -- mypy correctly flags the mismatch
+    # since sqlcipher3-wheels ships its own type stubs (`py.typed`), unlike
+    # most of this codebase's other optional native dependencies. Ignored
+    # deliberately here, the same way embeddings.py/reranker.py handle an
+    # optional dependency's types, rather than threading a Union through
+    # every caller of _get_db() for a runtime substitution that is exercised
+    # only when the caller opts in.
+    return conn  # type: ignore[return-value]
+
+
+def _row_factory_class() -> type:
+    """The ``Row`` class matching whichever driver :func:`_open_db_connection`
+    will use -- ``sqlite3.Row`` normally, or sqlcipher3's own ``Row`` class
+    when encryption is active.
+
+    The two are **not** interchangeable, discovered while writing this
+    feature's own tests (not a theoretical concern): ``sqlite3.Row``'s
+    constructor requires an actual ``sqlite3.Cursor`` --
+    ``db.row_factory = sqlite3.Row`` on an sqlcipher3 connection raises
+    ``TypeError: Row() argument 1 must be sqlite3.Cursor, not
+    sqlcipher3.dbapi2.Cursor`` on the very first dict-style row access,
+    since ``Row`` is a C type bound to its own module's Cursor/Connection
+    objects rather than a generic DB-API adapter. Every dict-style
+    ``row["column"]`` access throughout this codebase depends on the
+    connection's row_factory being set correctly, so this is a
+    correctness-critical part of the encrypted path, not cosmetic.
+    """
+    if DB_ENCRYPTION_KEY:
+        try:
+            from sqlcipher3 import dbapi2 as sqlcipher
+
+            return sqlcipher.Row
+        except ImportError:
+            pass
+    return sqlite3.Row
+
+
+def _sqlite_driver_errors() -> tuple[type[Exception], ...]:
+    """Exception base class(es) the currently-configured SQLite driver may raise.
+
+    Just ``(sqlite3.Error,)`` when encryption is off (the default) --
+    unchanged from before #184. When ``DB_ENCRYPTION_KEY`` is set and
+    ``sqlcipher3`` is importable, also includes sqlcipher3's own ``Error``
+    base, since (per :func:`_open_db_connection`'s docstring) it is a
+    disjoint hierarchy, not a subclass of ``sqlite3.Error``. Callers that
+    need to catch "any database driver error" regardless of which driver is
+    actually active -- e.g. ``backup.py``'s restore validation, which must
+    convert a corrupt-or-wrong-key file into a clean ``RestoreError`` either
+    way -- use ``except db._sqlite_driver_errors() as e:`` (a tuple is a
+    valid ``except`` target) instead of hardcoding ``sqlite3.Error``.
+    """
+    if DB_ENCRYPTION_KEY:
+        try:
+            from sqlcipher3 import dbapi2 as sqlcipher
+
+            return (sqlite3.Error, sqlcipher.Error)
+        except ImportError:
+            pass
+    return (sqlite3.Error,)
+
+
 def _get_db() -> sqlite3.Connection:
     """Return a per-thread SQLite connection, creating one if needed.
 
@@ -129,6 +275,11 @@ def _get_db() -> sqlite3.Connection:
     thread isolation is still provided by the per-thread ``threading.local``
     registry. All connections are tracked in ``_all_connections`` so
     ``_close_db()`` can shut them down at application exit.
+
+    Transparently opens an encrypted connection instead when
+    ``config.DB_ENCRYPTION_KEY`` is set (issue #184) -- see
+    :func:`_open_db_connection`. With the key unset (the default), the line
+    below is exactly the pre-#184 ``sqlite3.connect(...)`` call.
     """
     global _schema_ready
 
@@ -136,8 +287,8 @@ def _get_db() -> sqlite3.Connection:
     if conn is not None and getattr(_local, "generation", None) == _db_generation:
         return conn
 
-    db = sqlite3.connect(str(DB_PATH), timeout=10, check_same_thread=False)
-    db.row_factory = sqlite3.Row
+    db = _open_db_connection(str(DB_PATH), timeout=10)
+    db.row_factory = _row_factory_class()
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA busy_timeout=5000")
     db.execute("PRAGMA foreign_keys=ON")
@@ -149,6 +300,15 @@ def _get_db() -> sqlite3.Connection:
         try:
             sqlite_vec.load(db)
         except sqlite3.OperationalError as e:
+            log.debug("sqlite-vec extension load failed: %s (vector search disabled)", e)
+        except Exception as e:
+            # Reached only when DB_ENCRYPTION_KEY is set: sqlcipher3's
+            # OperationalError is not a subclass of sqlite3's (see
+            # _open_db_connection), so the except clause above can't catch
+            # it there. Re-raise unchanged for the unencrypted path so its
+            # exception behavior is provably identical to before #184.
+            if not DB_ENCRYPTION_KEY:
+                raise
             log.debug("sqlite-vec extension load failed: %s (vector search disabled)", e)
         db.enable_load_extension(False)
     except ImportError as e:

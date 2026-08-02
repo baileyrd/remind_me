@@ -6,18 +6,27 @@ than a raw file copy, which could read a torn/partially-checkpointed page
 while the WAL is mid-write. Backups live under ``BACKUP_DIR`` and are pruned
 to ``BACKUP_RETENTION_COUNT`` most-recent files after each new backup is
 created.
+
+When ``config.DB_ENCRYPTION_KEY`` is set (issue #184), the backup
+destination is opened through :func:`remind_me_mcp.db._open_db_connection`
+too, so a backup of an encrypted database is itself encrypted with the same
+key -- ``Connection.backup()`` copies pages as SQLCipher already stores them
+(ciphertext), it never decrypts in transit. See ARCHITECTURE.md's
+"Encryption at rest" section for what this does and doesn't cover.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from remind_me_mcp.config import BACKUP_DIR, BACKUP_RETENTION_COUNT, DB_PATH
+
+if TYPE_CHECKING:
+    import sqlite3
 
 log = logging.getLogger("remind_me_mcp.backup")
 
@@ -54,10 +63,16 @@ def create_backup(db: sqlite3.Connection, *, label: str = "manual") -> Path:
             ``list_backups``/``_prune_old_backups`` can never mistake a
             half-written file for a real, restorable backup.
     """
+    from remind_me_mcp.db import _open_db_connection
+
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     dest = BACKUP_DIR / f"{label}-{_timestamp()}.db"
     tmp_dest = dest.with_suffix(".db.tmp")
-    dest_conn = sqlite3.connect(str(tmp_dest))
+    # Encrypted when DB_ENCRYPTION_KEY is set (issue #184): same key as the
+    # live `db` connection being backed up, since Connection.backup() copies
+    # pages as-stored -- an unencrypted destination could not receive
+    # ciphertext pages from an encrypted source (and vice versa).
+    dest_conn = _open_db_connection(str(tmp_dest))
     try:
         db.backup(dest_conn)
     except Exception:
@@ -128,13 +143,21 @@ def _validate_backup_file(source: Path) -> None:
 
     Raises:
         RestoreError: if *source* doesn't exist, isn't a valid SQLite
-            database, or fails ``PRAGMA integrity_check``.
+            database, or fails ``PRAGMA integrity_check``. When
+            ``config.DB_ENCRYPTION_KEY`` is set (issue #184), also raised if
+            *source* can't be decrypted with the configured key -- including
+            the case where *source* is actually an unencrypted backup (e.g.
+            one taken before encryption was turned on): restoring across
+            that boundary isn't supported in this version, see
+            ARCHITECTURE.md's "Encryption at rest" adoption-story note.
     """
+    from remind_me_mcp.db import _open_db_connection, _sqlite_driver_errors
+
     if not source.exists():
         raise RestoreError(f"backup file not found: {source}")
     try:
-        conn = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
-    except sqlite3.OperationalError as e:
+        conn = _open_db_connection(str(source), readonly=True)
+    except _sqlite_driver_errors() as e:
         raise RestoreError(f"could not open {source} as a SQLite database: {e}") from e
     try:
         (result,) = conn.execute("PRAGMA integrity_check").fetchone()
@@ -145,7 +168,9 @@ def _validate_backup_file(source: Path) -> None:
         ).fetchone()
         if table_count == 0:
             raise RestoreError(f"{source} has no 'memories' table -- not a remind-me database")
-    except sqlite3.DatabaseError as e:
+    except RestoreError:
+        raise
+    except _sqlite_driver_errors() as e:
         raise RestoreError(f"{source} is not a valid SQLite database: {e}") from e
     finally:
         conn.close()

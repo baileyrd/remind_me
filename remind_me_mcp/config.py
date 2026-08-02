@@ -894,7 +894,40 @@ __all__ = [
     "RATE_LIMIT_WINDOW_SECONDS",
     "AUTO_UPDATE_CHECK",
     "UPDATE_EXPECTED_ORIGIN",
+    "DB_ENCRYPTION_KEY",
 ]
+
+# ---------------------------------------------------------------------------
+# Encryption at rest (issue #184)
+# ---------------------------------------------------------------------------
+
+DB_ENCRYPTION_KEY: str | None = os.environ.get("REMIND_ME_DB_ENCRYPTION_KEY") or None
+"""SQLCipher passphrase, opt-in and off by default. See ARCHITECTURE.md's
+"Encryption at rest" design note for the full rationale, coverage, and known
+limitations.
+
+When unset (the default), this changes nothing: `remind_me_mcp.db` and
+`backup.py` open the database exactly as before #184, via the stdlib
+`sqlite3` module -- the encrypted code path is never imported, never
+reached.
+
+When set, `db._open_db_connection` (the single choke point shared by the
+live connection and `backup.py`'s backup-destination/restore-validation
+connections) opens through the optional `sqlcipher3` package instead and
+issues `PRAGMA key = '<key>'` as the very first statement on the
+connection, before any other pragma or query -- SQLCipher's required
+activation sequence. Requires the `encryption` extra
+(`pip install remind-me-mcp[encryption]`); if the key is set but the
+package isn't installed, connection opening raises a clear `RuntimeError`
+rather than silently falling back to plaintext.
+
+Deliberately never logged -- not even the "generated a secret, here it is
+once" pattern `resolve_api_key`/`resolve_connector_token`/`resolve_ics_token`
+use elsewhere in this module, because those generate and persist a fresh
+secret (so logging it once is the only way the operator ever sees it); this
+key is always user-supplied and never auto-generated or persisted by this
+module, so there is nothing here that needs announcing, only a value to
+read once per connection and pass straight to SQLCipher."""
 
 # ---------------------------------------------------------------------------
 # Sync configuration
