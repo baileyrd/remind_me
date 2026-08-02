@@ -63,6 +63,24 @@ Day-2 commands:
 ~/remind_me/hub/setup.sh update    # git pull, rebuild image, restart hub
 ```
 
+## Security posture
+
+- **Transport:** clients reach the hub over an SSH tunnel (or Tailscale, if
+  `--tunnel` is dropped in favor of `--hub-url`) to `127.0.0.1:8765` on the
+  server — nothing is exposed on a public interface. Every hub route except
+  `GET /health` requires the bearer `SYNC_SECRET` clients configure at setup.
+- **Encryption at rest:** the hub's Postgres database holds plaintext
+  records (the same records a client would hold plaintext locally without
+  the client-side `REMIND_ME_DB_ENCRYPTION_KEY` opt-in — see
+  [ARCHITECTURE.md](../ARCHITECTURE.md#encryption-at-rest-is-opt-in-not-default-issue-184)).
+  This codebase does not implement any hub-side encryption today. If you
+  need at-rest protection for the hub's data, it's a deployment/
+  infrastructure decision, not something to configure here — e.g. your
+  cloud provider's disk encryption, or Postgres's `pgcrypto`/enterprise TDE
+  extensions if you're running a Postgres distribution that offers one.
+  This is stated here as the honest current posture, not a roadmap
+  commitment.
+
 ## Protocol
 
 The hub implements the same wire protocol as the peer server

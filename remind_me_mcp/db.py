@@ -47,6 +47,26 @@ Current schema versions:
             that appeared together in a search result set, surfaced only as
             an opt-in expand_co_retrieval search section (never feeding
             back into ranking).
+  22 -> 23: time-based reminders (issue #179) -- remind_at column on
+            memories plus a reminder_deliveries table recording which
+            (memory_id, remind_at) pairs the background scheduler has
+            already fired, so a reminder that comes due while the server is
+            offline still fires exactly once on the next poll instead of
+            repeating forever or being silently dropped.
+  23 -> 24: edit history (issue #187) -- memory_revisions table capturing a
+            memory's pre-edit content/category/tags/metadata each time
+            remind_me_update (or a revert) genuinely changes one of them, so
+            a bad edit can be inspected (remind_me_history) and undone
+            (remind_me_revert). Purely additive and, like reminder_deliveries
+            and wiki_pages, deliberately NOT synced -- see that migration's
+            docstring for why.
+  24 -> 25: analytics trend snapshots (issue #186) -- analytics_snapshots
+            table capturing one row per day of the vault's aggregate
+            vitality-bucket distribution and category counts, so the
+            dashboard can show drift over time instead of only the current
+            instant. Purely additive and, like memory_revisions and
+            reminder_deliveries, deliberately NOT synced -- see that
+            migration's docstring for why.
 """
 
 from __future__ import annotations
@@ -64,12 +84,15 @@ import httpx
 
 from remind_me_mcp import ann_index
 from remind_me_mcp.config import (
+    ANALYTICS_RETENTION_DAYS,
     ANN_MIN_CHUNKS,
+    DB_ENCRYPTION_KEY,
     DB_PATH,
     EMBED_BATCH_SIZE,
     EMBEDDING_BACKEND,
     EMBEDDING_DIM,
     EMBEDDING_MODEL,
+    REVISION_RETENTION_DAYS,
 )
 from remind_me_mcp.embeddings import _get_embedder, chunk_text
 
@@ -93,6 +116,151 @@ _schema_ready = False
 _db_generation = 0
 
 
+def _quote_sql_string(value: str) -> str:
+    """Escape *value* for embedding in a single-quoted SQL string literal.
+
+    Doubling every embedded ``'`` is SQLite's own (and standard SQL's)
+    complete escape for a quoted string literal -- there is no other
+    special character reachable from inside single quotes (no backslash
+    escapes, no comment/statement terminators), so this is a full escape,
+    not a partial mitigation. Needed by :func:`_open_db_connection` because
+    PRAGMA statements do not accept bound (``?``) parameters in sqlite3's C
+    API -- verified directly: ``PRAGMA key = ?`` raises
+    ``OperationalError: near "?": syntax error`` -- which is normally how a
+    value like an encryption key would be passed safely.
+    """
+    return value.replace("'", "''")
+
+
+def _open_db_connection(path: str, *, timeout: float = 10, readonly: bool = False) -> sqlite3.Connection:
+    """Open a connection to *path*, transparently encrypted when
+    ``config.DB_ENCRYPTION_KEY`` is set (issue #184).
+
+    Single choke point for opening *this project's own* database file (as
+    opposed to an in-memory test fixture or an unrelated third-party SQLite
+    file such as a `dbs` import source -- see ARCHITECTURE.md's "Encryption
+    at rest" section for the full list of call sites and why each is or
+    isn't routed through here), shared by :func:`_get_db` and
+    ``backup.py``'s backup-destination and restore-validation connections,
+    so the SQLCipher key-activation pragma is written in exactly one place
+    rather than risking drift across call sites.
+
+    With ``DB_ENCRYPTION_KEY`` unset (the default), this is byte-identical
+    to the plain ``sqlite3.connect(...)`` call it replaces: the encrypted
+    branch below is never imported, never reached, never executed.
+
+    When set, opens via the optional ``sqlcipher3`` package instead and
+    issues ``PRAGMA key = '<escaped key>'`` as the very first statement on
+    the connection, before any other pragma or query -- SQLCipher only
+    decrypts pages correctly if the key pragma is the first thing sent.
+    The returned object is API-compatible with ``sqlite3.Connection``
+    (``execute``, ``row_factory``, ``backup()``, ``enable_load_extension()``
+    all behave the same) but is **not** an ``isinstance`` of it: sqlcipher3
+    is a separately-compiled fork of the sqlite3 C extension, so its
+    ``Connection``/exception classes are disjoint from the stdlib's rather
+    than subclasses. See the ARCHITECTURE.md note for the consequence (some
+    ``except sqlite3.OperationalError``-style handlers elsewhere in this
+    codebase will not catch the sqlcipher3 equivalent when encryption is
+    enabled -- a documented, known v1 limitation, not fixed everywhere in
+    this change).
+
+    Args:
+        path: Filesystem path to the database file (or a ``file:`` URI when
+            *readonly* is True).
+        timeout: Passed through to the underlying ``connect()`` (ignored for
+            *readonly*, which never writes and so never waits on a lock).
+        readonly: Open via ``file:{path}?mode=ro`` instead of a normal
+            read-write connection (mirrors how ``backup.py`` already opened
+            its validation connection before this change).
+
+    Raises:
+        RuntimeError: if ``DB_ENCRYPTION_KEY`` is set but the ``sqlcipher3``
+            package (the ``encryption`` extra) is not installed.
+    """
+    if not DB_ENCRYPTION_KEY:
+        if readonly:
+            return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        return sqlite3.connect(path, timeout=timeout, check_same_thread=False)
+
+    try:
+        from sqlcipher3 import dbapi2 as sqlcipher
+    except ImportError as e:
+        raise RuntimeError(
+            "REMIND_ME_DB_ENCRYPTION_KEY is set but the optional 'sqlcipher3-wheels' "
+            "dependency is not installed. Install it with "
+            "`pip install remind-me-mcp[encryption]`, or unset "
+            "REMIND_ME_DB_ENCRYPTION_KEY to use an unencrypted database."
+        ) from e
+
+    if readonly:
+        conn = sqlcipher.connect(f"file:{path}?mode=ro", uri=True)
+    else:
+        conn = sqlcipher.connect(path, timeout=timeout, check_same_thread=False)
+    conn.execute(f"PRAGMA key = '{_quote_sql_string(DB_ENCRYPTION_KEY)}'")
+    # sqlcipher3.dbapi2.Connection is API-compatible with sqlite3.Connection
+    # (execute/row_factory/backup()/enable_load_extension() all verified to
+    # behave the same, see this function's docstring) but is a genuinely
+    # distinct type, not a subclass -- mypy correctly flags the mismatch
+    # since sqlcipher3-wheels ships its own type stubs (`py.typed`), unlike
+    # most of this codebase's other optional native dependencies. Ignored
+    # deliberately here, the same way embeddings.py/reranker.py handle an
+    # optional dependency's types, rather than threading a Union through
+    # every caller of _get_db() for a runtime substitution that is exercised
+    # only when the caller opts in.
+    return conn  # type: ignore[return-value]
+
+
+def _row_factory_class() -> type:
+    """The ``Row`` class matching whichever driver :func:`_open_db_connection`
+    will use -- ``sqlite3.Row`` normally, or sqlcipher3's own ``Row`` class
+    when encryption is active.
+
+    The two are **not** interchangeable, discovered while writing this
+    feature's own tests (not a theoretical concern): ``sqlite3.Row``'s
+    constructor requires an actual ``sqlite3.Cursor`` --
+    ``db.row_factory = sqlite3.Row`` on an sqlcipher3 connection raises
+    ``TypeError: Row() argument 1 must be sqlite3.Cursor, not
+    sqlcipher3.dbapi2.Cursor`` on the very first dict-style row access,
+    since ``Row`` is a C type bound to its own module's Cursor/Connection
+    objects rather than a generic DB-API adapter. Every dict-style
+    ``row["column"]`` access throughout this codebase depends on the
+    connection's row_factory being set correctly, so this is a
+    correctness-critical part of the encrypted path, not cosmetic.
+    """
+    if DB_ENCRYPTION_KEY:
+        try:
+            from sqlcipher3 import dbapi2 as sqlcipher
+
+            return sqlcipher.Row
+        except ImportError:
+            pass
+    return sqlite3.Row
+
+
+def _sqlite_driver_errors() -> tuple[type[Exception], ...]:
+    """Exception base class(es) the currently-configured SQLite driver may raise.
+
+    Just ``(sqlite3.Error,)`` when encryption is off (the default) --
+    unchanged from before #184. When ``DB_ENCRYPTION_KEY`` is set and
+    ``sqlcipher3`` is importable, also includes sqlcipher3's own ``Error``
+    base, since (per :func:`_open_db_connection`'s docstring) it is a
+    disjoint hierarchy, not a subclass of ``sqlite3.Error``. Callers that
+    need to catch "any database driver error" regardless of which driver is
+    actually active -- e.g. ``backup.py``'s restore validation, which must
+    convert a corrupt-or-wrong-key file into a clean ``RestoreError`` either
+    way -- use ``except db._sqlite_driver_errors() as e:`` (a tuple is a
+    valid ``except`` target) instead of hardcoding ``sqlite3.Error``.
+    """
+    if DB_ENCRYPTION_KEY:
+        try:
+            from sqlcipher3 import dbapi2 as sqlcipher
+
+            return (sqlite3.Error, sqlcipher.Error)
+        except ImportError:
+            pass
+    return (sqlite3.Error,)
+
+
 def _get_db() -> sqlite3.Connection:
     """Return a per-thread SQLite connection, creating one if needed.
 
@@ -107,6 +275,11 @@ def _get_db() -> sqlite3.Connection:
     thread isolation is still provided by the per-thread ``threading.local``
     registry. All connections are tracked in ``_all_connections`` so
     ``_close_db()`` can shut them down at application exit.
+
+    Transparently opens an encrypted connection instead when
+    ``config.DB_ENCRYPTION_KEY`` is set (issue #184) -- see
+    :func:`_open_db_connection`. With the key unset (the default), the line
+    below is exactly the pre-#184 ``sqlite3.connect(...)`` call.
     """
     global _schema_ready
 
@@ -114,8 +287,8 @@ def _get_db() -> sqlite3.Connection:
     if conn is not None and getattr(_local, "generation", None) == _db_generation:
         return conn
 
-    db = sqlite3.connect(str(DB_PATH), timeout=10, check_same_thread=False)
-    db.row_factory = sqlite3.Row
+    db = _open_db_connection(str(DB_PATH), timeout=10)
+    db.row_factory = _row_factory_class()
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA busy_timeout=5000")
     db.execute("PRAGMA foreign_keys=ON")
@@ -127,6 +300,15 @@ def _get_db() -> sqlite3.Connection:
         try:
             sqlite_vec.load(db)
         except sqlite3.OperationalError as e:
+            log.debug("sqlite-vec extension load failed: %s (vector search disabled)", e)
+        except Exception as e:
+            # Reached only when DB_ENCRYPTION_KEY is set: sqlcipher3's
+            # OperationalError is not a subclass of sqlite3's (see
+            # _open_db_connection), so the except clause above can't catch
+            # it there. Re-raise unchanged for the unencrypted path so its
+            # exception behavior is provably identical to before #184.
+            if not DB_ENCRYPTION_KEY:
+                raise
             log.debug("sqlite-vec extension load failed: %s (vector search disabled)", e)
         db.enable_load_extension(False)
     except ImportError as e:
@@ -277,7 +459,7 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 # Current target schema version.  Increment when adding a new migration step.
-_SCHEMA_VERSION = 22
+_SCHEMA_VERSION = 25
 
 
 
@@ -450,6 +632,21 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         _migrate_v21_to_v22(db)
         db.execute("PRAGMA user_version = 22")
         current_version = 22
+
+    if current_version < 23:
+        _migrate_v22_to_v23(db)
+        db.execute("PRAGMA user_version = 23")
+        current_version = 23
+
+    if current_version < 24:
+        _migrate_v23_to_v24(db)
+        db.execute("PRAGMA user_version = 24")
+        current_version = 24
+
+    if current_version < 25:
+        _migrate_v24_to_v25(db)
+        db.execute("PRAGMA user_version = 25")
+        current_version = 25
 
     db.commit()
 
@@ -1051,7 +1248,7 @@ _OUTBOX_PAYLOAD_COLUMNS = (
     "accessed_at", "access_count", "decay_rate", "vitality", "base_weight",
     "status", "memory_type", "source_capture_id",
     "subject", "predicate", "object", "superseded_by",
-    "doc_id", "chunk_index", "deleted_at",
+    "doc_id", "chunk_index", "deleted_at", "remind_at",
 )
 
 # Entity columns mirrored into sync_outbox payloads (FT-04). Memory records
@@ -1742,6 +1939,197 @@ def _migrate_v21_to_v22(db: sqlite3.Connection) -> None:
     """)
 
 
+def _migrate_v22_to_v23(db: sqlite3.Connection) -> None:
+    """v22 -> v23: time-based reminders -- remind_at + delivery tracking (issue #179).
+
+    Adds ``remind_at`` (nullable, ISO-8601 UTC, same canonical format as
+    every other timestamp in this schema -- see :func:`_now_iso`) to
+    ``memories``: a memory can carry an optional future-timestamp reminder,
+    set/cleared via ``remind_me_set_reminder``. This is a genuine content
+    field, not access-tracking metadata, so unlike the v22 exception it is
+    expected to ride the normal ``updated_at``-bumping write path -- it is
+    added to ``_OUTBOX_PAYLOAD_COLUMNS`` and the ``memories_outbox_ai``/
+    ``_au`` triggers are dropped and recreated to pick it up, exactly the
+    same pattern v12->v13 used for ``doc_id``/``chunk_index`` and v15->v16
+    used for ``deleted_at`` (HY-03).
+
+    A separate ``reminder_deliveries`` table is needed alongside the column
+    because "``remind_at`` is in the past" is not the same fact as "this
+    reminder has already fired": a reminder that becomes due while the
+    server is offline must still fire exactly once on the next poll after
+    restart, not on every poll thereafter (a bare timestamp comparison can't
+    tell "already delivered" apart from "missed while the server was down"),
+    and it must not be silently skipped either. One row is inserted per
+    (memory_id, remind_at) pair once :mod:`remind_me_mcp.scheduler` delivers
+    it; the scheduler's due-reminder query excludes any pair already present
+    here. No sync outbox trigger on this table -- purely local scheduler
+    bookkeeping, the same scope decision as ``memory_feedback`` (v16->v17)
+    and ``memory_associations`` (v18->v19): a reminder fired on one device
+    does not (yet) suppress the same reminder firing again on another.
+
+    A partial index on ``memories(remind_at)`` -- restricted to rows with a
+    set, non-deleted reminder -- keeps the scheduler's due-reminder poll
+    query cheap regardless of vault size, mirroring the partial
+    ``idx_outbox_unsent`` index (v2->v3).
+
+    Args:
+        db: An open SQLite connection.
+    """
+    with contextlib.suppress(sqlite3.OperationalError):
+        db.execute("ALTER TABLE memories ADD COLUMN remind_at TEXT DEFAULT NULL")
+
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_memories_remind_at ON memories(remind_at) "
+        "WHERE remind_at IS NOT NULL AND deleted_at IS NULL"
+    )
+
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS reminder_deliveries (
+            id           INTEGER PRIMARY KEY,
+            memory_id    TEXT NOT NULL,
+            remind_at    TEXT NOT NULL,
+            delivered_at TEXT NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_reminder_deliveries_memory_remind_at
+            ON reminder_deliveries(memory_id, remind_at);
+    """)
+
+    payload = _outbox_payload_sql("NEW.")
+    db.executescript(f"""
+        DROP TRIGGER IF EXISTS memories_outbox_ai;
+        DROP TRIGGER IF EXISTS memories_outbox_au;
+
+        CREATE TRIGGER IF NOT EXISTS memories_outbox_ai
+        AFTER INSERT ON memories
+        WHEN COALESCE((SELECT value FROM sync_flags WHERE key = 'sync_enabled'), '0') = '1'
+        BEGIN
+            INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+            VALUES (NEW.id, 'insert', {payload}, {_SQL_NOW_ISO});
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS memories_outbox_au
+        AFTER UPDATE ON memories
+        WHEN COALESCE((SELECT value FROM sync_flags WHERE key = 'sync_enabled'), '0') = '1'
+             AND NEW.updated_at IS NOT OLD.updated_at
+        BEGIN
+            INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+            VALUES (NEW.id, 'update', {payload}, {_SQL_NOW_ISO});
+        END;
+    """)
+
+
+def _migrate_v23_to_v24(db: sqlite3.Connection) -> None:
+    """v23 -> v24: edit history -- memory_revisions table (issue #187).
+
+    Follows the same "don't lose data on a destructive-looking operation"
+    precedent ARCHITECTURE.md documents for deletion (v15->v16's
+    ``deleted_at`` tombstone), applied to *edits* instead: ``remind_me_update``
+    overwrites a memory's content/category/tags/metadata in place with no way
+    to recover the previous value. ``memory_revisions`` snapshots that
+    pre-edit state before every genuine content-changing write, so
+    ``remind_me_history`` can show what changed and ``remind_me_revert`` can
+    undo it.
+
+    Scope of what's captured is deliberately narrower than "every column
+    ``memories`` has" -- it's exactly the fields ``MemoryUpdateInput`` can
+    change (``content``, ``category``, ``tags``, ``metadata``), not
+    ``remind_at``/``superseded_by``/vitality columns/etc. See
+    ``tools/crud.py``'s ``_apply_memory_field_update`` docstring for why the
+    snapshot lives at that shared choke point rather than duplicated across
+    ``remind_me_update`` and ``remind_me_revert``, and why that choice
+    naturally excludes reminder-only edits (``remind_me_set_reminder`` also
+    funnels through the same helper, but only ever touches ``remind_at``,
+    which isn't a tracked column) without special-casing them.
+
+    No new column on ``memories`` itself -- this is a purely additive side
+    table, unlike v22->v23's ``remind_at`` column, because nothing about
+    "what the current state is" changes; only a new place to look up what an
+    earlier state *was*.
+
+    Deliberately NO sync outbox trigger, the same scope decision v10->v11
+    (wiki tables), v16->v17 (``memory_feedback``), v18->v19
+    (``memory_associations``), and v22->v23 (``reminder_deliveries``) already
+    made for their own local-only tables: this is a local audit log of edits
+    made on *this* device, not a synced entity, so a revision captured here
+    does not (yet) propagate to or merge with another device's edit history
+    for the same memory.
+
+    An index on ``(memory_id, edited_at)`` supports the "list revisions for
+    this memory, newest first" query ``remind_me_history`` runs.
+
+    Args:
+        db: An open SQLite connection.
+    """
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS memory_revisions (
+            id              INTEGER PRIMARY KEY,
+            memory_id       TEXT NOT NULL,
+            content         TEXT,
+            category        TEXT,
+            tags            TEXT,
+            metadata        TEXT,
+            edited_at       TEXT NOT NULL,
+            revision_reason TEXT DEFAULT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_memory_revisions_memory_edited
+            ON memory_revisions(memory_id, edited_at);
+    """)
+
+
+def _migrate_v24_to_v25(db: sqlite3.Connection) -> None:
+    """v24 -> v25: analytics trend snapshots (issue #186).
+
+    ``vitality.build_vitality_report`` (the same computation
+    ``remind_me_vitality_report`` and ``GET /api/vitality`` already expose)
+    and ``GET /api/stats``'s category counts are both point-in-time-only --
+    there was previously nowhere to see how the vault's health or category
+    mix has drifted over weeks or months, only its current instant. This
+    table gives the background scheduler somewhere to park one small daily
+    rollup so a dashboard trend chart has history to plot.
+
+    Columns deliberately mirror exactly what the read-time report already
+    produces rather than inventing a new shape: ``vitality_buckets`` reuses
+    ``build_vitality_report``'s bucket-label scheme (e.g. ``"0.00-0.05"``)
+    and ``category_counts`` reuses ``GET /api/stats``'s
+    ``{category: count}`` shape, both stored as JSON text (SQLite has no
+    native JSON column type) -- the same convention ``memories.tags``/
+    ``memories.metadata`` already use.
+
+    One row per calendar day (enforced by ``analytics.capture_analytics_snapshot``
+    checking for an existing same-day row before inserting, not by a SQL
+    UNIQUE constraint on a truncated date -- ``captured_at`` stores the full
+    capture timestamp, which is useful context to keep, not just a date).
+
+    Deliberately NO sync outbox trigger, the same scope decision v22->v23
+    (``reminder_deliveries``) and v23->v24 (``memory_revisions``) already
+    made for their own local-only tables: this is a per-node observability
+    rollup of *this* device's vault state at capture time, not a synced
+    entity -- a snapshot captured here says nothing about another device's
+    vault and has no sensible cross-device merge.
+
+    An index on ``captured_at`` supports both the "list snapshot history,
+    oldest first" query the trend endpoint runs and the retention
+    compaction's range delete (:func:`_compact_analytics_snapshots`).
+
+    Args:
+        db: An open SQLite connection.
+    """
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS analytics_snapshots (
+            id               INTEGER PRIMARY KEY,
+            captured_at      TEXT NOT NULL,
+            total_memories   INTEGER NOT NULL,
+            vitality_buckets TEXT NOT NULL,
+            category_counts  TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_analytics_snapshots_captured_at
+            ON analytics_snapshots(captured_at);
+    """)
+
+
 def embedding_mismatch_info(db: sqlite3.Connection) -> dict[str, str] | None:
     """Read-only check: do the stored vectors' model/dim/backend differ from
     the currently configured ``EMBEDDING_MODEL``/``EMBEDDING_DIM``/
@@ -2052,6 +2440,74 @@ def _purge_memory(
     else:
         db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
     return removed_vec_rowids
+
+
+# ---------------------------------------------------------------------------
+# Revision retention (issue #187)
+# ---------------------------------------------------------------------------
+
+
+def _compact_revisions(db: sqlite3.Connection) -> int:
+    """Hard-delete memory_revisions rows older than REVISION_RETENTION_DAYS.
+
+    Purely time-based, mirroring sync._compact_tombstones's shape -- no
+    per-peer acknowledgment tracking, because memory_revisions is a
+    local-only audit table with no sync counterpart to stay consistent with
+    (see the v23->v24 migration docstring). That is also why this is called
+    from remind_me_mcp.scheduler's always-on reminder-poll loop rather than
+    sync.py's loop the way _compact_tombstones is: tombstone compaction is
+    gated on config.SYNC_ENABLED because a non-syncing node hard-deletes
+    immediately and never accumulates tombstones to compact, but revisions
+    are captured on every genuine content edit regardless of whether sync is
+    configured at all -- gating their pruning on sync being enabled would
+    mean a single, never-synced device's revision table grows forever.
+
+    Args:
+        db: An open SQLite connection.
+
+    Returns:
+        The number of pruned revision rows.
+    """
+    cutoff = (datetime.now(UTC) - timedelta(days=REVISION_RETENTION_DAYS)).isoformat()
+    cur = db.execute("DELETE FROM memory_revisions WHERE edited_at < ?", (cutoff,))
+    db.commit()
+    removed = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+    if removed:
+        log.debug("Compacted %d memory revision(s)", removed)
+    return removed
+
+
+# ---------------------------------------------------------------------------
+# Analytics snapshot retention (issue #186)
+# ---------------------------------------------------------------------------
+
+
+def _compact_analytics_snapshots(db: sqlite3.Connection) -> int:
+    """Hard-delete analytics_snapshots rows older than ANALYTICS_RETENTION_DAYS.
+
+    Purely time-based, mirroring :func:`_compact_revisions`'s shape exactly
+    -- no per-peer acknowledgment tracking, because analytics_snapshots is a
+    local-only observability table with no sync counterpart to stay
+    consistent with (see the v24->v25 migration docstring). Called from
+    :mod:`remind_me_mcp.scheduler`'s always-on reminder-poll loop for the
+    same reason revision compaction is: snapshots accumulate regardless of
+    whether sync is configured at all, so gating pruning on sync being
+    enabled would mean a single, never-synced device's snapshot table grows
+    forever (bounded here, but still unbounded is still wrong in principle).
+
+    Args:
+        db: An open SQLite connection.
+
+    Returns:
+        The number of pruned snapshot rows.
+    """
+    cutoff = (datetime.now(UTC) - timedelta(days=ANALYTICS_RETENTION_DAYS)).isoformat()
+    cur = db.execute("DELETE FROM analytics_snapshots WHERE captured_at < ?", (cutoff,))
+    db.commit()
+    removed = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+    if removed:
+        log.debug("Compacted %d analytics snapshot(s)", removed)
+    return removed
 
 
 def _embed_and_store_rows(rows: list[tuple[int, str]]) -> int:
@@ -3020,6 +3476,8 @@ __all__ = [
     "_embed_and_store_batch",
     "_prune_orphan_chunks",
     "_purge_memory",
+    "_compact_revisions",
+    "_compact_analytics_snapshots",
     "_fuse_query_embedding",
     "_semantic_search",
     "_hydrate_ann_hits",

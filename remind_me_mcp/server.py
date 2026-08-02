@@ -104,6 +104,11 @@ async def app_lifespan(app: FastMCP):
     from remind_me_mcp.watcher import start_watcher, stop_watcher
     start_watcher()
 
+    # Issue #179: reminder scheduler — unconditional, unlike the watcher
+    # above (reminders have no separate opt-in, only a poll interval).
+    from remind_me_mcp.scheduler import start_scheduler, stop_scheduler
+    start_scheduler()
+
     # FT-09/Phase 5a: push/webhook ingestion — start_webhook_server() is a
     # no-op unless REMIND_ME_WEBHOOK_SECRET is configured.
     from remind_me_mcp.webhook_server import start_webhook_server, stop_webhook_server
@@ -126,8 +131,10 @@ async def app_lifespan(app: FastMCP):
         # FT-03/FT-09/SY-*/SE-07: stop the watcher, webhook, peer server, and
         # sync threads *before* closing the database connections so an
         # in-flight scan, request, or sync cycle never writes to a closed
-        # handle.
+        # handle. Issue #179: the reminder scheduler stops alongside the
+        # watcher, for the same reason.
         stop_watcher()
+        stop_scheduler()
         stop_webhook_server()
         stop_peer_server()
         stop_sync_thread()

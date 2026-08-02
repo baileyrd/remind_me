@@ -20,12 +20,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from remind_me_mcp import ann_index
+from remind_me_mcp import config as _config
+from remind_me_mcp.analytics import get_analytics_trend
+from remind_me_mcp.api_keys import ApiKeyStore
 from remind_me_mcp.config import (
     DB_PATH,
     SYNC_ENABLED,
     is_in_export_roots,
     is_in_import_roots,
     resolve_api_key,
+    resolve_ics_token,
 )
 from remind_me_mcp.db import (
     _embed_and_store,
@@ -41,6 +45,7 @@ from remind_me_mcp.db import (
     _row_to_dict,
 )
 from remind_me_mcp.exporter import EXPORT_FORMATS, collect_export_records, export_memories, render_export
+from remind_me_mcp.ics_export import build_ics
 from remind_me_mcp.importer import IMPORT_KINDS, import_chat_file, import_directory
 from remind_me_mcp.vitality import DECAY_RATES, build_vitality_report
 
@@ -96,6 +101,13 @@ def _header(scope: _Scope, name: bytes) -> str:
     return ""
 
 
+_SCOPE_MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+"""Methods a 'read'-scoped API key (issue #185) may not use — every method
+that changes state. Deliberately includes DELETE (unlike
+JSONContentTypeMiddleware's narrower _MUTATING_METHODS, which only cares
+about routes that carry a JSON body)."""
+
+
 class BearerAuthMiddleware:
     """Pure-ASGI bearer-token middleware (SE-05).
 
@@ -108,6 +120,22 @@ class BearerAuthMiddleware:
         secret: The expected bearer token; ``None`` disables auth entirely.
         protect_prefix: Only paths starting with this prefix are gated.
         allow_paths: Exact paths that always pass (e.g. ``/health``).
+        allow_prefixes: Path prefixes that always pass regardless of
+            ``protect_prefix`` (issue #190: the ``/api/reminders/{token}.ics``
+            calendar feed can't use this header-based scheme at all — a
+            calendar app's "subscribe by URL" poller has no way to attach an
+            Authorization header — so it authenticates itself via its own
+            path token instead; mirrors remote.py's SecretPathMiddleware
+            ``allow_prefixes``).
+        key_store: Optional :class:`~remind_me_mcp.api_keys.ApiKeyStore`
+            (issue #185). When a request's bearer token doesn't match
+            ``secret`` (the backward-compat, always-read-write default key),
+            it is checked against this store instead. A match with
+            ``scope="read"`` is rejected with 403 on a mutating method
+            (``_SCOPE_MUTATING_METHODS``) and otherwise passes through with
+            the same access as the default key. ``None`` (the combined-mode
+            MCP HTTP wrapper's usage) skips this entirely — scoped keys are a
+            dashboard-API-only concept, not a general MCP HTTP auth feature.
     """
 
     def __init__(
@@ -116,26 +144,55 @@ class BearerAuthMiddleware:
         secret: str | None,
         protect_prefix: str = "/",
         allow_paths: tuple[str, ...] = (),
+        allow_prefixes: tuple[str, ...] = (),
+        key_store: ApiKeyStore | None = None,
     ) -> None:
         self.app = app
         self.secret = secret
         self.protect_prefix = protect_prefix
         self.allow_paths = allow_paths
+        self.allow_prefixes = allow_prefixes
+        self.key_store = key_store
 
     async def __call__(self, scope: _Scope, receive: _Receive, send: _Send) -> None:
-        """Enforce bearer auth on protected HTTP paths; pass everything else through."""
+        """Enforce bearer auth (and, for a scoped key, method scope) on protected paths."""
         if scope["type"] != "http" or self.secret is None:
             await self.app(scope, receive, send)
             return
         path = scope.get("path", "")
-        if path in self.allow_paths or not path.startswith(self.protect_prefix):
+        if (
+            path in self.allow_paths
+            or any(path.startswith(p) for p in self.allow_prefixes)
+            or not path.startswith(self.protect_prefix)
+        ):
             await self.app(scope, receive, send)
             return
         auth = _header(scope, b"authorization")
         expected = f"Bearer {self.secret}"
         if hmac.compare_digest(auth.encode("utf-8"), expected.encode("utf-8")):
+            # The backward-compat default key: always full read-write access,
+            # exactly as before scoped keys existed.
             await self.app(scope, receive, send)
             return
+        if self.key_store is not None and auth.startswith("Bearer "):
+            presented = auth[len("Bearer ") :]
+            record = self.key_store.verify(presented)
+            if record is not None:
+                method = str(scope.get("method", "")).upper()
+                if record.get("scope") == "read" and method in _SCOPE_MUTATING_METHODS:
+                    await _send_json(
+                        send,
+                        403,
+                        {
+                            "error": (
+                                f"API key {record.get('name')!r} is read-only "
+                                f"(scope=read); {method} requires a read-write key"
+                            )
+                        },
+                    )
+                    return
+                await self.app(scope, receive, send)
+                return
         await _send_json(send, 401, {"error": "Unauthorized"})
 
 
@@ -332,6 +389,22 @@ def _build_api_app() -> Starlette:
         def _work() -> JSONResponse:
             db = _get_db()
             return _json_ok(build_vitality_report(db))
+
+        return await asyncio.to_thread(_work)
+
+    async def api_analytics_trend(request: Request) -> JSONResponse:
+        """Return the vault's daily analytics-snapshot history (issue #186).
+
+        One row per calendar day the background scheduler has captured
+        (:func:`remind_me_mcp.analytics.maybe_capture_analytics_snapshot`),
+        oldest first -- the dashboard's trend panel plots this directly.
+        Returns an empty array (not an error) on a fresh install that hasn't
+        captured a snapshot yet.
+        """
+
+        def _work() -> JSONResponse:
+            db = _get_db()
+            return _json_ok({"snapshots": get_analytics_trend(db)})
 
         return await asyncio.to_thread(_work)
 
@@ -1137,6 +1210,54 @@ def _build_api_app() -> Starlette:
 
         return await asyncio.to_thread(_work)
 
+    async def api_reminders_ics(request: Request) -> Response:
+        """Subscribable ICS calendar feed of reminders (issue #190).
+
+        ``GET /api/reminders/{token}.ics`` — unauthenticated by the normal
+        Authorization-header bearer scheme every other ``/api/*`` route
+        uses: a calendar app's "subscribe by URL" feature polls this URL
+        from the provider's own servers on a schedule the user doesn't
+        control, with no way to attach custom headers. Auth instead lives
+        in the URL itself — the ``token`` path segment must match
+        ``config.resolve_ics_token()`` (REMIND_ME_ICS_TOKEN), compared with
+        ``hmac.compare_digest`` to avoid a timing side channel — same
+        secret-path pattern as the FT-05 remote-connector fallback
+        (remote.py's SecretPathMiddleware). A wrong token gets a bare 404,
+        not a 401 or any error revealing the token was even checked, so a
+        probe can't distinguish "wrong token" from "route doesn't exist".
+
+        WARNING: whoever holds this URL can read every reminder's content —
+        treat it exactly like a password (same caveat the README already
+        states for the remote-connector secret-path URL).
+
+        Includes every reminder remind_me_list_reminders' ``all`` window
+        would (upcoming + overdue-but-undelivered), same query shape.
+        """
+        token = request.path_params["token"]
+        expected = resolve_ics_token()
+        if not hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8")):
+            return _json_err("Not found", 404)
+
+        def _work() -> Response:
+            db = _get_db()
+            now = _now_iso()
+            not_delivered = (
+                "NOT EXISTS (SELECT 1 FROM reminder_deliveries rd "
+                "WHERE rd.memory_id = m.id AND rd.remind_at = m.remind_at)"
+            )
+            rows = db.execute(
+                f"""SELECT m.* FROM memories m
+                     WHERE m.remind_at IS NOT NULL
+                       AND m.deleted_at IS NULL
+                       AND (m.remind_at > ? OR (m.remind_at <= ? AND {not_delivered}))
+                     ORDER BY m.remind_at ASC""",
+                [now, now],
+            ).fetchall()
+            reminders = [_row_to_dict(r) for r in rows]
+            return Response(build_ics(reminders), media_type="text/calendar")
+
+        return await asyncio.to_thread(_work)
+
     async def index(request: Request) -> HTMLResponse:
         """Serve the dashboard UI as a single-page app."""
         return HTMLResponse(_build_dashboard_html())
@@ -1146,6 +1267,7 @@ def _build_api_app() -> Starlette:
         Route("/health", health),
         Route("/api/stats", api_stats),
         Route("/api/vitality", api_vitality),
+        Route("/api/analytics/trend", api_analytics_trend, methods=["GET"]),
         Route("/api/memories", api_list, methods=["GET"]),
         Route("/api/memories", api_add, methods=["POST"]),
         Route("/api/memories/search", api_search),
@@ -1157,6 +1279,10 @@ def _build_api_app() -> Starlette:
         Route("/api/memories/{memory_id}", api_delete, methods=["DELETE"]),
         Route("/api/import", api_import, methods=["POST"]),
         Route("/api/export", api_export, methods=["GET"]),
+        # Secret-path auth (see api_reminders_ics docstring), not the
+        # Authorization-header bearer scheme every other /api/* route below
+        # uses — must precede the BearerAuthMiddleware allow_prefixes check.
+        Route("/api/reminders/{token}.ics", api_reminders_ics, methods=["GET"]),
         Route("/api/entity", api_entity, methods=["GET"]),
         Route("/api/entities", api_entities, methods=["GET"]),
         Route("/api/entity/traverse", api_entity_traverse, methods=["GET"]),
@@ -1175,6 +1301,12 @@ def _build_api_app() -> Starlette:
     # persists a key on first run; REMIND_ME_API_KEY=disabled opts out.
     api_key = resolve_api_key()
 
+    # issue #185: additional named, scope-limited keys layered on top of the
+    # single default key above. Read fresh from config.MEMORY_DIR (not a
+    # module-level default) so tests that monkeypatch it see the isolated
+    # store, matching every other secret-file path in this codebase.
+    key_store = ApiKeyStore(_config.MEMORY_DIR / "api_keys.json")
+
     middleware = [
         Middleware(
             CORSMiddleware,
@@ -1182,7 +1314,13 @@ def _build_api_app() -> Starlette:
             allow_methods=["*"],
             allow_headers=["*"],
         ),
-        Middleware(BearerAuthMiddleware, secret=api_key, protect_prefix="/api/"),
+        Middleware(
+            BearerAuthMiddleware,
+            secret=api_key,
+            protect_prefix="/api/",
+            allow_prefixes=("/api/reminders/",),
+            key_store=key_store,
+        ),
         Middleware(JSONContentTypeMiddleware),
     ]
 

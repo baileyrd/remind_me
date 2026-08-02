@@ -35,8 +35,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 from typing import Any
 
-from remind_me_mcp.config import WEBHOOK_BIND, WEBHOOK_PORT, WEBHOOK_SECRET
+from remind_me_mcp.config import (
+    RATE_LIMIT_ENABLED,
+    RATE_LIMIT_REQUESTS,
+    RATE_LIMIT_WINDOW_SECONDS,
+    WEBHOOK_BIND,
+    WEBHOOK_PORT,
+    WEBHOOK_SECRET,
+)
 from remind_me_mcp.importer import IMPORT_KINDS, import_content
+from remind_me_mcp.rate_limit import RateLimiter, resolve_key, retry_after_seconds
 from remind_me_mcp.telemetry import maybe_span
 
 log = logging.getLogger("remind_me_mcp.webhook_server")
@@ -48,6 +56,14 @@ _MAX_LENGTH_RANGE = (100, 50000)  # mirrors ChatImportInput.max_length bounds
 
 _ERROR_HISTORY = 10
 """How many recent error messages the status surface keeps."""
+
+# Rate limiting (issue #183). Built once at import time from the resolved
+# config defaults; tests that need a different limit/window monkeypatch the
+# instance's .limit/.window_seconds/.clock attributes directly (the same
+# monkeypatch-the-live-object pattern _reset_webhook_stats already uses for
+# the request counters), rather than rebuilding it from RATE_LIMIT_REQUESTS/
+# RATE_LIMIT_WINDOW_SECONDS after those module constants have been patched.
+_rate_limiter = RateLimiter(limit=RATE_LIMIT_REQUESTS, window_seconds=RATE_LIMIT_WINDOW_SECONDS)
 
 
 class WebhookHandler(BaseHTTPRequestHandler):
@@ -69,11 +85,13 @@ class WebhookHandler(BaseHTTPRequestHandler):
         auth = self.headers.get("Authorization", "")
         return hmac.compare_digest(auth, f"Bearer {WEBHOOK_SECRET}")
 
-    def _send_json(self, status: int, data: dict) -> None:
+    def _send_json(self, status: int, data: dict, extra_headers: dict[str, str] | None = None) -> None:
         body = json.dumps(data).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         with contextlib.suppress(BrokenPipeError, ConnectionResetError):
             self.wfile.write(body)
@@ -98,7 +116,39 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     break
                 remaining -= len(chunk)
 
+    def _rate_limited(self) -> bool:
+        """Enforce the request-rate limit (issue #183); True if this request was rejected.
+
+        Runs as the outermost check, ahead of ``_auth()``: an anonymous flood
+        that never presents the correct bearer token is still bounded (keyed
+        by IP), while a caller presenting the exact ``WEBHOOK_SECRET`` gets
+        its own dedicated, more generous bucket -- see
+        ``remind_me_mcp.rate_limit``'s module docstring for the full
+        rationale, including why this deliberately does NOT key by whatever
+        credential was merely *presented* (only a verified match earns the
+        dedicated bucket).
+        """
+        if not RATE_LIMIT_ENABLED:
+            return False
+        auth = self.headers.get("Authorization", "")
+        bearer_prefix = "Bearer "
+        presented = auth[len(bearer_prefix):] if auth.startswith(bearer_prefix) else ""
+        key = resolve_key(presented, self.client_address[0], WEBHOOK_SECRET or None)
+        result = _rate_limiter.hit(key)
+        if result.allowed:
+            return False
+        self._drain_body()
+        self._send_json(
+            429,
+            {"error": "rate limit exceeded"},
+            {"Retry-After": str(retry_after_seconds(result.retry_after))},
+        )
+        return True
+
     def do_POST(self):
+        if self._rate_limited():
+            return
+
         if not self._auth():
             self._drain_body()
             self._send_json(401, {"error": "unauthorized"})

@@ -1,7 +1,8 @@
 """
 Tests for remind_me_mcp.config robustness (HY-06).
 
-Covers guarded integer environment parsing (_env_int) and the guarantee that
+Covers guarded integer environment parsing (_env_int), guarded boolean
+environment parsing (_env_bool, issue #183), and the guarantee that
 importing the package does not call logging.basicConfig (root logging setup
 belongs to the __main__ entrypoint).
 """
@@ -13,7 +14,7 @@ import stat
 import sys
 from typing import TYPE_CHECKING
 
-from remind_me_mcp.config import _env_int, restrict_to_owner
+from remind_me_mcp.config import _env_bool, _env_int, restrict_to_owner
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -57,6 +58,36 @@ def test_env_int_negative_value_parsed(monkeypatch: pytest.MonkeyPatch) -> None:
     """Negative integers parse fine (validation is the consumer's concern)."""
     monkeypatch.setenv("REMIND_ME_TEST_INT", "-5")
     assert _env_int("REMIND_ME_TEST_INT", 42) == -5
+
+
+# ---------------------------------------------------------------------------
+# _env_bool — guarded boolean environment parsing (issue #183)
+# ---------------------------------------------------------------------------
+
+
+def test_env_bool_unset_returns_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("REMIND_ME_TEST_BOOL", raising=False)
+    assert _env_bool("REMIND_ME_TEST_BOOL", True) is True
+    assert _env_bool("REMIND_ME_TEST_BOOL", False) is False
+
+
+def test_env_bool_empty_string_disables_regardless_of_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit empty value is False even when default=True -- matching
+    the REMIND_ME_RERANK="" empty-string-disables convention."""
+    monkeypatch.setenv("REMIND_ME_TEST_BOOL", "")
+    assert _env_bool("REMIND_ME_TEST_BOOL", True) is False
+
+
+def test_env_bool_recognized_false_spellings(monkeypatch: pytest.MonkeyPatch) -> None:
+    for spelling in ("false", "False", "FALSE", "0", "no", "off", "  false  "):
+        monkeypatch.setenv("REMIND_ME_TEST_BOOL", spelling)
+        assert _env_bool("REMIND_ME_TEST_BOOL", True) is False, spelling
+
+
+def test_env_bool_anything_else_is_true(monkeypatch: pytest.MonkeyPatch) -> None:
+    for spelling in ("true", "1", "yes", "on", "garbage"):
+        monkeypatch.setenv("REMIND_ME_TEST_BOOL", spelling)
+        assert _env_bool("REMIND_ME_TEST_BOOL", False) is True, spelling
 
 
 # ---------------------------------------------------------------------------

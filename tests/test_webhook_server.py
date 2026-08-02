@@ -29,11 +29,15 @@ AUTH = {"Authorization": f"Bearer {SECRET}"}
 
 @pytest.fixture(autouse=True)
 def _reset_webhook_stats() -> Iterator[None]:
-    """The request counters are module-level globals — reset around every test."""
+    """The request counters and rate-limiter buckets are module-level
+    globals — reset around every test so one test's traffic can't leak into
+    the next (the same WebhookHandler class, and therefore the same
+    module-level _rate_limiter, is reused across every test in this file)."""
     webhook_server._requests_ingested = 0
     webhook_server._requests_skipped = 0
     webhook_server._requests_errored = 0
     webhook_server._errors.clear()
+    webhook_server._rate_limiter.reset()
     yield
 
 
@@ -321,10 +325,12 @@ def test_ingest_invalid_max_length_400(webhook_url: str) -> None:
 
 def test_ingest_unsupported_suffix_returns_422(webhook_url: str) -> None:
     """A validation error surfaced from import_content (not the handler's
-    own up-front checks) comes back as 422, carrying the importer's reason."""
+    own up-front checks) comes back as 422, carrying the importer's reason.
+
+    .docx (not .pdf -- FT-19 made that a supported, first-class kind)."""
     resp = httpx.post(
         f"{webhook_url}/ingest",
-        json=chat_payload(filename="notes.pdf"),
+        json=chat_payload(filename="notes.docx"),
         headers=AUTH,
     )
     assert resp.status_code == 422
@@ -367,6 +373,73 @@ def test_ingest_oversized_body_rejected(
 def test_unknown_post_route_404(webhook_url: str) -> None:
     resp = httpx.post(f"{webhook_url}/nope", json={}, headers=AUTH)
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting (issue #183)
+# ---------------------------------------------------------------------------
+
+
+def test_ingest_returns_429_with_retry_after_once_limit_exceeded(
+    webhook_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(webhook_server._rate_limiter, "limit", 2)
+
+    ok1 = httpx.post(f"{webhook_url}/ingest", json=chat_payload(filename="a.json"), headers=AUTH)
+    ok2 = httpx.post(f"{webhook_url}/ingest", json=chat_payload(filename="b.json"), headers=AUTH)
+    assert ok1.status_code == 200
+    assert ok2.status_code == 200
+
+    blocked = httpx.post(f"{webhook_url}/ingest", json=chat_payload(filename="c.json"), headers=AUTH)
+    assert blocked.status_code == 429
+    assert "Retry-After" in blocked.headers
+    assert int(blocked.headers["Retry-After"]) >= 1
+    assert blocked.json() == {"error": "rate limit exceeded"}
+
+
+def test_ingest_rate_limit_checked_before_auth(
+    webhook_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An anonymous flood (never presenting the right secret) is bounded by
+    IP too -- the limiter runs ahead of _auth(), not only for valid callers."""
+    monkeypatch.setattr(webhook_server._rate_limiter, "limit", 1)
+
+    first = httpx.post(f"{webhook_url}/ingest", json=chat_payload())  # no auth header at all
+    assert first.status_code == 401
+
+    second = httpx.post(f"{webhook_url}/ingest", json=chat_payload())
+    assert second.status_code == 429
+
+
+def test_ingest_authenticated_caller_has_its_own_bucket(
+    webhook_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A caller presenting the exact WEBHOOK_SECRET is bucketed separately
+    from anonymous/wrong-secret traffic sharing the same source IP -- one
+    exhausting its quota must not affect the other."""
+    monkeypatch.setattr(webhook_server._rate_limiter, "limit", 1)
+
+    # Exhaust the anonymous (IP-keyed) bucket.
+    anon_first = httpx.post(f"{webhook_url}/ingest", json=chat_payload())
+    anon_second = httpx.post(f"{webhook_url}/ingest", json=chat_payload())
+    assert anon_first.status_code == 401
+    assert anon_second.status_code == 429
+
+    # The authenticated caller (same source IP -- both hit 127.0.0.1) still
+    # gets its own fresh quota.
+    authed = httpx.post(f"{webhook_url}/ingest", json=chat_payload(), headers=AUTH)
+    assert authed.status_code == 200
+
+
+def test_ingest_rate_limit_disabled_via_empty_string(
+    webhook_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(webhook_server, "RATE_LIMIT_ENABLED", False)
+    monkeypatch.setattr(webhook_server._rate_limiter, "limit", 1)
+
+    for i in range(5):
+        resp = httpx.post(f"{webhook_url}/ingest", json=chat_payload(filename=f"f{i}.json"), headers=AUTH)
+        assert resp.status_code == 200
 
 
 # ---------------------------------------------------------------------------

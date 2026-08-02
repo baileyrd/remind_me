@@ -691,6 +691,63 @@ def test_wrong_secret_path_and_bearer_rejected(oauth_client) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Rate limiting composes with OAuth mode too (issue #183)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def rate_limited_oauth_client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Like oauth_client, but with a tiny REMIND_ME_RATE_LIMIT_REQUESTS."""
+    from starlette.testclient import TestClient
+
+    monkeypatch.setattr(cfg, "AUTO_UPDATE_CHECK", False)
+    monkeypatch.setattr(cfg, "MEMORY_DIR", tmp_path)
+    monkeypatch.setattr(main_mod.mcp, "_session_manager", None)
+    monkeypatch.setattr(cfg, "RATE_LIMIT_REQUESTS", 1)
+    monkeypatch.setattr(cfg, "RATE_LIMIT_WINDOW_SECONDS", 60)
+
+    app = build_remote_app(_OWNER, issuer=_ISSUER)
+    with TestClient(app, base_url=_ISSUER, raise_server_exceptions=False) as client:
+        yield client
+
+
+def test_legacy_bearer_rate_limited_ahead_of_oauth_auth_stack(rate_limited_oauth_client) -> None:
+    """The rate limiter is the outermost layer even in OAuth mode: it runs
+    ahead of the SDK's own bearer/RequireAuth middleware."""
+    ok = rate_limited_oauth_client.post(
+        "/mcp", json=_MCP_INITIALIZE, headers={**_MCP_HEADERS, "Authorization": f"Bearer {_OWNER}"}
+    )
+    assert ok.status_code == 200, ok.text
+
+    blocked = rate_limited_oauth_client.post(
+        "/mcp", json=_MCP_INITIALIZE, headers={**_MCP_HEADERS, "Authorization": f"Bearer {_OWNER}"}
+    )
+    assert blocked.status_code == 429
+    assert int(blocked.headers["Retry-After"]) >= 1
+    assert blocked.json() == {"error": "rate limit exceeded"}
+
+
+def test_oauth_metadata_and_register_routes_are_not_rate_limited(rate_limited_oauth_client) -> None:
+    """Only the MCP endpoint itself is guarded -- the auth/metadata surface
+    (out of scope for this issue) keeps working even after the MCP bucket
+    for the owner token is exhausted."""
+    rate_limited_oauth_client.post(
+        "/mcp", json=_MCP_INITIALIZE, headers={**_MCP_HEADERS, "Authorization": f"Bearer {_OWNER}"}
+    )
+    # Bucket now exhausted for the owner credential.
+    assert (
+        rate_limited_oauth_client.post(
+            "/mcp", json=_MCP_INITIALIZE, headers={**_MCP_HEADERS, "Authorization": f"Bearer {_OWNER}"}
+        ).status_code
+        == 429
+    )
+
+    assert rate_limited_oauth_client.get("/.well-known/oauth-authorization-server").status_code == 200
+    assert rate_limited_oauth_client.get("/health").status_code == 200
+    assert _register(rate_limited_oauth_client)["client_id"]
+
+
+# ---------------------------------------------------------------------------
 # Issuer handling
 # ---------------------------------------------------------------------------
 

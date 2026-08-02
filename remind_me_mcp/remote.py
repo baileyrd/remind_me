@@ -55,10 +55,12 @@ module in MCP stdio mode never loads the web framework.
 from __future__ import annotations
 
 import hmac
+import json
 import logging
 from typing import TYPE_CHECKING, Any
 
 from remind_me_mcp.api import _header, _send_json
+from remind_me_mcp.rate_limit import RateLimiter, resolve_key, retry_after_seconds
 
 if TYPE_CHECKING:
     from starlette.applications import Starlette
@@ -66,6 +68,25 @@ if TYPE_CHECKING:
     from remind_me_mcp.api import _ASGIApp, _Receive, _Scope, _Send
 
 log = logging.getLogger("remind_me_mcp.remote")
+
+
+async def _send_json_with_headers(
+    send: _Send, status: int, payload: dict[str, Any], headers: dict[str, str] | None = None
+) -> None:
+    """Like ``api._send_json``, but allows extra response headers.
+
+    Needed for the 429 response's ``Retry-After`` header (issue #183) --
+    ``api._send_json`` only ever sends Content-Type/Content-Length.
+    """
+    body = json.dumps(payload).encode("utf-8")
+    response_headers = [
+        (b"content-type", b"application/json"),
+        (b"content-length", str(len(body)).encode("ascii")),
+    ]
+    for name, value in (headers or {}).items():
+        response_headers.append((name.encode("ascii"), value.encode("ascii")))
+    await send({"type": "http.response.start", "status": status, "headers": response_headers})
+    await send({"type": "http.response.body", "body": body})
 
 
 def redact_token(token: str) -> str:
@@ -168,6 +189,81 @@ class SecretPathMiddleware:
         await _send_json(send, 404, {"error": "Not found"})
 
 
+class RateLimitMiddleware:
+    """Outermost rate-limit gate for the remote MCP connector (issue #183).
+
+    Placed *ahead of* :class:`SecretPathMiddleware` and (in OAuth mode) the
+    SDK's own auth stack, so a flood of entirely unauthenticated requests
+    against the MCP endpoint is bounded before any auth work happens at
+    all -- mirrors ``webhook_server.WebhookHandler._rate_limited``'s
+    before-auth placement. Only ``guarded_prefixes`` (the MCP path) is
+    limited; ``/health`` and (in OAuth mode) the ``/.well-known`` metadata /
+    ``/authorize`` / ``/register`` / ``/token`` / ``/consent`` routes are
+    untouched -- those aren't the surface this issue targets, and
+    ``/register`` already has its own abuse guard (``oauth.MAX_REGISTERED_CLIENTS``).
+
+    Key resolution mirrors ``SecretPathMiddleware``'s own credential
+    extraction: the secret-path segment for ``{mcp_path}/<token>`` requests,
+    or the ``Authorization`` header for a bare ``{mcp_path}`` request --
+    compared against the same static connector *token* SecretPathMiddleware
+    itself checks. See ``remind_me_mcp.rate_limit``'s module docstring for
+    why only a verified match against that static token earns the dedicated
+    "known" bucket, and why OAuth's dynamically-issued per-client access
+    tokens fall back to the IP-keyed bucket instead of each being
+    individually (and expensively) re-verified here.
+    """
+
+    def __init__(
+        self,
+        app: _ASGIApp,
+        limiter: RateLimiter,
+        token: str,
+        mcp_path: str = "/mcp",
+        guarded_prefixes: tuple[str, ...] = ("/mcp",),
+    ) -> None:
+        self.app = app
+        self.limiter = limiter
+        self.token = token
+        self.mcp_path = mcp_path
+        self.guarded_prefixes = guarded_prefixes
+
+    async def __call__(self, scope: _Scope, receive: _Receive, send: _Send) -> None:
+        """Rate-limit HTTP requests under ``guarded_prefixes``; everything else passes through."""
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        path = str(scope.get("path", ""))
+        if not any(path == p or path.startswith(p + "/") for p in self.guarded_prefixes):
+            await self.app(scope, receive, send)
+            return
+
+        prefix = self.mcp_path + "/"
+        if path.startswith(prefix):
+            # Secret-path form: {mcp_path}/<token>[/...] -- the candidate
+            # credential is the path segment itself, whether or not it
+            # actually matches (SecretPathMiddleware, further in, is what
+            # rejects a wrong one with a 404).
+            presented, _, _rest = path[len(prefix):].partition("/")
+        else:
+            auth = _header(scope, b"authorization")
+            bearer_prefix = "Bearer "
+            presented = auth[len(bearer_prefix):] if auth.startswith(bearer_prefix) else ""
+
+        client = scope.get("client")
+        remote_addr = str(client[0]) if client else ""
+        key = resolve_key(presented, remote_addr, self.token)
+        result = self.limiter.hit(key)
+        if not result.allowed:
+            await _send_json_with_headers(
+                send,
+                429,
+                {"error": "rate limit exceeded"},
+                {"Retry-After": str(retry_after_seconds(result.retry_after))},
+            )
+            return
+        await self.app(scope, receive, send)
+
+
 def build_remote_app(token: str, issuer: str | None = None) -> Starlette:
     """Build the remote-connector Starlette app (FT-05/FT-07).
 
@@ -214,6 +310,7 @@ def build_remote_app(token: str, issuer: str | None = None) -> Starlette:
     from starlette.responses import JSONResponse
     from starlette.routing import Route
 
+    from remind_me_mcp import config as cfg
     from remind_me_mcp.server import mcp
 
     # Must be set before the first streamable_http_app() call — the session
@@ -226,6 +323,19 @@ def build_remote_app(token: str, issuer: str | None = None) -> Starlette:
     # (same SE-03 layout as combined mode — no nested Mount).
     mcp_http_app = mcp.streamable_http_app()
     mcp_path = str(mcp.settings.streamable_http_path)
+
+    # issue #183: rate-limit the MCP endpoint itself. Read at build time (not
+    # inside the middleware) so a monkeypatched config value takes effect the
+    # next time the app is (re)built, same as every other config value this
+    # function already bakes in (issuer, token). Built even when disabled so
+    # the branches below don't need their own conditional — the middleware
+    # just never gets added to the list.
+    rate_limiter = RateLimiter(limit=cfg.RATE_LIMIT_REQUESTS, window_seconds=cfg.RATE_LIMIT_WINDOW_SECONDS)
+    rate_limit_middleware = (
+        [Middleware(RateLimitMiddleware, limiter=rate_limiter, token=token, mcp_path=mcp_path)]
+        if cfg.RATE_LIMIT_ENABLED
+        else []
+    )
 
     async def health(request: Any) -> JSONResponse:
         """Unauthenticated liveness probe (SE-04) — reveals no data."""
@@ -250,7 +360,8 @@ def build_remote_app(token: str, issuer: str | None = None) -> Starlette:
                 *mcp_http_app.routes,
             ],
             middleware=[
-                Middleware(SecretPathMiddleware, token=token, mcp_path=mcp_path)
+                *rate_limit_middleware,
+                Middleware(SecretPathMiddleware, token=token, mcp_path=mcp_path),
             ],
             lifespan=_remote_lifespan,
         )
@@ -269,7 +380,6 @@ def build_remote_app(token: str, issuer: str | None = None) -> Starlette:
     from pydantic import AnyHttpUrl
     from starlette.middleware.authentication import AuthenticationMiddleware
 
-    from remind_me_mcp import config as cfg
     from remind_me_mcp.oauth import CONSENT_PATH, OAuthStateStore, SingleUserOAuthProvider
 
     issuer_url = AnyHttpUrl(issuer)  # raises ValueError on a malformed URL
@@ -336,6 +446,7 @@ def build_remote_app(token: str, issuer: str | None = None) -> Starlette:
             protected_mcp,
         ],
         middleware=[
+            *rate_limit_middleware,
             Middleware(
                 SecretPathMiddleware,
                 token=token,
@@ -389,6 +500,7 @@ def get_remote_status() -> dict[str, Any]:
 
 __all__ = [
     "SecretPathMiddleware",
+    "RateLimitMiddleware",
     "build_remote_app",
     "get_remote_status",
     "redact_token",

@@ -209,6 +209,136 @@ async def memory_get(memory_id: str) -> str:
     return _fmt_memory_md(_row_to_dict(row))
 
 
+# Columns a pre-edit memory_revisions snapshot (issue #187) tracks — exactly
+# the fields MemoryUpdateInput can change, not every column _apply_memory_
+# field_update might be asked to touch. See _apply_memory_field_update's
+# docstring for why gating on these specific columns is what keeps a
+# remind_me_set_reminder call from producing a spurious revision.
+_REVISION_TRACKED_COLUMNS = frozenset({"content", "category", "tags", "metadata"})
+
+
+def _extract_tracked_field_changes(
+    sets: list[str], bindings: list[Any]
+) -> dict[str, Any]:
+    """Map each tracked column touched by ``sets`` to its incoming new value.
+
+    Every ``sets`` fragment in this codebase has one of two shapes: a bound
+    placeholder (``"content = ?"``, consuming the next value off ``bindings``
+    in order) or a bare literal (``"remind_at = NULL"`` / ``"superseded_by =
+    NULL"``, no binding consumed). This walks both shapes to keep the
+    bindings cursor aligned, but only returns columns in
+    ``_REVISION_TRACKED_COLUMNS`` — a fragment for an untracked column (e.g.
+    ``remind_at``) is parsed just enough to advance the cursor correctly and
+    then discarded.
+
+    Args:
+        sets: The same ``sets`` list passed to _apply_memory_field_update.
+        bindings: The same ``bindings`` list, positionally aligned with the
+            ``?`` placeholders in ``sets``.
+
+    Returns:
+        ``{column: new_value}`` for each tracked column present in ``sets``.
+    """
+    changes: dict[str, Any] = {}
+    idx = 0
+    for fragment in sets:
+        col, _, rhs = fragment.partition("=")
+        col = col.strip()
+        rhs = rhs.strip()
+        if rhs == "?":
+            value = bindings[idx]
+            idx += 1
+        elif rhs.upper() == "NULL":
+            value = None
+        else:
+            # No other literal shape appears in this codebase today — skip
+            # rather than mis-parse an unrecognized fragment.
+            continue
+        if col in _REVISION_TRACKED_COLUMNS:
+            changes[col] = value
+    return changes
+
+
+def _apply_memory_field_update(
+    db: sqlite3.Connection,
+    memory_id: str,
+    sets: list[str],
+    bindings: list[Any],
+    *,
+    revision_reason: str | None = None,
+) -> None:
+    """Apply a raw column UPDATE to one memory row, always bumping updated_at.
+
+    The single place every write path that mutates a real content column on
+    ``memories`` funnels through — ``remind_me_update`` below,
+    ``remind_me_revert`` (``tools/history.py``, issue #187), and
+    ``remind_me_set_reminder`` (``tools/reminders.py``, issue #179) via the
+    ``_pkg.<name>`` patchable-lookup convention (see this module's
+    docstring) — so ``updated_at`` is bumped consistently. That is what the
+    sync outbox trigger's LWW comparison keys off, and what distinguishes a
+    genuine content change from the v22 access-tracking exception (which
+    deliberately does NOT bump ``updated_at``). Callers must already have
+    verified the memory exists and is not soft-deleted, and must not pass an
+    empty ``sets``.
+
+    Edit history (issue #187): before applying the update, this snapshots
+    the row's *current* ``content``/``category``/``tags``/``metadata`` into
+    ``memory_revisions`` — but only when ``sets`` actually touches one of
+    those tracked columns AND the incoming value genuinely differs from what
+    is already stored (mirroring the v22 migration's "only sync on genuine
+    content change" discipline — a same-value update creates no revision).
+    This is a deliberate judgment call: rather than duplicate the snapshot
+    logic in ``remind_me_update`` and ``remind_me_revert`` separately, it
+    lives once at this shared choke point. A useful side effect falls out of
+    that choice for free — ``remind_me_set_reminder`` calls this same
+    function, but ``sets`` for it only ever contains ``"remind_at = ..."``,
+    which is not a tracked column, so a reminder set/clear never produces a
+    revision. The snapshot INSERT and the ``memories`` UPDATE share the one
+    ``db.commit()`` below (no commit in between), so a crash between the two
+    cannot leave one without the other — same transactional discipline as
+    ``_purge_memory``'s soft-delete path.
+
+    Args:
+        db: An open SQLite connection. This function commits.
+        memory_id: The memory to update.
+        sets: SQL ``"column = ?"`` (or a literal fragment, e.g.
+            ``"remind_at = NULL"``) pieces, not including ``updated_at``.
+        bindings: Positional bind values matching the ``?`` placeholders in
+            ``sets``, in the same order.
+        revision_reason: Optional free-text note stored on the captured
+            revision (e.g. "revert to revision 3"). Never required — plain
+            ``remind_me_update`` calls leave it ``NULL``.
+    """
+    changes = _extract_tracked_field_changes(sets, bindings)
+    if changes:
+        old_row = db.execute(
+            "SELECT content, category, tags, metadata FROM memories WHERE id = ?",
+            (memory_id,),
+        ).fetchone()
+        if old_row is not None and any(
+            old_row[col] != new_value for col, new_value in changes.items()
+        ):
+            db.execute(
+                """INSERT INTO memory_revisions
+                       (memory_id, content, category, tags, metadata, edited_at, revision_reason)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    memory_id,
+                    old_row["content"],
+                    old_row["category"],
+                    old_row["tags"],
+                    old_row["metadata"],
+                    _now_iso(),
+                    revision_reason,
+                ),
+            )
+
+    all_sets = [*sets, "updated_at = ?"]
+    all_bindings = [*bindings, _now_iso(), memory_id]
+    db.execute(f"UPDATE memories SET {', '.join(all_sets)} WHERE id = ?", all_bindings)
+    db.commit()
+
+
 @mcp.tool(
     name="remind_me_update",
     annotations={
@@ -255,12 +385,7 @@ async def memory_update(params: MemoryUpdateInput) -> str:
     if not sets:
         return "Nothing to update — no fields provided."
 
-    sets.append("updated_at = ?")
-    bindings.append(_now_iso())
-    bindings.append(params.memory_id)
-
-    db.execute(f"UPDATE memories SET {', '.join(sets)} WHERE id = ?", bindings)
-    db.commit()
+    _apply_memory_field_update(db, params.memory_id, sets, bindings)
     # Re-embed if content changed
     if params.content is not None:
         await asyncio.to_thread(_pkg._embed_and_store, params.memory_id, params.content)

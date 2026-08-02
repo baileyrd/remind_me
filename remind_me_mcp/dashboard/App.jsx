@@ -61,6 +61,7 @@ function useMemoryStore() {
   const [memories, setMemories] = useState([]);
   const [stats, setStats] = useState({ total: 0, categories: {}, sources: {}, tags: {} });
   const [vitality, setVitality] = useState({ vitality_buckets: {}, active_count: 0, dormant_count: 0, vault_health_score: "0%", average_vitality: 0 });
+  const [trend, setTrend] = useState({ snapshots: [] });
   const [loading, setLoading] = useState(true);
 
   const refresh = useCallback(async (params = {}) => {
@@ -82,6 +83,10 @@ function useMemoryStore() {
       const v = await api("/vitality");
       setVitality(v);
     } catch (e) { console.error("vitality:", e); }
+    try {
+      const t = await api("/analytics/trend");
+      setTrend(t);
+    } catch (e) { console.error("analytics trend:", e); }
     setLoading(false);
   }, []);
 
@@ -115,7 +120,7 @@ function useMemoryStore() {
 
   useEffect(() => { refresh(); }, [refresh]);
 
-  return { memories, stats, vitality, loading, refresh, search, add, update, remove };
+  return { memories, stats, vitality, trend, loading, refresh, search, add, update, remove };
 }
 
 function useWikiStore() {
@@ -290,6 +295,44 @@ function BarChart({data, colorMap, preserveOrder}) {
           )
         )
       )
+    )
+  );
+}
+
+// Simple inline-SVG line+area chart (issue #186) -- same "no charting
+// library" posture as BarChart above, just a different mark shape. Plots
+// one numeric field (valueKey) from a list of {captured_at, ...} snapshot
+// dicts (oldest first, as GET /api/analytics/trend already returns them).
+// A viewBox of a fixed logical width/height with preserveAspectRatio="none"
+// lets the <svg> stretch to its container via plain CSS width:100% -- no
+// resize-observer or JS layout math needed, mirroring BarChart's own
+// percentage-width bars.
+function TrendChart({data, valueKey, color}) {
+  const height = 100;
+  const width = 300;
+  if (!data || data.length === 0) {
+    return React.createElement("div", {style:{fontSize:13,color:theme.textMuted,fontFamily:sans,textAlign:"center",padding:"32px 0"}}, "No trend data yet — a daily snapshot is captured automatically; check back tomorrow.");
+  }
+  const values = data.map(d => Number(d[valueKey]) || 0);
+  const max = Math.max(...values, 1);
+  const min = Math.min(0, ...values);
+  const range = (max - min) || 1;
+  const stepX = data.length > 1 ? width / (data.length - 1) : 0;
+  const coords = values.map((v, i) => [
+    data.length > 1 ? i * stepX : width / 2,
+    height - ((v - min) / range) * height,
+  ]);
+  const linePoints = coords.map(([x, y]) => x + "," + y).join(" ");
+  const areaPoints = linePoints + " " + width + "," + height + " 0," + height;
+  const stroke = color || theme.accent;
+  return React.createElement("div", null,
+    React.createElement("svg", {viewBox:"0 0 "+width+" "+height, preserveAspectRatio:"none", style:{width:"100%",height:120,display:"block",overflow:"visible"}},
+      React.createElement("polygon", {points:areaPoints, fill:stroke+"22", stroke:"none"}),
+      React.createElement("polyline", {points:linePoints, fill:"none", stroke:stroke, strokeWidth:1.5, vectorEffect:"non-scaling-stroke"})
+    ),
+    React.createElement("div", {style:{display:"flex",justifyContent:"space-between",marginTop:8,fontSize:11,fontFamily:mono,color:theme.textMuted}},
+      React.createElement("span", null, (data[0].captured_at||"").slice(0,10)),
+      React.createElement("span", null, (data[data.length-1].captured_at||"").slice(0,10))
     )
   );
 }
@@ -602,6 +645,7 @@ function App() {
 
   const stats = store.stats;
   const vitality = store.vitality;
+  const trend = store.trend;
   const allCategories = Object.keys(stats.categories||{});
   const allTags = Object.keys(stats.tags||{}).sort((a,b)=>(stats.tags[b]||0)-(stats.tags[a]||0));
   const entityQueryLower = entityQuery.trim().toLowerCase();
@@ -798,6 +842,13 @@ function App() {
               React.createElement("span",{style:{fontFamily:mono,fontSize:12,color:theme.textMuted}}, "Vault health "+(vitality.vault_health_score||"0%")+" · "+(vitality.active_count||0)+" active · "+(vitality.dormant_count||0)+" dormant")
             ),
             React.createElement(BarChart,{data:vitality.vitality_buckets||{},preserveOrder:true,colorMap:{"0.00-0.05":theme.danger,"0.05-0.25":"#f59e0b","0.25-0.50":"#eab308","0.50-0.75":"#84cc16","0.75+":"#22c55e"}})
+          ),
+          React.createElement("div",{style:{background:theme.surface,border:"1px solid "+theme.border,borderRadius:8,padding:20,marginTop:16}},
+            React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:16}},
+              React.createElement("h3",{style:{fontFamily:mono,fontSize:13,fontWeight:600,color:theme.textSecondary,textTransform:"uppercase",letterSpacing:"0.04em"}},"Vault Trend"),
+              React.createElement("span",{style:{fontFamily:mono,fontSize:12,color:theme.textMuted}}, (trend.snapshots||[]).length+" daily snapshot"+((trend.snapshots||[]).length===1?"":"s"))
+            ),
+            React.createElement(TrendChart,{data:trend.snapshots||[],valueKey:"total_memories",color:theme.accent})
           ),
           React.createElement("div",{style:{background:theme.surface,border:"1px solid "+theme.border,borderRadius:8,padding:20,marginTop:16}},
             React.createElement("h3",{style:{fontFamily:mono,fontSize:13,fontWeight:600,color:theme.textSecondary,marginBottom:16,textTransform:"uppercase",letterSpacing:"0.04em"}},"Top Tags"),

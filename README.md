@@ -9,7 +9,9 @@ Persistent, searchable memory that works across **Claude.ai**, **Claude Code**, 
 **Capture & import**
 - **Chat export import** — ingest JSON, JSONL, or Markdown exports from Claude, ChatGPT, or custom formats
 - **Document ingestion** — import Markdown notes and plain-text files, chunked per-section (heading context preserved) or per-paragraph; `kind=auto` detects chat vs document per file
-- **Bulk directory import** — point at a folder of exports/notes and import them all
+- **PDF and image (OCR) ingestion** — import `.pdf` files (chunked per-page, page number kept as metadata) and `.png`/`.jpg`/`.jpeg` images (OCR'd into a single memory); `kind=auto` routes both automatically. Requires the optional `pdf`/`image` extras — see [PDF and Image Import](#pdf-and-image-import)
+- **Readwise highlights import** — import a Readwise "Export" JSON file as one memory per highlight (book/article title, author, category, and the highlight's own note all kept as metadata/content); requires explicit `kind=readwise` — see [Importing from Readwise](#importing-from-readwise)
+- **Bulk directory import** — point at a folder of exports/notes/PDFs/images and import them all
 - **Watched folders** — set `REMIND_ME_WATCH_DIRS` and new or changed files auto-ingest in the background; changed files supersede their previous import
 - **Push/webhook ingestion** — set `REMIND_ME_WEBHOOK_SECRET` and `POST /ingest` accepts content directly over the network, no filesystem staging required
 - **Ingest-time normalization** — `remind_me_normalize_batch`/`remind_me_normalize_apply` distill noisy raw imports into clean `{question, summary, resolution?}` memories, non-destructively linked back to the source
@@ -202,10 +204,44 @@ to run an open localhost API (not recommended). Mutating requests must send
 `Content-Type: application/json` (cross-origin form posts are rejected with 415).
 `GET /health` is an unauthenticated liveness probe.
 
+#### Scoped API keys
+
+The default key above always has full read-write access — it's the same
+credential in every request. To share a read-only dashboard view, or embed a
+key in a lower-trust client without handing out full write access, create an
+additional **named, scoped** key with the `remind_me_api_key` MCP tool:
+
+```
+remind_me_api_key(action="create", name="dashboard-viewer", scope="read")
+```
+
+This returns the plaintext key **exactly once** — save it immediately; only
+its SHA-256 hash is stored afterward, so it cannot be retrieved again, only
+revoked and replaced. A `read`-scoped key authenticates normally against
+every `GET` route but is rejected with `403` on any mutating route
+(`POST`/`PUT`/`PATCH`/`DELETE`); a `read-write`-scoped key has the same full
+access as the default key. Use it exactly like the default key:
+
+```bash
+curl -H "Authorization: Bearer <scoped-key>" http://localhost:5199/api/stats
+```
+
+`remind_me_api_key(action="list")` shows every key's name/scope/created_at
+(never the key material), including a synthetic `default` entry for the
+backward-compat key above. `remind_me_api_key(action="revoke", name=...)`
+immediately ends a named key's access — the default key isn't revocable this
+way, since it's config-managed (the env var or its own auto-generated file),
+not app-managed; set `REMIND_ME_API_KEY=disabled` or delete the persisted
+`api_key` file to rotate it instead.
+
+This is not multi-tenancy (see [ARCHITECTURE.md](ARCHITECTURE.md)): every key
+— default or scoped — reads and writes the exact same single vault; only the
+*scope* differs per key, there is no per-key data partitioning.
+
 ### What It Does
 
 - **Browse & search** — full-text search with `⌘K` shortcut, category sidebar with counts, clickable tag filters
-- **View stats** — bar charts for categories, sources, and top tags; database size and server info
+- **View stats** — bar charts for categories, sources, vitality distribution, and top tags; a **Vault Trend** line chart plotting total-memory-count drift over the daily analytics snapshots the background scheduler captures automatically (empty state on a fresh install with no history yet); database size and server info
 - **Add memories** — modal form with content editor, color-coded category picker, and tag input
 - **Edit & delete** — inline controls on every memory card with confirmation dialogs
 - **Expand/collapse** — long memories truncate at 200 characters with a click to expand
@@ -221,6 +257,7 @@ The dashboard is powered by a REST API you can also use directly:
 | `GET` | `/health` | Liveness probe (no auth) |
 | `GET` | `/api/stats` | Memory statistics, categories, tags, DB info |
 | `GET` | `/api/vitality` | Vault vitality report: active/dormant counts, health score, vitality-bucket distribution |
+| `GET` | `/api/analytics/trend` | Daily analytics-snapshot history for the dashboard's Vault Trend panel: `{snapshots: [{captured_at, total_memories, vitality_buckets, category_counts}, ...]}`, oldest first (empty array on a fresh install) |
 | `GET` | `/api/memories?category=&tags=&limit=&offset=` | List memories with filters, paginated (`total`/`count`/`offset`/`limit`/`has_more`) |
 | `GET` | `/api/memories/search?q=&category=&tags=&limit=&offset=` | Full-text search, paginated the same way |
 | `GET` | `/api/memories/{id}` | Get a single memory |
@@ -306,6 +343,16 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_get` | Retrieve a single memory by ID |
 | `remind_me_update` | Update a memory's content, category, tags, or metadata |
 | `remind_me_delete` | Permanently delete a memory |
+| `remind_me_history` | List a memory's prior content revisions, newest first — see [Edit History](#edit-history) |
+| `remind_me_revert` | Restore a memory to a prior revision — see [Edit History](#edit-history) |
+
+### Reminders
+
+| Tool | Description |
+|------|-------------|
+| `remind_me_set_reminder` | Set a future `remind_at` timestamp on an existing memory, or clear one already set (omit/null `remind_at`) — must be a valid ISO-8601 timestamp in the future |
+| `remind_me_list_reminders` | List memories with a set reminder: `upcoming` (still in the future), `overdue` (due but not yet delivered — e.g. the server was offline), or `all` |
+| `remind_me_digest` | Summarize recent additions, vault vitality, reminders, and sync health in one read — see [Digest](#digest) |
 
 ### Capture & decomposition
 
@@ -355,8 +402,8 @@ The stats view replaces the main content area with summary cards, horizontal bar
 
 | Tool | Description |
 |------|-------------|
-| `remind_me_import_chat` | Import a single chat export or document file (`kind`: auto/chat/document) |
-| `remind_me_import_directory` | Bulk import all exports/documents from a directory |
+| `remind_me_import_chat` | Import a single chat export, document, PDF, or image file (`kind`: auto/chat/document/pdf/image) |
+| `remind_me_import_directory` | Bulk import all exports/documents/PDFs/images from a directory |
 | `remind_me_import_mempalace` | Bulk-import memories from a MemPalace ChromaDB store, one page at a time (requires the optional `mempalace` extra) |
 | `remind_me_import_dbs` | Bulk-import memories from a [dbs](https://github.com/baileyrd/daily-backup-system) SQLite store, one page at a time — source and tags land as knowledge-graph entities, not flattened prose |
 | `remind_me_list_connectors` | List every registered import connector (built-in and third-party) and which are valid `remind_me_import_chat` kinds |
@@ -368,10 +415,11 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_watch_status` | Folder watcher status: watched dirs, scan counters, recent errors |
 | `remind_me_webhook_status` | Push/webhook ingestion status: bind/port, request counters, recent errors |
 | `remind_me_revoke_clients` | List OAuth connector clients, or revoke one (with all of its tokens) |
+| `remind_me_api_key` | Create, list, or revoke named, scope-limited (`read`/`read-write`) dashboard API keys — see [Authentication](#authentication) |
 | `remind_me_check_update` | Check if a newer version is available on origin/main |
 | `remind_me_self_update` | Pull latest changes from origin and reinstall the package |
 
-46 tools + 6 prompts + 4 resources (`memory://stats`, `memory://categories`, `wiki://schema`, `wiki://index`).
+49 tools + 6 prompts + 4 resources (`memory://stats`, `memory://categories`, `wiki://schema`, `wiki://index`).
 
 ### Prompts: the maintenance loops as one-shot workflows
 
@@ -390,7 +438,7 @@ Every argument is optional (batch size, similarity threshold), so invoking a pro
 
 ### Tool profiles (context cost)
 
-The full surface is 46 tools costing **~21k tokens of context in every session**, on every client, whether or not an admin tool is ever touched. For a server whose job is putting memories *into* context that's an awkward ratio — `remind_me_wiki_load` defaults to a 12k budget, so the tool definitions cost ~1.8× an entire wiki load before a single memory is retrieved.
+The full surface is 48 tools costing **~21k tokens of context in every session**, on every client, whether or not an admin tool is ever touched. For a server whose job is putting memories *into* context that's an awkward ratio — `remind_me_wiki_load` defaults to a 12k budget, so the tool definitions cost ~1.8× an entire wiki load before a single memory is retrieved.
 
 ```bash
 REMIND_ME_TOOL_PROFILE=standard remind-me-mcp
@@ -398,7 +446,7 @@ REMIND_ME_TOOL_PROFILE=standard remind-me-mcp
 
 | Profile | Tools | Context | Drops |
 |---|---|---|---|
-| `full` *(default)* | 46 | ~21k | nothing — today's behavior |
+| `full` *(default)* | 48 | ~21k | nothing — today's behavior |
 | `standard` | 30 | ~14.8k | imports, sync, backup, updater, ops |
 | `core` | 17 | ~7.8k | the above, plus the maintenance loops and their prompts |
 
@@ -541,6 +589,50 @@ Switching `REMIND_ME_EMBEDDING_MODEL`, `REMIND_ME_EMBEDDING_DIM`, or `REMIND_ME_
 
 Use `remind_me_server_status` to see how many memories have embeddings and whether the model is loaded.
 
+## PDF and Image Import
+
+Two more import kinds, `pdf` and `image`, sit alongside `chat`/`document` — same `remind_me_import_chat`/`remind_me_import_directory` tools, same hash-dedup and `kind=auto` routing, just two more optional extras so a base install doesn't pull in PDF/OCR dependencies.
+
+### Enabling PDF Import
+
+```bash
+pip install pypdf
+# Or with uv:
+uv pip install "remind-me-mcp[pdf]"
+```
+
+A `.pdf` file is chunked **per page** via [`pypdf`](https://pypdf.readthedocs.io/) (pure-Python — no system binary like poppler-utils required); each chunk's metadata carries a `page` number, the same role the `document` connector's Markdown heading breadcrumb plays. A page too long for one memory is split further, with every resulting sub-chunk still tagged with that page's number.
+
+### Enabling Image (OCR) Import
+
+```bash
+pip install rapidocr-onnxruntime
+# Or with uv:
+uv pip install "remind-me-mcp[image]"
+```
+
+A `.png`/`.jpg`/`.jpeg` file is OCR'd via [RapidOCR](https://github.com/RapidAI/RapidOCR) into a single memory (whole image as one chunk). **Why RapidOCR over `pytesseract`:** this server already depends on `onnxruntime` for the embedder/reranker, so an ONNX-based OCR engine reuses infrastructure already present rather than adding a new runtime family — and RapidOCR's detection/recognition models ship *inside* the pip package itself, so OCR works fully offline with no HuggingFace download (unlike the embedder/reranker). `pytesseract` was considered and rejected: it additionally requires the system `tesseract` binary, which pip can't install and which isn't present in this project's CI/dev images.
+
+### Without These Extras
+
+Importing a `.pdf`/image file without its extra installed returns a clear, actionable error (e.g. *"PDF import requires the 'pdf' extra: pip install remind-me-mcp[pdf]"*) — not a bare `ModuleNotFoundError` traceback. Every other import kind, and the rest of the server, is completely unaffected either way.
+
+## CLI
+
+For quick one-shot access without going through an MCP client — scripting, cron jobs, or just checking something from a terminal — `remind-me-mcp` also accepts three direct subcommands, alongside its existing flags:
+
+```bash
+remind-me-mcp add "buy oat milk on the way home" [--category CAT] [--tags a,b,c]
+remind-me-mcp search "wifi password" [--limit N] [--json]
+remind-me-mcp list [--limit N] [--category CAT] [--json]
+```
+
+- `add` stores a memory and prints its id — the same `remind_me_add` logic an MCP client would trigger, not a separate implementation.
+- `search` runs the same hybrid FTS5 + semantic retrieval as `remind_me_search`, printing Markdown by default or JSON with `--json`.
+- `list` browses by filter (no ranking) exactly like `remind_me_list`, same output options.
+
+These operate on the exact same `REMIND_ME_MCP_DIR` (and therefore the exact same `memory.db`) as the server — set the env var the same way for both, or rely on the shared `~/.remind-me` default. A CLI command can run safely at any time, whether or not a server is currently running: it opens an ordinary WAL-mode SQLite connection (the same one the server itself opens) and closes it when done, and it deliberately never touches the server's own single-instance lock file (`MCP_PID_FILE`, issue #126) — that lock only prevents two *server* processes (each running background sync/watcher/scheduler threads) from racing each other, not a short-lived CLI read or write. A first invocation against a fresh `REMIND_ME_MCP_DIR` auto-initializes the database exactly like a fresh server start does — there is no separate "init" step.
+
 ## Backups
 
 For a single-user app where one SQLite file holds someone's entire memory store, a failed or buggy migration (or just wanting a checkpoint before a risky bulk edit) needs a real safety net, not a reminder to "remember to copy the file."
@@ -556,6 +648,10 @@ For a single-user app where one SQLite file holds someone's entire memory store,
   ```
   Validates the backup (`PRAGMA integrity_check` plus a sanity check that it's actually a remind-me database) before touching anything, and snapshots the *current* database first so a bad restore is itself recoverable. Refuses to run while an MCP server is holding the lock on this database. `--restore` accepts either a bare filename (resolved against the backups directory) or a full path to any valid backup file.
 
+## Encryption at Rest
+
+Optional, opt-in, off by default. Setting `REMIND_ME_DB_ENCRYPTION_KEY` (requires `pip install remind-me-mcp[encryption]`) encrypts `memory.db` and its backups at rest via [SQLCipher](https://www.zetetic.net/sqlcipher/). Not for every user or install — see [ARCHITECTURE.md's "Encryption at rest" design note](ARCHITECTURE.md#encryption-at-rest-is-opt-in-not-default-issue-184) for the full rationale, what is and isn't covered, and the v1 adoption story (encryption must be enabled before an install's first run; there's no in-place re-encryption of an existing plaintext database yet).
+
 ## Importing Chats & Documents
 
 The import tools (`remind_me_import_chat`, `remind_me_import_directory`, `POST /api/import`) share one pipeline: hash-based deduplication (re-importing the same file content is a no-op), batched embedding, and a `kind` parameter that controls parsing.
@@ -564,9 +660,12 @@ The import tools (`remind_me_import_chat`, `remind_me_import_directory`, `POST /
 
 | Kind | Behavior |
 |------|----------|
-| `auto` *(default)* | `.json`/`.jsonl` always parse as chat. `.md`/`.markdown`/`.txt` are content-sniffed: files with chat role markers (`**User:**`, `## Assistant`, …) import as chat, everything else as a document |
+| `auto` *(default)* | `.json`/`.jsonl` always parse as chat. `.pdf` always parses as pdf; `.png`/`.jpg`/`.jpeg` always parses as image. `.md`/`.markdown`/`.txt` are content-sniffed: files with chat role markers (`**User:**`, `## Assistant`, …) import as chat, everything else as a document. **Never** resolves to `readwise` — see below |
 | `chat` | Force the chat-export parser (chunked per-message) |
 | `document` | Force document chunking (`.md`/`.markdown`/`.txt` only) |
+| `pdf` | Force per-page PDF chunking (`.pdf` only; requires the optional `pdf` extra) — see [PDF and Image Import](#pdf-and-image-import) |
+| `image` | Force OCR of an image into a single memory (`.png`/`.jpg`/`.jpeg` only; requires the optional `image` extra) — see [PDF and Image Import](#pdf-and-image-import) |
+| `readwise` | Force a Readwise "Export" JSON file into one memory per highlight (`.json` only, must be requested explicitly — never chosen by `auto`) — see [Importing from Readwise](#importing-from-readwise) |
 
 Document imports chunk Markdown per-section (the heading context is kept with each chunk and stored in metadata) and plain text per-paragraph. They get `source: document_import` and default to category `document`.
 
@@ -574,7 +673,33 @@ Imports are restricted to paths inside `REMIND_ME_IMPORT_ROOTS` (default: your h
 
 ### Pluggable Connectors
 
-The `chat` and `document` kinds are plain parser functions registered by kind string in `remind_me_mcp/importer.py` (`register_connector(kind, connector)`), not a hardcoded dispatch — `remind_me_import_chat`/`remind_me_import_directory` resolve the effective kind exactly as before, then look it up in the registry. A third-party module can register more connectors without touching `importer.py`; `remind_me_mcp/mempalace_import.py` does this for its own `_parse_frontmatter` step, registered under `"mempalace"` purely for discovery (its real ingestion path, `remind_me_import_mempalace`, keeps its own bespoke per-drawer dedup/paging loop — MemPalace drawers arrive individually from a paginated ChromaDB read, not as one raw file). `remind_me_mcp/dbs_import.py` follows the same pattern for [dbs](https://github.com/baileyrd/daily-backup-system) — see [Importing from dbs](#importing-from-dbs) below. Call `remind_me_list_connectors` to see every registered connector and which are valid `remind_me_import_chat` kinds.
+Every import kind — including the built-in `chat`, `document`, `pdf`, `image`, and `readwise` — is a plain parser function registered by kind string in `remind_me_mcp/importer.py`, not a hardcoded dispatch. `remind_me_import_chat`/`remind_me_import_directory`/`POST /api/import` resolve the effective kind (by extension, or by content-sniffing for `auto`, or by whatever the caller forced) and then look it up in one registry. A third-party module can register more kinds **without touching `importer.py` at all** — this is the whole point of the registry, and it's meant to be actually used by someone outside this codebase, not just an internal implementation detail. What follows is the contract, not just a pointer to source.
+
+**Registering a connector.** Call `register_connector(kind, parser)` at import time (module-level, right after defining `parser` — see every built-in below):
+
+```python
+from remind_me_mcp.importer import register_connector
+
+def my_connector(raw: str, meta: dict) -> tuple[list[tuple[str, dict]], int]:
+    ...
+
+register_connector("my_kind", my_connector)
+```
+
+- `kind` is any string. It's only reachable through `remind_me_import_chat`/`remind_me_import_directory`/`POST /api/import` if it's also added to `importer.IMPORT_KINDS` (a first-party change) *and*, if it needs `kind="auto"` to route to it, wired into the effective-kind resolution in `_ingest_parsed` — most third-party connectors instead register purely for **discovery** (`remind_me_list_connectors`) and drive their own bespoke ingestion function/tool, the way `mempalace_import.py` and `dbs_import.py` do (see below): a MemPalace drawer or a dbs item arrives individually from a paginated read, not as one raw file, so neither ever flows through the file-based `import_chat_file` pipeline at all.
+- The parser's signature is fixed: `(raw: str, meta: dict[str, Any]) -> tuple[list[tuple[str, str_or_dict]], int]` — concretely, `(content, chunk_metadata)` pairs plus a raw-entry count. `raw` is the file's content decoded as UTF-8 (`errors="replace"`); a binary format (like `pdf`/`image`) instead reads `meta["raw_bytes"]` — the *undecoded* original bytes — and ignores `raw` entirely, since UTF-8-decoding binary data would corrupt it. `meta` also carries `suffix`, `extract_mode`, and `max_length`.
+- Each `content` string becomes one memory's content; each paired `chunk_metadata` dict is merged into that memory's stored `metadata` JSON — this is the mechanism for attaching source-specific context (a PDF's page number, a Readwise highlight's book title/author) without threading a special case through the shared pipeline. Use `remind_me_mcp.importer._chunk_text(text, max_length)` to split anything that might exceed `max_length` — every built-in connector does, so oversized content is handled the exact same way everywhere.
+- The `int` return value is the count of logical source units found *before* chunking (e.g. messages, or highlights) — it becomes the `raw_entries` field of the import result. For a connector where chunking *is* the extraction unit (like `document`), it just equals the number of chunks returned.
+
+**What you get for free.** Once a connector returns that shape, `_ingest_parsed` (the one function every kind funnels through) handles everything else identically: SHA-256 content-hash dedup against `chat_imports` (re-importing the same file is a no-op), assigning deterministic memory ids, batched embedding, and the `doc_id`/`chunk_index` bookkeeping that makes neighbor-aware chunk retrieval and `remind_me_undo_import` work. None of that is something a connector author needs to think about, let alone reimplement.
+
+**Reference implementations**, roughly in order of how much of the shared pipeline they use:
+
+- `remind_me_mcp/readwise_import.py` — the fullest example of "just implement the parser": turns a Readwise export into one `(highlight_text[+note], {book/author/... metadata})` pair per highlight, and nothing else — dedup, chunking, and embedding are entirely `_ingest_parsed`'s job. Also the best example of *deliberately not* joining `kind="auto"`'s content-sniffing (documented in its own module docstring) when a format shares a suffix with an existing kind and can't be told apart reliably.
+- `remind_me_mcp/dbs_import.py` — a connector registered purely for discovery (`remind_me_list_connectors`), with its own dedicated tool (`remind_me_import_dbs`) and bespoke per-item dedup/supersession loop, because dbs items arrive individually from a live SQLite read rather than as one file. Read this one if your source is a live store you'd page through, not a static export file.
+- `remind_me_mcp/mempalace_import.py` — the same discovery-only pattern as `dbs_import.py`, for a ChromaDB-backed store.
+
+Call `remind_me_list_connectors` to see every registered connector and which subset are valid `remind_me_import_chat`/`remind_me_import_directory` kinds (`IMPORT_KINDS` — narrower than the full registry, for exactly the discovery-only reason above).
 
 ### Importing from dbs
 
@@ -589,6 +714,21 @@ remind_me_import_dbs(db_path="/path/to/dbs.sqlite3")
 - `source`/`item_type` filter to one dbs source or item kind; `tags` adds extra tags to every imported memory; `dry_run` reports what would happen without writing.
 
 This is the highest-fidelity of the three ways to feed dbs's collected content into remind_me (see dbs's `docs/remind-me-integration-review-2026-07-21.md` for the other two — an unzipped-notes export watched by `REMIND_ME_WATCH_DIRS`, or a per-item webhook push) — the only one that gives Claude entity-level provenance (which source, which tags) instead of prose to parse back out.
+
+### Importing from Readwise
+
+[Readwise](https://readwise.io) exports your highlights as JSON — either via Settings → Export, or by calling its documented Export API (`GET https://readwise.io/api/v2/export/`, see [readwise.io/api_deets](https://readwise.io/api_deets)) and saving the response. Import the resulting file with `kind` set explicitly:
+
+```
+Use remind_me_import_chat with:
+  file_path: ~/Downloads/readwise-export.json
+  kind: readwise
+```
+
+- **`kind=readwise` is never inferred by `auto`.** A Readwise export and an arbitrary chat export are both plain `.json` files, and unlike the Markdown chat-role-marker sniff `auto` already does, there's no reliable, false-positive-free way to content-sniff a Readwise export apart from other JSON shapes — guessing wrong would risk silently misrouting an existing chat export. You always have to ask for `readwise` by name.
+- **One memory per highlight**, not one memory per book/article. A highlight is Readwise's own atomic unit — grouping a book's highlights into one memory would force every highlight to compete with every other highlight from the same book for search ranking and embedding budget, which is exactly the retrieval precision a memory store exists to protect. Book context isn't lost, just demoted to metadata: every highlight's memory carries the book/article's `title`, `author`, `category` (`books`/`articles`/`tweets`/`podcasts`/...), and `source_url`, plus the highlight's own `location`, `highlighted_at`, `tags`, and Readwise highlight URL, all under a `readwise_`-prefixed key in metadata.
+- **A highlight's own note is appended to its content**, not discarded — `"{highlight text}\n\nNote: {your note}"` — since the note is often the actual reason you highlighted the passage, and only memory content participates in full-text search.
+- Same hash-based dedup, chunking, and embedding as every other import kind (it flows through the same shared pipeline) — re-importing the same export file is a no-op.
 
 ### Claude Export Format
 
@@ -617,6 +757,7 @@ Use remind_me_import_directory with:
 - **JSONL**: One message or conversation per line
 - **Markdown**: Chat exports (headings or bold markers for roles: `## Human`, `**Assistant:**`, …) or plain notes (imported as documents)
 - **Plain text** (`.txt`): imported as documents, chunked per-paragraph
+- **Readwise export** (`.json`, `kind=readwise` required — see [Importing from Readwise](#importing-from-readwise)): one memory per highlight
 
 ## Exporting & Backup
 
@@ -674,6 +815,7 @@ curl -X POST http://127.0.0.1:8769/ingest \
 - **Same pipeline as file import** — `content` is UTF-8 text; `filename`'s extension selects the parser (JSON/JSONL chat exports, Markdown/plain-text documents), and hash dedup applies exactly like `remind_me_import_chat`. `category`, `tags`, `extract_mode`, `max_length`, and `kind` are all optional, with the same defaults as `remind_me_import_chat`.
 - **Status** — `remind_me_webhook_status` reports enabled/running state, bind/port, and request counters (ingested/skipped/errored); `remind_me_server_status` includes a one-line summary too.
 - **Configuration** — `REMIND_ME_WEBHOOK_PORT` (default 8769), `REMIND_ME_WEBHOOK_BIND`, `REMIND_ME_WEBHOOK_SECRET`.
+- **Rate limited** — `POST /ingest` enforces `REMIND_ME_RATE_LIMIT_REQUESTS` (default 60) per `REMIND_ME_RATE_LIMIT_WINDOW_SECONDS` (default 60), returning `429` with a `Retry-After` header once exceeded. The check runs *before* the bearer check, keyed by IP, so an anonymous flood is bounded too — but a request presenting the exact `REMIND_ME_WEBHOOK_SECRET` gets its own dedicated bucket, so a legitimate high-volume pusher is never throttled by unrelated traffic hitting the same tunnel. Set `REMIND_ME_RATE_LIMIT_ENABLED=""` to disable entirely (shared with the [remote connector](#claudeai-custom-connector-remote-mcp)'s limit — see [Environment Variables](#environment-variables)).
 
 ## Ingest-Time Normalization
 
@@ -764,6 +906,66 @@ export REMIND_ME_WIKI_DIR=~/notes/wiki
 # Cap the default whole-wiki load (estimated tokens; 0 = unlimited)
 export REMIND_ME_WIKI_LOAD_TOKEN_BUDGET=12000
 ```
+
+## Reminders
+
+A memory can carry an optional future `remind_at` timestamp. A background scheduler polls for due reminders every `REMIND_ME_REMINDER_POLL_INTERVAL` seconds (default 60) and delivers each exactly once:
+
+- **`remind_me_set_reminder`** — sets or clears `remind_at` on an existing memory. A past or unparseable timestamp is rejected outright rather than silently accepted as a no-op reminder. Setting/clearing a reminder is a real content change, so it bumps `updated_at` like any other field edit (routed through the same internal update path as `remind_me_update`).
+- **`remind_me_list_reminders`** — lists memories with a set reminder: `upcoming` (still in the future), `overdue` (due but not yet delivered — typically because the server was offline when it came due), or `all`.
+- **Fires exactly once, even across restarts** — a `reminder_deliveries` table records which `(memory_id, remind_at)` pairs have already fired. A reminder that becomes due while the server is offline still fires exactly once on the next poll after restart; it neither re-fires on every subsequent poll nor gets silently dropped.
+- **Delivery is a log line today** — outbound notification channels (email, push, etc.) are tracked separately; the scheduler's due-reminder logic is already structured with a swappable delivery hook so a real channel can plug in without changing how due reminders are found.
+- **Configuration** — `REMIND_ME_REMINDER_POLL_INTERVAL` (default 60 seconds). The scheduler itself always runs; there is no separate enable switch.
+
+## Calendar Export
+
+`GET /api/reminders/{token}.ics` (issue #190) is a subscribable ICS feed of every `upcoming`/`overdue`-and-undelivered reminder — paste it into Google/Apple/Outlook calendar's "subscribe by URL" feature to see reminders alongside the rest of your calendar, refreshed on whatever poll interval the calendar provider itself uses.
+
+- **`remind_me_reminders_ics_url`** (MCP tool) — returns the full feed URL (scheme/host/port from the running dashboard server) so you don't need filesystem or env access to read the token yourself. Returns a placeholder explaining how to enable the HTTP surface if the current MCP connection is stdio-only (there is no server to serve the feed from in that mode).
+- **Secret-path auth, not a bearer header** — a calendar subscription is polled unauthenticated by the provider's own servers on a schedule you don't control, with no way to attach an `Authorization` header, so this route can't use the same bearer-token scheme the rest of `/api/*` uses. Instead the token lives in the URL path itself (`REMIND_ME_ICS_TOKEN`, auto-generated and persisted at `~/.remind-me/ics_token` on first use, exactly like the dashboard API key — SE-01) and is checked with `hmac.compare_digest`. **⚠ Treat this URL like a password** — whoever holds it can read every reminder's content — same caveat the [Claude.ai Custom Connector](#claudeai-custom-connector-remote-mcp) section already states for its own secret-path fallback. Rotate by deleting the token file; every calendar app subscribed to the old URL then gets a 404 and needs re-pointing at the new one.
+- **Stable event identity** — each VEVENT's `UID` is derived deterministically from the memory id and `remind_at` (not a random UUID per fetch), so an unchanged reminder updates in place across polls instead of piling up duplicate events; changing `remind_at` mints a new UID for what is genuinely a new occurrence.
+- **No new dependency** — ICS generation is hand-rolled (`remind_me_mcp/ics_export.py`), including RFC 5545 text escaping and 75-octet line folding, rather than pulling in a third-party iCalendar library for a format this small (same minimal-dependency bias as the `[semantic]`/`[ann]`/etc. optional extras).
+
+## Notifications
+
+Optional outbound notification channels (issue #180) that a fired reminder or a faulted sync status can push out, instead of only being visible to whoever happens to be reading logs or calling a status tool. Each channel is gated on its own config being present — no separate enable flag, and no channel configured means `remind_me_mcp.notifications.notify()` is a safe no-op everywhere it's called.
+
+- **Webhook** (`REMIND_ME_NOTIFY_WEBHOOK_URL`) — POSTs one generic JSON payload, `{"subject": ..., "body": ..., "source": "remind-me"}`, to the configured URL. One config covers ntfy/Slack/Discord/Mattermost/Pushover-via-webhook uniformly; there's no per-service formatting (Slack blocks, ntfy priority headers, Discord embeds, ...) built in — point the URL at a small relay/transform first if you want a service's native formatting. A short timeout (`REMIND_ME_NOTIFY_WEBHOOK_TIMEOUT`, default 5s) keeps a hung endpoint from blocking the caller.
+- **Email** (`REMIND_ME_NOTIFY_SMTP_HOST` + `REMIND_ME_NOTIFY_SMTP_TO`) — sends via stdlib `smtplib`/`email.message.EmailMessage` (no new dependency). `REMIND_ME_NOTIFY_SMTP_PORT` 465 always uses implicit TLS (`SMTP_SSL`); any other port uses plain `SMTP` with STARTTLS applied when `REMIND_ME_NOTIFY_SMTP_USE_TLS` is true (the default). `REMIND_ME_NOTIFY_SMTP_USER`/`_PASSWORD` are optional — omit both to skip SMTP AUTH against a relay that allows unauthenticated submission.
+- **Both, one, or neither** can be configured at once — `notify()` fans out to every configured channel, catching and logging any individual notifier's failure so a broken channel never blocks another or the caller.
+
+Two wiring points, both optional in the sense that they're no-ops with nothing configured:
+
+- **Reminders** — the scheduler's default delivery hook (see [Reminders](#reminders)) logs the due reminder *and* calls `notify()` with the memory's content as the body, on every fired reminder.
+- **Sync faults** — `remind_me_sync_reconcile` calls `notify()` when its verdict is `fault` (not `pull-lag`/`node-ahead`/`in-sync` — see [Multi-Machine Sync](#multi-machine-sync)). Throttled to once per `REMIND_ME_NOTIFY_SYNC_FAULT_INTERVAL` seconds (default 1800) per persisting fault, since reconcile can be called repeatedly by an external monitor — alerting on every call would repeat the alert-fatigue mistake `remind_me_sync_status`/`remind_me_sync_reconcile` themselves were once guilty of (see the Wave 4 incident in `BACKLOG.md`).
+
+Deliberately *not* wired into `remind_me_server_status`'s maintenance-backlog nudges or the feedback hint — those are in-band by design (surfaced only inside a live tool response), not outbound alerts.
+
+## Edit History
+
+`remind_me_update` overwrites a memory's content/category/tags/metadata in place — issue #187 gives it the same "don't lose data on a destructive-looking operation" treatment [deletion already gets](#deletion-propagates-too) from `deleted_at` tombstones, applied to edits instead of deletes.
+
+- **`remind_me_history`** — lists a memory's prior revisions, newest first, each with a timestamp and a short content preview. `limit` (default 10) caps how many come back; `response_format` supports `markdown` or `json`.
+- **`remind_me_revert`** — restores a memory's content/category/tags/metadata to a prior revision by `revision_id` (from `remind_me_history`'s output). A `revision_id` that doesn't exist, or belongs to a different memory, fails with a clear error instead of silently doing nothing or reverting the wrong thing.
+- **A revision is captured automatically** whenever `remind_me_update` (or a revert) genuinely changes tracked content — a no-op update (setting a field to the value it already has) creates no revision, mirroring how sync only propagates genuine content changes.
+- **A revert is itself an edit, not a raw overwrite** — it's implemented by calling the exact same internal update path `remind_me_update` uses, so it bumps `updated_at`, rides the normal sync outbox trigger like any other change, and — because it's just another edit through that path — automatically snapshots the state just before the revert. That means reverting is itself undoable, with no special-case code for it.
+- **Scope: content fields only.** What's tracked is exactly what `remind_me_update` can change (`content`, `category`, `tags`, `metadata`) — not `remind_at` or the vitality/classification columns. `remind_me_set_reminder` happens to funnel through the same shared internal update helper, but since it only ever touches `remind_at`, it never produces a revision.
+- **Local only, never synced** — like `reminder_deliveries` and the wiki index tables, `memory_revisions` carries no sync outbox trigger. Edit history is per-device audit trail, not a replicated entity; a revert on one device does not (yet) merge with another device's edit history for the same memory.
+- **Retention** — `REMIND_ME_REVISION_RETENTION_DAYS` (default 90) bounds how far back `remind_me_revert` can reach. Old revisions are pruned by the always-on reminder-scheduler loop (not the sync loop — revisions accumulate regardless of whether sync is configured at all).
+
+## Digest
+
+`remind_me_digest` (issue #188) is a compressed, one-read snapshot of the vault: recent additions, vault vitality, reminders, and sync health. It is pure synthesis — every section calls the exact same underlying function its own standalone tool already uses (`vitality.build_vitality_report`, the same function behind `remind_me_vitality_report` in [Lifecycle](#lifecycle); the reminders window logic behind [`remind_me_list_reminders`](#reminders); `sync.get_sync_status`, the same function behind `remind_me_sync_status` in [Multi-Machine Sync](#multi-machine-sync)), so the digest can never disagree with those tools' own numbers.
+
+- **Works standalone, no configuration required** — call `remind_me_digest` any time; an empty vault gets a coherent "nothing to report" digest rather than an error or a blank response.
+- **`since_days`** (default 7) controls how far back counts as a "recent addition."
+- **`response_format`** — `markdown` (default) for a readable report, or `json` for the same underlying data programmatically.
+- When sync is enabled, the tool also fetches a fresh `remind_me_sync_reconcile`-equivalent hub verdict (`in-sync`/`pull-lag`/`node-ahead`/`fault`) and appends it to the Sync Health section — best-effort; a hub that can't be reached doesn't fail the digest, that line is simply omitted.
+
+**Optional scheduled delivery** — `REMIND_ME_DIGEST_INTERVAL` (`"daily"`, `"weekly"`, or unset/`""` to disable, the default) periodically builds the digest and pushes it through [Notifications](#notifications)' `notify()`, exactly like a fired reminder or a sync fault. Unlike the reminder scheduler (always on), this is genuinely opt-in — a digest is a standing summary, not core reminder functionality.
+
+- **Piggybacks on the existing reminder-poll thread** rather than a second background thread: the check is a single disabled-by-default attribute read when unset, so a zero-config server pays nothing extra per poll tick. See `remind_me_mcp/scheduler.py`'s module docstring for the full reasoning.
+- **Throttled by a persisted watermark**, not an in-memory timer — the last-sent timestamp lives in the same `sync_flags` key/value table `remind_me_mcp.sync` already uses for its own cross-restart bookkeeping (under the key `digest_last_sent_at`), so a server restart mid-interval does not immediately re-fire a digest that was already sent.
 
 ## Multi-Machine Sync
 
@@ -940,6 +1142,8 @@ Streamable HTTP transport. Two auth modes share the same server:
   (Claude Code, scripts) may instead use `https://<host>/mcp` with
   `Authorization: Bearer <connector-token>`. The secret path and bearer
   token keep working even when OAuth is on. Everything else gets a 404/401.
+
+**Rate limited** — the MCP endpoint (both `/mcp/<token>` and `/mcp`, in either auth mode) enforces `REMIND_ME_RATE_LIMIT_REQUESTS` (default 60) per `REMIND_ME_RATE_LIMIT_WINDOW_SECONDS` (default 60), returning `429` with a `Retry-After` header once exceeded — the same limiter and defaults as the [push/webhook endpoint](#pushwebhook-ingestion). It runs as the outermost check, ahead of the secret-path/bearer gate and (in OAuth mode) the SDK's own auth stack, so a flood of entirely unauthenticated requests against a leaked or guessed tunnel URL is bounded too. A request presenting the exact connector token — via either the secret path or the legacy bearer header — gets its own dedicated bucket, so the owner's real traffic is never throttled by unrelated probing that happens to share the tunnel's forwarding address (which is what every remote caller's apparent IP collapses to, behind most tunnel setups). OAuth's dynamically-issued per-client access tokens aren't individually re-verified for this check (that would duplicate the provider's own async token lookup); they share the IP-keyed bucket like anonymous traffic — a deliberate tradeoff documented in `remind_me_mcp/rate_limit.py`. Set `REMIND_ME_RATE_LIMIT_ENABLED=""` to disable entirely.
 
 ### 1. Expose the port over HTTPS
 
@@ -1149,6 +1353,7 @@ Every new memory used to start at a flat `base_weight=1.0` regardless of kind, s
 | `REMIND_ME_EMBEDDING_BACKEND` | `onnx` | Embedding backend: `onnx` (in-process) or `ollama` (local daemon) |
 | `REMIND_ME_EMBEDDING_DIM` | `384` | Embedding dimension — must match the model (nomic-embed-text=768, bge-m3=1024). Changing it requires recreating the vector table + `remind_me_reindex` |
 | `REMIND_ME_BACKUP_RETENTION_COUNT` | `10` | Number of backup files (manual + pre-migration) kept under `MEMORY_DIR/backups/`; oldest pruned after each new backup |
+| `REMIND_ME_DB_ENCRYPTION_KEY` | *(unset)* | SQLCipher passphrase for encryption at rest — see [Encryption at Rest](#encryption-at-rest). Requires the `encryption` extra (`pip install remind-me-mcp[encryption]`); unset (default) leaves `memory.db`/backups exactly as before this option existed. Never logged |
 | `REMIND_ME_OLLAMA_URL` | `http://localhost:11434` | Ollama daemon URL (when backend is `ollama`) |
 | `REMIND_ME_OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Ollama embedding model name. Query/passage instruction prefixes (e.g. `search_query:`/`search_document:`) are applied automatically for known model families (`nomic-embed-text`, `bge-*`, `e5-*`) — see `embeddings._ROLE_PREFIXES` |
 | `REMIND_ME_EMBED_CHUNK_CHARS` | `1600` | Character window size for sliding-window embedding of long content |
@@ -1165,7 +1370,21 @@ Every new memory used to start at a flat `base_weight=1.0` regardless of kind, s
 | `REMIND_ME_WATCH_DIRS` | *(unset)* | `os.pathsep`-separated (`:` on macOS/Linux, `;` on Windows) directories for the folder watcher to auto-ingest. Empty = watcher disabled. Each directory must lie inside `REMIND_ME_IMPORT_ROOTS` |
 | `REMIND_ME_WATCH_INTERVAL` | `60` | Seconds between folder watcher scan passes |
 | `REMIND_ME_WATCH_GRACE` | `5` | Debounce grace period in seconds — files modified more recently than this are deferred until a scan sees a stable (mtime, size) |
-| `REMIND_ME_TOOL_PROFILE` | `full` | Advertised tool surface: `full` (46 tools, ~21k context), `standard` (30, ~14.8k — drops imports/sync/ops), or `core` (17, ~7.8k — conversational only, also hides the maintenance prompts). An unrecognised value logs a warning and falls back to `full` |
+| `REMIND_ME_REMINDER_POLL_INTERVAL` | `60` | Seconds between the reminder scheduler's poll passes for due `remind_at` timestamps. The scheduler itself always runs — no separate enable switch |
+| `REMIND_ME_REVISION_RETENTION_DAYS` | `90` | An edit-history snapshot (see [Edit History](#edit-history)) older than this is hard-deleted by the reminder-scheduler loop — purely time-based, no per-peer acknowledgment tracking (`memory_revisions` is never synced). Bounds how far back `remind_me_revert` can reach |
+| `REMIND_ME_ANALYTICS_RETENTION_DAYS` | `730` | A daily analytics-trend snapshot (`analytics_snapshots`, `GET /api/analytics/trend`) older than this is hard-deleted by the reminder-scheduler loop — purely time-based, never synced. Deliberately an order of magnitude past `REMIND_ME_REVISION_RETENTION_DAYS`'s 90-day default: each row is one tiny daily rollup meant for long-range trend viewing, not audit |
+| `REMIND_ME_NOTIFY_WEBHOOK_URL` | *(unset)* | Webhook URL that receives a generic `{"subject", "body", "source": "remind-me"}` JSON POST per notification. Empty disables the webhook notifier — gated on config presence, no separate enable flag |
+| `REMIND_ME_NOTIFY_WEBHOOK_TIMEOUT` | `5` | Seconds to wait for the webhook POST before giving up, so a hung endpoint can't block the reminder scheduler or sync thread |
+| `REMIND_ME_NOTIFY_SMTP_HOST` | *(unset)* | SMTP server host. Empty (with no recipients) disables the email notifier |
+| `REMIND_ME_NOTIFY_SMTP_PORT` | `587` | SMTP port. `465` always uses implicit TLS (`SMTP_SSL`) regardless of `_USE_TLS`; any other port uses plain `SMTP` with STARTTLS applied when `_USE_TLS` is true |
+| `REMIND_ME_NOTIFY_SMTP_USER` | *(unset)* | SMTP AUTH username. Empty skips SMTP AUTH entirely |
+| `REMIND_ME_NOTIFY_SMTP_PASSWORD` | *(unset)* | SMTP AUTH password |
+| `REMIND_ME_NOTIFY_SMTP_FROM` | *(unset)* | From address. Falls back to `REMIND_ME_NOTIFY_SMTP_USER` when unset |
+| `REMIND_ME_NOTIFY_SMTP_TO` | *(unset)* | Comma-separated recipient address(es). Required (with `_SMTP_HOST`) for the email notifier to be considered configured |
+| `REMIND_ME_NOTIFY_SMTP_USE_TLS` | `true` | STARTTLS a plaintext SMTP connection before authenticating. No effect on port 465 (always implicit TLS) |
+| `REMIND_ME_NOTIFY_SYNC_FAULT_INTERVAL` | `1800` | Minimum seconds between sync-fault notifications, so a persisting `fault` verdict from `remind_me_sync_reconcile` doesn't re-alert on every call |
+| `REMIND_ME_DIGEST_INTERVAL` | *(unset)* | `daily`, `weekly`, or unset/empty to disable scheduled digest delivery via `notify()`. The on-demand `remind_me_digest` tool call always works regardless of this setting |
+| `REMIND_ME_TOOL_PROFILE` | `full` | Advertised tool surface: `full` (48 tools, ~21k context), `standard` (30, ~14.8k — drops imports/sync/ops), or `core` (17, ~7.8k — conversational only, also hides the maintenance prompts). An unrecognised value logs a warning and falls back to `full` |
 | `REMIND_ME_MAINTENANCE_NUDGES` | `true` | Whether search/add responses may carry a maintenance-backlog nudge. Set `false` to silence them entirely |
 | `REMIND_ME_MAINTENANCE_NUDGE_INTERVAL` | `3600` | Minimum seconds between nudge *checks*. Bounds cost as well as noise — the backlog COUNTs only run when this has elapsed |
 | `REMIND_ME_MAINTENANCE_NUDGE_THRESHOLD` | `25` | Queue depth a backlog must reach before it's worth mentioning |
@@ -1173,6 +1392,9 @@ Every new memory used to start at a flat `base_weight=1.0` regardless of kind, s
 | `REMIND_ME_WEBHOOK_SECRET` | *(unset)* | Bearer token for the push/webhook ingestion server. Empty = disabled — the server refuses to start without it |
 | `REMIND_ME_WEBHOOK_PORT` | `8769` | Port for the push/webhook ingestion server |
 | `REMIND_ME_WEBHOOK_BIND` | `127.0.0.1` | Bind address for the push/webhook ingestion server. Widen deliberately (e.g. a Tailscale IP) since it writes arbitrary pushed content directly into memory |
+| `REMIND_ME_RATE_LIMIT_ENABLED` | `true` | Whether `POST /ingest` and the remote MCP connector's endpoint enforce a request-rate limit. `""` disables it entirely, mirroring how `REMIND_ME_RERANK=""` disables reranking |
+| `REMIND_ME_RATE_LIMIT_REQUESTS` | `60` | Max requests per `REMIND_ME_RATE_LIMIT_WINDOW_SECONDS` per rate-limit key (a verified bearer/connector token, or the caller's IP as a fallback) |
+| `REMIND_ME_RATE_LIMIT_WINDOW_SECONDS` | `60` | Window length in seconds for `REMIND_ME_RATE_LIMIT_REQUESTS` |
 | `REMIND_ME_OTEL_ENABLED` | `false` | Enable OpenTelemetry tracing of tool calls, sync cycles, and watcher scans. Requires the `otel` extra (`pip install remind-me-mcp[otel]`); degrades gracefully to a no-op if missing |
 | `REMIND_ME_OTEL_ENDPOINT` | *(unset)* | OTLP/HTTP collector endpoint (e.g. `http://localhost:4318/v1/traces`). Unset uses the OTLP exporter's own default |
 | `REMIND_ME_OTEL_SERVICE_NAME` | `remind-me-mcp` | `service.name` resource attribute reported to the collector |

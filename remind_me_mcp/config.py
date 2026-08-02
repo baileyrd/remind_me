@@ -13,6 +13,10 @@ import os
 import secrets
 import subprocess
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 # Module logger only — root logging setup (logging.basicConfig) lives in the
 # __main__ entrypoint so importing this package never hijacks the host
@@ -85,6 +89,31 @@ def _env_int(name: str, default: int) -> int:
             default,
         )
         return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Read a boolean environment variable, falling back to *default* when unset.
+
+    Recognizes ``false``/``0``/``no``/``off`` (case-insensitive, surrounding
+    whitespace stripped) as False. Deliberately unlike :func:`_env_int`'s
+    "blank means unset" rule: an explicit *empty string* is also treated as
+    False here regardless of *default* -- ``REMIND_ME_X=""`` is a meaningful,
+    explicit opt-out for a boolean flag (mirroring how
+    ``REMIND_ME_RERANK=""`` disables reranking), not the same as the
+    variable being unset at all. Anything else (including unset) resolves
+    to *default*.
+
+    Args:
+        name: The environment variable name.
+        default: Value returned when the variable is unset.
+
+    Returns:
+        The parsed boolean.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("false", "0", "no", "off", "")
 
 # ---------------------------------------------------------------------------
 # Directory / file paths
@@ -281,6 +310,79 @@ def resolve_mcp_http_secret() -> str:
 # Security
 # ---------------------------------------------------------------------------
 
+
+def _resolve_or_generate_secret(
+    explicit: str | None,
+    filename: str,
+    *,
+    label: str,
+    noun: str,
+    log_generated: Callable[[Path, str], None],
+) -> str:
+    """Shared "read-existing-file-or-generate-and-persist" secret resolution.
+
+    Factors out the body that :func:`resolve_api_key`, :func:`resolve_connector_token`,
+    and :func:`resolve_ics_token` each repeated verbatim (issue #185 is the
+    third consumer of this exact pattern; this is the resulting factoring):
+    trust an explicit value if the caller already resolved one; else read an
+    existing 0600 secret file; else generate a fresh one, persist it with
+    0600 permissions, and log the generation exactly once.
+
+    Deliberately does NOT own the "which env var wins, and any special
+    sentinel values" step -- that varies per caller (only ``resolve_api_key``
+    treats the literal ``"disabled"`` specially) and stays in each caller,
+    which passes in its own already-resolved ``explicit`` value. It also
+    doesn't own the log message shown at generation time -- callers log a
+    different level of detail (``resolve_api_key`` never logs the key itself,
+    only its file path; the others log the file path *and* the secret) --
+    passed in as ``log_generated`` instead of a single templated string.
+
+    Reads ``MEMORY_DIR`` at call time (not a captured default) so tests can
+    monkeypatch it, matching every caller's own "reads module attributes at
+    call time" contract.
+
+    Args:
+        explicit: The caller's already-resolved env var value, or None when
+            unset. Returned as-is when not None -- no file I/O happens.
+        filename: File name under ``MEMORY_DIR`` to read/persist the secret at.
+        label: Human name for the secret, used in the ephemeral-fallback
+            warning's first clause (e.g. ``"connector token"``).
+        noun: Short noun for the same warning's second clause (``"key"`` or
+            ``"token"``), matching each call site's original wording.
+        log_generated: Called with ``(secret_file, secret)`` exactly once,
+            immediately after a fresh secret is generated and persisted --
+            never on a cache hit (an existing file, or an explicit value).
+
+    Returns:
+        The effective secret.
+    """
+    if explicit is not None:
+        return explicit
+    secret_file = MEMORY_DIR / filename
+    try:
+        if secret_file.is_file():
+            existing = secret_file.read_text(encoding="utf-8").strip()
+            if existing:
+                return existing
+        secret = secrets.token_urlsafe(32)
+        secret_file.touch(mode=0o600, exist_ok=True)
+        restrict_to_owner(secret_file)
+        secret_file.write_text(secret + "\n", encoding="utf-8")
+        log_generated(secret_file, secret)
+        return secret
+    except OSError as exc:
+        secret = secrets.token_urlsafe(32)
+        log.warning(
+            "Could not persist %s at %s (%s); using an ephemeral %s for this run: %s",
+            label,
+            secret_file,
+            exc,
+            noun,
+            secret,
+        )
+        return secret
+
+
 API_KEY: str | None = os.environ.get("REMIND_ME_API_KEY") or None
 """Bearer token for /api/* routes, from the REMIND_ME_API_KEY env var.
 
@@ -291,6 +393,12 @@ want an open localhost API."""
 
 API_KEY_FILE = MEMORY_DIR / "api_key"
 """Location of the auto-generated dashboard API key (created with 0600 perms)."""
+
+API_KEYS_FILE = MEMORY_DIR / "api_keys.json"
+"""Location of the named, scoped API key store (issue #185; 0600 perms) --
+see ``remind_me_mcp.api_keys.ApiKeyStore``. Additive to ``API_KEY``/
+``API_KEY_FILE`` above, which remains the implicit backward-compat
+read-write key and is never stored in this file."""
 
 
 def resolve_api_key() -> str | None:
@@ -316,33 +424,18 @@ def resolve_api_key() -> str | None:
             )
             return None
         return API_KEY
-    key_file = MEMORY_DIR / "api_key"
-    try:
-        if key_file.is_file():
-            existing = key_file.read_text(encoding="utf-8").strip()
-            if existing:
-                return existing
-        key = secrets.token_urlsafe(32)
-        key_file.touch(mode=0o600, exist_ok=True)
-        restrict_to_owner(key_file)
-        key_file.write_text(key + "\n", encoding="utf-8")
+
+    def _log_generated(key_file: Path, key: str) -> None:
         log.info(
             "Generated dashboard API key — stored at %s. Clients must send "
             "'Authorization: Bearer <key>'. Set REMIND_ME_API_KEY=disabled to "
             "opt out of dashboard auth.",
             key_file,
         )
-        return key
-    except OSError as exc:
-        key = secrets.token_urlsafe(32)
-        log.warning(
-            "Could not persist dashboard API key at %s (%s); using an "
-            "ephemeral key for this run: %s",
-            key_file,
-            exc,
-            key,
-        )
-        return key
+
+    return _resolve_or_generate_secret(
+        None, "api_key", label="dashboard API key", noun="key", log_generated=_log_generated
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -401,18 +494,9 @@ def resolve_connector_token() -> str:
     Reads module attributes at call time so tests can monkeypatch
     ``REMOTE_MCP_TOKEN`` / ``MEMORY_DIR``.
     """
-    if REMOTE_MCP_TOKEN is not None:
-        return REMOTE_MCP_TOKEN.strip()
-    token_file = MEMORY_DIR / "connector_token"
-    try:
-        if token_file.is_file():
-            existing = token_file.read_text(encoding="utf-8").strip()
-            if existing:
-                return existing
-        token = secrets.token_urlsafe(32)
-        token_file.touch(mode=0o600, exist_ok=True)
-        restrict_to_owner(token_file)
-        token_file.write_text(token + "\n", encoding="utf-8")
+    explicit = REMOTE_MCP_TOKEN.strip() if REMOTE_MCP_TOKEN is not None else None
+
+    def _log_generated(token_file: Path, token: str) -> None:
         log.info(
             "Generated remote MCP connector token — stored at %s. Connector "
             "URL path: /mcp/%s (treat the URL like a password; rotate by "
@@ -420,17 +504,65 @@ def resolve_connector_token() -> str:
             token_file,
             token,
         )
-        return token
-    except OSError as exc:
-        token = secrets.token_urlsafe(32)
-        log.warning(
-            "Could not persist connector token at %s (%s); using an "
-            "ephemeral token for this run: %s",
+
+    return _resolve_or_generate_secret(
+        explicit, "connector_token", label="connector token", noun="token", log_generated=_log_generated
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reminders calendar feed (issue #190)
+# ---------------------------------------------------------------------------
+
+ICS_TOKEN: str | None = os.environ.get("REMIND_ME_ICS_TOKEN") or None
+"""Secret path token for the ``GET /api/reminders/{token}.ics`` calendar feed,
+from the REMIND_ME_ICS_TOKEN env var.
+
+When unset, a token is auto-generated on first use and persisted under
+MEMORY_DIR (see resolve_ics_token) -- mirroring resolve_connector_token, not
+resolve_api_key: there is no 'disabled' opt-out, because the token doubles as
+the URL path itself (the feed cannot use the Authorization-header bearer
+scheme the rest of /api/* uses -- a calendar app's "subscribe by URL" feature
+polls the URL from the provider's own servers on a schedule the user doesn't
+control, with no way to attach custom headers), so the endpoint must never
+fall open."""
+
+ICS_TOKEN_FILE = MEMORY_DIR / "ics_token"
+"""Location of the auto-generated reminders-feed token (0600 perms). Delete
+the file to rotate: a fresh token is generated on next resolution, which
+also changes the subscribe URL every calendar app must be re-pointed at."""
+
+
+def resolve_ics_token() -> str:
+    """Return the effective reminders-feed secret-path token (issue #190).
+
+    Resolution order mirrors :func:`resolve_connector_token` (FT-05):
+      1. ``REMIND_ME_ICS_TOKEN`` env var — always wins when set.
+      2. The token persisted at ``MEMORY_DIR/ics_token``.
+      3. First use: generate a new token, persist it with 0600 permissions,
+         and log the resulting feed path once (the only time the full token
+         is logged).
+
+    If the token file can be neither read nor written, an ephemeral token is
+    generated for this process (and logged) so the feed never falls open.
+
+    Reads module attributes at call time so tests can monkeypatch
+    ``ICS_TOKEN`` / ``MEMORY_DIR``.
+    """
+    explicit = ICS_TOKEN.strip() if ICS_TOKEN is not None else None
+
+    def _log_generated(token_file: Path, token: str) -> None:
+        log.info(
+            "Generated reminders calendar feed token — stored at %s. Feed "
+            "path: /api/reminders/%s.ics (treat this URL like a password; "
+            "rotate by deleting the file).",
             token_file,
-            exc,
             token,
         )
-        return token
+
+    return _resolve_or_generate_secret(
+        explicit, "ics_token", label="reminders feed token", noun="token", log_generated=_log_generated
+    )
 
 
 _import_roots_env: str | None = os.environ.get("REMIND_ME_IMPORT_ROOTS")
@@ -496,6 +628,134 @@ is deferred until a later scan observes the same (mtime, size) signature, so
 partially-written files are never ingested mid-write."""
 
 # ---------------------------------------------------------------------------
+# Reminders (issue #179)
+# ---------------------------------------------------------------------------
+
+REMINDER_POLL_INTERVAL = _env_int("REMIND_ME_REMINDER_POLL_INTERVAL", 60)
+"""Seconds between remind_me_mcp.scheduler poll passes for due reminders
+(memories.remind_at <= now, not yet in reminder_deliveries). Unlike the
+folder watcher, the scheduler always runs -- this only tunes how often it
+checks, not whether it's enabled."""
+
+# ---------------------------------------------------------------------------
+# Edit history (issue #187)
+# ---------------------------------------------------------------------------
+
+REVISION_RETENTION_DAYS = _env_int("REMIND_ME_REVISION_RETENTION_DAYS", 90)
+"""How many days a pre-edit memory_revisions snapshot (issue #187) is kept
+before db._compact_revisions hard-deletes it. Purely time-based, mirroring
+TOMBSTONE_RETENTION_DAYS -- no cross-device acknowledgment tracking, since
+memory_revisions is a local-only audit table that is never synced (see the
+v23->v24 migration docstring). Deliberately shorter than
+TOMBSTONE_RETENTION_DAYS's 180-day default: losing an old revision snapshot
+only narrows how far back remind_me_revert can reach, not the same class of
+risk as resurrecting a deleted memory that TOMBSTONE_RETENTION_DAYS's longer
+window guards against."""
+
+# ---------------------------------------------------------------------------
+# Analytics trend snapshots (issue #186)
+# ---------------------------------------------------------------------------
+
+ANALYTICS_RETENTION_DAYS = _env_int("REMIND_ME_ANALYTICS_RETENTION_DAYS", 730)
+"""How many days a daily analytics_snapshots row (issue #186) is kept before
+db._compact_analytics_snapshots hard-deletes it. Purely time-based, mirroring
+REVISION_RETENTION_DAYS/TOMBSTONE_RETENTION_DAYS -- no cross-device
+acknowledgment tracking, since analytics_snapshots is a local-only
+observability table that is never synced (see the v24->v25 migration
+docstring). Deliberately an order of magnitude more generous than
+REVISION_RETENTION_DAYS's 90-day default (and well beyond
+TOMBSTONE_RETENTION_DAYS's 180): each row is one tiny daily rollup (a couple
+of small JSON blobs, not full content), and the whole point of the trend
+panel is long-range "is my vault healthy over time" viewing, not short-range
+audit -- 730 days keeps two full years of daily points, which is cheap
+(roughly 730 rows regardless of vault size) and still leaves a bounded
+retention window rather than growing forever."""
+
+# ---------------------------------------------------------------------------
+# Notifications (issue #180)
+# ---------------------------------------------------------------------------
+
+NOTIFY_WEBHOOK_URL = os.environ.get("REMIND_ME_NOTIFY_WEBHOOK_URL", "")
+"""Webhook URL that receives a generic JSON POST
+(``{"subject": ..., "body": ..., "source": "remind-me"}``) for each
+notification -- one config covers ntfy/Slack/Discord/Mattermost/
+Pushover-via-webhook uniformly, deliberately without per-service payload
+formatting (point this at a small relay/transform if you want native
+formatting on one of those services). Empty (default) disables the webhook
+notifier entirely -- gated on config presence, mirroring how the
+embedder/reranker decide availability from configuration alone rather than a
+separate on/off flag."""
+
+NOTIFY_WEBHOOK_TIMEOUT = _env_int("REMIND_ME_NOTIFY_WEBHOOK_TIMEOUT", 5)
+"""Seconds to wait for the webhook POST before giving up, so a hung endpoint
+can never block the reminder scheduler or sync thread that triggered the
+notification."""
+
+NOTIFY_SMTP_HOST = os.environ.get("REMIND_ME_NOTIFY_SMTP_HOST", "")
+"""SMTP server host. Empty (default) disables the email notifier -- gated on
+config presence, mirroring NOTIFY_WEBHOOK_URL."""
+
+NOTIFY_SMTP_PORT = _env_int("REMIND_ME_NOTIFY_SMTP_PORT", 587)
+"""SMTP server port. Port 465 always uses implicit TLS (smtplib.SMTP_SSL)
+regardless of NOTIFY_SMTP_USE_TLS; any other port uses plain smtplib.SMTP
+with STARTTLS applied when NOTIFY_SMTP_USE_TLS is true."""
+
+NOTIFY_SMTP_USER = os.environ.get("REMIND_ME_NOTIFY_SMTP_USER", "")
+"""SMTP AUTH username. Empty skips SMTP AUTH entirely (some internal relays
+allow unauthenticated submission)."""
+
+NOTIFY_SMTP_PASSWORD = os.environ.get("REMIND_ME_NOTIFY_SMTP_PASSWORD", "")
+"""SMTP AUTH password."""
+
+NOTIFY_SMTP_FROM = os.environ.get("REMIND_ME_NOTIFY_SMTP_FROM", "")
+"""Envelope/header From address. Falls back to NOTIFY_SMTP_USER when unset,
+since most providers require From to match the authenticated account anyway."""
+
+NOTIFY_SMTP_TO = os.environ.get("REMIND_ME_NOTIFY_SMTP_TO", "")
+"""Comma-separated recipient address(es). Required (with NOTIFY_SMTP_HOST)
+for the email notifier to be considered configured."""
+
+NOTIFY_SMTP_USE_TLS: bool = os.environ.get(
+    "REMIND_ME_NOTIFY_SMTP_USE_TLS", "true"
+).strip().lower() not in ("false", "0", "no", "off")
+"""Whether to STARTTLS a plaintext SMTP connection before authenticating
+(default true, matching the port 587 default). Has no effect on port 465,
+which always uses implicit TLS. Set false only against a trusted local relay
+with no TLS support."""
+
+NOTIFY_SYNC_FAULT_INTERVAL = _env_int("REMIND_ME_NOTIFY_SYNC_FAULT_INTERVAL", 1800)
+"""Minimum seconds between sync-fault notifications. remind_me_sync_reconcile
+can be called repeatedly (e.g. by an external monitor) while a fault verdict
+persists; alerting on every call would be exactly the alert-fatigue failure
+BACKLOG Wave 4 documents, so this throttles to one notification per window
+per persisting fault rather than firing on every poll."""
+
+# ---------------------------------------------------------------------------
+# Digest (issue #188)
+# ---------------------------------------------------------------------------
+
+DIGEST_INTERVAL = os.environ.get("REMIND_ME_DIGEST_INTERVAL", "").strip().lower()
+"""'daily' / 'weekly' / '' (default, disabled). Unlike REMINDER_POLL_INTERVAL,
+scheduled digest delivery is genuinely opt-in -- a digest is a standing
+summary, not core reminder functionality, so it stays off until configured.
+The on-demand `remind_me_digest` tool call is unaffected by this either way;
+it always works standalone."""
+
+_DIGEST_INTERVAL_SECONDS: dict[str, int] = {"daily": 86400, "weekly": 604800}
+
+DIGEST_INTERVAL_SECONDS: int | None = _DIGEST_INTERVAL_SECONDS.get(DIGEST_INTERVAL)
+"""Resolved seconds for DIGEST_INTERVAL, or None when disabled or an
+unrecognized value was given (treated the same as disabled -- a typo'd
+interval should not silently pick some other cadence)."""
+
+if DIGEST_INTERVAL and DIGEST_INTERVAL_SECONDS is None:
+    log.warning(
+        "REMIND_ME_DIGEST_INTERVAL=%r is not 'daily' or 'weekly' -- "
+        "scheduled digest delivery stays disabled",
+        DIGEST_INTERVAL,
+    )
+
+# ---------------------------------------------------------------------------
 # Push/webhook ingestion (FT-09, Phase 5a)
 # ---------------------------------------------------------------------------
 
@@ -510,6 +770,26 @@ WEBHOOK_SECRET = os.environ.get("REMIND_ME_WEBHOOK_SECRET", "")
 """Bearer token required on every /ingest request. The webhook server
 refuses to start when this is unset — an unsecured push endpoint would be
 worse than useless."""
+
+# ---------------------------------------------------------------------------
+# Rate limiting (issue #183)
+# ---------------------------------------------------------------------------
+
+RATE_LIMIT_ENABLED: bool = _env_bool("REMIND_ME_RATE_LIMIT_ENABLED", True)
+"""Whether the webhook ingest endpoint and remote MCP connector enforce a
+request-rate limit. Default on. REMIND_ME_RATE_LIMIT_ENABLED="" disables it
+entirely, mirroring how REMIND_ME_RERANK="" disables reranking -- an
+explicit empty value is as much an opt-out as any of the recognized false
+spellings."""
+
+RATE_LIMIT_REQUESTS = _env_int("REMIND_ME_RATE_LIMIT_REQUESTS", 60)
+"""Max requests per REMIND_ME_RATE_LIMIT_WINDOW_SECONDS per rate-limit key
+(remind_me_mcp.rate_limit.RateLimiter). Sync traffic uses its own hub/peer
+protocol (peer_server.py), entirely separate from the two routes this
+limits, so SYNC_INTERVAL's cadence never factors into this default."""
+
+RATE_LIMIT_WINDOW_SECONDS = _env_int("REMIND_ME_RATE_LIMIT_WINDOW_SECONDS", 60)
+"""Window length in seconds for REMIND_ME_RATE_LIMIT_REQUESTS."""
 
 # ---------------------------------------------------------------------------
 # Updates
@@ -571,6 +851,7 @@ __all__ = [
     "resolve_mcp_http_secret",
     "API_KEY",
     "API_KEY_FILE",
+    "API_KEYS_FILE",
     "resolve_api_key",
     "REMOTE_MCP",
     "REMOTE_MCP_HOST",
@@ -580,6 +861,9 @@ __all__ = [
     "REMOTE_MCP_ISSUER",
     "OAUTH_STATE_FILE",
     "resolve_connector_token",
+    "ICS_TOKEN",
+    "ICS_TOKEN_FILE",
+    "resolve_ics_token",
     "IMPORT_ROOTS",
     "is_in_import_roots",
     "EXPORT_ROOTS",
@@ -587,12 +871,63 @@ __all__ = [
     "WATCH_DIRS",
     "WATCH_INTERVAL",
     "WATCH_GRACE",
+    "REMINDER_POLL_INTERVAL",
+    "REVISION_RETENTION_DAYS",
+    "ANALYTICS_RETENTION_DAYS",
+    "NOTIFY_WEBHOOK_URL",
+    "NOTIFY_WEBHOOK_TIMEOUT",
+    "NOTIFY_SMTP_HOST",
+    "NOTIFY_SMTP_PORT",
+    "NOTIFY_SMTP_USER",
+    "NOTIFY_SMTP_PASSWORD",
+    "NOTIFY_SMTP_FROM",
+    "NOTIFY_SMTP_TO",
+    "NOTIFY_SMTP_USE_TLS",
+    "NOTIFY_SYNC_FAULT_INTERVAL",
+    "DIGEST_INTERVAL",
+    "DIGEST_INTERVAL_SECONDS",
     "WEBHOOK_PORT",
     "WEBHOOK_BIND",
     "WEBHOOK_SECRET",
+    "RATE_LIMIT_ENABLED",
+    "RATE_LIMIT_REQUESTS",
+    "RATE_LIMIT_WINDOW_SECONDS",
     "AUTO_UPDATE_CHECK",
     "UPDATE_EXPECTED_ORIGIN",
+    "DB_ENCRYPTION_KEY",
 ]
+
+# ---------------------------------------------------------------------------
+# Encryption at rest (issue #184)
+# ---------------------------------------------------------------------------
+
+DB_ENCRYPTION_KEY: str | None = os.environ.get("REMIND_ME_DB_ENCRYPTION_KEY") or None
+"""SQLCipher passphrase, opt-in and off by default. See ARCHITECTURE.md's
+"Encryption at rest" design note for the full rationale, coverage, and known
+limitations.
+
+When unset (the default), this changes nothing: `remind_me_mcp.db` and
+`backup.py` open the database exactly as before #184, via the stdlib
+`sqlite3` module -- the encrypted code path is never imported, never
+reached.
+
+When set, `db._open_db_connection` (the single choke point shared by the
+live connection and `backup.py`'s backup-destination/restore-validation
+connections) opens through the optional `sqlcipher3` package instead and
+issues `PRAGMA key = '<key>'` as the very first statement on the
+connection, before any other pragma or query -- SQLCipher's required
+activation sequence. Requires the `encryption` extra
+(`pip install remind-me-mcp[encryption]`); if the key is set but the
+package isn't installed, connection opening raises a clear `RuntimeError`
+rather than silently falling back to plaintext.
+
+Deliberately never logged -- not even the "generated a secret, here it is
+once" pattern `resolve_api_key`/`resolve_connector_token`/`resolve_ics_token`
+use elsewhere in this module, because those generate and persist a fresh
+secret (so logging it once is the only way the operator ever sees it); this
+key is always user-supplied and never auto-generated or persisted by this
+module, so there is nothing here that needs announcing, only a value to
+read once per connection and pass straight to SQLCipher."""
 
 # ---------------------------------------------------------------------------
 # Sync configuration

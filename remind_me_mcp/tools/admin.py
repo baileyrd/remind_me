@@ -14,7 +14,13 @@ import json
 import sqlite3
 from typing import Any
 
-from remind_me_mcp import ann_index, config
+from remind_me_mcp import (
+    ann_index,
+    config,
+    image_import,  # noqa: F401 — registers the "image" import kind (FT-19)
+    pdf_import,  # noqa: F401 — registers the "pdf" import kind (FT-19)
+    readwise_import,  # noqa: F401 — registers the "readwise" import kind (FT-20)
+)
 from remind_me_mcp import tools as _pkg
 from remind_me_mcp.config import EMBED_BATCH_SIZE, SYNC_ENABLED
 from remind_me_mcp.db import _now_iso
@@ -57,13 +63,28 @@ except ImportError:
     },
 )
 async def memory_import_chat(params: ChatImportInput) -> str:
-    """Import a chat export (JSON, JSONL, or Markdown) or a document/notes file into memory.
+    """Import a chat export (JSON, JSONL, or Markdown), a document/notes file,
+    a PDF, an image, or a Readwise highlights export into memory.
 
     Supports Claude's export format, OpenAI's export format, and generic {role, content} message
     arrays — plus generic documents (FT-02): Markdown notes are chunked per-section (heading
-    context kept with each chunk and stored as metadata), plain text per-paragraph. With the
-    default kind='auto', chat-style markdown imports as chat and notes files as documents.
-    Deduplicates by file hash — re-importing the same file is a no-op.
+    context kept with each chunk and stored as metadata), plain text per-paragraph. Also PDFs
+    and images (FT-19): a .pdf is chunked per-page (page number kept as metadata, mirroring the
+    document connector's heading context) via the optional 'pdf' extra; a .png/.jpg/.jpeg is
+    OCR'd into a single memory via the optional 'image' extra — importing either kind without
+    its extra installed returns a clear error naming the exact `pip install` command, not a
+    traceback. With the default kind='auto', chat-style markdown imports as chat, notes files
+    as documents, .pdf as pdf, and .png/.jpg/.jpeg as image. Deduplicates by file hash —
+    re-importing the same file is a no-op.
+
+    A Readwise "Export" JSON file (FT-20) needs `kind='readwise'` passed explicitly — it is
+    never chosen by `kind='auto'`, since a Readwise export and an arbitrary chat export are
+    both indistinguishable-by-extension .json files and this server has no reliable way to
+    content-sniff one from the other without risking misrouting an existing chat export (see
+    `remind_me_mcp/readwise_import.py`'s docstring). Each highlight becomes its own memory
+    (finer-grained than one memory per book, for search precision), tagged in metadata with
+    its book/article title, author, category, and source URL; a highlight's own note is
+    appended to its content rather than discarded.
 
     Args:
         params (ChatImportInput): File path, import kind, extraction mode, and tagging options.
@@ -93,6 +114,13 @@ async def memory_import_chat(params: ChatImportInput) -> str:
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
         log.error("Import parse error for %s: %s", params.file_path, e)
         return json.dumps({"status": "error", "error": f"Failed to parse file: {e}"})
+    except RuntimeError as e:
+        # FT-19: the pdf/image connectors raise RuntimeError (not a bare
+        # ImportError traceback) for a missing optional extra or an
+        # unparseable file — already an actionable, user-facing message
+        # (see pdf_import.PDF_EXTRA_INSTALL_MSG / image_import.IMAGE_EXTRA_INSTALL_MSG).
+        log.warning("Import failed for %s: %s", params.file_path, e)
+        return json.dumps({"status": "error", "error": str(e)})
     return json.dumps(result, indent=2)
 
 
@@ -107,11 +135,15 @@ async def memory_import_chat(params: ChatImportInput) -> str:
     },
 )
 async def memory_import_directory(params: BulkImportDirInput) -> str:
-    """Bulk import all chat export and document files from a directory.
+    """Bulk import all chat export, document, PDF, and image files from a directory.
 
-    Scans for .json, .jsonl, .md, .markdown, and .txt files. With the default
-    kind='auto' each file is routed individually: chat exports are chunked
-    per-message, documents per-section/paragraph (FT-02). Skips
+    Scans for .json, .jsonl, .md, .markdown, .txt, .pdf, .png, .jpg, and
+    .jpeg files (FT-19 added the last four). With the default kind='auto'
+    each file is routed individually: chat exports are chunked per-message,
+    documents per-section/paragraph (FT-02), PDFs per-page, and images OCR'd
+    into a single memory (FT-19; require the optional 'pdf'/'image' extras
+    respectively — a file needing a missing extra is reported as a per-file
+    error in the result, the rest of the batch still imports). Skips
     already-imported files (hash-based deduplication). Delegates to the
     shared import_directory() function in importer.py (DRY).
 
@@ -1375,6 +1407,124 @@ async def remind_me_revoke_clients(client_id: str = "") -> str:
     if result is None:
         return json.dumps({"status": "error", "error": f"Unknown client_id: {client_id}"})
     return json.dumps({"status": "revoked", **result}, indent=2)
+
+
+@mcp.tool(
+    name="remind_me_api_key",
+    annotations={
+        "title": "Create / List / Revoke Scoped Dashboard API Keys",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def remind_me_api_key(action: str = "list", name: str = "", scope: str = "read") -> str:
+    """Create, list, or revoke named, scope-limited dashboard API keys (issue #185).
+
+    The dashboard's ``/api/*`` routes already require the single default
+    bearer key (SE-01, ``REMIND_ME_API_KEY`` / auto-generated). This tool
+    layers additional, independently named keys on top of that one — useful
+    for sharing a read-only dashboard view, or embedding a key in a
+    lower-trust client, without handing out the full read-write default key.
+    This is NOT multi-tenancy (ARCHITECTURE.md non-goal): every key reads and
+    writes the exact same single vault; only its *scope* differs.
+
+    Actions:
+      - ``"list"`` (default): returns every key's name/scope/created_at —
+        including a synthetic ``"default"`` entry for the backward-compat
+        key — but NEVER key material or its hash.
+      - ``"create"``: generates a new key with the given ``name`` and
+        ``scope`` ('read' or 'read-write'), stores only its SHA-256 hash, and
+        returns the plaintext key — the ONLY time it is ever shown. Save it
+        immediately; it cannot be retrieved again, only revoked.
+      - ``"revoke"``: deletes a named key by ``name``, immediately ending its
+        access (the dashboard server re-reads the key store on every
+        request). The ``"default"`` key cannot be revoked this way — it is
+        config-managed (``REMIND_ME_API_KEY`` or its own auto-generated
+        file), not app-managed; use ``REMIND_ME_API_KEY=disabled`` or delete
+        the persisted ``api_key`` file to rotate it instead.
+
+    A ``read``-scoped key authenticates normally for every ``GET`` route but
+    is rejected with 403 on any mutating route (POST/PUT/PATCH/DELETE). A
+    ``read-write``-scoped key has the same full access as the default key.
+
+    Args:
+        action: One of 'create', 'list', 'revoke'. Defaults to 'list'.
+        name: Required for 'create'/'revoke' — the key's unique name.
+        scope: Required for 'create' — 'read' or 'read-write'. Defaults to
+            'read' (the safer default for a newly-created key).
+
+    Returns:
+        str: JSON — the key list, the newly-created key (plaintext, once),
+        a revocation confirmation, or an error.
+    """
+    from remind_me_mcp import config as cfg
+    from remind_me_mcp.api_keys import DEFAULT_KEY_NAME, SCOPES, ApiKeyStore
+
+    store = ApiKeyStore(cfg.MEMORY_DIR / "api_keys.json")
+    action = action.strip().lower()
+
+    if action == "list":
+        # File I/O off the event loop (PF-06 conventions).
+        keys = await asyncio.to_thread(store.list_keys)
+        return json.dumps(
+            {
+                "keys": [
+                    {
+                        "name": DEFAULT_KEY_NAME,
+                        "scope": "read-write",
+                        "created_at": None,
+                        "note": (
+                            "backward-compat key (REMIND_ME_API_KEY / auto-generated); "
+                            "config-managed, not revocable through this tool"
+                        ),
+                    },
+                    *keys,
+                ],
+                "state_file": str(store.path),
+            },
+            indent=2,
+        )
+
+    if action == "create":
+        if not name:
+            return json.dumps({"status": "error", "error": "name is required for action='create'"})
+        try:
+            plaintext = await asyncio.to_thread(store.create_key, name, scope)
+        except ValueError as e:
+            return json.dumps({"status": "error", "error": str(e)})
+        return json.dumps(
+            {
+                "status": "created",
+                "name": name,
+                "scope": scope,
+                "key": plaintext,
+                "warning": (
+                    "Save this key now — it is shown only once and cannot be "
+                    "retrieved again (only its hash is stored). Send it as "
+                    "'Authorization: Bearer <key>'."
+                ),
+            },
+            indent=2,
+        )
+
+    if action == "revoke":
+        if not name:
+            return json.dumps({"status": "error", "error": "name is required for action='revoke'"})
+        try:
+            revoked = await asyncio.to_thread(store.revoke_key, name)
+        except ValueError as e:
+            return json.dumps({"status": "error", "error": str(e)})
+        if not revoked:
+            return json.dumps({"status": "error", "error": f"Unknown key name: {name!r}"})
+        return json.dumps({"status": "revoked", "name": name})
+
+    return json.dumps({
+        "status": "error",
+        "error": f"Unknown action {action!r}: use 'create', 'list', or 'revoke'",
+        "scopes": list(SCOPES),
+    })
 
 
 # ---------------------------------------------------------------------------

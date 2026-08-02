@@ -8,6 +8,7 @@ instances directly to tool handler functions.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
@@ -371,17 +372,171 @@ class MemoryDeleteInput(BaseModel):
     )
 
 
+# ---------------------------------------------------------------------------
+# Reminder models (issue #179)
+# ---------------------------------------------------------------------------
+
+
+class SetReminderInput(BaseModel):
+    """Input for remind_me_set_reminder: set or clear a memory's reminder."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    memory_id: str = Field(
+        ..., description="The ID of the memory to set or clear a reminder on", min_length=1
+    )
+    remind_at: str | None = Field(
+        default=None,
+        description=(
+            "ISO-8601 timestamp for when this memory should be surfaced as a "
+            "reminder (naive timestamps are assumed UTC). Must be in the "
+            "future. Omit or pass null to clear an existing reminder instead "
+            "of setting one."
+        ),
+    )
+
+    @field_validator("remind_at")
+    @classmethod
+    def validate_remind_at(cls, v: str | None) -> str | None:
+        """Reject an unparseable or non-future timestamp; canonicalize to UTC.
+
+        A no-op reminder (one that would never fire because it is already in
+        the past) is rejected outright rather than silently accepted, same
+        reasoning as MemoryAddInput's contradiction-supersession warnings:
+        surprising behavior should fail loudly, not quietly do nothing.
+        """
+        if v is None or not v.strip():
+            return None
+        try:
+            dt = datetime.fromisoformat(v.strip())
+        except ValueError as e:
+            raise ValueError(f"remind_at is not a valid ISO-8601 timestamp: {v!r}") from e
+        dt = dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+        now = datetime.now(UTC)
+        if dt <= now:
+            raise ValueError(
+                f"remind_at must be in the future, got {dt.isoformat()} "
+                f"(current time: {now.isoformat()})"
+            )
+        return dt.isoformat()
+
+
+class ReminderWindow(StrEnum):
+    """Which reminders remind_me_list_reminders surfaces."""
+
+    UPCOMING = "upcoming"
+    OVERDUE = "overdue"
+    ALL = "all"
+
+
+class ListRemindersInput(BaseModel):
+    """Input for remind_me_list_reminders: list memories with a set reminder."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    when: ReminderWindow = Field(
+        default=ReminderWindow.UPCOMING,
+        description=(
+            "'upcoming' — reminders still in the future. "
+            "'overdue' — reminders whose time has passed but have not yet "
+            "been delivered by the scheduler (e.g. the server was offline "
+            "when they came due). "
+            "'all' — the union of both."
+        ),
+    )
+    limit: int = Field(default=20, ge=1, le=100)
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
+
+
+# ---------------------------------------------------------------------------
+# Edit history models (issue #187)
+# ---------------------------------------------------------------------------
+
+
+class RevisionHistoryInput(BaseModel):
+    """Input for remind_me_history: list a memory's prior content revisions."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    memory_id: str = Field(
+        ..., description="The ID of the memory to list revision history for", min_length=1
+    )
+    limit: int = Field(
+        default=10,
+        ge=1,
+        le=100,
+        description="Maximum number of revisions to return, newest first.",
+    )
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
+
+
+class RevertInput(BaseModel):
+    """Input for remind_me_revert: restore a memory to a prior revision."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    memory_id: str = Field(
+        ..., description="The ID of the memory to revert", min_length=1
+    )
+    revision_id: int = Field(
+        ...,
+        description=(
+            "The revision id to restore, from remind_me_history's output. "
+            "Must belong to this memory_id."
+        ),
+    )
+    reason: str | None = Field(
+        default=None,
+        description=(
+            "Optional free-text note for why this revert happened, stored "
+            "on the new revision this revert itself creates (a revert is "
+            "just another edit — it snapshots the pre-revert state too, so "
+            "it can itself be undone)."
+        ),
+        max_length=500,
+    )
+
+
+class DigestInput(BaseModel):
+    """Input for remind_me_digest: a synthesized vault snapshot (issue #188).
+
+    Assembles recent additions, vault vitality, reminders, and sync health
+    into one read -- see remind_me_mcp.digest for the section-by-section
+    detail. Works with no configuration; scheduled delivery of the same
+    digest through a notification channel is a separate opt-in
+    (REMIND_ME_DIGEST_INTERVAL).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    since_days: int = Field(
+        default=7,
+        ge=1,
+        le=365,
+        description="How many days back counts as a 'recent addition' in the digest's first section.",
+    )
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
+
+
 class ImportKind(StrEnum):
-    """How to parse an imported file (FT-02).
+    """How to parse an imported file (FT-02, extended by FT-19 and FT-20).
 
     AUTO routes by extension and content sniffing: .json/.jsonl always import
-    as chat; .md/.markdown/.txt import as chat when they contain chat role
+    as chat; .pdf always imports as pdf; .png/.jpg/.jpeg always import as
+    image; .md/.markdown/.txt import as chat when they contain chat role
     markers (e.g. '**User:**', '## Assistant'), otherwise as a document.
+    READWISE (a Readwise "Export" JSON file, one memory per highlight) is
+    deliberately NOT reachable through AUTO — a Readwise export and a chat
+    export are both plain .json with no reliable content-sniff to tell them
+    apart, so it must be requested explicitly (see readwise_import.py).
     """
 
     AUTO = "auto"
     CHAT = "chat"
     DOCUMENT = "document"
+    PDF = "pdf"
+    IMAGE = "image"
+    READWISE = "readwise"
 
 
 class ChatImportInput(BaseModel):
@@ -427,12 +582,21 @@ class ChatImportInput(BaseModel):
     kind: ImportKind = Field(
         default=ImportKind.AUTO,
         description=(
-            "How to parse the file (FT-02): "
+            "How to parse the file (FT-02, extended by FT-19 and FT-20): "
             "'auto' — detect by extension/content (chat-style markdown imports "
-            "as chat, notes markdown/text as a document), "
+            "as chat, notes markdown/text as a document, .pdf as pdf, "
+            "image extensions as image; never resolves to 'readwise' — see below), "
             "'chat' — force the chat-export parser, "
             "'document' — force per-section/paragraph document chunking "
-            "(.md/.markdown/.txt only)"
+            "(.md/.markdown/.txt only), "
+            "'pdf' — force per-page PDF chunking (.pdf only; requires the "
+            "optional 'pdf' extra), "
+            "'image' — force OCR of an image into a single memory "
+            "(.png/.jpg/.jpeg only; requires the optional 'image' extra), "
+            "'readwise' — force a Readwise 'Export' JSON file into one memory "
+            "per highlight (.json only; must be requested explicitly — 'auto' "
+            "never picks it, since a Readwise export and a chat export are both "
+            "indistinguishable-by-extension .json files)"
         ),
     )
 
@@ -450,9 +614,11 @@ class ChatImportInput(BaseModel):
             raise ValueError(f"Path not in allowed import roots: {p}")
         if not p.exists():
             raise ValueError(f"File not found: {p}")
-        if p.suffix.lower() not in (".json", ".jsonl", ".md", ".markdown", ".txt"):
+        if p.suffix.lower() not in (
+            ".json", ".jsonl", ".md", ".markdown", ".txt", ".pdf", ".png", ".jpg", ".jpeg",
+        ):
             raise ValueError(
-                f"Unsupported file type: {p.suffix}. Use .json, .jsonl, or .md"
+                f"Unsupported file type: {p.suffix}. Use .json, .jsonl, .md, .pdf, or an image"
             )
         return str(p)
 
@@ -556,8 +722,10 @@ class BulkImportDirInput(BaseModel):
     kind: ImportKind = Field(
         default=ImportKind.AUTO,
         description=(
-            "Per-file parsing mode (FT-02): 'auto' (detect chat vs document "
-            "per file), 'chat', or 'document'"
+            "Per-file parsing mode (FT-02, extended by FT-19 and FT-20): 'auto' "
+            "(detect chat/document/pdf/image per file — never 'readwise', which "
+            "must be forced explicitly and then applies to every .json file in "
+            "the directory), 'chat', 'document', 'pdf', 'image', or 'readwise'"
         ),
     )
 
@@ -1251,6 +1419,10 @@ __all__ = [
     "MemoryListInput",
     "MemoryUpdateInput",
     "MemoryDeleteInput",
+    "SetReminderInput",
+    "ReminderWindow",
+    "ListRemindersInput",
+    "DigestInput",
     "ImportKind",
     "ChatImportInput",
     "MemoryStatsInput",

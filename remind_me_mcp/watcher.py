@@ -46,8 +46,11 @@ from remind_me_mcp.telemetry import maybe_span
 
 log = logging.getLogger("remind_me_mcp.watcher")
 
-WATCH_EXTENSIONS = (".md", ".markdown", ".txt", ".json", ".jsonl")
-"""File extensions the watcher ingests — the same set the importer supports."""
+WATCH_EXTENSIONS = (".md", ".markdown", ".txt", ".json", ".jsonl", ".pdf", ".png", ".jpg", ".jpeg")
+"""File extensions the watcher ingests — the same set the importer supports
+(FT-19 added the pdf/image extensions; a pdf/image dropped into a watched
+folder without its optional extra installed surfaces as a watcher import
+error like any other per-file failure, not a crash)."""
 
 _ERROR_HISTORY = 10
 """How many recent error messages the watcher keeps for the status surface."""

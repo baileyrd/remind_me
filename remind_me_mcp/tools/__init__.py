@@ -13,6 +13,8 @@ Formerly a single ~2000-line module; split into submodules (HY-02):
   - ``capture``   — auto_capture / get_capture / decompose(+batch)
   - ``entity``    — remind_me_entity knowledge-graph lookup (FT-04)
   - ``lifecycle`` — vitality_report / reclassify(+batch) / consolidate
+  - ``reminders`` — remind_me_set_reminder / remind_me_list_reminders (issue #179),
+    remind_me_reminders_ics_url (issue #190), remind_me_digest (issue #188)
   - ``wiki``      — LLM Wiki: page read/write/list/search/load/delete + compile (FT-08)
   - ``admin``     — stats / reindex / server_status / updates / imports / resources
   - ``prompts``   — MCP prompts driving the multi-step maintenance loops
@@ -109,9 +111,11 @@ from remind_me_mcp.tools import (
     capture,
     crud,
     entity,
+    history,
     lifecycle,
     normalize,
     prompts,
+    reminders,
     search,
     wiki,
 )
@@ -154,6 +158,7 @@ from remind_me_mcp.tools.capture import (
     remind_me_get_capture,
 )
 from remind_me_mcp.tools.crud import (
+    _apply_memory_field_update,
     memory_add,
     memory_delete,
     memory_get,
@@ -164,6 +169,10 @@ from remind_me_mcp.tools.entity import (
     _expand_via_entity_relations,
     remind_me_entity,
     remind_me_entity_traverse,
+)
+from remind_me_mcp.tools.history import (
+    remind_me_history,
+    remind_me_revert,
 )
 from remind_me_mcp.tools.lifecycle import (
     remind_me_consolidate,
@@ -182,6 +191,12 @@ from remind_me_mcp.tools.prompts import (
     consolidate_duplicates,
     decompose_facts,
     normalize_imports,
+)
+from remind_me_mcp.tools.reminders import (
+    remind_me_digest,
+    remind_me_list_reminders,
+    remind_me_reminders_ics_url,
+    remind_me_set_reminder,
 )
 from remind_me_mcp.tools.search import (
     _STRUCTURED_PATTERN,
@@ -246,6 +261,12 @@ __all__ = [
     "memory_get",
     "memory_update",
     "memory_delete",
+    "remind_me_history",
+    "remind_me_revert",
+    "remind_me_set_reminder",
+    "remind_me_list_reminders",
+    "remind_me_reminders_ics_url",
+    "remind_me_digest",
     "memory_export",
     "memory_import_chat",
     "memory_import_directory",
