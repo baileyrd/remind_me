@@ -31,6 +31,7 @@ thread and joins it before the database connections are closed (SE-07).
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -166,20 +167,40 @@ class FolderWatcher:
         Hidden entries are skipped per path component *relative to the watch
         dir*, so a hidden watch dir itself (e.g. ``~/.notes``) still works.
         Missing watch dirs are skipped silently — they may appear later.
+
+        Uses os.walk with an onerror callback (rather than Path.rglob, whose
+        generator raises out of the whole traversal on the first inaccessible
+        subdirectory) so one bad subtree — a permission-denied folder, a
+        broken Windows junction/reparse point — is logged and skipped without
+        aborting the scan for this root or any other watch dir.
         """
         files: set[Path] = set()
         for root in self.watch_dirs:
             if not root.is_dir():
                 log.debug("Watch dir missing, skipping: %s", root)
                 continue
-            for path in root.rglob("*"):
-                if path.suffix.lower() not in WATCH_EXTENSIONS:
-                    continue
-                rel_parts = path.relative_to(root).parts
+
+            def _on_walk_error(exc: OSError, _root: Path = root) -> None:
+                log.warning("Skipping inaccessible path while scanning %s: %s", _root, exc)
+
+            for dirpath, dirnames, filenames in os.walk(root, onerror=_on_walk_error):
+                dir_path = Path(dirpath)
+                rel_parts = dir_path.relative_to(root).parts
                 if any(part.startswith(".") for part in rel_parts):
+                    dirnames[:] = []  # already inside a hidden dir — don't descend further
                     continue
-                if path.is_file():
-                    files.add(path)
+                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+                for name in filenames:
+                    if name.startswith("."):
+                        continue
+                    path = dir_path / name
+                    if path.suffix.lower() not in WATCH_EXTENSIONS:
+                        continue
+                    try:
+                        if path.is_file():
+                            files.add(path)
+                    except OSError as exc:
+                        log.warning("Skipping unreadable file %s: %s", path, exc)
         return sorted(files)
 
     def scan_once(self) -> dict[str, int]:
@@ -211,8 +232,13 @@ class FolderWatcher:
 
             if self._ingested.get(path) == sig:
                 continue  # unchanged since last import attempt
-            if (now - st.st_mtime) < self.grace and self._pending.get(path) != sig:
+            age = now - st.st_mtime
+            if 0 <= age < self.grace and self._pending.get(path) != sig:
                 # Too fresh and not yet seen with this signature — debounce.
+                # A negative age (clock skew, or a copy from a network share/
+                # removable media with a skewed clock) means the mtime is in
+                # the future; treat that as immediately stable rather than
+                # debouncing forever.
                 self._pending[path] = sig
                 counts["debounced"] += 1
                 continue
@@ -463,8 +489,8 @@ def get_watch_status() -> dict[str, Any]:
             "enabled": False,
             "running": False,
             "watch_dirs": [],
-            "hint": "set REMIND_ME_WATCH_DIRS (colon-separated dirs inside the "
-            "import roots) to enable the folder watcher",
+            "hint": "set REMIND_ME_WATCH_DIRS (os.pathsep-separated dirs inside "
+            "the import roots) to enable the folder watcher",
         }
     return watcher.status()
 

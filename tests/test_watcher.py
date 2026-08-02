@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -31,7 +32,6 @@ from remind_me_mcp.watcher import (
 
 if TYPE_CHECKING:
     import sqlite3
-    from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -226,6 +226,36 @@ def test_unsupported_and_hidden_files_ignored(
     assert mems[0]["metadata"]["filename"] == "ok.txt"
 
 
+def test_candidate_files_survives_walk_error_and_scans_other_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A permission error scanning one watch dir (simulated via os.walk's
+    onerror callback) is logged and skipped -- it must not abort scanning of
+    other watch dirs, unlike a raw Path.rglob() generator which propagates
+    the first OSError out of the whole traversal."""
+    bad_root = tmp_path / "bad_root"
+    bad_root.mkdir()
+    good_root = tmp_path / "good_root"
+    good_root.mkdir()
+    _write(good_root / "note.md", "A reachable note.")
+
+    real_walk = os.walk
+
+    def fake_walk(top, onerror=None, **kwargs):
+        if Path(top) == bad_root:
+            if onerror is not None:
+                onerror(PermissionError(13, "Access is denied", str(top)))
+            return
+        yield from real_walk(top, onerror=onerror, **kwargs)
+
+    monkeypatch.setattr(watcher_mod.os, "walk", fake_walk)
+    watcher = FolderWatcher([bad_root, good_root])
+
+    files = watcher._candidate_files()
+
+    assert files == [good_root / "note.md"]
+
+
 def test_fresh_file_debounced_until_signature_stable(
     db_conn: sqlite3.Connection, watch_dir: Path
 ) -> None:
@@ -250,6 +280,23 @@ def test_fresh_file_debounced_until_signature_stable(
     # Signature unchanged since the last scan → stable → ingested.
     third = watcher.scan_once()
     assert third["ingested"] == 1
+    assert len(_memories(db_conn)) == 1
+
+
+def test_future_mtime_ingested_immediately_not_debounced_forever(
+    db_conn: sqlite3.Connection, watch_dir: Path
+) -> None:
+    """A file whose mtime is in the future (clock skew, or copied from a
+    network share/removable media with a skewed clock) must not debounce
+    forever -- a negative (now - mtime) age is treated as immediately stable."""
+    path = watch_dir / "future.md"
+    _write(path, "Written with a skewed clock.", age=-3600.0)  # mtime an hour in the future
+    watcher = FolderWatcher([watch_dir], grace=3600.0)
+
+    counts = watcher.scan_once()
+
+    assert counts["ingested"] == 1
+    assert counts["debounced"] == 0
     assert len(_memories(db_conn)) == 1
 
 

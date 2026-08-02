@@ -9,11 +9,15 @@ belongs to the __main__ entrypoint).
 from __future__ import annotations
 
 import logging
+import stat
+import sys
 from typing import TYPE_CHECKING
 
-from remind_me_mcp.config import _env_int
+from remind_me_mcp.config import _env_int, restrict_to_owner
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     import pytest
 
 # ---------------------------------------------------------------------------
@@ -53,6 +57,61 @@ def test_env_int_negative_value_parsed(monkeypatch: pytest.MonkeyPatch) -> None:
     """Negative integers parse fine (validation is the consumer's concern)."""
     monkeypatch.setenv("REMIND_ME_TEST_INT", "-5")
     assert _env_int("REMIND_ME_TEST_INT", 42) == -5
+
+
+# ---------------------------------------------------------------------------
+# restrict_to_owner — secret-file permission hardening
+# ---------------------------------------------------------------------------
+
+
+def test_restrict_to_owner_sets_0600_permissions(tmp_path: Path) -> None:
+    """restrict_to_owner always applies chmod 0600, regardless of platform."""
+    secret = tmp_path / "secret"
+    secret.write_text("s3cr3t", encoding="utf-8")
+
+    restrict_to_owner(secret)
+
+    if sys.platform != "win32":
+        assert stat.S_IMODE(secret.stat().st_mode) == 0o600
+
+
+def test_restrict_to_owner_does_not_raise_on_windows(tmp_path: Path) -> None:
+    """On Windows, restrict_to_owner shells out to icacls to set real NTFS
+    ACLs (os.chmod alone only toggles the read-only attribute there) but must
+    never raise -- ACL hardening is best-effort and must not break secret
+    persistence if icacls is unavailable or fails."""
+    secret = tmp_path / "secret"
+    secret.write_text("s3cr3t", encoding="utf-8")
+
+    restrict_to_owner(secret)  # must not raise
+
+    assert secret.read_text(encoding="utf-8") == "s3cr3t"
+
+
+def test_restrict_to_owner_logs_warning_when_icacls_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failing icacls call is logged as a warning, not raised."""
+    import subprocess
+
+    import remind_me_mcp.config as cfg
+
+    secret = tmp_path / "secret"
+    secret.write_text("s3cr3t", encoding="utf-8")
+
+    monkeypatch.setattr(cfg.os, "name", "nt")
+    monkeypatch.setenv("USERDOMAIN", "TESTDOMAIN")
+    monkeypatch.setenv("USERNAME", "testuser")
+
+    def fake_run(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, "icacls")
+
+    monkeypatch.setattr(cfg.subprocess, "run", fake_run)
+
+    with caplog.at_level(logging.WARNING, logger="remind_me_mcp.config"):
+        restrict_to_owner(secret)  # must not raise
+
+    assert any("icacls" in rec.message for rec in caplog.records)
 
 
 # ---------------------------------------------------------------------------

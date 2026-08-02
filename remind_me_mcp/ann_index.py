@@ -74,6 +74,28 @@ structurally broken index (e.g. a dimension mismatch from a changed
 embedding model) isn't retried on every single search. A fresh process
 (after fixing the underlying cause) gets a clean attempt."""
 
+_mutations_since_save = 0
+"""Add/remove count since the index was last persisted. Compared against
+config.ANN_AUTOSAVE_EVERY by _maybe_autosave() so an abnormal process exit
+(crash, taskkill /F, power loss) loses at most one autosave interval's worth
+of incremental updates instead of everything since the last clean shutdown."""
+
+
+def _maybe_autosave_locked() -> None:
+    """Persist the index if enough mutations have accrued. Called with `_lock` held."""
+    global _mutations_since_save
+    every = config.ANN_AUTOSAVE_EVERY
+    if every <= 0 or _index is None:
+        return
+    _mutations_since_save += 1
+    if _mutations_since_save < every:
+        return
+    _mutations_since_save = 0
+    try:
+        _index.save(str(_index_path()))
+    except Exception:
+        log.warning("Failed to autosave ANN index to disk", exc_info=True)
+
 
 def _index_path() -> Any:
     return config.MEMORY_DIR / "ann_index.usearch"
@@ -105,7 +127,7 @@ def get_index(db: sqlite3.Connection) -> Any | None:
     (sqlite-vec not loaded), or a previous build/load attempt failed this
     process (sticky — see `_index_failed`).
     """
-    global _index, _index_failed
+    global _index, _index_failed, _mutations_since_save
     if _usearch() is None or _index_failed:
         return None
     with _lock:
@@ -154,6 +176,7 @@ def get_index(db: sqlite3.Connection) -> Any | None:
             _index_failed = True
             return None
         _index = idx
+        _mutations_since_save = 0
         return _index
 
 
@@ -179,6 +202,8 @@ def add_vector(db: sqlite3.Connection, vec_rowid: int, vector: bytes) -> None:
             )
         except Exception:
             log.warning("Failed to add vector %d to ANN index", vec_rowid, exc_info=True)
+            return
+        _maybe_autosave_locked()
 
 
 def remove_vector(db: sqlite3.Connection, vec_rowid: int) -> None:
@@ -196,6 +221,8 @@ def remove_vector(db: sqlite3.Connection, vec_rowid: int) -> None:
                 idx.remove(vec_rowid)
         except Exception:
             log.warning("Failed to remove vector %d from ANN index", vec_rowid, exc_info=True)
+            return
+        _maybe_autosave_locked()
 
 
 def search(db: sqlite3.Connection, query_vector: bytes, k: int) -> list[tuple[int, float]] | None:
@@ -224,6 +251,7 @@ def search(db: sqlite3.Connection, query_vector: bytes, k: int) -> list[tuple[in
 
 def save_index() -> None:
     """Persist the in-memory ANN index to disk. Called at server shutdown."""
+    global _mutations_since_save
     with _lock:
         if _index is None:
             return
@@ -231,12 +259,14 @@ def save_index() -> None:
             _index.save(str(_index_path()))
         except Exception:
             log.warning("Failed to save ANN index to disk", exc_info=True)
+        else:
+            _mutations_since_save = 0
 
 
 def rebuild_index(db: sqlite3.Connection) -> int:
     """Force a full rebuild from memories_vec. Returns the vector count (0 if
     ANN is unavailable)."""
-    global _index, _index_failed
+    global _index, _index_failed, _mutations_since_save
     if _usearch() is None:
         return 0
     with _lock:
@@ -248,6 +278,7 @@ def rebuild_index(db: sqlite3.Connection) -> int:
             return 0
         _index = idx
         _index_failed = False
+        _mutations_since_save = 0
         return len(idx)
 
 
@@ -284,10 +315,11 @@ def invalidate_index(db: sqlite3.Connection) -> None:
 
 def reset_for_tests() -> None:
     """Clear all cached state. Test-only — production code never needs this."""
-    global _index, _index_failed
+    global _index, _index_failed, _mutations_since_save
     with _lock:
         _index = None
         _index_failed = False
+        _mutations_since_save = 0
 
 
 __all__ = [

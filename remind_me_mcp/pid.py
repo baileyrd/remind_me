@@ -26,11 +26,40 @@ log = logging.getLogger("remind_me_mcp.pid")
 # ---------------------------------------------------------------------------
 
 
+def _pid_is_alive(pid: int) -> bool:
+    """Check whether a process with the given PID is currently running.
+
+    On POSIX, os.kill(pid, 0) is a safe existence check. On Windows, signal 0
+    is aliased to CTRL_C_EVENT (GenerateConsoleCtrlEvent), which raises OSError
+    for a live process that isn't a console process-group leader — so we use
+    OpenProcess via ctypes instead, which is a real existence check there.
+    """
+    if os.name == "nt":
+        import ctypes
+
+        process_query_limited_information = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(  # type: ignore[attr-defined]
+            process_query_limited_information, False, pid
+        )
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)  # type: ignore[attr-defined]
+            return True
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but is owned by another user — still alive.
+        return True
+    return True
+
+
 def _read_pid_file(path: Path | None = None) -> dict[str, Any] | None:
     """Read a PID file and verify the recorded process is still alive.
 
     Checks whether the process listed in the PID file is running via
-    os.kill(pid, 0). Removes stale or malformed PID files automatically.
+    _pid_is_alive(). Removes stale or malformed PID files automatically.
 
     Args:
         path: The PID file to read. Defaults to PID_FILE (the UI dashboard's
@@ -50,13 +79,11 @@ def _read_pid_file(path: Path | None = None) -> dict[str, Any] | None:
         pid = data.get("pid")
         # Check if process is actually alive
         if pid:
-            try:
-                os.kill(pid, 0)  # signal 0 = just check existence
+            if _pid_is_alive(pid):
                 return data
-            except OSError:
-                # Process is dead, clean up stale PID file
-                path.unlink(missing_ok=True)
-                return None
+            # Process is dead, clean up stale PID file
+            path.unlink(missing_ok=True)
+            return None
         return None
     except (json.JSONDecodeError, KeyError, TypeError):
         path.unlink(missing_ok=True)
@@ -153,6 +180,7 @@ def get_server_status() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 __all__ = [
+    "_pid_is_alive",
     "_read_pid_file",
     "_write_pid_file",
     "_remove_pid_file",
