@@ -69,7 +69,7 @@ if TYPE_CHECKING:
 
 import httpx
 
-from remind_me_mcp import ann_index, config
+from remind_me_mcp import ann_index, config, notifications
 from remind_me_mcp.config import (
     HUB_URL,
     NODE_ID,
@@ -79,6 +79,7 @@ from remind_me_mcp.config import (
     SYNC_SECRET,
 )
 from remind_me_mcp.db import _delete_chunks, _embed_and_store_rows, _get_db, _now_iso
+from remind_me_mcp.maintenance import _due
 from remind_me_mcp.telemetry import maybe_span
 
 log = logging.getLogger("remind_me_mcp.sync")
@@ -1487,6 +1488,36 @@ def _verdict(
     return "pull-lag", hints
 
 
+def _notify_sync_fault(hub_url: str, hints: list[str]) -> None:
+    """Notify on a ``fault`` reconcile verdict, throttled (issue #180).
+
+    ``remind_me_sync_reconcile`` is a read-only tool that can be called
+    repeatedly (e.g. by an external monitor polling it on a schedule) while
+    the same fault persists across many calls; notifying on every single one
+    would be exactly the alert-fatigue failure BACKLOG Wave 4 documents (a
+    prior production incident's status surfaces were technically correct but
+    trained the reader to ignore them). Reuses
+    :func:`remind_me_mcp.maintenance._due`'s named-throttle-slot helper
+    rather than duplicating it -- cross-module reuse of a leading-underscore
+    helper already has precedent in this codebase (e.g. ``sync._upsert_records``
+    imported directly into ``peer_server.py``, ``config._env_int`` into this
+    module), so this follows the same pattern rather than growing a second
+    throttle implementation.
+
+    Never raises: a diagnostic call must not fail because notifying about it did.
+    """
+    if not _due("sync_fault", config.NOTIFY_SYNC_FAULT_INTERVAL):
+        return
+    hint = hints[0] if hints else "sync verdict is fault"
+    try:
+        notifications.notify(
+            "remind_me: sync fault",
+            f"remind_me_sync_reconcile reported a fault against {hub_url}: {hint}",
+        )
+    except Exception as e:  # noqa: BLE001 — a reconcile call must never raise over this
+        log.warning("Sync fault notification failed: %s", e)
+
+
 async def reconcile_with_hub(client: httpx.AsyncClient | None = None) -> dict[str, Any]:
     """Diff this node's record counts against the hub's, with a verdict (SY-14).
 
@@ -1496,6 +1527,12 @@ async def reconcile_with_hub(client: httpx.AsyncClient | None = None) -> dict[st
     benign case (hub ahead, pull lag) and the real fault (node ahead, push not
     landing) differ only by a sign, which is easy to skim past; encoding it
     here means it's decided once, not re-derived per incident.
+
+    A ``fault`` verdict also triggers a throttled
+    :func:`remind_me_mcp.notifications.notify` call (issue #180, see
+    :func:`_notify_sync_fault`) — a no-op unless a notification channel is
+    configured, and rate-limited so a persisting fault doesn't re-alert on
+    every call.
 
     Args:
         client: Optional httpx client, for tests. A new one is created when
@@ -1586,6 +1623,8 @@ async def reconcile_with_hub(client: httpx.AsyncClient | None = None) -> dict[st
     cursor_stalled = bool(categories) and _cursor_progress(db, "hub", watermark)
 
     verdict, hints = _verdict(categories, last_pull_age, cursor_stalled)
+    if verdict == "fault":
+        _notify_sync_fault(HUB_URL, hints)
     pending, _ = _pending_to_remote(db, "hub")
 
     def _cmp(hub_value: Any, local_value: int) -> dict[str, Any]:

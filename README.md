@@ -782,6 +782,21 @@ A memory can carry an optional future `remind_at` timestamp. A background schedu
 - **Delivery is a log line today** — outbound notification channels (email, push, etc.) are tracked separately; the scheduler's due-reminder logic is already structured with a swappable delivery hook so a real channel can plug in without changing how due reminders are found.
 - **Configuration** — `REMIND_ME_REMINDER_POLL_INTERVAL` (default 60 seconds). The scheduler itself always runs; there is no separate enable switch.
 
+## Notifications
+
+Optional outbound notification channels (issue #180) that a fired reminder or a faulted sync status can push out, instead of only being visible to whoever happens to be reading logs or calling a status tool. Each channel is gated on its own config being present — no separate enable flag, and no channel configured means `remind_me_mcp.notifications.notify()` is a safe no-op everywhere it's called.
+
+- **Webhook** (`REMIND_ME_NOTIFY_WEBHOOK_URL`) — POSTs one generic JSON payload, `{"subject": ..., "body": ..., "source": "remind-me"}`, to the configured URL. One config covers ntfy/Slack/Discord/Mattermost/Pushover-via-webhook uniformly; there's no per-service formatting (Slack blocks, ntfy priority headers, Discord embeds, ...) built in — point the URL at a small relay/transform first if you want a service's native formatting. A short timeout (`REMIND_ME_NOTIFY_WEBHOOK_TIMEOUT`, default 5s) keeps a hung endpoint from blocking the caller.
+- **Email** (`REMIND_ME_NOTIFY_SMTP_HOST` + `REMIND_ME_NOTIFY_SMTP_TO`) — sends via stdlib `smtplib`/`email.message.EmailMessage` (no new dependency). `REMIND_ME_NOTIFY_SMTP_PORT` 465 always uses implicit TLS (`SMTP_SSL`); any other port uses plain `SMTP` with STARTTLS applied when `REMIND_ME_NOTIFY_SMTP_USE_TLS` is true (the default). `REMIND_ME_NOTIFY_SMTP_USER`/`_PASSWORD` are optional — omit both to skip SMTP AUTH against a relay that allows unauthenticated submission.
+- **Both, one, or neither** can be configured at once — `notify()` fans out to every configured channel, catching and logging any individual notifier's failure so a broken channel never blocks another or the caller.
+
+Two wiring points, both optional in the sense that they're no-ops with nothing configured:
+
+- **Reminders** — the scheduler's default delivery hook (see [Reminders](#reminders)) logs the due reminder *and* calls `notify()` with the memory's content as the body, on every fired reminder.
+- **Sync faults** — `remind_me_sync_reconcile` calls `notify()` when its verdict is `fault` (not `pull-lag`/`node-ahead`/`in-sync` — see [Multi-Machine Sync](#multi-machine-sync)). Throttled to once per `REMIND_ME_NOTIFY_SYNC_FAULT_INTERVAL` seconds (default 1800) per persisting fault, since reconcile can be called repeatedly by an external monitor — alerting on every call would repeat the alert-fatigue mistake `remind_me_sync_status`/`remind_me_sync_reconcile` themselves were once guilty of (see the Wave 4 incident in `BACKLOG.md`).
+
+Deliberately *not* wired into `remind_me_server_status`'s maintenance-backlog nudges or the feedback hint — those are in-band by design (surfaced only inside a live tool response), not outbound alerts.
+
 ## Multi-Machine Sync
 
 ### Distributed Sync (recommended)
@@ -1183,6 +1198,16 @@ Every new memory used to start at a flat `base_weight=1.0` regardless of kind, s
 | `REMIND_ME_WATCH_INTERVAL` | `60` | Seconds between folder watcher scan passes |
 | `REMIND_ME_WATCH_GRACE` | `5` | Debounce grace period in seconds — files modified more recently than this are deferred until a scan sees a stable (mtime, size) |
 | `REMIND_ME_REMINDER_POLL_INTERVAL` | `60` | Seconds between the reminder scheduler's poll passes for due `remind_at` timestamps. The scheduler itself always runs — no separate enable switch |
+| `REMIND_ME_NOTIFY_WEBHOOK_URL` | *(unset)* | Webhook URL that receives a generic `{"subject", "body", "source": "remind-me"}` JSON POST per notification. Empty disables the webhook notifier — gated on config presence, no separate enable flag |
+| `REMIND_ME_NOTIFY_WEBHOOK_TIMEOUT` | `5` | Seconds to wait for the webhook POST before giving up, so a hung endpoint can't block the reminder scheduler or sync thread |
+| `REMIND_ME_NOTIFY_SMTP_HOST` | *(unset)* | SMTP server host. Empty (with no recipients) disables the email notifier |
+| `REMIND_ME_NOTIFY_SMTP_PORT` | `587` | SMTP port. `465` always uses implicit TLS (`SMTP_SSL`) regardless of `_USE_TLS`; any other port uses plain `SMTP` with STARTTLS applied when `_USE_TLS` is true |
+| `REMIND_ME_NOTIFY_SMTP_USER` | *(unset)* | SMTP AUTH username. Empty skips SMTP AUTH entirely |
+| `REMIND_ME_NOTIFY_SMTP_PASSWORD` | *(unset)* | SMTP AUTH password |
+| `REMIND_ME_NOTIFY_SMTP_FROM` | *(unset)* | From address. Falls back to `REMIND_ME_NOTIFY_SMTP_USER` when unset |
+| `REMIND_ME_NOTIFY_SMTP_TO` | *(unset)* | Comma-separated recipient address(es). Required (with `_SMTP_HOST`) for the email notifier to be considered configured |
+| `REMIND_ME_NOTIFY_SMTP_USE_TLS` | `true` | STARTTLS a plaintext SMTP connection before authenticating. No effect on port 465 (always implicit TLS) |
+| `REMIND_ME_NOTIFY_SYNC_FAULT_INTERVAL` | `1800` | Minimum seconds between sync-fault notifications, so a persisting `fault` verdict from `remind_me_sync_reconcile` doesn't re-alert on every call |
 | `REMIND_ME_TOOL_PROFILE` | `full` | Advertised tool surface: `full` (48 tools, ~21k context), `standard` (30, ~14.8k — drops imports/sync/ops), or `core` (17, ~7.8k — conversational only, also hides the maintenance prompts). An unrecognised value logs a warning and falls back to `full` |
 | `REMIND_ME_MAINTENANCE_NUDGES` | `true` | Whether search/add responses may carry a maintenance-backlog nudge. Set `false` to silence them entirely |
 | `REMIND_ME_MAINTENANCE_NUDGE_INTERVAL` | `3600` | Minimum seconds between nudge *checks*. Bounds cost as well as noise — the backlog COUNTs only run when this has elapsed |

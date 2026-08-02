@@ -1,5 +1,12 @@
 # Release Notes
 
+## v1.30.0 — 2026-08-02
+
+### New Features
+
+- **Outbound notification channels (#180)** — a new `remind_me_mcp.notifications` module with a `WebhookNotifier` (a generic `{"subject", "body", "source": "remind-me"}` JSON POST to `REMIND_ME_NOTIFY_WEBHOOK_URL` — one config covers ntfy/Slack/Discord/Mattermost/Pushover-via-webhook uniformly, deliberately without per-service payload formatting) and an `EmailNotifier` (stdlib `smtplib`/`EmailMessage`, no new dependency; `REMIND_ME_NOTIFY_SMTP_HOST`/`_PORT`/`_USER`/`_PASSWORD`/`_FROM`/`_TO`/`_USE_TLS`). Each channel is gated on its own env vars being present rather than a separate enable flag, mirroring how the embedder/reranker decide availability from configuration alone; `notify()` fans out to whichever are configured and never raises, so a broken or unconfigured channel can't break its caller.
+- **Wired into two places.** The reminder scheduler's default delivery hook (issue #179's `_delivery_hook` seam) now calls `notify()` with the memory's content alongside its existing log line — logging always happens, notifying is additive and a no-op when nothing is configured. `remind_me_sync_reconcile` calls `notify()` when its verdict is `fault` (not `pull-lag`/`node-ahead`/`in-sync`), throttled to once per `REMIND_ME_NOTIFY_SYNC_FAULT_INTERVAL` seconds (default 1800) per persisting fault via `maintenance._due` — reconcile can be called repeatedly by an external monitor, and alerting on every call would repeat the alert-fatigue mistake the Wave 4 incident already documents for this exact subsystem. Deliberately **not** wired into the maintenance-nudge/feedback-hint surfaces, which stay in-band by design (surfaced only inside a live tool response, not pushed out).
+
 ## v1.29.0 — 2026-08-02
 
 ### New Features

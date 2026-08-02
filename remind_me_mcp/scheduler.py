@@ -9,9 +9,10 @@ what lets a reminder that comes due while the server is offline fire exactly
 once on the next poll after restart, instead of firing on every subsequent
 poll forever or being silently dropped.
 
-Delivery itself is a log line for now -- issue #180 (outbound notification
-channels) will plug a real delivery mechanism into the ``_delivery_hook``
-seam below without needing to touch the due-query/poll logic here.
+Delivery is a log line plus a fan-out to any configured outbound notification
+channel (:mod:`remind_me_mcp.notifications`, issue #180) -- ``notify()`` is a
+no-op when nothing is configured, so the default hook always logs and always
+attempts to notify, regardless of whether a webhook/SMTP channel is set up.
 
 Lifecycle: :func:`start_scheduler` is called from the server lifespan
 unconditionally (unlike the folder watcher, which is opt-in via
@@ -27,6 +28,7 @@ import logging
 import threading
 from typing import TYPE_CHECKING, Any
 
+from remind_me_mcp import notifications
 from remind_me_mcp.config import REMINDER_POLL_INTERVAL
 from remind_me_mcp.db import _get_db, _now_iso, _row_to_dict
 
@@ -38,11 +40,9 @@ log = logging.getLogger("remind_me_mcp.scheduler")
 
 
 def _log_delivery(memory: dict[str, Any]) -> None:
-    """Default delivery hook: log the due reminder at INFO level.
-
-    Issue #180 (outbound notification channels) replaces or wraps this
-    callable once a real delivery mechanism (email, push, etc.) lands --
-    the due-query/poll logic in :func:`poll_once` never needs to change.
+    """Log the due reminder at INFO level. Kept separate from notification
+    fan-out (below) so logging always happens regardless of whether any
+    notification channel is configured, and stays independently testable.
     """
     content = memory.get("content") or ""
     preview = content[:200] + ("…" if len(content) > 200 else "")
@@ -54,9 +54,24 @@ def _log_delivery(memory: dict[str, Any]) -> None:
     )
 
 
-# Delivery seam for issue #180 — swap this module-level callable to plug in a
-# real notification channel; poll_once()'s due-reminder query never changes.
-_delivery_hook: Callable[[dict[str, Any]], None] = _log_delivery
+def _default_delivery(memory: dict[str, Any]) -> None:
+    """Default delivery hook: log, then fan out to any configured notifier.
+
+    ``notifications.notify`` (issue #180) is a no-op when no webhook/SMTP
+    channel is configured, so this always logs *and* always attempts to
+    notify -- one call site, no branching on configuration here. The memory's
+    content becomes the notification body; the id and remind_at timestamp
+    identify which reminder fired.
+    """
+    _log_delivery(memory)
+    subject = f"Reminder due: memory `{memory.get('id')}`"
+    body = memory.get("content") or ""
+    notifications.notify(subject, body)
+
+
+# Delivery seam — swap this module-level callable to plug in a different
+# delivery mechanism entirely; poll_once()'s due-reminder query never changes.
+_delivery_hook: Callable[[dict[str, Any]], None] = _default_delivery
 
 
 def poll_once(db: sqlite3.Connection | None = None) -> int:

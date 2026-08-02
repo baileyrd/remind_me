@@ -506,6 +506,65 @@ folder watcher, the scheduler always runs -- this only tunes how often it
 checks, not whether it's enabled."""
 
 # ---------------------------------------------------------------------------
+# Notifications (issue #180)
+# ---------------------------------------------------------------------------
+
+NOTIFY_WEBHOOK_URL = os.environ.get("REMIND_ME_NOTIFY_WEBHOOK_URL", "")
+"""Webhook URL that receives a generic JSON POST
+(``{"subject": ..., "body": ..., "source": "remind-me"}``) for each
+notification -- one config covers ntfy/Slack/Discord/Mattermost/
+Pushover-via-webhook uniformly, deliberately without per-service payload
+formatting (point this at a small relay/transform if you want native
+formatting on one of those services). Empty (default) disables the webhook
+notifier entirely -- gated on config presence, mirroring how the
+embedder/reranker decide availability from configuration alone rather than a
+separate on/off flag."""
+
+NOTIFY_WEBHOOK_TIMEOUT = _env_int("REMIND_ME_NOTIFY_WEBHOOK_TIMEOUT", 5)
+"""Seconds to wait for the webhook POST before giving up, so a hung endpoint
+can never block the reminder scheduler or sync thread that triggered the
+notification."""
+
+NOTIFY_SMTP_HOST = os.environ.get("REMIND_ME_NOTIFY_SMTP_HOST", "")
+"""SMTP server host. Empty (default) disables the email notifier -- gated on
+config presence, mirroring NOTIFY_WEBHOOK_URL."""
+
+NOTIFY_SMTP_PORT = _env_int("REMIND_ME_NOTIFY_SMTP_PORT", 587)
+"""SMTP server port. Port 465 always uses implicit TLS (smtplib.SMTP_SSL)
+regardless of NOTIFY_SMTP_USE_TLS; any other port uses plain smtplib.SMTP
+with STARTTLS applied when NOTIFY_SMTP_USE_TLS is true."""
+
+NOTIFY_SMTP_USER = os.environ.get("REMIND_ME_NOTIFY_SMTP_USER", "")
+"""SMTP AUTH username. Empty skips SMTP AUTH entirely (some internal relays
+allow unauthenticated submission)."""
+
+NOTIFY_SMTP_PASSWORD = os.environ.get("REMIND_ME_NOTIFY_SMTP_PASSWORD", "")
+"""SMTP AUTH password."""
+
+NOTIFY_SMTP_FROM = os.environ.get("REMIND_ME_NOTIFY_SMTP_FROM", "")
+"""Envelope/header From address. Falls back to NOTIFY_SMTP_USER when unset,
+since most providers require From to match the authenticated account anyway."""
+
+NOTIFY_SMTP_TO = os.environ.get("REMIND_ME_NOTIFY_SMTP_TO", "")
+"""Comma-separated recipient address(es). Required (with NOTIFY_SMTP_HOST)
+for the email notifier to be considered configured."""
+
+NOTIFY_SMTP_USE_TLS: bool = os.environ.get(
+    "REMIND_ME_NOTIFY_SMTP_USE_TLS", "true"
+).strip().lower() not in ("false", "0", "no", "off")
+"""Whether to STARTTLS a plaintext SMTP connection before authenticating
+(default true, matching the port 587 default). Has no effect on port 465,
+which always uses implicit TLS. Set false only against a trusted local relay
+with no TLS support."""
+
+NOTIFY_SYNC_FAULT_INTERVAL = _env_int("REMIND_ME_NOTIFY_SYNC_FAULT_INTERVAL", 1800)
+"""Minimum seconds between sync-fault notifications. remind_me_sync_reconcile
+can be called repeatedly (e.g. by an external monitor) while a fault verdict
+persists; alerting on every call would be exactly the alert-fatigue failure
+BACKLOG Wave 4 documents, so this throttles to one notification per window
+per persisting fault rather than firing on every poll."""
+
+# ---------------------------------------------------------------------------
 # Push/webhook ingestion (FT-09, Phase 5a)
 # ---------------------------------------------------------------------------
 
@@ -598,6 +657,16 @@ __all__ = [
     "WATCH_INTERVAL",
     "WATCH_GRACE",
     "REMINDER_POLL_INTERVAL",
+    "NOTIFY_WEBHOOK_URL",
+    "NOTIFY_WEBHOOK_TIMEOUT",
+    "NOTIFY_SMTP_HOST",
+    "NOTIFY_SMTP_PORT",
+    "NOTIFY_SMTP_USER",
+    "NOTIFY_SMTP_PASSWORD",
+    "NOTIFY_SMTP_FROM",
+    "NOTIFY_SMTP_TO",
+    "NOTIFY_SMTP_USE_TLS",
+    "NOTIFY_SYNC_FAULT_INTERVAL",
     "WEBHOOK_PORT",
     "WEBHOOK_BIND",
     "WEBHOOK_SECRET",
