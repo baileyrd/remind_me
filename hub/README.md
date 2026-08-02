@@ -81,6 +81,61 @@ Day-2 commands:
   This is stated here as the honest current posture, not a roadmap
   commitment.
 
+### Running the hub over HTTPS
+
+**The client side already supports it — there is nothing to change in the
+code.** `REMIND_ME_HUB_URL` is passed to `httpx` verbatim with no scheme
+handling anywhere, so pointing a node at `https://…` works as soon as
+something is terminating TLS in front of the hub:
+
+```json
+"REMIND_ME_HUB_URL": "https://hub.example.ts.net"
+```
+
+`client-setup.sh --hub-url https://…` passes through the same way.
+
+What the hub does *not* do is terminate TLS itself: it runs
+`uvicorn main:app` over plain HTTP, because the deployments this repo
+documents get their encryption from the transport instead — an SSH tunnel to
+`127.0.0.1:8765`, or Tailscale (WireGuard). **HTTPS is worth adding when the
+hub is reachable some other way**, e.g. over a LAN or a public hostname.
+Three options, in rough order of fit:
+
+1. **`tailscale cert`** — a genuinely publicly-trusted certificate for the
+   node's `*.ts.net` name, with no public DNS record and no open ports. The
+   best fit if clients already reach the hub over Tailscale, since nothing
+   about the network exposure changes.
+2. **Caddy in front** — the same pattern [section 4 below](#4-front-it-with-https)
+   already documents for the remote connector, so the deployment stays
+   consistent. Automatic certificate issuance and renewal, at the cost of a
+   public hostname and ports 80/443.
+3. **uvicorn's own `--ssl-keyfile` / `--ssl-certfile`** — fewest moving
+   parts, but renewal becomes the container's problem, and the Containerfile's
+   `CMD` has to change. Prefer one of the above unless you are already
+   managing certificates some other way.
+
+**A private or self-signed CA needs one env var on each node.** `httpx`
+verifies against the system trust store, so a private certificate fails with
+`CERTIFICATE_VERIFY_FAILED`. Point Python's default SSL context at your CA
+bundle — no application config is involved:
+
+```json
+"env": {
+  "REMIND_ME_HUB_URL": "https://hub.internal",
+  "SSL_CERT_FILE": "/etc/ssl/certs/my-internal-ca.pem"
+}
+```
+
+**Two things to know before switching.** A TLS *trust* failure currently
+reports as if the hub were down: `remind_me_sync_reconcile` labels it
+`unreachable` and `client-setup.sh` warns "hub is NOT answering". The hub is
+answering — the certificate just isn't trusted — and the underlying
+`CERTIFICATE_VERIFY_FAILED` does appear in the hint, so check there before
+chasing a network problem. And **peer-to-peer sync stays HTTP**: peer URLs
+are built as `http://{ip}:{PEER_PORT}` and the peer server speaks no TLS, so
+only *hub* traffic becomes HTTPS. That traffic already runs inside
+Tailscale's WireGuard tunnel, which is why it hasn't needed its own layer.
+
 ## Protocol
 
 The hub implements the same wire protocol as the peer server

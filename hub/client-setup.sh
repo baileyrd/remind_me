@@ -9,6 +9,9 @@
 #   --secret HEX        SYNC_SECRET from the server's hub.env. Prompted if absent.
 #   --hub-url URL       Hub URL as seen from this machine
 #                       (default http://127.0.0.1:8765 — the tunnel's local end).
+#                       https:// works as-is when something terminates TLS in
+#                       front of the hub; see "Running the hub over HTTPS" in
+#                       hub/README.md (a private CA needs SSL_CERT_FILE set).
 #   --tunnel USER@HOST[:PORT]
 #                       Also set up a persistent SSH tunnel to the hub server:
 #                       dedicated key, ~/.ssh/config block, systemd user service.
