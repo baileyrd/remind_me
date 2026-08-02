@@ -550,6 +550,14 @@ The embedding model (`all-MiniLM-L6-v2`, ~80MB) downloads automatically on first
 - **Graceful fallback**: if the embedding dependencies aren't installed, everything still works — you just get FTS5 keyword search only
 - **Results are labeled** with their search method: ⚡ hybrid (matched both), 🔮 semantic only, 🔤 keyword only
 
+### Language Coverage
+
+Both the default embedding model and the default reranker (see [Changing the Embedding Model](#changing-the-embedding-model) and the [`REMIND_ME_RERANK_MODEL` reference below](#environment-variables)) are optimized for specific languages, not general-purpose multilingual retrieval — worth knowing before relying on semantic search over non-English content:
+
+- **Embedding model** — the default [`sentence-transformers/all-MiniLM-L6-v2`](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) is trained and evaluated on English sentence pairs. It has no documented multilingual training data or evaluation, so semantic similarity for non-English content (or cross-lingual queries) is unreliable — expect it to behave close to random for languages it wasn't trained on. FTS5 keyword search is unaffected (it matches literal terms regardless of language), so hybrid search degrades to keyword-only quality for non-English content rather than failing outright.
+- **Reranker** — the default [`BAAI/bge-reranker-base`](https://huggingface.co/BAAI/bge-reranker-base) is a **bilingual Chinese/English** cross-encoder (it pairs with BGE's `bge-large-en-v1.5`/`bge-large-zh-v1.5` embedding models), not a general multilingual model. It reorders candidates well for English or Chinese queries; for any other language it's providing little more signal than chance. That said, reranking only ever *reorders* the existing RRF-ranked candidate list — it never filters — so a bad rerank on unsupported-language content degrades at worst to the plain RRF order, never to dropped results.
+- If your vault is primarily non-English (or mixed-language), see the multilingual embedding model recommendation below; there is currently no non-English/multilingual alternative wired up for the reranker (`REMIND_ME_RERANK=""` disables reranking entirely if it's doing more harm than good for your content).
+
 ### Scaling Semantic Search (ANN Index)
 
 By default, semantic search does an exact brute-force scan over every stored chunk vector via `sqlite-vec` — fast enough for a typical personal store, but it gets slower as the number of chunks grows (linearly with the store size). Once a store passes a size threshold, an optional HNSW approximate-nearest-neighbor index (via [`usearch`](https://github.com/unum-cloud/usearch)) takes over automatically:
@@ -585,6 +593,16 @@ This only generates embeddings for memories that don't have them yet — existin
 
 Switching `REMIND_ME_EMBEDDING_MODEL`, `REMIND_ME_EMBEDDING_DIM`, or `REMIND_ME_EMBEDDING_BACKEND` no longer requires remembering to manually reindex. The server records which model/dimension/backend produced the vectors currently stored, and detects a mismatch automatically at startup: stale vectors (and the on-disk ANN index, if built) are cleared so search never silently serves results from the wrong embedding space, and every memory falls through to the normal "missing embeddings" path — run `remind_me_reindex` to rebuild them under the new model.
 
+**Recommended override for multilingual vaults**: [`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`](https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2) — trained on parallel data for 50+ languages, widely adopted for multilingual semantic search, and a genuine drop-in: it outputs the same 384-dimensional vectors as the default model, so only `REMIND_ME_EMBEDDING_MODEL` needs to change, not `REMIND_ME_EMBEDDING_DIM`:
+
+```bash
+REMIND_ME_EMBEDDING_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+```
+
+Then run `remind_me_reindex` (the model-mismatch detection above clears stale vectors automatically). **Tradeoff, not a strict upgrade**: a multilingual model spreads its capacity across 50+ languages instead of specializing in one, so on an English-only vault it typically scores somewhat below the English-specialized `all-MiniLM-L6-v2` default — only switch if your content actually spans languages.
+
+For heavier multilingual needs (100+ languages, much longer documents, or combined dense/sparse/multi-vector retrieval), [`BAAI/bge-m3`](https://huggingface.co/BAAI/bge-m3) is a stronger option in principle, but it is **not** a same-effort drop-in with this server's ONNX loader today: the official `BAAI/bge-m3` repo doesn't publish an `onnx/model.onnx` at the path `embeddings.py`'s loader expects (only community-converted mirrors do, e.g. `aapot/bge-m3-onnx`, unverified here for correctness/currency), and it outputs 1024-dimensional vectors, so it would also need `REMIND_ME_EMBEDDING_DIM=1024`. Treat it as a "possible future option requiring more verification," not a documented recommendation like the multilingual MiniLM model above.
+
 ### Checking Status
 
 Use `remind_me_server_status` to see how many memories have embeddings and whether the model is loaded.
@@ -612,6 +630,14 @@ uv pip install "remind-me-mcp[image]"
 ```
 
 A `.png`/`.jpg`/`.jpeg` file is OCR'd via [RapidOCR](https://github.com/RapidAI/RapidOCR) into a single memory (whole image as one chunk). **Why RapidOCR over `pytesseract`:** this server already depends on `onnxruntime` for the embedder/reranker, so an ONNX-based OCR engine reuses infrastructure already present rather than adding a new runtime family — and RapidOCR's detection/recognition models ship *inside* the pip package itself, so OCR works fully offline with no HuggingFace download (unlike the embedder/reranker). `pytesseract` was considered and rejected: it additionally requires the system `tesseract` binary, which pip can't install and which isn't present in this project's CI/dev images.
+
+**Language coverage**: the connector constructs `RapidOCR()` with no arguments, so it loads the models bundled inside the `rapidocr-onnxruntime` package — the `ch_PP-OCRv4` detection and recognition models plus a `ch_ppocr_mobile_v2.0` orientation classifier. That recognition model's character set (baked into the model itself) covers **Chinese and English/Latin script + digits only**; other scripts — Japanese, Korean, Arabic, Cyrillic, Devanagari, and others — are not recognized (detection may still find text regions, but recognized characters will be garbage). If you need OCR for one of those, three optional env vars pass straight through to RapidOCR's own model-path constructor arguments, so you can point the connector at an alternate-language model downloaded separately from [RapidOCR's model zoo](https://github.com/RapidAI/RapidOCR) — unset by default, so behavior is unchanged unless you opt in:
+
+| Variable | Default | Description |
+|---|---|---|
+| `REMIND_ME_OCR_DET_MODEL_PATH` | *(unset)* | Path to an alternate ONNX text-detection model (`RapidOCR(det_model_path=...)`) |
+| `REMIND_ME_OCR_CLS_MODEL_PATH` | *(unset)* | Path to an alternate ONNX text-orientation-classification model (`RapidOCR(cls_model_path=...)`) |
+| `REMIND_ME_OCR_REC_MODEL_PATH` | *(unset)* | Path to an alternate ONNX text-recognition model (`RapidOCR(rec_model_path=...)`) — this is the one whose character set actually determines what script(s) get recognized; pair it with a matching `_DET_MODEL_PATH` if the target script needs different detection geometry |
 
 ### Without These Extras
 
@@ -1349,7 +1375,7 @@ Every new memory used to start at a flat `base_weight=1.0` regardless of kind, s
 | `REMIND_ME_REMOTE_HOST` | `127.0.0.1` | Host to bind the remote MCP connector (keep localhost; let the tunnel do the exposing) |
 | `REMIND_ME_REMOTE_TOKEN` | *(auto-generated)* | Connector token (doubles as the secret URL path and the OAuth owner credential). When unset, generated on first run and stored at `~/.remind-me/connector_token` (0600). Delete the file to rotate |
 | `REMIND_ME_REMOTE_ISSUER` | *(unset)* | Public HTTPS origin of the remote connector (e.g. the tunnel hostname). Setting it activates the single-user OAuth 2.1 authorization server; unset falls back to the secret-path mode with a warning |
-| `REMIND_ME_EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | HuggingFace model for semantic embeddings (ONNX backend) |
+| `REMIND_ME_EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | HuggingFace model for semantic embeddings (ONNX backend). The default is English-trained/English-optimized — see [Language Coverage](#language-coverage) for a recommended multilingual override |
 | `REMIND_ME_EMBEDDING_BACKEND` | `onnx` | Embedding backend: `onnx` (in-process) or `ollama` (local daemon) |
 | `REMIND_ME_EMBEDDING_DIM` | `384` | Embedding dimension — must match the model (nomic-embed-text=768, bge-m3=1024). Changing it requires recreating the vector table + `remind_me_reindex` |
 | `REMIND_ME_BACKUP_RETENTION_COUNT` | `10` | Number of backup files (manual + pre-migration) kept under `MEMORY_DIR/backups/`; oldest pruned after each new backup |
@@ -1408,8 +1434,11 @@ Every new memory used to start at a flat `base_weight=1.0` regardless of kind, s
 | `REMIND_ME_RRF_W_IDF` | `0.0` | RRF weight for the IDF signal (derived from FTS5's `bm25()` score). Off by default — set a positive value to opt in |
 | `REMIND_ME_RRF_FUSION` | `rank` | Fusion mode: `rank` (classic ordinal Reciprocal Rank Fusion) or `score` (normalized-magnitude fusion over `bm25`/semantic-distance/recency/vitality — preserves match-strength information that rank-only RRF discards). Off by default; opt in with `score` |
 | `REMIND_ME_RERANK` | `onnx` | Reranks the top search candidates with a cross-encoder (on by default — bounded to `REMIND_ME_RERANK_TOP_K` candidates, so latency is small and constant). Set to `""` to disable for latency-sensitive deployments |
-| `REMIND_ME_RERANK_MODEL` | `BAAI/bge-reranker-base` | HuggingFace cross-encoder repo (must ship `onnx/model.onnx`) |
+| `REMIND_ME_RERANK_MODEL` | `BAAI/bge-reranker-base` | HuggingFace cross-encoder repo (must ship `onnx/model.onnx`). The default is a bilingual Chinese/English model — see [Language Coverage](#language-coverage) |
 | `REMIND_ME_RERANK_TOP_K` | `20` | How many top RRF candidates the reranker rescores |
+| `REMIND_ME_OCR_DET_MODEL_PATH` | *(unset)* | Path to an alternate ONNX text-detection model for image OCR (`RapidOCR(det_model_path=...)`) — see [Enabling Image (OCR) Import](#enabling-image-ocr-import) |
+| `REMIND_ME_OCR_CLS_MODEL_PATH` | *(unset)* | Path to an alternate ONNX text-orientation-classification model for image OCR (`RapidOCR(cls_model_path=...)`) |
+| `REMIND_ME_OCR_REC_MODEL_PATH` | *(unset)* | Path to an alternate ONNX text-recognition model for image OCR (`RapidOCR(rec_model_path=...)`) — determines which script(s) OCR can actually read; the bundled default only covers Chinese + English/Latin+digits |
 | `REMIND_ME_QUERY_EXPANSION` | *(unset)* | Set to `hyde` to expand queries with a hypothetical answer passage before vector search |
 | `REMIND_ME_HYDE_MODEL` | `llama3.2` | Ollama model that writes the HyDE passage |
 | `REMIND_ME_HYDE_TIMEOUT` | `15` | Seconds to wait for HyDE generation before falling back to the plain query |

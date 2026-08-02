@@ -792,6 +792,41 @@ RATE_LIMIT_WINDOW_SECONDS = _env_int("REMIND_ME_RATE_LIMIT_WINDOW_SECONDS", 60)
 """Window length in seconds for REMIND_ME_RATE_LIMIT_REQUESTS."""
 
 # ---------------------------------------------------------------------------
+# OCR (image import, issue #181/#202)
+# ---------------------------------------------------------------------------
+#
+# image_import.py's default RapidOCR() call uses the models bundled inside
+# the rapidocr-onnxruntime wheel (ch_PP-OCRv4 detection/recognition +
+# ch_ppocr_mobile_v2.0 orientation classification) -- a combined Chinese +
+# English/Latin+digits charset baked into the recognition model's ONNX
+# metadata. It does not recognize other scripts (Japanese, Korean, Arabic,
+# Cyrillic, Devanagari, ...). RapidOCR's own constructor already accepts
+# det_model_path/cls_model_path/rec_model_path kwargs to swap in a
+# different script's model (downloaded separately -- RapidOCR's model zoo
+# publishes per-language recognition models, but only the Chinese+English
+# one ships in the pip package itself). These three env vars are a thin,
+# optional passthrough to that existing RapidOCR capability, unset (None)
+# by default so behavior is byte-for-byte identical to plain RapidOCR()
+# until a user opts in.
+
+OCR_DET_MODEL_PATH = os.environ.get("REMIND_ME_OCR_DET_MODEL_PATH") or None
+"""Optional path to an alternate ONNX text-detection model, passed through
+to RapidOCR(det_model_path=...). Unset by default."""
+
+OCR_CLS_MODEL_PATH = os.environ.get("REMIND_ME_OCR_CLS_MODEL_PATH") or None
+"""Optional path to an alternate ONNX text-orientation-classification model,
+passed through to RapidOCR(cls_model_path=...). Unset by default."""
+
+OCR_REC_MODEL_PATH = os.environ.get("REMIND_ME_OCR_REC_MODEL_PATH") or None
+"""Optional path to an alternate ONNX text-recognition model, passed through
+to RapidOCR(rec_model_path=...). This is the model whose baked-in character
+set actually determines which script(s) OCR can read -- set it (typically
+paired with a matching REMIND_ME_OCR_DET_MODEL_PATH, since detection
+geometry can differ by script) to a recognition model downloaded from
+RapidOCR's model zoo (https://github.com/RapidAI/RapidOCR) for a script the
+bundled ch_PP-OCRv4 model doesn't cover. Unset by default."""
+
+# ---------------------------------------------------------------------------
 # Updates
 # ---------------------------------------------------------------------------
 
@@ -895,6 +930,9 @@ __all__ = [
     "AUTO_UPDATE_CHECK",
     "UPDATE_EXPECTED_ORIGIN",
     "DB_ENCRYPTION_KEY",
+    "OCR_DET_MODEL_PATH",
+    "OCR_CLS_MODEL_PATH",
+    "OCR_REC_MODEL_PATH",
 ]
 
 # ---------------------------------------------------------------------------

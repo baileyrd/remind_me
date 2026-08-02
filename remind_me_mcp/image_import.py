@@ -38,6 +38,19 @@ member.
 Ingestion itself (hash dedup, chunk storage, batched embedding) is entirely
 handled by :func:`remind_me_mcp.importer._ingest_parsed` — this module only
 turns image bytes into a single ``(chunk_content, chunk_metadata)`` pair.
+
+**Language coverage (issue #202)**: :func:`_get_ocr_engine` constructs
+``RapidOCR()`` with no arguments, so it loads the models bundled inside the
+``rapidocr-onnxruntime`` wheel — ``ch_PP-OCRv4`` detection/recognition plus
+``ch_ppocr_mobile_v2.0`` orientation classification. That recognition
+model's character set (baked into its ONNX metadata) covers Chinese and
+English/Latin script + digits only; other scripts (Japanese, Korean,
+Arabic, Cyrillic, Devanagari, ...) are not recognized. ``REMIND_ME_OCR_
+DET_MODEL_PATH``/``_CLS_MODEL_PATH``/``_REC_MODEL_PATH`` (see
+``config.py``) are an optional passthrough to RapidOCR's own
+``det_model_path``/``cls_model_path``/``rec_model_path`` constructor
+kwargs — unset by default, so behavior is unchanged unless a user points
+them at an alternate-script model downloaded from RapidOCR's model zoo.
 """
 
 from __future__ import annotations
@@ -46,6 +59,7 @@ import logging
 import threading
 from typing import Any
 
+from remind_me_mcp.config import OCR_CLS_MODEL_PATH, OCR_DET_MODEL_PATH, OCR_REC_MODEL_PATH
 from remind_me_mcp.importer import register_connector
 
 log = logging.getLogger("remind_me_mcp.image_import")
@@ -95,7 +109,20 @@ def _get_ocr_engine() -> Any:
                 "Image import dependency not installed (%s). %s", e, IMAGE_EXTRA_INSTALL_MSG
             )
             raise RuntimeError(IMAGE_EXTRA_INSTALL_MSG) from e
-        _ocr_engine = RapidOCR()
+        # Optional passthrough (issue #202) to RapidOCR's own model-path
+        # kwargs, so a user can point at an alternate-script detection/
+        # classification/recognition model instead of the bundled
+        # Chinese+English-only ch_PP-OCRv4 default. All three env vars are
+        # unset (None) by default, so kwargs stays empty and this is exactly
+        # RapidOCR() -- today's behavior, unchanged.
+        kwargs: dict[str, str] = {}
+        if OCR_DET_MODEL_PATH:
+            kwargs["det_model_path"] = OCR_DET_MODEL_PATH
+        if OCR_CLS_MODEL_PATH:
+            kwargs["cls_model_path"] = OCR_CLS_MODEL_PATH
+        if OCR_REC_MODEL_PATH:
+            kwargs["rec_model_path"] = OCR_REC_MODEL_PATH
+        _ocr_engine = RapidOCR(**kwargs)
         return _ocr_engine
 
 
