@@ -209,6 +209,36 @@ async def memory_get(memory_id: str) -> str:
     return _fmt_memory_md(_row_to_dict(row))
 
 
+def _apply_memory_field_update(
+    db: sqlite3.Connection, memory_id: str, sets: list[str], bindings: list[Any]
+) -> None:
+    """Apply a raw column UPDATE to one memory row, always bumping updated_at.
+
+    The single place every write path that mutates a real content column on
+    ``memories`` funnels through — ``remind_me_update`` below, and
+    ``remind_me_set_reminder`` (``tools/reminders.py``, issue #179) via the
+    ``_pkg.<name>`` patchable-lookup convention (see this module's
+    docstring) — so ``updated_at`` is bumped consistently. That is what the
+    sync outbox trigger's LWW comparison keys off, and what distinguishes a
+    genuine content change from the v22 access-tracking exception (which
+    deliberately does NOT bump ``updated_at``). Callers must already have
+    verified the memory exists and is not soft-deleted, and must not pass an
+    empty ``sets``.
+
+    Args:
+        db: An open SQLite connection. This function commits.
+        memory_id: The memory to update.
+        sets: SQL ``"column = ?"`` (or a literal fragment, e.g.
+            ``"remind_at = NULL"``) pieces, not including ``updated_at``.
+        bindings: Positional bind values matching the ``?`` placeholders in
+            ``sets``, in the same order.
+    """
+    all_sets = [*sets, "updated_at = ?"]
+    all_bindings = [*bindings, _now_iso(), memory_id]
+    db.execute(f"UPDATE memories SET {', '.join(all_sets)} WHERE id = ?", all_bindings)
+    db.commit()
+
+
 @mcp.tool(
     name="remind_me_update",
     annotations={
@@ -255,12 +285,7 @@ async def memory_update(params: MemoryUpdateInput) -> str:
     if not sets:
         return "Nothing to update — no fields provided."
 
-    sets.append("updated_at = ?")
-    bindings.append(_now_iso())
-    bindings.append(params.memory_id)
-
-    db.execute(f"UPDATE memories SET {', '.join(sets)} WHERE id = ?", bindings)
-    db.commit()
+    _apply_memory_field_update(db, params.memory_id, sets, bindings)
     # Re-embed if content changed
     if params.content is not None:
         await asyncio.to_thread(_pkg._embed_and_store, params.memory_id, params.content)

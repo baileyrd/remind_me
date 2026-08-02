@@ -1,5 +1,11 @@
 # Release Notes
 
+## v1.29.0 — 2026-08-02
+
+### New Features
+
+- **Time-based reminders (#179)** — a memory can now carry an optional `remind_at` timestamp. `remind_me_set_reminder` sets or clears it (rejecting a past or unparseable timestamp outright rather than silently accepting a no-op reminder); `remind_me_list_reminders` surfaces `upcoming`/`overdue`/`all` reminders. A background scheduler (`REMIND_ME_REMINDER_POLL_INTERVAL`, default 60s) polls for due reminders and delivers each exactly once, tracked in a new `reminder_deliveries` table — a bare "remind_at is in the past" check can't distinguish "already delivered" from "missed while the server was offline," so a reminder that comes due during downtime still fires exactly once on the next poll after restart rather than repeating forever or being silently dropped. Delivery is a log line for now, behind a swappable hook (`remind_me_mcp.scheduler._delivery_hook`) so outbound notification channels (#180) can plug in without touching the due-reminder query logic.
+
 ## v1.28.0 — 2026-08-01
 
 A production incident (a stuck query hanging the server, which masked a stuck sync cursor for over an hour) turned into a dozen tracked issues (#119-#130) covering the whole failure chain — not just the two live bugs, but the missing tests, tooling, and process guards that let them go unnoticed for so long.

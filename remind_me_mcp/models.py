@@ -8,6 +8,7 @@ instances directly to tool handler functions.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
@@ -369,6 +370,82 @@ class MemoryDeleteInput(BaseModel):
     memory_id: str = Field(
         ..., description="The ID of the memory to delete", min_length=1
     )
+
+
+# ---------------------------------------------------------------------------
+# Reminder models (issue #179)
+# ---------------------------------------------------------------------------
+
+
+class SetReminderInput(BaseModel):
+    """Input for remind_me_set_reminder: set or clear a memory's reminder."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    memory_id: str = Field(
+        ..., description="The ID of the memory to set or clear a reminder on", min_length=1
+    )
+    remind_at: str | None = Field(
+        default=None,
+        description=(
+            "ISO-8601 timestamp for when this memory should be surfaced as a "
+            "reminder (naive timestamps are assumed UTC). Must be in the "
+            "future. Omit or pass null to clear an existing reminder instead "
+            "of setting one."
+        ),
+    )
+
+    @field_validator("remind_at")
+    @classmethod
+    def validate_remind_at(cls, v: str | None) -> str | None:
+        """Reject an unparseable or non-future timestamp; canonicalize to UTC.
+
+        A no-op reminder (one that would never fire because it is already in
+        the past) is rejected outright rather than silently accepted, same
+        reasoning as MemoryAddInput's contradiction-supersession warnings:
+        surprising behavior should fail loudly, not quietly do nothing.
+        """
+        if v is None or not v.strip():
+            return None
+        try:
+            dt = datetime.fromisoformat(v.strip())
+        except ValueError as e:
+            raise ValueError(f"remind_at is not a valid ISO-8601 timestamp: {v!r}") from e
+        dt = dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+        now = datetime.now(UTC)
+        if dt <= now:
+            raise ValueError(
+                f"remind_at must be in the future, got {dt.isoformat()} "
+                f"(current time: {now.isoformat()})"
+            )
+        return dt.isoformat()
+
+
+class ReminderWindow(StrEnum):
+    """Which reminders remind_me_list_reminders surfaces."""
+
+    UPCOMING = "upcoming"
+    OVERDUE = "overdue"
+    ALL = "all"
+
+
+class ListRemindersInput(BaseModel):
+    """Input for remind_me_list_reminders: list memories with a set reminder."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    when: ReminderWindow = Field(
+        default=ReminderWindow.UPCOMING,
+        description=(
+            "'upcoming' — reminders still in the future. "
+            "'overdue' — reminders whose time has passed but have not yet "
+            "been delivered by the scheduler (e.g. the server was offline "
+            "when they came due). "
+            "'all' — the union of both."
+        ),
+    )
+    limit: int = Field(default=20, ge=1, le=100)
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
 
 
 class ImportKind(StrEnum):
@@ -1251,6 +1328,9 @@ __all__ = [
     "MemoryListInput",
     "MemoryUpdateInput",
     "MemoryDeleteInput",
+    "SetReminderInput",
+    "ReminderWindow",
+    "ListRemindersInput",
     "ImportKind",
     "ChatImportInput",
     "MemoryStatsInput",

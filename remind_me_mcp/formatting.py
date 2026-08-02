@@ -44,6 +44,8 @@ def _fmt_memory_md(m: dict) -> str:
     if meta_str:
         lines.append(f"**Metadata:** {meta_str}")
     lines.append(f"**Created:** {m['created_at']}  |  **Updated:** {m['updated_at']}")
+    if m.get("remind_at"):
+        lines.append(f"**Reminder:** {m['remind_at']}")
     lines.append("")
     lines.append(m["content"][:2000] + ("…" if len(m["content"]) > 2000 else ""))
     lines.append("")

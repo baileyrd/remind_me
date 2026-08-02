@@ -47,6 +47,12 @@ Current schema versions:
             that appeared together in a search result set, surfaced only as
             an opt-in expand_co_retrieval search section (never feeding
             back into ranking).
+  22 -> 23: time-based reminders (issue #179) -- remind_at column on
+            memories plus a reminder_deliveries table recording which
+            (memory_id, remind_at) pairs the background scheduler has
+            already fired, so a reminder that comes due while the server is
+            offline still fires exactly once on the next poll instead of
+            repeating forever or being silently dropped.
 """
 
 from __future__ import annotations
@@ -277,7 +283,7 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 # Current target schema version.  Increment when adding a new migration step.
-_SCHEMA_VERSION = 22
+_SCHEMA_VERSION = 23
 
 
 
@@ -450,6 +456,11 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         _migrate_v21_to_v22(db)
         db.execute("PRAGMA user_version = 22")
         current_version = 22
+
+    if current_version < 23:
+        _migrate_v22_to_v23(db)
+        db.execute("PRAGMA user_version = 23")
+        current_version = 23
 
     db.commit()
 
@@ -1051,7 +1062,7 @@ _OUTBOX_PAYLOAD_COLUMNS = (
     "accessed_at", "access_count", "decay_rate", "vitality", "base_weight",
     "status", "memory_type", "source_capture_id",
     "subject", "predicate", "object", "superseded_by",
-    "doc_id", "chunk_index", "deleted_at",
+    "doc_id", "chunk_index", "deleted_at", "remind_at",
 )
 
 # Entity columns mirrored into sync_outbox payloads (FT-04). Memory records
@@ -1730,6 +1741,86 @@ def _migrate_v21_to_v22(db: sqlite3.Connection) -> None:
     payload = _outbox_payload_sql("NEW.")
     db.executescript(f"""
         DROP TRIGGER IF EXISTS memories_outbox_au;
+
+        CREATE TRIGGER IF NOT EXISTS memories_outbox_au
+        AFTER UPDATE ON memories
+        WHEN COALESCE((SELECT value FROM sync_flags WHERE key = 'sync_enabled'), '0') = '1'
+             AND NEW.updated_at IS NOT OLD.updated_at
+        BEGIN
+            INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+            VALUES (NEW.id, 'update', {payload}, {_SQL_NOW_ISO});
+        END;
+    """)
+
+
+def _migrate_v22_to_v23(db: sqlite3.Connection) -> None:
+    """v22 -> v23: time-based reminders -- remind_at + delivery tracking (issue #179).
+
+    Adds ``remind_at`` (nullable, ISO-8601 UTC, same canonical format as
+    every other timestamp in this schema -- see :func:`_now_iso`) to
+    ``memories``: a memory can carry an optional future-timestamp reminder,
+    set/cleared via ``remind_me_set_reminder``. This is a genuine content
+    field, not access-tracking metadata, so unlike the v22 exception it is
+    expected to ride the normal ``updated_at``-bumping write path -- it is
+    added to ``_OUTBOX_PAYLOAD_COLUMNS`` and the ``memories_outbox_ai``/
+    ``_au`` triggers are dropped and recreated to pick it up, exactly the
+    same pattern v12->v13 used for ``doc_id``/``chunk_index`` and v15->v16
+    used for ``deleted_at`` (HY-03).
+
+    A separate ``reminder_deliveries`` table is needed alongside the column
+    because "``remind_at`` is in the past" is not the same fact as "this
+    reminder has already fired": a reminder that becomes due while the
+    server is offline must still fire exactly once on the next poll after
+    restart, not on every poll thereafter (a bare timestamp comparison can't
+    tell "already delivered" apart from "missed while the server was down"),
+    and it must not be silently skipped either. One row is inserted per
+    (memory_id, remind_at) pair once :mod:`remind_me_mcp.scheduler` delivers
+    it; the scheduler's due-reminder query excludes any pair already present
+    here. No sync outbox trigger on this table -- purely local scheduler
+    bookkeeping, the same scope decision as ``memory_feedback`` (v16->v17)
+    and ``memory_associations`` (v18->v19): a reminder fired on one device
+    does not (yet) suppress the same reminder firing again on another.
+
+    A partial index on ``memories(remind_at)`` -- restricted to rows with a
+    set, non-deleted reminder -- keeps the scheduler's due-reminder poll
+    query cheap regardless of vault size, mirroring the partial
+    ``idx_outbox_unsent`` index (v2->v3).
+
+    Args:
+        db: An open SQLite connection.
+    """
+    with contextlib.suppress(sqlite3.OperationalError):
+        db.execute("ALTER TABLE memories ADD COLUMN remind_at TEXT DEFAULT NULL")
+
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_memories_remind_at ON memories(remind_at) "
+        "WHERE remind_at IS NOT NULL AND deleted_at IS NULL"
+    )
+
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS reminder_deliveries (
+            id           INTEGER PRIMARY KEY,
+            memory_id    TEXT NOT NULL,
+            remind_at    TEXT NOT NULL,
+            delivered_at TEXT NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_reminder_deliveries_memory_remind_at
+            ON reminder_deliveries(memory_id, remind_at);
+    """)
+
+    payload = _outbox_payload_sql("NEW.")
+    db.executescript(f"""
+        DROP TRIGGER IF EXISTS memories_outbox_ai;
+        DROP TRIGGER IF EXISTS memories_outbox_au;
+
+        CREATE TRIGGER IF NOT EXISTS memories_outbox_ai
+        AFTER INSERT ON memories
+        WHEN COALESCE((SELECT value FROM sync_flags WHERE key = 'sync_enabled'), '0') = '1'
+        BEGIN
+            INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+            VALUES (NEW.id, 'insert', {payload}, {_SQL_NOW_ISO});
+        END;
 
         CREATE TRIGGER IF NOT EXISTS memories_outbox_au
         AFTER UPDATE ON memories

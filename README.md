@@ -307,6 +307,13 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_update` | Update a memory's content, category, tags, or metadata |
 | `remind_me_delete` | Permanently delete a memory |
 
+### Reminders
+
+| Tool | Description |
+|------|-------------|
+| `remind_me_set_reminder` | Set a future `remind_at` timestamp on an existing memory, or clear one already set (omit/null `remind_at`) — must be a valid ISO-8601 timestamp in the future |
+| `remind_me_list_reminders` | List memories with a set reminder: `upcoming` (still in the future), `overdue` (due but not yet delivered — e.g. the server was offline), or `all` |
+
 ### Capture & decomposition
 
 | Tool | Description |
@@ -371,7 +378,7 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_check_update` | Check if a newer version is available on origin/main |
 | `remind_me_self_update` | Pull latest changes from origin and reinstall the package |
 
-46 tools + 6 prompts + 4 resources (`memory://stats`, `memory://categories`, `wiki://schema`, `wiki://index`).
+48 tools + 6 prompts + 4 resources (`memory://stats`, `memory://categories`, `wiki://schema`, `wiki://index`).
 
 ### Prompts: the maintenance loops as one-shot workflows
 
@@ -390,7 +397,7 @@ Every argument is optional (batch size, similarity threshold), so invoking a pro
 
 ### Tool profiles (context cost)
 
-The full surface is 46 tools costing **~21k tokens of context in every session**, on every client, whether or not an admin tool is ever touched. For a server whose job is putting memories *into* context that's an awkward ratio — `remind_me_wiki_load` defaults to a 12k budget, so the tool definitions cost ~1.8× an entire wiki load before a single memory is retrieved.
+The full surface is 48 tools costing **~21k tokens of context in every session**, on every client, whether or not an admin tool is ever touched. For a server whose job is putting memories *into* context that's an awkward ratio — `remind_me_wiki_load` defaults to a 12k budget, so the tool definitions cost ~1.8× an entire wiki load before a single memory is retrieved.
 
 ```bash
 REMIND_ME_TOOL_PROFILE=standard remind-me-mcp
@@ -398,7 +405,7 @@ REMIND_ME_TOOL_PROFILE=standard remind-me-mcp
 
 | Profile | Tools | Context | Drops |
 |---|---|---|---|
-| `full` *(default)* | 46 | ~21k | nothing — today's behavior |
+| `full` *(default)* | 48 | ~21k | nothing — today's behavior |
 | `standard` | 30 | ~14.8k | imports, sync, backup, updater, ops |
 | `core` | 17 | ~7.8k | the above, plus the maintenance loops and their prompts |
 
@@ -764,6 +771,16 @@ export REMIND_ME_WIKI_DIR=~/notes/wiki
 # Cap the default whole-wiki load (estimated tokens; 0 = unlimited)
 export REMIND_ME_WIKI_LOAD_TOKEN_BUDGET=12000
 ```
+
+## Reminders
+
+A memory can carry an optional future `remind_at` timestamp. A background scheduler polls for due reminders every `REMIND_ME_REMINDER_POLL_INTERVAL` seconds (default 60) and delivers each exactly once:
+
+- **`remind_me_set_reminder`** — sets or clears `remind_at` on an existing memory. A past or unparseable timestamp is rejected outright rather than silently accepted as a no-op reminder. Setting/clearing a reminder is a real content change, so it bumps `updated_at` like any other field edit (routed through the same internal update path as `remind_me_update`).
+- **`remind_me_list_reminders`** — lists memories with a set reminder: `upcoming` (still in the future), `overdue` (due but not yet delivered — typically because the server was offline when it came due), or `all`.
+- **Fires exactly once, even across restarts** — a `reminder_deliveries` table records which `(memory_id, remind_at)` pairs have already fired. A reminder that becomes due while the server is offline still fires exactly once on the next poll after restart; it neither re-fires on every subsequent poll nor gets silently dropped.
+- **Delivery is a log line today** — outbound notification channels (email, push, etc.) are tracked separately; the scheduler's due-reminder logic is already structured with a swappable delivery hook so a real channel can plug in without changing how due reminders are found.
+- **Configuration** — `REMIND_ME_REMINDER_POLL_INTERVAL` (default 60 seconds). The scheduler itself always runs; there is no separate enable switch.
 
 ## Multi-Machine Sync
 
@@ -1165,7 +1182,8 @@ Every new memory used to start at a flat `base_weight=1.0` regardless of kind, s
 | `REMIND_ME_WATCH_DIRS` | *(unset)* | `os.pathsep`-separated (`:` on macOS/Linux, `;` on Windows) directories for the folder watcher to auto-ingest. Empty = watcher disabled. Each directory must lie inside `REMIND_ME_IMPORT_ROOTS` |
 | `REMIND_ME_WATCH_INTERVAL` | `60` | Seconds between folder watcher scan passes |
 | `REMIND_ME_WATCH_GRACE` | `5` | Debounce grace period in seconds — files modified more recently than this are deferred until a scan sees a stable (mtime, size) |
-| `REMIND_ME_TOOL_PROFILE` | `full` | Advertised tool surface: `full` (46 tools, ~21k context), `standard` (30, ~14.8k — drops imports/sync/ops), or `core` (17, ~7.8k — conversational only, also hides the maintenance prompts). An unrecognised value logs a warning and falls back to `full` |
+| `REMIND_ME_REMINDER_POLL_INTERVAL` | `60` | Seconds between the reminder scheduler's poll passes for due `remind_at` timestamps. The scheduler itself always runs — no separate enable switch |
+| `REMIND_ME_TOOL_PROFILE` | `full` | Advertised tool surface: `full` (48 tools, ~21k context), `standard` (30, ~14.8k — drops imports/sync/ops), or `core` (17, ~7.8k — conversational only, also hides the maintenance prompts). An unrecognised value logs a warning and falls back to `full` |
 | `REMIND_ME_MAINTENANCE_NUDGES` | `true` | Whether search/add responses may carry a maintenance-backlog nudge. Set `false` to silence them entirely |
 | `REMIND_ME_MAINTENANCE_NUDGE_INTERVAL` | `3600` | Minimum seconds between nudge *checks*. Bounds cost as well as noise — the backlog COUNTs only run when this has elapsed |
 | `REMIND_ME_MAINTENANCE_NUDGE_THRESHOLD` | `25` | Queue depth a backlog must reach before it's worth mentioning |

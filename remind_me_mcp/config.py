@@ -496,6 +496,16 @@ is deferred until a later scan observes the same (mtime, size) signature, so
 partially-written files are never ingested mid-write."""
 
 # ---------------------------------------------------------------------------
+# Reminders (issue #179)
+# ---------------------------------------------------------------------------
+
+REMINDER_POLL_INTERVAL = _env_int("REMIND_ME_REMINDER_POLL_INTERVAL", 60)
+"""Seconds between remind_me_mcp.scheduler poll passes for due reminders
+(memories.remind_at <= now, not yet in reminder_deliveries). Unlike the
+folder watcher, the scheduler always runs -- this only tunes how often it
+checks, not whether it's enabled."""
+
+# ---------------------------------------------------------------------------
 # Push/webhook ingestion (FT-09, Phase 5a)
 # ---------------------------------------------------------------------------
 
@@ -587,6 +597,7 @@ __all__ = [
     "WATCH_DIRS",
     "WATCH_INTERVAL",
     "WATCH_GRACE",
+    "REMINDER_POLL_INTERVAL",
     "WEBHOOK_PORT",
     "WEBHOOK_BIND",
     "WEBHOOK_SECRET",
