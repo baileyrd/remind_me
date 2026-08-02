@@ -159,10 +159,10 @@ answers your question — they are not interchangeable.
 
 ```bash
 curl -s http://127.0.0.1:8765/health
-# {"status":"ok","role":"hub","version":"1.4.0","db":"ok","time":"..."}
+# {"status":"ok","role":"hub","version":"1.5.0","db":"ok","time":"..."}
 
 curl -s -H "Authorization: Bearer $SYNC_SECRET" http://127.0.0.1:8765/count
-# {"role":"hub","version":"1.4.0",
+# {"role":"hub","version":"1.5.0",
 #  "memories":{"total":812,"live":790,"tombstones":22},
 #  "entities":143,"memory_entities":901,"entity_relations":37,"time":"..."}
 
@@ -178,13 +178,38 @@ table scans, which is the right cost once per reconcile and the wrong cost
 once per minute. `table=` accepts `memories`, `entities`, `memory_entities`
 or `entity_relations`; anything else is a `400`.
 
+Two filters, both memories-oriented:
+
+```bash
+# How many records changed in the last hour? One request, no client state.
+curl -s -H "Authorization: Bearer $SYNC_SECRET" \
+     "http://127.0.0.1:8765/count?since=$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)"
+
+# Which node pushed what — the one fact no node can compute for itself.
+curl -s -H "Authorization: Bearer $SYNC_SECRET" \
+     'http://127.0.0.1:8765/count?by=origin_node&table=memories'
+```
+
+`since=` takes any ISO-8601 timestamp and is index-backed. It counts records
+*touched* in the window, tombstones included — a delete is a change — so it
+reports a `total` with no live/tombstone split, which would invite reading it
+as a live-record delta.
+
+`by=origin_node` is opt-in because it reintroduces a `GROUP BY`; the default
+path stays scan-only. Combine it with `since=` for "who has pushed anything
+lately", i.e. the real question behind "which node stopped syncing".
+
+Filters can't be combined with `approx=1` (a `400`): planner estimates are
+whole-table, and silently ignoring the filter would answer a different
+question than the one asked.
+
 For a purely trend-shaped question — a graph that only needs to go up and to
 the right — add `?approx=1`:
 
 ```bash
 curl -s -H "Authorization: Bearer $SYNC_SECRET" \
      'http://127.0.0.1:8765/count?approx=1'
-# {"role":"hub","version":"1.4.0","approximate":true,
+# {"role":"hub","version":"1.5.0","approximate":true,
 #  "memories":{"total":812},"entities":143,...}
 ```
 
@@ -352,7 +377,7 @@ systemctl --user daemon-reload
 systemctl --user start remind-me-postgres.service
 systemctl --user start remind-me-hub.service
 curl -s http://127.0.0.1:8765/health
-# {"status":"ok","role":"hub","version":"1.4.0","db":"ok","time":"..."}
+# {"status":"ok","role":"hub","version":"1.5.0","db":"ok","time":"..."}
 ```
 
 The hub creates (or migrates) the database schema itself at startup, and

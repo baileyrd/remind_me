@@ -208,9 +208,12 @@ def test_exact_is_the_default() -> None:
     tree = ast.parse(_source())
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == "count":
-            approx_arg = [a for a in node.args.args if a.arg == "approx"]
-            assert approx_arg, "/count must accept an approx parameter"
-            default = node.args.defaults[-1]
+            names = [a.arg for a in node.args.args]
+            assert "approx" in names, "/count must accept an approx parameter"
+            # Defaults align to the *end* of the argument list, so index from
+            # there rather than assuming approx is last — it isn't any more.
+            offset = len(names) - len(node.args.defaults)
+            default = node.args.defaults[names.index("approx") - offset]
             assert isinstance(default, ast.Constant) and default.value is False
             return
     raise AssertionError("hub/main.py has no /count route")
@@ -224,3 +227,45 @@ def test_response_always_declares_which_kind_of_count_it_gave() -> None:
     correctness on.
     """
     assert "'approximate': approx" in _count_body()
+
+
+def test_grouping_is_opt_in_only() -> None:
+    """The no-GROUP-BY guarantee applies to the default path, not ?by=.
+
+    ?by=origin_node deliberately reintroduces one — it is the only way to
+    read a hub-only fact — but it must stay opt-in, or the endpoint quietly
+    becomes as expensive as the /stats it exists to avoid.
+    """
+    src = _source()
+    # The grouping lives in its own helper, so the default path (asserted
+    # GROUP BY-free by test_count_does_not_group) can't accidentally acquire it.
+    assert "_count_by_origin_node" in src
+    body = _count_body()
+    assert "if by else None" in body or "if by " in body, (
+        "the per-node breakdown must be conditional on the ?by= parameter"
+    )
+
+
+def test_since_is_a_bound_parameter_not_interpolated() -> None:
+    """Unlike the table name, a timestamp *is* parameterizable.
+
+    There is no reason for a user-supplied value to reach the SQL text when
+    the driver will bind it.
+    """
+    for node in ast.walk(ast.parse(_source())):
+        if isinstance(node, ast.FunctionDef) and node.name == "_count_tables_since":
+            body = ast.unparse(node.body[1:] if ast.get_docstring(node) else node.body)
+            assert "%s" in body, "since must be bound, not interpolated"
+            assert "{since}" not in body
+            return
+    raise AssertionError("hub/main.py has no _count_tables_since helper")
+
+
+def test_approx_rejects_filters_it_cannot_honour() -> None:
+    """Planner estimates are whole-table only.
+
+    Silently ignoring ?since= would return a number answering a different
+    question than the one asked — worse than a 400.
+    """
+    body = _count_body()
+    assert "approx and (since or by)" in body

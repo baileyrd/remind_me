@@ -55,7 +55,7 @@ from psycopg.types.json import Jsonb
 log = logging.getLogger("remind_me_hub")
 logging.basicConfig(level=logging.INFO)
 
-HUB_VERSION = "1.4.0"
+HUB_VERSION = "1.5.0"
 """Version of the hub server, reported by /health, /count and /stats.
 
 Versioned independently of the ``remind-me-mcp`` package rather than tracking
@@ -625,8 +625,78 @@ def _count_tables(
     return counts
 
 
+def _count_tables_since(
+    conn: psycopg.Connection, wanted: tuple[str, ...], since: str
+) -> dict[str, Any]:
+    """Counts restricted to records touched since *since* (issue #217).
+
+    Only ``memories`` has an ``updated_at`` to filter on; the graph tables
+    are immutable insert-or-ignore edges stamped with ``created_at``, so
+    "changed since" is the same question as "created since" for them and is
+    answered from that column instead. Both are index-backed
+    (``idx_memories_updated_at_id``, ``idx_links_created_at``,
+    ``idx_entity_relations_created_at_id``).
+
+    ``since`` is a bound parameter, never interpolated -- unlike the table
+    name, a timestamp *is* a parameterizable position, so there is no reason
+    for it to go anywhere near the SQL text.
+    """
+    column = {
+        "memories": "updated_at",
+        "entities": "updated_at",
+        "memory_entities": "created_at",
+        "entity_relations": "created_at",
+    }
+    counts: dict[str, Any] = {}
+    for name in wanted:
+        (row,) = conn.execute(
+            f"SELECT COUNT(*) AS count FROM {name} WHERE {column[name]} > %s",
+            (since,),
+        ).fetchall()
+        if name == "memories":
+            # No live/tombstone split here on purpose: a tombstone written in
+            # the window is a record that *changed* in the window, which is
+            # what this filter is asking about. Splitting it would invite
+            # reading the result as a live-record delta, which it is not.
+            counts["memories"] = {"total": row["count"]}
+        else:
+            counts[name] = row["count"]
+    return counts
+
+
+def _count_by_origin_node(
+    conn: psycopg.Connection, since: str | None
+) -> dict[str, int]:
+    """Per-pushing-node memory counts -- the one hub-only breakdown.
+
+    ``origin_node`` is set by /sync/push and never crosses the wire, so no
+    node can compute this for itself. Honours ``since`` when given, which is
+    what turns it into "who has pushed anything lately", i.e. the actual
+    question behind "which node stopped syncing".
+    """
+    clause = "WHERE updated_at > %s" if since else ""
+    params = (since,) if since else ()
+    rows = conn.execute(
+        f"""
+        SELECT COALESCE(NULLIF(origin_node, ''), '(unattributed)') AS origin_node,
+               COUNT(*)                                            AS count
+          FROM memories
+          {clause}
+         GROUP BY 1
+         ORDER BY 2 DESC
+        """,
+        params,
+    ).fetchall()
+    return {r["origin_node"]: r["count"] for r in rows}
+
+
 @app.get("/count", dependencies=[Depends(_require_auth)])
-def count(table: str | None = None, approx: bool = False) -> JSONResponse:
+def count(
+    table: str | None = None,
+    approx: bool = False,
+    since: str | None = None,
+    by: str | None = None,
+) -> JSONResponse:
     """Scalar record counts — the cheap subset of /stats, safe to poll.
 
     /stats answers "how does my node differ from the hub, and where?", and
@@ -656,23 +726,66 @@ def count(table: str | None = None, approx: bool = False) -> JSONResponse:
     and the /count-vs-/stats agreement check both need real numbers, and a
     silently-estimated total would be worse than a slow one. The response
     says which it gave you.
+
+    Two filters (issue #217), both memories-only, since neither question has
+    a meaning for the graph tables:
+
+    - ``?since=<ISO timestamp>`` counts records touched since then, so
+      "how many landed in the last hour?" is one request rather than two
+      samples and client-side state to subtract them. Index-backed by
+      ``idx_memories_updated_at_id``.
+    - ``?by=origin_node`` returns the per-node breakdown. This is the one
+      genuinely hub-only fact -- ``origin_node`` never crosses the wire, so
+      no node can compute it -- and until now reading it meant paying for
+      /stats' whole aggregate, including the category pass the caller didn't
+      ask for. Opt-in precisely because it reintroduces a GROUP BY: the
+      default path stays scan-only, which is what the endpoint is for.
     """
     if table is not None and table not in _COUNTABLE:
         raise HTTPException(
             status_code=400,
             detail=f"unknown table {table!r}; expected one of {', '.join(_COUNTABLE)}",
         )
+    if by is not None and by != "origin_node":
+        raise HTTPException(
+            status_code=400, detail=f"unknown grouping {by!r}; expected origin_node"
+        )
+    if since is not None:
+        try:
+            since = _canon_ts(since)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"invalid since timestamp {since!r}; expected ISO-8601",
+            ) from None
+    if approx and (since or by):
+        # The estimate is a whole-table row count -- there is no filtered or
+        # grouped equivalent in the catalog. Rejecting beats silently
+        # ignoring the filter and returning a number that answers a different
+        # question than the one asked.
+        raise HTTPException(
+            status_code=400,
+            detail="approx=1 cannot be combined with since or by; "
+            "planner estimates are whole-table only",
+        )
+
     wanted = (table,) if table else _COUNTABLE
 
     with _connect() as conn:
-        counts = (
-            _approx_count_tables(conn, wanted) if approx else _count_tables(conn, wanted)
-        )
+        if approx:
+            counts = _approx_count_tables(conn, wanted)
+        elif since:
+            counts = _count_tables_since(conn, wanted, since)
+        else:
+            counts = _count_tables(conn, wanted)
+        by_origin = _count_by_origin_node(conn, since) if by else None
 
     return JSONResponse(
         content={
             "role": "hub",
             "version": HUB_VERSION,
+            **({"since": since} if since else {}),
+            **({"by_origin_node": by_origin} if by_origin is not None else {}),
             # Always present, not only when true: a caller that forgot to ask
             # would otherwise have to infer exactness from the absence of a
             # key, and "no live/tombstone split" is too quiet a signal to
