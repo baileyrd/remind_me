@@ -55,7 +55,7 @@ from psycopg.types.json import Jsonb
 log = logging.getLogger("remind_me_hub")
 logging.basicConfig(level=logging.INFO)
 
-HUB_VERSION = "1.1.0"
+HUB_VERSION = "1.2.0"
 """Version of the hub server, reported by /health, /count and /stats.
 
 Versioned independently of the ``remind-me-mcp`` package rather than tracking
@@ -360,6 +360,27 @@ app = FastAPI(
     redoc_url=None,
     openapi_url=None,
 )
+
+
+@app.middleware("http")
+async def _stamp_version(request: Request, call_next):
+    """Put HUB_VERSION on every response, including errors (issue #209).
+
+    Middleware rather than per-route, and the reason is the point: the value
+    of this header is that it covers the routes nobody remembered to
+    annotate. A client doing ordinary work (/sync/push, /sync/pull) would
+    otherwise have to make a second, unrelated request to /health to learn
+    which build answered it -- so the version was readable exactly where it
+    was least needed and absent everywhere else.
+
+    Errors are covered deliberately. A 401 or a 500 is when "which build is
+    this?" matters most, and those responses never carry a JSON body with the
+    version in it. It also makes HEAD and header-only monitoring probes work,
+    which cannot read a body at all.
+    """
+    response = await call_next(request)
+    response.headers["X-Hub-Version"] = HUB_VERSION
+    return response
 
 
 # ---------------------------------------------------------------------------

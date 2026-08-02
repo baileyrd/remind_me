@@ -236,6 +236,30 @@ def test_guard_reads_the_real_hub_version() -> None:
     assert _guard().extract_version(_source()) == _hub_version()
 
 
+def test_version_header_is_applied_app_wide() -> None:
+    """The header must be middleware, not per-route.
+
+    Its entire value is covering the routes nobody remembered to annotate —
+    /sync/push and /sync/pull, which is where nearly all real traffic goes,
+    plus error responses that carry no JSON body at all. A per-route
+    implementation would drift out of coverage the first time a route is
+    added.
+    """
+    src = _source()
+    tree = ast.parse(src)
+    middlewares = [
+        ast.unparse(dec)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
+        for dec in node.decorator_list
+        if isinstance(dec, ast.Call)
+        and isinstance(dec.func, ast.Attribute)
+        and dec.func.attr == "middleware"
+    ]
+    assert middlewares, "X-Hub-Version must be stamped by @app.middleware, not per route"
+    assert "X-Hub-Version" in src
+
+
 def test_public_version_carries_no_build_detail() -> None:
     """The unauthenticated version stays a bare string.
 

@@ -159,10 +159,10 @@ answers your question — they are not interchangeable.
 
 ```bash
 curl -s http://127.0.0.1:8765/health
-# {"status":"ok","role":"hub","version":"1.1.0","db":"ok","time":"..."}
+# {"status":"ok","role":"hub","version":"1.2.0","db":"ok","time":"..."}
 
 curl -s -H "Authorization: Bearer $SYNC_SECRET" http://127.0.0.1:8765/count
-# {"role":"hub","version":"1.1.0",
+# {"role":"hub","version":"1.2.0",
 #  "memories":{"total":812,"live":790,"tombstones":22},
 #  "entities":143,"memory_entities":901,"entity_relations":37,"time":"..."}
 
@@ -186,6 +186,13 @@ raw totals across the two looks like permanent drift.
 Both counting routes are bearer-authenticated: totals and category names
 leak how much is stored and how fast it grows. `/health` stays public
 because deploy healthchecks need it, and it stays free of counts.
+
+Every response — every route, including errors and `401`s — also carries an
+`X-Hub-Version` header, so a client doing ordinary `/sync/push`/`/sync/pull`
+work learns the build without a second request, and `curl -I` works as a
+deploy check. `remind_me_mcp/sync.py` records it from whatever the hub
+answers, which is where `remind_me_sync_status`'s `hub_version` comes from
+(no network call of its own — it reports what the last sync cycle saw).
 
 **Versioning.** `HUB_VERSION` in `main.py` is a literal string, bumped by
 hand — the container image contains `main.py` and nothing else (no
@@ -295,7 +302,7 @@ systemctl --user daemon-reload
 systemctl --user start remind-me-postgres.service
 systemctl --user start remind-me-hub.service
 curl -s http://127.0.0.1:8765/health
-# {"status":"ok","role":"hub","version":"1.1.0","db":"ok","time":"..."}
+# {"status":"ok","role":"hub","version":"1.2.0","db":"ok","time":"..."}
 ```
 
 The hub creates (or migrates) the database schema itself at startup, and

@@ -1305,15 +1305,15 @@ async def test_probe_peer_unreachable() -> None:
 
 
 @pytest.fixture()
-def clean_peer_versions() -> Iterator[None]:
+def clean_remote_versions() -> Iterator[None]:
     """Isolate the module-level peer-version map between tests."""
-    sync._peer_versions.clear()
+    sync._remote_versions.clear()
     yield
-    sync._peer_versions.clear()
+    sync._remote_versions.clear()
 
 
 async def test_probe_peer_records_the_version_it_already_fetched(
-    clean_peer_versions: None,
+    clean_remote_versions: None,
 ) -> None:
     """Issue #208: the probe's body was being discarded.
 
@@ -1328,15 +1328,15 @@ async def test_probe_peer_records_the_version_it_already_fetched(
         ok = await sync._probe_peer(client, {"node_id": "p", "url": "http://peer"})
 
     assert ok is True
-    assert sync._peer_versions["p"]["version"] == "1.52.0"
+    assert sync._remote_versions["p"]["version"] == "1.52.0"
     # Timestamped, so a peer that later goes unreachable reads as "last seen
     # running X" rather than "is running X".
-    assert sync._peer_versions["p"]["at"]
+    assert sync._remote_versions["p"]["at"]
     assert len(recorder.requests) == 1, "must not make a second request for the version"
 
 
 async def test_probe_peer_records_nothing_for_an_older_peer(
-    clean_peer_versions: None,
+    clean_remote_versions: None,
 ) -> None:
     """A peer predating version reporting stays unknown, not placeholdered.
 
@@ -1348,11 +1348,54 @@ async def test_probe_peer_records_nothing_for_an_older_peer(
         ok = await sync._probe_peer(client, {"node_id": "p", "url": "http://peer"})
 
     assert ok is True
-    assert "p" not in sync._peer_versions
+    assert "p" not in sync._remote_versions
+
+
+async def test_hub_version_captured_from_any_response_header(
+    clean_remote_versions: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #209: ordinary hub traffic carries the build, so no probe is needed.
+
+    The header is the mechanism precisely because push/pull already talk to
+    the hub constantly — before this, the version was only readable from the
+    three routes whose bodies carry it.
+    """
+    monkeypatch.setattr(sync, "HUB_URL", "http://hub.example")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"records": [], "count": 0}, headers={"X-Hub-Version": "1.1.0"}
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        event_hooks={"response": [sync._capture_hub_version]},
+    ) as client:
+        await client.get("http://hub.example/sync/pull")
+
+    assert sync._remote_versions["hub"]["version"] == "1.1.0"
+
+
+async def test_hub_version_capture_ignores_other_hosts(
+    clean_remote_versions: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A peer that happened to send the header must not be filed as the hub."""
+    monkeypatch.setattr(sync, "HUB_URL", "http://hub.example")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={}, headers={"X-Hub-Version": "9.9.9"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        event_hooks={"response": [sync._capture_hub_version]},
+    ) as client:
+        await client.get("http://peer.example/sync/pull")
+
+    assert "hub" not in sync._remote_versions
 
 
 async def test_probe_peer_survives_a_junk_health_body(
-    clean_peer_versions: None,
+    clean_remote_versions: None,
 ) -> None:
     """Reachability is this function's contract, not response shape."""
 
@@ -1363,7 +1406,7 @@ async def test_probe_peer_survives_a_junk_health_body(
         ok = await sync._probe_peer(client, {"node_id": "p", "url": "http://peer"})
 
     assert ok is True
-    assert "p" not in sync._peer_versions
+    assert "p" not in sync._remote_versions
 
 
 # ---------------------------------------------------------------------------

@@ -1063,15 +1063,50 @@ def _compact_tombstones(db: sqlite3.Connection) -> int:
 # remote so a recovered remote stops reporting a stale error.
 _last_errors: dict[str, dict[str, str]] = {}
 
-# Per-remote build identity, keyed the same way as _last_errors. Populated
-# from the /health response _probe_peer already fetches every cycle (issue
-# #208) -- no extra request. Deliberately in-memory alongside the errors
-# above rather than persisted: a version observed before the last restart is
-# a guess about a machine this process hasn't spoken to since, and reporting
-# a guess as a fact is the failure mode this whole feature exists to avoid.
-# Each entry carries the observation time so a peer that has since gone
-# unreachable is read as "last seen running X", not "is running X".
-_peer_versions: dict[str, dict[str, str]] = {}
+# Per-remote build identity, keyed the same way as _last_errors ("hub" or a
+# peer's node_id). Two feeds, both piggybacking on requests that already
+# happen: peers via the /health body _probe_peer fetches every cycle (issue
+# #208), the hub via the X-Hub-Version header it stamps on every response
+# (issue #209). Neither costs a request.
+#
+# Deliberately in-memory alongside the errors above rather than persisted: a
+# version observed before the last restart is a guess about a machine this
+# process hasn't spoken to since, and reporting a guess as a fact is the
+# failure mode this whole feature exists to avoid. Each entry carries the
+# observation time, so a remote that has since gone unreachable reads as
+# "last seen running X", not "is running X".
+_remote_versions: dict[str, dict[str, str]] = {}
+
+
+def _record_version(remote_id: str, version: str | None) -> None:
+    """Remember a remote's reported build, ignoring an absent one.
+
+    Absent means "this remote predates version reporting", which must stay
+    distinguishable from a version we have actually seen -- so nothing is
+    written rather than a placeholder.
+    """
+    if version:
+        _remote_versions[remote_id] = {"version": str(version), "at": _now_iso()}
+
+
+HUB_VERSION_HEADER = "X-Hub-Version"
+
+
+async def _capture_hub_version(response: httpx.Response) -> None:
+    """httpx response hook recording the hub's build from any response.
+
+    Registered once on the sync cycle's client rather than at each call site,
+    which is the whole point of the hub sending this as a header: push and
+    pull already talk to the hub constantly, so the build is observable
+    without the dedicated /health or /stats call `reconcile_with_hub` needs.
+
+    Keyed off the header's presence, not the URL, so a peer (which doesn't
+    send it) is simply never recorded here -- its version comes from
+    _probe_peer instead.
+    """
+    version = response.headers.get(HUB_VERSION_HEADER)
+    if version and HUB_URL and str(response.request.url).startswith(HUB_URL):
+        _record_version("hub", version)
 
 # Minimum gap between drain-rate baseline updates. Without this, two status
 # calls seconds apart would overwrite the baseline with a near-zero elapsed
@@ -1292,7 +1327,7 @@ def get_sync_status() -> dict[str, Any]:
             # (issue #208). Absent for the hub -- its version comes from
             # reconcile's /stats call, not from peer discovery -- and for
             # peers that predate version reporting.
-            "version": _peer_versions.get(row["remote_id"]),
+            "version": _remote_versions.get(row["remote_id"]),
         }
         # Graph-table cursors are stored as synthetic "{remote_id}#{suffix}"
         # rows in this same table (_pull_graph_table) so they don't collide
@@ -1316,7 +1351,7 @@ def get_sync_status() -> dict[str, Any]:
                     "ever_contacted": False,
                     "pending": _pending_to_remote(db, remote_id)[0],
                     "last_error": err,
-                    "version": _peer_versions.get(remote_id),
+                    "version": _remote_versions.get(remote_id),
                 }
             )
 
@@ -1326,6 +1361,11 @@ def get_sync_status() -> dict[str, Any]:
         # This node's build. Sync bugs are usually version-skew bugs across a
         # fleet, and this is the report an operator already runs per node.
         "version": __version__,
+        # The hub's, as last seen on its X-Hub-Version header (issue #209).
+        # None until this process has completed a hub request -- unlike
+        # reconcile, this report makes no network call of its own, so it can
+        # only tell you what the cycle already observed.
+        "hub_version": _remote_versions.get("hub"),
         "hub_url": HUB_URL,
         "sync_interval_seconds": SYNC_INTERVAL,
         # The triggers are gated on this flag (SY-07); if it ever disagrees
@@ -1883,7 +1923,7 @@ async def _discover_peers() -> list[dict[str, str]]:
 async def _probe_peer(client: httpx.AsyncClient, peer: dict) -> bool:
     """Check if a peer is running remind_me by hitting its /health endpoint.
 
-    Also records the peer's reported build in ``_peer_versions`` (issue
+    Also records the peer's reported build in ``_remote_versions`` (issue
     #208). This request already happened every cycle and its body was
     discarded; the body now carries ``version``, which is the single most
     useful fact when two nodes disagree, so throwing it away meant either
@@ -1907,11 +1947,7 @@ async def _probe_peer(client: httpx.AsyncClient, peer: dict) -> bool:
         try:
             body = resp.json()
             version = body.get("version") if isinstance(body, dict) else None
-            if version:
-                _peer_versions[peer["node_id"]] = {
-                    "version": str(version),
-                    "at": _now_iso(),
-                }
+            _record_version(peer["node_id"], version)
         except Exception as e:  # noqa: BLE001 — reachability is the contract
             log.debug("Peer %s /health body unparsable: %s", peer["node_id"], e)
         return True
@@ -1929,7 +1965,12 @@ async def _sync_once() -> None:
     # `async with` statement with httpx.AsyncClient (async), so it wraps the
     # whole cycle as its own outer `with` instead.
     with maybe_span("sync.cycle"):
-        async with httpx.AsyncClient() as client:
+        # The response hook records the hub's build from whatever it answers
+        # (issue #209) -- no dedicated request, and it covers push/pull, which
+        # is nearly all of this cycle's traffic.
+        async with httpx.AsyncClient(
+            event_hooks={"response": [_capture_hub_version]}
+        ) as client:
 
             # --- Hub sync ---
             if HUB_URL:
