@@ -11,6 +11,34 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # HUB_VERSION is a hand-maintained literal (the hub's image holds main.py and
+  # nothing else, so there is nothing to derive one from at runtime). A stale
+  # value is worse than none — /health, setup.sh's rollover check and
+  # remind_me_sync_reconcile all report it as the deployed build. Opt out of a
+  # bump with the `no-hub-version-bump` label or `[skip hub-version]` in the
+  # PR body when a change genuinely alters nothing observable.
+  hub-version:
+    name: HUB_VERSION bump
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The default shallow clone has no merge base to diff against.
+          fetch-depth: 0
+
+      - name: Require a HUB_VERSION bump when hub/main.py changes
+        # The PR body and labels are attacker-controlled on a fork PR, so they
+        # are passed as env vars — interpolating them into `run:` would be a
+        # shell injection.
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          python3 .github/scripts/check_hub_version.py \
+            --base "${{ github.event.pull_request.base.sha }}" \
+            --head "${{ github.event.pull_request.head.sha }}"
+
   ci:
     name: Python ${{ matrix.python-version }} (${{ matrix.extras }})
     runs-on: ubuntu-latest

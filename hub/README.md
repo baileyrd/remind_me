@@ -159,10 +159,10 @@ answers your question — they are not interchangeable.
 
 ```bash
 curl -s http://127.0.0.1:8765/health
-# {"status":"ok","role":"hub","version":"1.0.0","db":"ok","time":"..."}
+# {"status":"ok","role":"hub","version":"1.1.0","db":"ok","time":"..."}
 
 curl -s -H "Authorization: Bearer $SYNC_SECRET" http://127.0.0.1:8765/count
-# {"role":"hub","version":"1.0.0",
+# {"role":"hub","version":"1.1.0",
 #  "memories":{"total":812,"live":790,"tombstones":22},
 #  "entities":143,"memory_entities":901,"entity_relations":37,"time":"..."}
 
@@ -295,7 +295,7 @@ systemctl --user daemon-reload
 systemctl --user start remind-me-postgres.service
 systemctl --user start remind-me-hub.service
 curl -s http://127.0.0.1:8765/health
-# {"status":"ok","role":"hub","version":"1.0.0","db":"ok","time":"..."}
+# {"status":"ok","role":"hub","version":"1.1.0","db":"ok","time":"..."}
 ```
 
 The hub creates (or migrates) the database schema itself at startup, and

@@ -167,6 +167,75 @@ def test_interactive_docs_routes_are_disabled() -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# The CI bump guard (.github/scripts/check_hub_version.py)
+# ---------------------------------------------------------------------------
+
+
+def _guard():
+    """Import the CI script, which lives outside the package."""
+    import importlib.util
+
+    path = HUB_MAIN.parent.parent / ".github" / "scripts" / "check_hub_version.py"
+    spec = importlib.util.spec_from_file_location("check_hub_version", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_OLD = 'HUB_VERSION = "1.0.0"\nx = 1\n'
+_EDITED = 'HUB_VERSION = "1.0.0"\nx = 2\n'
+_BUMPED = 'HUB_VERSION = "1.1.0"\nx = 2\n'
+
+
+def test_guard_passes_when_the_hub_is_untouched() -> None:
+    ok, _ = _guard().decide(_OLD, _OLD, skip=False)
+    assert ok
+
+
+def test_guard_passes_when_the_version_was_bumped() -> None:
+    ok, message = _guard().decide(_OLD, _BUMPED, skip=False)
+    assert ok
+    assert "1.0.0 -> 1.1.0" in message
+
+
+def test_guard_fails_on_an_edit_without_a_bump() -> None:
+    """The whole point: a changed hub with an unchanged version is the bug."""
+    ok, message = _guard().decide(_OLD, _EDITED, skip=False)
+    assert not ok
+    assert "still 1.0.0" in message
+
+
+def test_guard_honours_the_opt_out() -> None:
+    """Comment-only edits must not be forced to churn the version."""
+    ok, message = _guard().decide(_OLD, _EDITED, skip=True)
+    assert ok
+    assert "opted out" in message
+
+
+def test_guard_fails_if_the_constant_disappears() -> None:
+    ok, message = _guard().decide(_OLD, "x = 2\n", skip=False)
+    assert not ok
+    assert "HUB_VERSION" in message
+
+
+def test_guard_ignores_the_constant_name_in_prose() -> None:
+    """`HUB_VERSION` appears throughout the file's own docstrings.
+
+    Only the column-0 assignment counts, or a docstring mentioning the name
+    would be read as the declaration.
+    """
+    guard = _guard()
+    assert guard.extract_version('"""See HUB_VERSION = "9.9.9" above."""\n') is None
+    assert guard.extract_version(_OLD) == "1.0.0"
+
+
+def test_guard_reads_the_real_hub_version() -> None:
+    """The regex must match the file as actually written, not a fixture of it."""
+    assert _guard().extract_version(_source()) == _hub_version()
+
+
 def test_public_version_carries_no_build_detail() -> None:
     """The unauthenticated version stays a bare string.
 

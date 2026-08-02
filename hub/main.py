@@ -55,7 +55,7 @@ from psycopg.types.json import Jsonb
 log = logging.getLogger("remind_me_hub")
 logging.basicConfig(level=logging.INFO)
 
-HUB_VERSION = "1.0.0"
+HUB_VERSION = "1.1.0"
 """Version of the hub server, reported by /health, /count and /stats.
 
 Versioned independently of the ``remind-me-mcp`` package rather than tracking
