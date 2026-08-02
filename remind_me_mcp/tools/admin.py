@@ -613,6 +613,11 @@ async def remind_me_server_status() -> str:
     status = _pkg.get_server_status()
     lines = ["## Remind Me Server Status\n"]
 
+    # First line, deliberately: a stale install after a failed self-update
+    # explains more odd behaviour than anything else in this report, and it
+    # is the one fact a session otherwise has no way to observe.
+    lines.append(f"**Version:** {status['version']}")
+
     if status["ui_server"] == "running":
         lines.append(f"**Dashboard UI:** ✓ Running at {status['ui_url']}")
         lines.append(f"**UI PID:** {status['ui_pid']}")

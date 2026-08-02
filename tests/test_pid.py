@@ -23,6 +23,7 @@ from remind_me_mcp.pid import (
     _write_pid_file,
     get_server_status,
 )
+from remind_me_mcp.version import __version__
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -210,6 +211,7 @@ def test_get_server_status_running(pid_file: Path, monkeypatch: pytest.MonkeyPat
     assert status["ui_url"] == "http://127.0.0.1:5199"
     assert status["ui_pid"] == os.getpid()
     assert status["ui_started"]
+    assert status["version"] == __version__
     assert isinstance(status["db_path"], str)
     assert isinstance(status["db_exists"], bool)
 
@@ -219,6 +221,9 @@ def test_get_server_status_stopped_when_no_pid_file(pid_file: Path) -> None:
     status = get_server_status()
     assert status["ui_server"] == "stopped"
     assert status["ui_url"] is None
+    # Reported in both branches: "which build is this?" is asked most often
+    # right after an update, when the dashboard may well be down.
+    assert status["version"] == __version__
     assert isinstance(status["db_path"], str)
     assert isinstance(status["db_exists"], bool)
 

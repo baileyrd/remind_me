@@ -179,6 +179,7 @@ def test_status_running(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureF
             "ui_url": "http://127.0.0.1:5199",
             "ui_pid": 4242,
             "ui_started": "2026-01-01T00:00:00Z",
+            "version": "9.9.9",
             "db_path": "/tmp/memory.db",
             "db_exists": True,
         },
@@ -189,6 +190,7 @@ def test_status_running(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureF
     assert code == 0
     assert "Dashboard running at http://127.0.0.1:5199 (PID 4242)" in out
     assert "Database: /tmp/memory.db (exists)" in out
+    assert "remind-me-mcp 9.9.9" in out
 
 
 def test_status_stopped(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
@@ -196,7 +198,13 @@ def test_status_stopped(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureF
     monkeypatch.setattr(
         main_mod,
         "get_server_status",
-        lambda: {"ui_server": "stopped", "ui_url": None, "db_path": "/tmp/memory.db", "db_exists": False},
+        lambda: {
+            "ui_server": "stopped",
+            "ui_url": None,
+            "version": "9.9.9",
+            "db_path": "/tmp/memory.db",
+            "db_exists": False,
+        },
     )
 
     code = _run_main_expect_exit(monkeypatch, "--status")
@@ -204,6 +212,9 @@ def test_status_stopped(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureF
     assert code == 0
     assert "Dashboard not running" in out
     assert "Database: /tmp/memory.db (missing)" in out
+    # Reported even with the dashboard down — "did my update land?" is asked
+    # exactly when things aren't running.
+    assert "remind-me-mcp 9.9.9" in out
 
 
 # ---------------------------------------------------------------------------
