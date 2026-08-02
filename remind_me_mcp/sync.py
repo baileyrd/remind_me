@@ -1063,6 +1063,16 @@ def _compact_tombstones(db: sqlite3.Connection) -> int:
 # remote so a recovered remote stops reporting a stale error.
 _last_errors: dict[str, dict[str, str]] = {}
 
+# Per-remote build identity, keyed the same way as _last_errors. Populated
+# from the /health response _probe_peer already fetches every cycle (issue
+# #208) -- no extra request. Deliberately in-memory alongside the errors
+# above rather than persisted: a version observed before the last restart is
+# a guess about a machine this process hasn't spoken to since, and reporting
+# a guess as a fact is the failure mode this whole feature exists to avoid.
+# Each entry carries the observation time so a peer that has since gone
+# unreachable is read as "last seen running X", not "is running X".
+_peer_versions: dict[str, dict[str, str]] = {}
+
 # Minimum gap between drain-rate baseline updates. Without this, two status
 # calls seconds apart would overwrite the baseline with a near-zero elapsed
 # time and report a meaningless rate. Below this threshold the older baseline
@@ -1278,6 +1288,11 @@ def get_sync_status() -> dict[str, Any]:
             "ever_contacted": row["last_attempt_at"] != _EPOCH,
             "pending": _pending_to_remote(db, row["remote_id"])[0],
             "last_error": _last_errors.get(row["remote_id"]),
+            # Build last observed on that peer, with the time it was seen
+            # (issue #208). Absent for the hub -- its version comes from
+            # reconcile's /stats call, not from peer discovery -- and for
+            # peers that predate version reporting.
+            "version": _peer_versions.get(row["remote_id"]),
         }
         # Graph-table cursors are stored as synthetic "{remote_id}#{suffix}"
         # rows in this same table (_pull_graph_table) so they don't collide
@@ -1301,6 +1316,7 @@ def get_sync_status() -> dict[str, Any]:
                     "ever_contacted": False,
                     "pending": _pending_to_remote(db, remote_id)[0],
                     "last_error": err,
+                    "version": _peer_versions.get(remote_id),
                 }
             )
 
@@ -1865,14 +1881,40 @@ async def _discover_peers() -> list[dict[str, str]]:
 
 
 async def _probe_peer(client: httpx.AsyncClient, peer: dict) -> bool:
-    """Check if a peer is running remind_me by hitting its /health endpoint."""
+    """Check if a peer is running remind_me by hitting its /health endpoint.
+
+    Also records the peer's reported build in ``_peer_versions`` (issue
+    #208). This request already happened every cycle and its body was
+    discarded; the body now carries ``version``, which is the single most
+    useful fact when two nodes disagree, so throwing it away meant either
+    living without it or making a second request for something already on
+    the wire.
+
+    A peer predating version reporting simply has no field, and nothing is
+    recorded for it -- absent reads as "unknown", which is honest, whereas a
+    placeholder would not be. Parsing failures are non-fatal for the same
+    reason the probe itself is: this function's contract is reachability,
+    and a peer that answers 200 is reachable whatever its body looks like.
+    """
     try:
         resp = await client.get(
             f"{peer['url']}/health",
             headers=HEADERS,
             timeout=3,
         )
-        return resp.status_code == 200
+        if resp.status_code != 200:
+            return False
+        try:
+            body = resp.json()
+            version = body.get("version") if isinstance(body, dict) else None
+            if version:
+                _peer_versions[peer["node_id"]] = {
+                    "version": str(version),
+                    "at": _now_iso(),
+                }
+        except Exception as e:  # noqa: BLE001 — reachability is the contract
+            log.debug("Peer %s /health body unparsable: %s", peer["node_id"], e)
+        return True
     except Exception:
         return False
 

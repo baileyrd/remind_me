@@ -12,10 +12,13 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import pytest
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 import remind_me_mcp.db as _db_mod
 import remind_me_mcp.sync as sync
@@ -1301,6 +1304,68 @@ async def test_probe_peer_unreachable() -> None:
     assert ok is False
 
 
+@pytest.fixture()
+def clean_peer_versions() -> Iterator[None]:
+    """Isolate the module-level peer-version map between tests."""
+    sync._peer_versions.clear()
+    yield
+    sync._peer_versions.clear()
+
+
+async def test_probe_peer_records_the_version_it_already_fetched(
+    clean_peer_versions: None,
+) -> None:
+    """Issue #208: the probe's body was being discarded.
+
+    This request happens every cycle regardless, so recording the build costs
+    nothing — the alternative was a second request for something already on
+    the wire.
+    """
+    recorder = RequestRecorder(
+        {"/health": {"status": "ok", "role": "peer", "version": "1.52.0"}}
+    )
+    async with mock_client(recorder) as client:
+        ok = await sync._probe_peer(client, {"node_id": "p", "url": "http://peer"})
+
+    assert ok is True
+    assert sync._peer_versions["p"]["version"] == "1.52.0"
+    # Timestamped, so a peer that later goes unreachable reads as "last seen
+    # running X" rather than "is running X".
+    assert sync._peer_versions["p"]["at"]
+    assert len(recorder.requests) == 1, "must not make a second request for the version"
+
+
+async def test_probe_peer_records_nothing_for_an_older_peer(
+    clean_peer_versions: None,
+) -> None:
+    """A peer predating version reporting stays unknown, not placeholdered.
+
+    Absent reads as "unknown", which is honest; a stand-in value would be a
+    guess reported as a fact — the exact failure this feature exists to stop.
+    """
+    recorder = RequestRecorder({"/health": {"status": "ok", "node_id": "p"}})
+    async with mock_client(recorder) as client:
+        ok = await sync._probe_peer(client, {"node_id": "p", "url": "http://peer"})
+
+    assert ok is True
+    assert "p" not in sync._peer_versions
+
+
+async def test_probe_peer_survives_a_junk_health_body(
+    clean_peer_versions: None,
+) -> None:
+    """Reachability is this function's contract, not response shape."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"not json at all")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        ok = await sync._probe_peer(client, {"node_id": "p", "url": "http://peer"})
+
+    assert ok is True
+    assert "p" not in sync._peer_versions
+
+
 # ---------------------------------------------------------------------------
 # Sync cycle
 # ---------------------------------------------------------------------------
@@ -2241,6 +2306,9 @@ def test_sync_status_reports_outbox_depth_and_trigger_gate(
     # only half the answer without knowing which build it is running.
     assert status["version"] == __version__
     assert status["outbox"]["pending"] == 2
+    # Every remote entry carries the key, present-or-None, so a caller can
+    # index it without branching on which remotes have been probed.
+    assert all("version" in r for r in status["remotes"])
     # The triggers are gated on this flag; a mismatch means writes silently
     # aren't queued, so it's reported rather than assumed.
     assert status["outbox_trigger_gate"] == "1"
