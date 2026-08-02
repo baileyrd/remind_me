@@ -1262,6 +1262,8 @@ Each node runs a small HTTP server (default port 8766, bind via `REMIND_ME_PEER_
 | `GET` | `/sync/pull_entities?since=&since_id=&limit=` | Pull entity records (404 on pre-entity-graph peers is treated as "no entity support") |
 | `GET` | `/sync/pull_links?since=&since_id=&limit=` | Pull memory-entity link records |
 
+The sync hub (`hub/`) implements the same wire protocol against Postgres, plus a few hub-only extensions not present here (an opt-in `since_seq` cursor immune to late-push-from-an-offline-node ordering bugs, a `full=1` re-seed mode, request timeouts, a push size cap, and a tombstone-purge endpoint) — see [`hub/README.md`](hub/README.md#protocol) for the details.
+
 ### File-Based Sync (alternative)
 
 If you prefer not to run a hub, the memory database lives in a single directory (default: `~/.remind-me/`) and can be synced with file-based tools:
@@ -1292,9 +1294,40 @@ Set `REMIND_ME_MCP_DIR` to any path:
 export REMIND_ME_MCP_DIR="/mnt/synced-drive/remind-me"
 ```
 
-## Remote Access via HTTP Transport
+## HTTP Transport (Local or Remote)
 
-The `--serve-mcp` flag runs the MCP server over Streamable HTTP transport, making it accessible remotely without spawning a subprocess.
+The `--serve-mcp` flag runs the MCP server over Streamable HTTP transport instead of stdio: one long-lived process that any number of clients point at over `/mcp`, rather than each client spawning (and each session re-spawning) its own subprocess.
+
+### Local Use: One Shared Server for Multiple Agents
+
+The default config in [step 2](#2-configure-for-claude-code) (`"command": "remind-me-mcp"`) spawns a fresh stdio subprocess *per agent, per session*. Fine for one agent at a time, but if you routinely run several Claude Code sessions, IDE windows, or other local MCP clients against the same memory store concurrently, each subprocess independently loads its own copy of the embedding model, opens its own SQLite connection, and runs its own copy of every background loop (watcher, sync, self-update check) — redundant work, and more opportunities to contend on the same WAL-mode database file.
+
+Running one `--serve-mcp` process instead and pointing every local client at it over HTTP avoids all of that: one embedding model in memory, one set of background loops, one place logs land.
+
+1. Start the server once, bound to localhost (the default — no `--mcp-host` needed for same-machine use):
+   ```bash
+   remind-me-mcp --serve-mcp
+   ```
+   It refuses to start a second time while one is already running (`MCP_PID_FILE` liveness check). A wrapper script that checks whether the port is already listening before launching avoids paying for a doomed process spawn on top of that check; keep any such script — and the secrets in its environment — out of version control. Run it under whatever this OS's normal "keep a background process alive and restart it on crash" mechanism is — a systemd user service on Linux (same shape as the [example under Remote Access](#remote-access)), a Scheduled Task on Windows, `launchd` on macOS.
+
+2. Point every local agent's MCP config at the HTTP endpoint instead of a spawned command:
+   ```json
+   {
+     "mcpServers": {
+       "remind-me": {
+         "type": "http",
+         "url": "http://127.0.0.1:8767/mcp"
+       }
+     }
+   }
+   ```
+   No `Authorization` header needed here — standalone `--serve-mcp` bound to its default `127.0.0.1` stays unauthenticated by design (see `REMIND_ME_MCP_HTTP_SECRET` in the [environment variables](#environment-variables) table), since anything that can reach localhost on this machine could reach the memory store directly anyway.
+
+3. Every agent now shares the same live memory: something one agent stores or edits is immediately visible to the others' next `remind_me_search`/`remind_me_list` call — there's no per-session cache to go stale.
+
+### Remote Access
+
+Point a client on a *different* machine at the same transport over Tailscale or an SSH tunnel — same `--serve-mcp` server, no separate mode.
 
 Claude Code config (remote machine via Tailscale):
 ```json

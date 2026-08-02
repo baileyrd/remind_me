@@ -105,6 +105,76 @@ hub is pull-only (peers push to each other; nobody pushes hub state to you):
   reach nodes whose pull cursor already passed that entity. Union-merge is
   idempotent, so the bump converges instead of churning.
 
+### Pull cursor: `hub_seq` vs. client-authored `updated_at`
+
+`/sync/pull` supports three cursor modes, checked in this order:
+
+1. **`since_seq`** (opt-in) — a keyset cursor on `hub_seq`, a hub-assigned
+   `BIGINT` bumped on every insert *and* every accepted update, independent
+   of the pushed record's own `updated_at`. This is the fix for a real
+   failure mode: a node offline for two weeks pushes records still stamped
+   with two-week-old timestamps — *behind* every other node's already-advanced
+   `updated_at` cursor — and a `updated_at`-ordered pull never surfaces them
+   again. `updated_at` still drives LWW conflict resolution; `hub_seq` only
+   changes what the *pull cursor* orders on, so the two concerns don't get
+   conflated the way they used to be.
+2. **`since_id` set, no `since_seq`** — legacy `(updated_at, id)` keyset
+   cursor.
+3. **neither set** — legacy strict `updated_at > since` comparison.
+
+This is purely additive: a client that never sends `since_seq` gets exactly
+the old behavior (and the old bug), so existing deployments and the peer
+protocol (SQLite peers have no `hub_seq` concept) are unaffected. Every pull
+response includes `hub_seq` per record regardless of which mode served the
+request — an old client simply ignores the field it doesn't recognize.
+
+**Known gap:** `remind_me_mcp/sync.py` (the client) does not send
+`since_seq` yet — the hub-side fix landed first, deliberately, since it
+could be written and statically checked without a live Postgres to test
+against, while updating the live production sync path needs its own
+careful review. Track this at the client end before assuming the
+late-push problem is fully closed.
+
+### Full re-seed (`full=1`)
+
+`/sync/pull` and `/sync/pull_entities` accept `full=true`, which drops the
+`exclude_node` filter entirely regardless of whether `exclude_node` was also
+passed. Without it, a node that loses its local database and gets
+re-provisioned with the *same* `node_id` can only ever pull records some
+*other* node touched — everything it originally authored and pushed stays on
+the hub, permanently excluded by its own `exclude_node`. Point a client with
+an empty local `memories` table at `full=1` to recover its full history back
+from the hub.
+
+### Hardening
+
+- **Auth comparison is byte-safe.** `_require_auth` compares UTF-8-encoded
+  bytes, not `str` — `hmac.compare_digest` raises `TypeError` on a non-ASCII
+  `str`, which a crafted `Authorization` header could trigger to get an
+  unhandled 500 (and a log-spam vector) instead of a clean 401.
+- **`/health` never echoes the raw exception.** A Postgres connection
+  failure logs the full exception server-side but returns a fixed
+  `"unreachable"` string publicly — `OperationalError` text routinely embeds
+  host, resolved IP, port, database name, and username, and `/health` is
+  deliberately unauthenticated.
+- **Connect/statement timeouts.** Every request opens its own connection
+  with `connect_timeout=5` and a `statement_timeout` (`REMIND_ME_HUB_STATEMENT_TIMEOUT_MS`,
+  default 15000ms), so a Postgres host that *hangs* rather than cleanly
+  refusing can't block requests for the OS TCP timeout (minutes) and exhaust
+  the request threadpool — including `/health`, which is meant to survive
+  exactly this.
+- **`/sync/push` rejects oversized batches.** Batches over `MAX_PUSH_BATCH`
+  (1000 records) get a `413` instead of being fully materialized into memory
+  — protection against a client bug that keeps retrying a growing backlog,
+  not just malice.
+- **`POST /admin/compact_tombstones`** (bearer-authenticated) hard-deletes
+  memories tombstoned longer than `REMIND_ME_HUB_TOMBSTONE_RETENTION_DAYS`
+  (default 90) ago, mirroring the client-side `sync._compact_tombstones`.
+  Purely time-based, same tradeoff as the client: no per-node cursor
+  acknowledgment tracking, so a node offline longer than the retention
+  window can miss a delete. Operator-triggered (e.g. cron), not automatic —
+  the hub has no existing periodic-task loop to hang this off of.
+
 ## Files
 
 | File | Purpose |
