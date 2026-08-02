@@ -996,6 +996,7 @@ async def test_server_status_no_ui(
             "ui_url": None,
             "ui_pid": None,
             "ui_started": None,
+            "version": "9.9.9",
             "db_path": "/tmp/test/memory.db",
             "db_exists": True,
         },
@@ -1004,6 +1005,9 @@ async def test_server_status_no_ui(
     result = await remind_me_server_status()
 
     assert "Not running" in result
+    # A stale install after a failed self-update explains more odd behaviour
+    # than anything else here, and a session can't otherwise observe it.
+    assert "**Version:** 9.9.9" in result
 
 
 async def test_server_status_otel_disabled_by_default(

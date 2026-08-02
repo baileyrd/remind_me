@@ -81,6 +81,7 @@ from remind_me_mcp.config import (
 from remind_me_mcp.db import _delete_chunks, _embed_and_store_rows, _get_db, _now_iso
 from remind_me_mcp.maintenance import _due
 from remind_me_mcp.telemetry import maybe_span
+from remind_me_mcp.version import __version__
 
 log = logging.getLogger("remind_me_mcp.sync")
 
@@ -1062,6 +1063,51 @@ def _compact_tombstones(db: sqlite3.Connection) -> int:
 # remote so a recovered remote stops reporting a stale error.
 _last_errors: dict[str, dict[str, str]] = {}
 
+# Per-remote build identity, keyed the same way as _last_errors ("hub" or a
+# peer's node_id). Two feeds, both piggybacking on requests that already
+# happen: peers via the /health body _probe_peer fetches every cycle (issue
+# #208), the hub via the X-Hub-Version header it stamps on every response
+# (issue #209). Neither costs a request.
+#
+# Deliberately in-memory alongside the errors above rather than persisted: a
+# version observed before the last restart is a guess about a machine this
+# process hasn't spoken to since, and reporting a guess as a fact is the
+# failure mode this whole feature exists to avoid. Each entry carries the
+# observation time, so a remote that has since gone unreachable reads as
+# "last seen running X", not "is running X".
+_remote_versions: dict[str, dict[str, str]] = {}
+
+
+def _record_version(remote_id: str, version: str | None) -> None:
+    """Remember a remote's reported build, ignoring an absent one.
+
+    Absent means "this remote predates version reporting", which must stay
+    distinguishable from a version we have actually seen -- so nothing is
+    written rather than a placeholder.
+    """
+    if version:
+        _remote_versions[remote_id] = {"version": str(version), "at": _now_iso()}
+
+
+HUB_VERSION_HEADER = "X-Hub-Version"
+
+
+async def _capture_hub_version(response: httpx.Response) -> None:
+    """httpx response hook recording the hub's build from any response.
+
+    Registered once on the sync cycle's client rather than at each call site,
+    which is the whole point of the hub sending this as a header: push and
+    pull already talk to the hub constantly, so the build is observable
+    without the dedicated /health or /stats call `reconcile_with_hub` needs.
+
+    Keyed off the header's presence, not the URL, so a peer (which doesn't
+    send it) is simply never recorded here -- its version comes from
+    _probe_peer instead.
+    """
+    version = response.headers.get(HUB_VERSION_HEADER)
+    if version and HUB_URL and str(response.request.url).startswith(HUB_URL):
+        _record_version("hub", version)
+
 # Minimum gap between drain-rate baseline updates. Without this, two status
 # calls seconds apart would overwrite the baseline with a near-zero elapsed
 # time and report a meaningless rate. Below this threshold the older baseline
@@ -1237,6 +1283,7 @@ def get_sync_status() -> dict[str, Any]:
         return {
             "enabled": False,
             "node_id": NODE_ID or None,
+            "version": __version__,
             "hub_url": HUB_URL or None,
             "hint": (
                 "set " + ", ".join(missing) + " to enable sync; the outbox "
@@ -1276,6 +1323,11 @@ def get_sync_status() -> dict[str, Any]:
             "ever_contacted": row["last_attempt_at"] != _EPOCH,
             "pending": _pending_to_remote(db, row["remote_id"])[0],
             "last_error": _last_errors.get(row["remote_id"]),
+            # Build last observed on that peer, with the time it was seen
+            # (issue #208). Absent for the hub -- its version comes from
+            # reconcile's /stats call, not from peer discovery -- and for
+            # peers that predate version reporting.
+            "version": _remote_versions.get(row["remote_id"]),
         }
         # Graph-table cursors are stored as synthetic "{remote_id}#{suffix}"
         # rows in this same table (_pull_graph_table) so they don't collide
@@ -1299,12 +1351,21 @@ def get_sync_status() -> dict[str, Any]:
                     "ever_contacted": False,
                     "pending": _pending_to_remote(db, remote_id)[0],
                     "last_error": err,
+                    "version": _remote_versions.get(remote_id),
                 }
             )
 
     return {
         "enabled": True,
         "node_id": NODE_ID,
+        # This node's build. Sync bugs are usually version-skew bugs across a
+        # fleet, and this is the report an operator already runs per node.
+        "version": __version__,
+        # The hub's, as last seen on its X-Hub-Version header (issue #209).
+        # None until this process has completed a hub request -- unlike
+        # reconcile, this report makes no network call of its own, so it can
+        # only tell you what the cycle already observed.
+        "hub_version": _remote_versions.get("hub"),
         "hub_url": HUB_URL,
         "sync_interval_seconds": SYNC_INTERVAL,
         # The triggers are gated on this flag (SY-07); if it ever disagrees
@@ -1518,7 +1579,214 @@ def _notify_sync_fault(hub_url: str, hints: list[str]) -> None:
         log.warning("Sync fault notification failed: %s", e)
 
 
-async def reconcile_with_hub(client: httpx.AsyncClient | None = None) -> dict[str, Any]:
+def _cmp_counts(hub_value: Any, local_value: int) -> dict[str, Any]:
+    """One hub-vs-local comparison entry.
+
+    Module-level so the quick path and the full path can't describe the same
+    comparison differently -- a caller diffing the two outputs would have no
+    way to tell a shape difference from a real one.
+    """
+    hub_n = hub_value if isinstance(hub_value, int) else 0
+    return {"hub": hub_n, "local": local_value, "delta": hub_n - local_value}
+
+
+async def _hub_totals_agree(
+    client: httpx.AsyncClient, local: dict[str, Any]
+) -> bool | None:
+    """Ask the hub's /count whether every total matches *local* (issue #215).
+
+    Returns True/False, or None when the hub has no /count (predating it) or
+    the request failed -- both meaning "no answer", which the caller must
+    treat as "go and do the full comparison", never as agreement.
+
+    Measured on a 200k-row hub: /count ~41ms against /stats ~128ms, so
+    skipping /stats is worth roughly 3x on the common no-drift path.
+    """
+    try:
+        resp = await client.get(f"{HUB_URL}/count", headers=HEADERS, timeout=15)
+        if resp.status_code != 200:
+            return None
+        hub = resp.json()
+    except Exception as e:  # noqa: BLE001 — a status call must never raise
+        log.debug("Hub /count pre-check unavailable: %s", e)
+        return None
+
+    memories = hub.get("memories")
+    if not isinstance(memories, dict) or hub.get("approximate"):
+        # An estimate can't settle an equality question. Nothing asks for
+        # approx here, so this only fires against something unexpected --
+        # in which case the full comparison is the right fallback.
+        return None
+    return (
+        memories.get("total") == local["total"]
+        and memories.get("tombstones") == local["tombstones"]
+        and hub.get("entities") == local["entities"]
+        and hub.get("memory_entities") == local["memory_entities"]
+        and hub.get("entity_relations") == local["entity_relations"]
+    )
+
+
+async def reconcile_with_peer(
+    node_id: str, client: httpx.AsyncClient | None = None
+) -> dict[str, Any]:
+    """Diff this node's record counts against one peer's (issue #216).
+
+    Peer sync carries the same records the hub does, but until now only the
+    hub could be reconciled against -- so "did my records actually reach that
+    machine?" had no answer short of shell access to it. This closes that
+    asymmetry using the peer's new ``GET /count``.
+
+    Totals only, deliberately, and not the same compromise ``quick`` makes on
+    the hub path: a peer has no ``/stats`` to fall back to, so a per-category
+    breakdown isn't a cheaper-or-fuller choice, it simply does not exist on
+    that side. The result says ``checked: "totals"`` for exactly that reason,
+    and the same caveat applies -- an offsetting recategorization is
+    invisible to any totals comparison.
+
+    The verdict logic is :func:`_verdict`, unchanged and shared with the hub
+    path: "local > remote means pushes aren't landing" is the same judgment
+    regardless of which remote is on the other end, and a second copy of it
+    would be a second place for the two to disagree.
+
+    Args:
+        node_id: The peer to reconcile against, as it appears in
+            ``remind_me_sync_status``'s ``remotes``.
+        client: Optional httpx client, for tests.
+
+    Returns:
+        A JSON-serializable dict, shaped like :func:`reconcile_with_hub`'s
+        with ``peer``/``peer_version`` in place of the hub fields. ``status``
+        is ``ok`` when the peer answered; otherwise ``disabled`` /
+        ``unknown-peer`` / ``unsupported`` / ``unauthorized`` /
+        ``unreachable`` / ``error`` with a hint, and no verdict.
+    """
+    if not SYNC_ENABLED:
+        return {
+            "status": "disabled",
+            "hint": "sync is not configured — see remind_me_sync_status",
+        }
+
+    peers = {p["node_id"]: p["url"] for p in await _discover_peers()}
+    if node_id not in peers:
+        return {
+            "status": "unknown-peer",
+            "peer": node_id,
+            # Naming the peers we *can* see turns "wrong name" and "peer is
+            # offline" into distinguishable situations rather than one
+            # unhelpful error.
+            "hint": (
+                "no such peer is currently discoverable; visible peers: "
+                + (", ".join(sorted(peers)) or "(none)")
+            ),
+        }
+    url = peers[node_id]
+
+    owns_client = client is None
+    client = client or httpx.AsyncClient()
+    try:
+        resp = await client.get(f"{url}/count", headers=HEADERS, timeout=15)
+        if resp.status_code == 404:
+            return {
+                "status": "unsupported",
+                "peer": node_id,
+                "hint": (
+                    "this peer has no GET /count endpoint — upgrade it to "
+                    "reconcile against it"
+                ),
+            }
+        if resp.status_code in (401, 403):
+            return {
+                "status": "unauthorized",
+                "peer": node_id,
+                "hint": "the peer rejected our bearer token — SYNC_SECRET mismatch",
+            }
+        resp.raise_for_status()
+        remote = resp.json()
+    except httpx.ConnectError as e:
+        return {"status": "unreachable", "peer": node_id, "hint": str(e)}
+    except Exception as e:  # noqa: BLE001 — a status call must never raise
+        return {"status": "error", "peer": node_id, "hint": f"{type(e).__name__}: {e}"}
+    finally:
+        if owns_client:
+            await client.aclose()
+
+    db = _get_db()
+    local = _local_counts(db)
+    remote_memories = remote.get("memories") or {}
+
+    # One synthetic "category" row per record type, which is the shape
+    # _verdict reads. The same trick _graph_verdict already uses for the
+    # entity-graph cursors -- the labels are record types rather than
+    # categories, and the judgment is identical either way.
+    rows = []
+    for label, remote_value, local_value in (
+        ("memories", remote_memories.get("total"), local["total"]),
+        ("tombstones", remote_memories.get("tombstones"), local["tombstones"]),
+        ("entities", remote.get("entities"), local["entities"]),
+        ("memory_entities", remote.get("memory_entities"), local["memory_entities"]),
+        ("entity_relations", remote.get("entity_relations"), local["entity_relations"]),
+    ):
+        remote_n = remote_value if isinstance(remote_value, int) else 0
+        if remote_n != local_value:
+            rows.append(
+                {
+                    "category": label,
+                    "hub": remote_n,
+                    "local": local_value,
+                    "delta": remote_n - local_value,
+                }
+            )
+
+    row = db.execute(
+        "SELECT last_pull_at, last_pull, last_pull_id FROM sync_log WHERE remote_id = ?",
+        (node_id,),
+    ).fetchone()
+    last_pull_at = row["last_pull_at"] if row else None
+    last_pull_age: float | None = None
+    if last_pull_at and last_pull_at != _EPOCH:
+        try:
+            last_pull_age = (
+                datetime.now(UTC) - datetime.fromisoformat(_canon_ts(last_pull_at))
+            ).total_seconds()
+        except (ValueError, TypeError):
+            last_pull_age = None
+
+    watermark = (row["last_pull"], row["last_pull_id"]) if row else None
+    cursor_stalled = bool(rows) and _cursor_progress(db, node_id, watermark)
+    verdict, hints = _verdict(rows, last_pull_age, cursor_stalled)
+
+    return {
+        "status": "ok",
+        "verdict": verdict,
+        "hints": hints,
+        # Totals are all a peer serves -- see the docstring; this is not the
+        # hub path's opt-in shortcut.
+        "checked": "totals",
+        "node_id": NODE_ID,
+        "version": __version__,
+        "peer": node_id,
+        "peer_url": url,
+        "peer_version": remote.get("version"),
+        "last_pull_at": last_pull_at,
+        "last_pull_age_seconds": (
+            round(last_pull_age) if last_pull_age is not None else None
+        ),
+        "outbox_pending": _pending_to_remote(db, node_id)[0],
+        "memories": _cmp_counts(remote_memories.get("total"), local["total"]),
+        "tombstones": _cmp_counts(remote_memories.get("tombstones"), local["tombstones"]),
+        "entities": _cmp_counts(remote.get("entities"), local["entities"]),
+        "memory_entities": _cmp_counts(
+            remote.get("memory_entities"), local["memory_entities"]
+        ),
+        "entity_relations": _cmp_counts(
+            remote.get("entity_relations"), local["entity_relations"]
+        ),
+    }
+
+
+async def reconcile_with_hub(
+    client: httpx.AsyncClient | None = None, quick: bool = False
+) -> dict[str, Any]:
     """Diff this node's record counts against the hub's, with a verdict (SY-14).
 
     Read-only on both sides. Answers "does my data match the hub?" — previously
@@ -1537,11 +1805,28 @@ async def reconcile_with_hub(client: httpx.AsyncClient | None = None) -> dict[st
     Args:
         client: Optional httpx client, for tests. A new one is created when
             omitted.
+        quick: Check the hub's cheap ``/count`` first and skip ``/stats``
+            entirely when every total already agrees (issue #215). Roughly
+            3x cheaper on a 200k-row hub (~41ms vs ~128ms, measured) for a
+            monitor polling the common no-drift case.
+
+            **Off by default, and that is a correctness decision, not
+            caution.** Equal totals do not prove equal contents: a
+            recategorization that synced on one side and not the other moves
+            a record between categories, leaving the total identical while
+            two categories drift in opposite directions. The full comparison
+            sees that; a totals-only check cannot. Since catching drift the
+            ordinary machinery missed is this function's entire job,
+            weakening the default to save 87ms would trade the thing it is
+            for the thing it costs. A caller that has decided totals are
+            enough can say so, and the result says plainly what was checked.
 
     Returns:
         A JSON-serializable dict. ``status`` is ``ok`` when the hub answered;
         otherwise ``disabled`` / ``unreachable`` / ``unsupported`` /
-        ``unauthorized`` / ``error`` with a hint, and no verdict.
+        ``unauthorized`` / ``error`` with a hint, and no verdict. A ``quick``
+        run that took the fast path is marked ``checked: "totals"`` and omits
+        the per-category breakdown it did not fetch.
     """
     if not SYNC_ENABLED:
         return {
@@ -1552,6 +1837,38 @@ async def reconcile_with_hub(client: httpx.AsyncClient | None = None) -> dict[st
     owns_client = client is None
     client = client or httpx.AsyncClient()
     try:
+        if quick:
+            # The pre-check needs local counts either way, and computing them
+            # twice on the slow path would give back what /count saved.
+            local = _local_counts(_get_db())
+            if await _hub_totals_agree(client, local) is True:
+                return {
+                    "status": "ok",
+                    "verdict": "in-sync",
+                    "hints": [],
+                    # Says what it actually verified. A caller comparing this
+                    # against a full run should be able to see why one has a
+                    # category breakdown and the other doesn't, without
+                    # inferring it from a missing key.
+                    "checked": "totals",
+                    "node_id": NODE_ID,
+                    "version": __version__,
+                    "hub_url": HUB_URL,
+                    "memories": _cmp_counts(local["total"], local["total"]),
+                    "tombstones": _cmp_counts(local["tombstones"], local["tombstones"]),
+                    "entities": _cmp_counts(local["entities"], local["entities"]),
+                    "memory_entities": _cmp_counts(
+                        local["memory_entities"], local["memory_entities"]
+                    ),
+                    "entity_relations": _cmp_counts(
+                        local["entity_relations"], local["entity_relations"]
+                    ),
+                    "outbox_pending": _pending_to_remote(_get_db(), "hub")[0],
+                }
+            # False (real drift) or None (no /count, or it failed) both fall
+            # through to the full comparison — only an explicit True may skip
+            # it, so an unanswerable pre-check can never be read as agreement.
+
         resp = await client.get(f"{HUB_URL}/stats", headers=HEADERS, timeout=15)
         if resp.status_code == 404:
             # A hub predating SY-13 has no /stats. Say so plainly rather than
@@ -1627,9 +1944,7 @@ async def reconcile_with_hub(client: httpx.AsyncClient | None = None) -> dict[st
         _notify_sync_fault(HUB_URL, hints)
     pending, _ = _pending_to_remote(db, "hub")
 
-    def _cmp(hub_value: Any, local_value: int) -> dict[str, Any]:
-        hub_n = hub_value if isinstance(hub_value, int) else 0
-        return {"hub": hub_n, "local": local_value, "delta": hub_n - local_value}
+    _cmp = _cmp_counts
 
     def _graph_verdict(
         cursor_id: str, label: str, hub_value: Any, local_value: int
@@ -1683,6 +1998,11 @@ async def reconcile_with_hub(client: httpx.AsyncClient | None = None) -> dict[st
         "verdict": verdict,
         "hints": hints,
         "node_id": NODE_ID,
+        "version": __version__,
+        # Absent on a hub older than the release that added it — reported as
+        # None rather than omitted, so "old hub" is visible in the output
+        # instead of looking like a field this node forgot to fill in.
+        "hub_version": hub.get("version"),
         "hub_url": HUB_URL,
         "last_pull_at": last_pull_at,
         "last_pull_age_seconds": (
@@ -1855,14 +2175,36 @@ async def _discover_peers() -> list[dict[str, str]]:
 
 
 async def _probe_peer(client: httpx.AsyncClient, peer: dict) -> bool:
-    """Check if a peer is running remind_me by hitting its /health endpoint."""
+    """Check if a peer is running remind_me by hitting its /health endpoint.
+
+    Also records the peer's reported build in ``_remote_versions`` (issue
+    #208). This request already happened every cycle and its body was
+    discarded; the body now carries ``version``, which is the single most
+    useful fact when two nodes disagree, so throwing it away meant either
+    living without it or making a second request for something already on
+    the wire.
+
+    A peer predating version reporting simply has no field, and nothing is
+    recorded for it -- absent reads as "unknown", which is honest, whereas a
+    placeholder would not be. Parsing failures are non-fatal for the same
+    reason the probe itself is: this function's contract is reachability,
+    and a peer that answers 200 is reachable whatever its body looks like.
+    """
     try:
         resp = await client.get(
             f"{peer['url']}/health",
             headers=HEADERS,
             timeout=3,
         )
-        return resp.status_code == 200
+        if resp.status_code != 200:
+            return False
+        try:
+            body = resp.json()
+            version = body.get("version") if isinstance(body, dict) else None
+            _record_version(peer["node_id"], version)
+        except Exception as e:  # noqa: BLE001 — reachability is the contract
+            log.debug("Peer %s /health body unparsable: %s", peer["node_id"], e)
+        return True
     except Exception:
         return False
 
@@ -1877,7 +2219,12 @@ async def _sync_once() -> None:
     # `async with` statement with httpx.AsyncClient (async), so it wraps the
     # whole cycle as its own outer `with` instead.
     with maybe_span("sync.cycle"):
-        async with httpx.AsyncClient() as client:
+        # The response hook records the hub's build from whatever it answers
+        # (issue #209) -- no dedicated request, and it covers push/pull, which
+        # is nearly all of this cycle's traffic.
+        async with httpx.AsyncClient(
+            event_hooks={"response": [_capture_hub_version]}
+        ) as client:
 
             # --- Hub sync ---
             if HUB_URL:

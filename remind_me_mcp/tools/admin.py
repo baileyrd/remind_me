@@ -613,6 +613,14 @@ async def remind_me_server_status() -> str:
     status = _pkg.get_server_status()
     lines = ["## Remind Me Server Status\n"]
 
+    # First line, deliberately: a stale install after a failed self-update
+    # explains more odd behaviour than anything else in this report, and it
+    # is the one fact a session otherwise has no way to observe.
+    # .get, not [], on purpose: this is the tool you call when something is
+    # already wrong, so it must not be the thing that raises. Coverage of the
+    # real value lives in tests/test_tools.py.
+    lines.append(f"**Version:** {status.get('version', 'unknown')}")
+
     if status["ui_server"] == "running":
         lines.append(f"**Dashboard UI:** ✓ Running at {status['ui_url']}")
         lines.append(f"**UI PID:** {status['ui_pid']}")
@@ -1227,7 +1235,7 @@ async def remind_me_sync_status() -> str:
         "openWorldHint": True,
     },
 )
-async def remind_me_sync_reconcile() -> str:
+async def remind_me_sync_reconcile(quick: bool = False) -> str:
     """Diff this node's record counts against the hub's and classify the drift (SY-14).
 
     Read-only on both sides — it calls the hub's ``GET /stats`` and compares
@@ -1245,6 +1253,16 @@ async def remind_me_sync_reconcile() -> str:
     - ``fault`` — hub ahead but the last successful pull is stale (or never
       happened), so it isn't lag
 
+    Args:
+        quick: Use the hub's cheap ``GET /count`` and skip ``/stats`` when
+            every total already agrees — about 3x cheaper on a large hub, for
+            a monitor polling the common no-drift case. Off by default
+            because equal totals don't prove equal contents: a
+            recategorization that synced on one side only leaves the total
+            unchanged while two categories drift in opposite directions, and
+            catching exactly that is what this tool is for. A quick run that
+            took the fast path is marked ``checked: "totals"``.
+
     Returns:
         str: JSON — verdict with hints, per-category drift (only categories
         that disagree, plus a count of those that don't), totals, tombstones,
@@ -1255,7 +1273,50 @@ async def remind_me_sync_reconcile() -> str:
     """
     from remind_me_mcp.sync import reconcile_with_hub
 
-    return json.dumps(await reconcile_with_hub(), indent=2)
+    return json.dumps(await reconcile_with_hub(quick=quick), indent=2)
+
+
+@mcp.tool(
+    name="remind_me_sync_reconcile_peer",
+    annotations={
+        "title": "Reconcile Against a Peer",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def remind_me_sync_reconcile_peer(node_id: str) -> str:
+    """Diff this node's record counts against one peer's (issue #216).
+
+    The peer-to-peer counterpart of ``remind_me_sync_reconcile``. Peer sync
+    carries the same records hub sync does, but only the hub could be
+    reconciled against — so "did my records actually reach that machine?" had
+    no answer short of shell access to it.
+
+    Verdicts are the same four (``in-sync`` / ``pull-lag`` / ``node-ahead`` /
+    ``fault``), from the same classifier, since "local > remote means pushes
+    aren't landing" doesn't depend on which remote is on the other end.
+
+    Compares totals only — a peer serves no ``/stats``, so there is no
+    per-category breakdown to fetch — which means an offsetting
+    recategorization (one category up, another down, total unchanged) is
+    invisible here. The result says ``checked: "totals"`` so that limit is
+    visible rather than assumed.
+
+    Args:
+        node_id: The peer to reconcile against, as it appears in
+            ``remind_me_sync_status``'s ``remotes`` list.
+
+    Returns:
+        str: JSON — verdict with hints, per-record-type totals with deltas,
+        outbox depth, last-pull age, and the peer's version. When the peer
+        isn't discoverable, can't be reached, or is too old to have
+        ``/count``, returns a status and hint instead of a verdict.
+    """
+    from remind_me_mcp.sync import reconcile_with_peer
+
+    return json.dumps(await reconcile_with_peer(node_id), indent=2)
 
 
 @mcp.tool(

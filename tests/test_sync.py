@@ -12,14 +12,18 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import pytest
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
 import remind_me_mcp.db as _db_mod
 import remind_me_mcp.sync as sync
 from remind_me_mcp.db import _ensure_schema, _now_iso
+from remind_me_mcp.version import __version__
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -1300,6 +1304,111 @@ async def test_probe_peer_unreachable() -> None:
     assert ok is False
 
 
+@pytest.fixture()
+def clean_remote_versions() -> Iterator[None]:
+    """Isolate the module-level peer-version map between tests."""
+    sync._remote_versions.clear()
+    yield
+    sync._remote_versions.clear()
+
+
+async def test_probe_peer_records_the_version_it_already_fetched(
+    clean_remote_versions: None,
+) -> None:
+    """Issue #208: the probe's body was being discarded.
+
+    This request happens every cycle regardless, so recording the build costs
+    nothing — the alternative was a second request for something already on
+    the wire.
+    """
+    recorder = RequestRecorder(
+        {"/health": {"status": "ok", "role": "peer", "version": "1.52.0"}}
+    )
+    async with mock_client(recorder) as client:
+        ok = await sync._probe_peer(client, {"node_id": "p", "url": "http://peer"})
+
+    assert ok is True
+    assert sync._remote_versions["p"]["version"] == "1.52.0"
+    # Timestamped, so a peer that later goes unreachable reads as "last seen
+    # running X" rather than "is running X".
+    assert sync._remote_versions["p"]["at"]
+    assert len(recorder.requests) == 1, "must not make a second request for the version"
+
+
+async def test_probe_peer_records_nothing_for_an_older_peer(
+    clean_remote_versions: None,
+) -> None:
+    """A peer predating version reporting stays unknown, not placeholdered.
+
+    Absent reads as "unknown", which is honest; a stand-in value would be a
+    guess reported as a fact — the exact failure this feature exists to stop.
+    """
+    recorder = RequestRecorder({"/health": {"status": "ok", "node_id": "p"}})
+    async with mock_client(recorder) as client:
+        ok = await sync._probe_peer(client, {"node_id": "p", "url": "http://peer"})
+
+    assert ok is True
+    assert "p" not in sync._remote_versions
+
+
+async def test_hub_version_captured_from_any_response_header(
+    clean_remote_versions: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #209: ordinary hub traffic carries the build, so no probe is needed.
+
+    The header is the mechanism precisely because push/pull already talk to
+    the hub constantly — before this, the version was only readable from the
+    three routes whose bodies carry it.
+    """
+    monkeypatch.setattr(sync, "HUB_URL", "http://hub.example")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"records": [], "count": 0}, headers={"X-Hub-Version": "1.1.0"}
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        event_hooks={"response": [sync._capture_hub_version]},
+    ) as client:
+        await client.get("http://hub.example/sync/pull")
+
+    assert sync._remote_versions["hub"]["version"] == "1.1.0"
+
+
+async def test_hub_version_capture_ignores_other_hosts(
+    clean_remote_versions: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A peer that happened to send the header must not be filed as the hub."""
+    monkeypatch.setattr(sync, "HUB_URL", "http://hub.example")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={}, headers={"X-Hub-Version": "9.9.9"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        event_hooks={"response": [sync._capture_hub_version]},
+    ) as client:
+        await client.get("http://peer.example/sync/pull")
+
+    assert "hub" not in sync._remote_versions
+
+
+async def test_probe_peer_survives_a_junk_health_body(
+    clean_remote_versions: None,
+) -> None:
+    """Reachability is this function's contract, not response shape."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"not json at all")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        ok = await sync._probe_peer(client, {"node_id": "p", "url": "http://peer"})
+
+    assert ok is True
+    assert "p" not in sync._remote_versions
+
+
 # ---------------------------------------------------------------------------
 # Sync cycle
 # ---------------------------------------------------------------------------
@@ -2198,6 +2307,9 @@ def test_sync_status_disabled_names_the_missing_env_vars(
     status = sync.get_sync_status()
 
     assert status["enabled"] is False
+    # Present even when sync is off: "which build is this?" is asked while
+    # diagnosing why sync never came up, not only once it is running.
+    assert status["version"] == __version__
     assert "REMIND_ME_NODE_ID" in status["hint"]
     assert "REMIND_ME_HUB_URL" in status["hint"]
     assert "REMIND_ME_SYNC_SECRET" in status["hint"]
@@ -2233,7 +2345,13 @@ def test_sync_status_reports_outbox_depth_and_trigger_gate(
 
     assert status["enabled"] is True
     assert status["node_id"] == "test-node"
+    # Reported alongside node_id: identifying a node in a fleet report is
+    # only half the answer without knowing which build it is running.
+    assert status["version"] == __version__
     assert status["outbox"]["pending"] == 2
+    # Every remote entry carries the key, present-or-None, so a caller can
+    # index it without branching on which remotes have been probed.
+    assert all("version" in r for r in status["remotes"])
     # The triggers are gated on this flag; a mismatch means writes silently
     # aren't queued, so it's reported rather than assumed.
     assert status["outbox_trigger_gate"] == "1"
@@ -2449,11 +2567,17 @@ def hub_stats(
     memory_entities: int = 0,
     entity_relations: int = 0,
     by_origin_node: dict[str, int] | None = None,
+    version: str | None = "1.0.0",
 ) -> dict[str, Any]:
-    """Build a hub GET /stats payload in the shape hub/main.py returns."""
+    """Build a hub GET /stats payload in the shape hub/main.py returns.
+
+    ``version=None`` drops the key entirely, standing in for a hub deployed
+    before /stats started reporting one.
+    """
     cats = by_category if by_category is not None else {}
     return {
         "role": "hub",
+        **({"version": version} if version is not None else {}),
         "memories": {
             "total": sum(cats.values()),
             "tombstones": tombstones,
@@ -2703,6 +2827,46 @@ async def test_reconcile_flags_node_ahead_as_the_serious_case(
     assert "not landing" in result["hints"][0]
     # The outbox depth is included because it usually explains the cause.
     assert result["outbox_pending"] == 5
+
+
+@pytest.mark.asyncio
+async def test_reconcile_reports_both_sides_versions(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """Version skew is a standing suspect whenever two sides disagree.
+
+    Reconcile is where the two sides are already being compared, so it is the
+    one place both builds can be read off together instead of curl'd from the
+    hub and matched against a node by hand.
+    """
+    insert_memory(sync_db, "m1")
+    recorder = stats_recorder(hub_stats(by_category={"general": 1}, version="1.2.3"))
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_hub(client)
+
+    assert result["version"] == __version__
+    assert result["hub_version"] == "1.2.3"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_reports_hub_version_as_none_on_an_older_hub(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """A hub that predates version reporting is still reconcilable.
+
+    The field is present-but-None rather than absent so 'old hub' reads as a
+    fact about the hub, not as a field this node failed to populate — and so
+    a caller can index it unconditionally.
+    """
+    insert_memory(sync_db, "m1")
+    recorder = stats_recorder(hub_stats(by_category={"general": 1}, version=None))
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_hub(client)
+
+    assert result["status"] == "ok"
+    assert result["hub_version"] is None
 
 
 @pytest.mark.asyncio
@@ -3039,3 +3203,236 @@ def test_genuine_content_update_still_enqueues_an_outbox_row(
 
     pending = sync_db.execute("SELECT COUNT(*) FROM sync_outbox").fetchone()[0]
     assert pending == 1
+
+
+# ---------------------------------------------------------------------------
+# reconcile quick mode (issue #215)
+# ---------------------------------------------------------------------------
+
+
+def count_and_stats_recorder(
+    count_payload: dict[str, Any] | None, stats_payload: dict[str, Any]
+) -> RequestRecorder:
+    responses: dict[str, Any] = {"/stats": stats_payload}
+    if count_payload is not None:
+        responses["/count"] = count_payload
+    return RequestRecorder(responses)
+
+
+def hub_count(
+    *, total: int, tombstones: int = 0, entities: int = 0,
+    memory_entities: int = 0, entity_relations: int = 0,
+) -> dict[str, Any]:
+    """A hub GET /count payload in the shape hub/main.py returns."""
+    return {
+        "role": "hub",
+        "version": "1.5.0",
+        "approximate": False,
+        "memories": {
+            "total": total,
+            "live": total - tombstones,
+            "tombstones": tombstones,
+        },
+        "entities": entities,
+        "memory_entities": memory_entities,
+        "entity_relations": entity_relations,
+        "time": _now_iso(),
+    }
+
+
+@pytest.mark.asyncio
+async def test_quick_skips_stats_when_totals_agree(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """The point of the fast path: the expensive call never happens."""
+    insert_memory(sync_db, "m1")
+    recorder = count_and_stats_recorder(hub_count(total=1), hub_stats(by_category={"general": 1}))
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_hub(client, quick=True)
+
+    assert result["verdict"] == "in-sync"
+    assert result["checked"] == "totals"
+    paths = [r.url.path for r in recorder.requests]
+    assert "/count" in paths
+    assert "/stats" not in paths, "quick mode must not pay for /stats when totals agree"
+
+
+@pytest.mark.asyncio
+async def test_quick_falls_through_to_stats_on_drift(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """Disagreeing totals need the breakdown, so the full path still runs."""
+    insert_memory(sync_db, "m1")
+    recorder = count_and_stats_recorder(hub_count(total=5), hub_stats(by_category={"general": 5}))
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_hub(client, quick=True)
+
+    assert "checked" not in result, "a fallen-through run is a full run"
+    assert result["memories"]["hub"] == 5
+    assert "/stats" in [r.url.path for r in recorder.requests]
+
+
+@pytest.mark.asyncio
+async def test_quick_falls_through_when_the_hub_has_no_count(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """An unanswerable pre-check must never be read as agreement.
+
+    A hub predating /count 404s it; treating that as "totals agree" would
+    report in-sync against a hub whose contents were never compared.
+    """
+    insert_memory(sync_db, "m1")
+    recorder = count_and_stats_recorder(None, hub_stats(by_category={"general": 1}))
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_hub(client, quick=True)
+
+    assert result["status"] == "ok"
+    assert "checked" not in result
+    assert "/stats" in [r.url.path for r in recorder.requests]
+
+
+@pytest.mark.asyncio
+async def test_quick_ignores_an_approximate_count(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """An estimate can't settle an equality question."""
+    insert_memory(sync_db, "m1")
+    payload = hub_count(total=1)
+    payload["approximate"] = True
+    recorder = count_and_stats_recorder(payload, hub_stats(by_category={"general": 1}))
+
+    async with mock_client(recorder) as client:
+        await sync.reconcile_with_hub(client, quick=True)
+
+    assert "/stats" in [r.url.path for r in recorder.requests]
+
+
+@pytest.mark.asyncio
+async def test_default_is_the_full_comparison(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """Equal totals don't prove equal contents.
+
+    An offsetting recategorization (one category up, another down, total
+    unchanged) is invisible to a totals-only check — and catching drift the
+    ordinary machinery missed is this function's whole job, so the default
+    must not take that shortcut.
+    """
+    insert_memory(sync_db, "m1", category="general")
+    recorder = count_and_stats_recorder(
+        hub_count(total=1), hub_stats(by_category={"fact": 1})
+    )
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_hub(client)
+
+    assert "/count" not in [r.url.path for r in recorder.requests]
+    # Totals match exactly; only the breakdown reveals the drift.
+    assert result["memories"]["delta"] == 0
+    assert {c["category"] for c in result["categories_with_drift"]} == {"fact", "general"}
+
+
+# ---------------------------------------------------------------------------
+# reconcile_with_peer (issue #216)
+# ---------------------------------------------------------------------------
+
+
+def peer_count(
+    *, total: int, tombstones: int = 0, entities: int = 0,
+    memory_entities: int = 0, entity_relations: int = 0, version: str = "1.52.0",
+) -> dict[str, Any]:
+    """A peer GET /count payload, in the shape peer_server.py returns."""
+    return {
+        "role": "peer",
+        "version": version,
+        "node_id": "peer-1",
+        "approximate": False,
+        "memories": {
+            "total": total, "live": total - tombstones, "tombstones": tombstones,
+        },
+        "entities": entities,
+        "memory_entities": memory_entities,
+        "entity_relations": entity_relations,
+        "time": _now_iso(),
+    }
+
+
+@pytest.fixture()
+def one_peer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make exactly one peer discoverable, without touching Tailscale."""
+    async def _peers() -> list[dict[str, str]]:
+        return [{"node_id": "peer-1", "url": "http://peer-1.example"}]
+
+    monkeypatch.setattr(sync, "_discover_peers", _peers)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_peer_reports_in_sync_when_totals_match(
+    sync_db: sqlite3.Connection, status_enabled: None, one_peer: None
+) -> None:
+    """The gap this closes: peer drift previously had no answer at all."""
+    insert_memory(sync_db, "m1")
+    recorder = RequestRecorder({"/count": peer_count(total=1)})
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_peer("peer-1", client)
+
+    assert result["status"] == "ok"
+    assert result["verdict"] == "in-sync"
+    assert result["peer"] == "peer-1"
+    assert result["peer_version"] == "1.52.0"
+    # Says what it compared: a peer serves no /stats, so there is no
+    # per-category breakdown to be had — that limit should be visible.
+    assert result["checked"] == "totals"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_peer_flags_node_ahead(
+    sync_db: sqlite3.Connection, status_enabled: None, one_peer: None
+) -> None:
+    """Local > remote means pushes aren't landing — same judgment as the hub.
+
+    Reusing _verdict is the point: a second copy would be a second place for
+    the two paths to disagree about what drift means.
+    """
+    for i in range(4):
+        insert_memory(sync_db, f"m{i}")
+    recorder = RequestRecorder({"/count": peer_count(total=1)})
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_peer("peer-1", client)
+
+    assert result["verdict"] == "node-ahead"
+    assert result["memories"]["delta"] == -3
+
+
+@pytest.mark.asyncio
+async def test_reconcile_peer_names_visible_peers_when_unknown(
+    sync_db: sqlite3.Connection, status_enabled: None, one_peer: None
+) -> None:
+    """"Wrong name" and "peer is offline" must be distinguishable."""
+    recorder = RequestRecorder()
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_peer("typo-node", client)
+
+    assert result["status"] == "unknown-peer"
+    assert "peer-1" in result["hint"]
+    assert recorder.requests == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_peer_reports_unsupported_on_an_older_peer(
+    sync_db: sqlite3.Connection, status_enabled: None, one_peer: None
+) -> None:
+    """A peer predating /count 404s — an upgrade, not an outage."""
+    recorder = RequestRecorder()  # 404s everything unknown
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_peer("peer-1", client)
+
+    assert result["status"] == "unsupported"
+    assert "verdict" not in result

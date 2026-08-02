@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from remind_me_mcp.config import DB_PATH, PID_FILE
 from remind_me_mcp.db import _now_iso
+from remind_me_mcp.version import __version__
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -152,8 +153,16 @@ def get_server_status() -> dict[str, Any]:
     Combines PID file inspection and an HTTP health check to determine
     whether the server is actually running and responding.
 
+    ``version`` is this process's installed package version. It is reported
+    whether or not the dashboard is running, because the question it answers
+    -- "is this the build I think it is?" -- is asked most often after an
+    update, when the dashboard may well be down. Note it describes the
+    process doing the asking, not the one behind ``ui_url``: those are the
+    same install in every supported layout, and ``GET /health`` is the
+    authority on a genuinely separate server.
+
     Returns:
-        Dict with keys: ui_server ('running' or 'stopped'), ui_url,
+        Dict with keys: ui_server ('running' or 'stopped'), ui_url, version,
         db_path, db_exists. Running instances also include ui_pid and
         ui_started.
     """
@@ -164,12 +173,14 @@ def get_server_status() -> dict[str, Any]:
             "ui_url": info["url"],
             "ui_pid": info["pid"],
             "ui_started": info.get("started_at", "unknown"),
+            "version": __version__,
             "db_path": str(DB_PATH),
             "db_exists": DB_PATH.exists(),
         }
     return {
         "ui_server": "stopped",
         "ui_url": None,
+        "version": __version__,
         "db_path": str(DB_PATH),
         "db_exists": DB_PATH.exists(),
     }

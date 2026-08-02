@@ -74,3 +74,83 @@ def test_deploy_readme_documents_all_three_targets() -> None:
     text = (_DEPLOY_DIR / "README.md").read_text()
     for target in ("docker-compose.yml", "fly.toml", "railway.json"):
         assert target in text
+
+
+# ---------------------------------------------------------------------------
+# Image identity and rollover verification (issues #212, #213)
+# ---------------------------------------------------------------------------
+
+_HUB_DIR = _DEPLOY_DIR.parent
+
+
+def test_containerfile_labels_carry_the_version() -> None:
+    """A stopped or crash-looping hub can't be asked over HTTP.
+
+    That is exactly when "which build is this?" matters, so the image has to
+    answer it too — via `podman inspect`, from a build-arg fed by setup.sh.
+    """
+    text = (_HUB_DIR / "Containerfile").read_text()
+    assert "ARG HUB_VERSION" in text
+    assert "org.opencontainers.image.version=" in text
+    assert "${HUB_VERSION}" in text
+
+
+def test_containerfile_version_arg_defaults_to_unknown() -> None:
+    """A hand-built image that skipped the build-arg must not claim a version.
+
+    Defaulting to a number would make `podman inspect` confidently report a
+    build the image may not contain — the same stale-but-authoritative
+    failure the HUB_VERSION constant exists to avoid.
+    """
+    text = (_HUB_DIR / "Containerfile").read_text()
+    assert "ARG HUB_VERSION=unknown" in text
+
+
+def test_setup_tags_the_image_with_the_version_and_latest() -> None:
+    """Both tags: `latest` for the quadlet, the version for rollback.
+
+    Every build overwriting `latest` alone leaves nothing to roll back to,
+    so a bad hub deploy could only be fixed by rebuilding from an older
+    checkout.
+    """
+    text = (_HUB_DIR / "setup.sh").read_text()
+    assert "hub_version_from_source" in text
+    assert '-t "remind-me-hub:$version"' in text
+    assert "-t remind-me-hub:latest" in text
+    assert '--build-arg "HUB_VERSION=$version"' in text
+
+
+def test_update_verifies_the_new_version_is_actually_serving() -> None:
+    """wait_for_hub proves *something* answers, not that it's the new build.
+
+    Without this check the classic bad deploy — failed build or no-op
+    restart, old process still serving — reports success.
+    """
+    text = (_HUB_DIR / "setup.sh").read_text()
+    assert "live_hub_version" in text
+    # Compared against the version just pulled, not the one seen before the
+    # restart: an update that touched no hub code is *expected* to leave it
+    # unchanged, and failing on that would be its own false alarm.
+    assert "expected=$(hub_version_from_source)" in text
+    assert "the new image is not serving" in text
+
+
+def test_ci_runs_the_hub_end_to_end_suite() -> None:
+    """The hub's only runtime coverage must stay wired up (issue #218).
+
+    Every hub test in tests/ is a static AST check, because no CI leg can
+    import hub/main.py — fastapi and psycopg aren't this package's
+    dependencies. If this job goes away, the hub is back to having zero
+    behaviour verified anywhere automatic, and the static checks quietly
+    become the only thing between a broken hub and a green build.
+    """
+    yaml = pytest.importorskip("yaml")
+    workflow = _HUB_DIR.parent / ".github" / "workflows" / "ci.yml"
+    with workflow.open() as f:
+        data = yaml.safe_load(f)
+
+    job = data["jobs"]["hub-e2e"]
+    assert "postgres" in job["services"], "the e2e needs a live Postgres"
+    steps = " ".join(str(s.get("run", "")) for s in job["steps"])
+    assert "e2e_test.py" in steps
+    assert "uvicorn main:app" in steps, "the e2e needs a real hub process"

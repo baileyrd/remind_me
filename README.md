@@ -204,7 +204,8 @@ curl -H "Authorization: Bearer $(cat ~/.remind-me/api_key)" http://localhost:519
 Set `REMIND_ME_API_KEY` to use your own token, or `REMIND_ME_API_KEY=disabled`
 to run an open localhost API (not recommended). Mutating requests must send
 `Content-Type: application/json` (cross-origin form posts are rejected with 415).
-`GET /health` is an unauthenticated liveness probe.
+`GET /health` is an unauthenticated liveness probe, and reports the installed
+version so you can tell which build a node is running without a token.
 
 #### Scoped API keys
 
@@ -285,7 +286,7 @@ The dashboard is powered by a REST API you can also use directly:
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/health` | Liveness probe (no auth) |
+| `GET` | `/health` | Liveness probe + node role and installed version (no auth) |
 | `GET` | `/manifest.json` | PWA manifest for "Add to Home Screen" (no auth) |
 | `GET` | `/api/stats` | Memory statistics, categories, tags, DB info |
 | `GET` | `/api/vitality` | Vault vitality report: active/dormant counts, health score, vitality-bucket distribution |
@@ -985,7 +986,7 @@ REMIND_ME_METRICS_ENABLED=1 remind-me-mcp --serve-ui
 curl http://127.0.0.1:5199/metrics
 ```
 
-- **What's exposed** — `remind_me_tool_calls_total{tool="..."}` and `remind_me_tool_call_duration_seconds_sum`/`_count{tool="..."}` (call count and total latency per MCP tool, from the single `_TracedFastMCP.call_tool` dispatch choke point already used for OTel/the watchdog); `remind_me_search_tier_results_total{tier="keyword"|"semantic"|"hybrid"}` (cumulative `remind_me_search` result counts by ranking tier); `remind_me_rate_limit_rejections_total` (requests rejected by the #183 rate limiter, from `RateLimiter.hit()`'s own rejection path); plus two gauges computed fresh on every scrape rather than tracked as counters — `remind_me_memories_total` and, when sync is configured, `remind_me_sync_outbox_pending`.
+- **What's exposed** — `remind_me_build_info{version="..."}` (a constant-1 gauge whose labels carry the build, the Prometheus idiom for metadata — join on it to annotate or group a panel by version, so "latency changed" and "we upgraded" are the same graph rather than two unrelated observations); `remind_me_tool_calls_total{tool="..."}` and `remind_me_tool_call_duration_seconds_sum`/`_count{tool="..."}` (call count and total latency per MCP tool, from the single `_TracedFastMCP.call_tool` dispatch choke point already used for OTel/the watchdog); `remind_me_search_tier_results_total{tier="keyword"|"semantic"|"hybrid"}` (cumulative `remind_me_search` result counts by ranking tier); `remind_me_rate_limit_rejections_total` (requests rejected by the #183 rate limiter, from `RateLimiter.hit()`'s own rejection path); plus two gauges computed fresh on every scrape rather than tracked as counters — `remind_me_memories_total` and, when sync is configured, `remind_me_sync_outbox_pending`.
 - **No new dependency** — the Prometheus text exposition format is hand-rolled in `remind_me_mcp/metrics.py` (a few dozen lines of `# HELP`/`# TYPE`/`name{labels} value` formatting) rather than adding the `prometheus_client` package, consistent with this codebase's general bias toward minimal dependencies. Thread-safe counter increments use the same single-`threading.Lock`-around-a-plain-dict approach `rate_limit.py` already established for an identical concurrency requirement.
 - **Auth stance: unauthenticated, gated on the enable flag instead.** `GET /metrics` sits outside `BearerAuthMiddleware`'s `/api/` prefix — the same posture as `/health` (SE-04) — because Prometheus scrape configs typically send no custom headers, and the endpoint is already opt-in at the config level. **This means anyone who can reach the dashboard port can see tool-call and search-volume patterns while it's enabled** — firewall the port or put a reverse proxy with its own auth in front of it if that's a concern on your network, the same mitigation already documented for the peer sync server's default bind and the reminders ICS feed above.
 - **Disabled behavior** — `GET /metrics` returns a plain `404` while `REMIND_ME_METRICS_ENABLED` is unset, not an empty-but-200 body.
@@ -1208,6 +1209,34 @@ git clone https://github.com/baileyrd/remind_me.git ~/remind_me
 
 See [`hub/README.md`](hub/README.md) for the protocol details, manual setup reference, restore procedure, and operations guide.
 
+#### Versions and Record Counts
+
+Both sides report their version, because sync problems across a fleet are
+often version-skew problems and the two halves release independently:
+
+| Where | Field | Notes |
+|-------|-------|-------|
+| `GET /health` on the hub | `version` | `HUB_VERSION`, hand-bumped in `hub/main.py`; no auth needed, so a deploy can be verified without the sync secret |
+| `GET /health` on a node's dashboard | `version` | the installed `remind-me-mcp` package version, same string `remind-me-mcp --version` prints |
+| `GET /health` on a node's peer server | `version` | same, but behind the sync secret — the peer port binds all interfaces by default |
+| `remind_me_sync_status` | `version` | this node's build, next to its `node_id` |
+| `remind_me_sync_reconcile` | `version`, `hub_version` | both sides in one report; `hub_version` is `null` against a hub older than this feature |
+
+`remind_me_sync_reconcile` accepts `quick=true`, which checks the hub's
+`/count` first and skips `/stats` when every total already agrees — measured
+at ~41ms against ~128ms on a 200k-row hub. It is **off by default on
+purpose**: equal totals don't prove equal contents (a recategorization that
+synced on one side only leaves the total unchanged while two categories drift
+in opposite directions), and catching exactly that drift is what reconcile is
+for. A quick run that took the fast path says so, via `checked: "totals"`.
+
+The hub also serves **`GET /count`** (bearer auth), the cheap counterpart to
+`/stats`: scalar `COUNT(*)`s with no `GROUP BY`, optionally narrowed with
+`?table=memories|entities|memory_entities|entity_relations`. Poll it from a
+dashboard tile or a drift alarm; reach for `/stats` only when you need the
+per-node/per-category breakdown that reconciliation uses. `memories.live`
+excludes tombstones and is the figure that should match a node's own count.
+
 #### Configuring a Node
 
 Add the sync environment variables to your MCP config:
@@ -1256,11 +1285,17 @@ Each node runs a small HTTP server (default port 8766, bind via `REMIND_ME_PEER_
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/health` | Node liveness + node_id |
+| `GET` | `/health` | Node liveness + node_id + installed version |
+| `GET` | `/count` | Record counts in the hub's `/count` shape, so one comparator serves both — what `remind_me_sync_reconcile_peer` reads |
 | `GET` | `/sync/pull?since=&since_id=&exclude_node=&limit=` | Pull memory records (keyset cursor on `(updated_at, id)` when `since_id` is sent) |
 | `POST` | `/sync/push` | Push records (responds with `processed_ids`) |
 | `GET` | `/sync/pull_entities?since=&since_id=&limit=` | Pull entity records (404 on pre-entity-graph peers is treated as "no entity support") |
 | `GET` | `/sync/pull_links?since=&since_id=&limit=` | Pull memory-entity link records |
+
+`remind_me_sync_reconcile_peer <node_id>` diffs this node against a peer,
+using the same four verdicts as the hub reconcile. Totals only — a peer serves
+no `/stats`, so there is no per-category breakdown to fetch, and the result
+says `checked: "totals"` rather than leaving that limit implicit.
 
 The sync hub (`hub/`) implements the same wire protocol against Postgres, plus a few hub-only extensions not present here (an opt-in `since_seq` cursor immune to late-push-from-an-offline-node ordering bugs, a `full=1` re-seed mode, request timeouts, a push size cap, and a tombstone-purge endpoint) — see [`hub/README.md`](hub/README.md#protocol) for the details.
 

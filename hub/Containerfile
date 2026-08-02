@@ -1,5 +1,12 @@
 FROM docker.io/library/python:3.12-slim
 
+# Kept in step with HUB_VERSION in main.py -- setup.sh reads the constant out
+# of the source and passes it here, so the two cannot disagree for an image
+# built the documented way. The default is deliberately "unknown" rather than
+# a number: a hand-built image that skipped the build-arg should say it
+# doesn't know, not claim a version it may not be running.
+ARG HUB_VERSION=unknown
+
 WORKDIR /app
 
 RUN pip install --no-cache-dir \
@@ -8,6 +15,15 @@ RUN pip install --no-cache-dir \
     "psycopg[binary]>=3.2,<4"
 
 COPY main.py .
+
+# The running hub reports its version over HTTP, which is no help when the
+# container is stopped or crash-looping -- exactly when you most need to know
+# which build you have. These make `podman inspect` answer it too.
+LABEL org.opencontainers.image.title="remind-me sync hub" \
+      org.opencontainers.image.description="Central sync point for the remind_me distributed sync engine" \
+      org.opencontainers.image.source="https://github.com/baileyrd/remind_me" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${HUB_VERSION}"
 
 EXPOSE 8765
 

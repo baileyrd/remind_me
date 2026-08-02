@@ -12,19 +12,29 @@ databases, real outbox triggers, real `sync._sync_once()`):
 - a stale record is processed (marked sent) but not applied (LWW)
 - auth and malformed-record isolation
 
-Run it:
+It also covers the hub's own read surfaces (/count and its filters, /stats
+agreement, /metrics, the X-Hub-Version header), which the pytest suite can
+only check statically — no CI leg can import hub/main.py at all, since
+fastapi and psycopg are deliberately not this package's dependencies.
+
+CI runs this on every push and pull request (the `hub-e2e` job in
+.github/workflows/ci.yml, against a postgres:16 service container). Run it
+locally the same way:
 
     # 1. Postgres with a remindme/remindme database available
     # 2. Hub:  DATABASE_URL=... SYNC_SECRET=test-secret uvicorn main:app --port 8765
     # 3. Test deps: pip install -e ../  psycopg[binary] httpx
     HUB_TEST_DSN=postgresql://remindme:...@host:5432/remindme python e2e_test.py
 
-The test writes its node databases to /tmp/node-a and /tmp/node-b (wipe
-them between runs) and inserts records into the hub's database — run it
-against a hub whose database you can throw away, never production.
+The test writes its node databases to /tmp/node-a and /tmp/node-b and refuses
+to start if they already exist (E2E_WIPE=1 clears them instead) — node B's
+whole job is converging from empty. It inserts records into the hub's
+database, so run it against a hub whose database you can throw away, never
+production.
 """
 import asyncio
 import os
+import shutil
 import sys
 
 HUB_URL = os.environ.get("HUB_TEST_URL", "http://127.0.0.1:8765")
@@ -56,6 +66,34 @@ def check(label, cond, detail=""):
     print(f"[{status}] {label}" + (f" — {detail}" if detail else ""))
     if not cond:
         sys.exit(1)
+
+
+def require_clean_node_dirs(*paths):
+    """Refuse to run against leftover node databases.
+
+    Node B's whole job here is converging *from empty*, and node A's outbox
+    assertions count rows. A stale /tmp/node-* from an earlier run turns both
+    into a different test that happens to pass or fail for unrelated reasons.
+    Set E2E_WIPE=1 to clear them instead of aborting (what CI does — a fresh
+    runner should be clean anyway, so a failure there means something else
+    is wrong and is worth hearing about).
+    """
+    stale = [p for p in paths if os.path.exists(p)]
+    if not stale:
+        return
+    if os.environ.get("E2E_WIPE") == "1":
+        for path in stale:
+            shutil.rmtree(path)
+        print(f"[INFO] wiped stale node databases: {', '.join(stale)}")
+        return
+    print(
+        f"[FAIL] stale node databases present: {', '.join(stale)}\n"
+        "       remove them (or set E2E_WIPE=1) — node B must start empty."
+    )
+    sys.exit(1)
+
+
+require_clean_node_dirs("/tmp/node-a", "/tmp/node-b")
 
 
 # ---------------- Node A: create local data, sync ----------------
@@ -103,7 +141,12 @@ with psycopg.connect(DSN) as conn:
           mem is not None and mem[0] == "Memory from node A")
     check("hub stored tags/metadata as JSONB",
           mem[1] == ["sync", "e2e"] and mem[2] == {"k": 1}, f"{mem[1]} {mem[2]}")
-    ent = conn.execute("SELECT name, kind, aliases FROM entities").fetchall()
+    # Looked up by name rather than asserting a total: this node also creates
+    # the "remind_me" project entity as the object of the entity_relation
+    # below, so a count of 1 has been unsatisfiable since relations were added.
+    ent = conn.execute(
+        "SELECT name, kind, aliases FROM entities WHERE name = 'Bailey Robertson'"
+    ).fetchall()
     check("hub stored entity with aliases",
           len(ent) == 1 and ent[0][1] == "person" and "bailey" in ent[0][2],
           str(ent))
@@ -126,8 +169,11 @@ asyncio.run(sync_mod._sync_once())
 ids = [r["id"] for r in db.execute(
     "SELECT id FROM memories WHERE id = 'node-a-mem-1'").fetchall()]
 check("node B pulled node A memory", ids == ["node-a-mem-1"], str(ids))
-ents = db.execute("SELECT name, kind, aliases FROM entities").fetchall()
-check("node B pulled entity", len(ents) == 1 and ents[0]["kind"] == "person")
+ents = db.execute(
+    "SELECT name, kind, aliases FROM entities WHERE name = 'Bailey Robertson'"
+).fetchall()
+check("node B pulled entity", len(ents) == 1 and ents[0]["kind"] == "person",
+      str([dict(r) for r in ents]))
 links = db.execute("SELECT memory_id, entity_id FROM memory_entities").fetchall()
 check("node B pulled link",
       len(links) == 1 and links[0]["memory_id"] == "node-a-mem-1")
@@ -212,5 +258,114 @@ body = r.json()
 check("malformed record isolated, good record applied",
       body["failed"] == 1 and body["accepted"] == 1
       and body["processed_ids"] == ["good-1"], str(body))
+
+# ---------------- Version + /count ----------------
+# The pytest suite can only check these statically (it can't import hub/main.py
+# at all — no fastapi/psycopg), so this is where the responses are read for
+# real. The interesting part is agreement: /count must not disagree with
+# /stats about the same records, which is the failure a separate cheap query
+# path invites.
+AUTH = {"Authorization": f"Bearer {SECRET}"}
+
+health = httpx.get(f"{HUB_URL}/health").json()
+check("health reports the hub version without auth",
+      bool(health.get("version")), str(health))
+
+counts = httpx.get(f"{HUB_URL}/count", headers=AUTH)
+check("count requires auth", httpx.get(f"{HUB_URL}/count").status_code == 401)
+check("count reports the hub version",
+      counts.json().get("version") == health["version"], str(counts.json()))
+
+stats = httpx.get(f"{HUB_URL}/stats", headers=AUTH).json()
+c = counts.json()
+check("count agrees with stats on totals",
+      c["memories"]["total"] == stats["memories"]["total"]
+      and c["memories"]["tombstones"] == stats["memories"]["tombstones"]
+      and c["entities"] == stats["entities"]
+      and c["memory_entities"] == stats["memory_entities"]
+      and c["entity_relations"] == stats["entity_relations"],
+      f"count={c} stats={stats}")
+check("count splits live from tombstoned",
+      c["memories"]["live"] == c["memories"]["total"] - c["memories"]["tombstones"],
+      str(c["memories"]))
+
+approx = httpx.get(f"{HUB_URL}/count?approx=1", headers=AUTH).json()
+check("approx mode declares itself", approx["approximate"] is True, str(approx))
+check("exact mode declares itself", c["approximate"] is False, str(c))
+# No live/tombstone split in approx mode: that needs a filtered scan, which is
+# the cost being avoided, and estimating it would be inventing a number.
+check("approx memories reports total only",
+      set(approx["memories"]) == {"total"}, str(approx["memories"]))
+
+one = httpx.get(f"{HUB_URL}/count?table=memories", headers=AUTH).json()
+check("count?table= narrows to one table",
+      "memories" in one and "entities" not in one, str(one))
+bad = httpx.get(f"{HUB_URL}/count?table=nope", headers=AUTH)
+check("count rejects an unknown table", bad.status_code == 400, str(bad.text))
+
+# Approximate mode reads planner statistics, so it is only meaningful once the
+# table has been analysed — a freshly-written table reports 0, which is the
+# documented caveat rather than a bug. ANALYZE first, then compare.
+with psycopg.connect(DSN) as conn:
+    conn.execute("ANALYZE memories")
+    conn.commit()
+analysed = httpx.get(f"{HUB_URL}/count?approx=1&table=memories", headers=AUTH).json()
+check("approx tracks exact once the table is analysed",
+      analysed["memories"]["total"] == c["memories"]["total"],
+      f'approx={analysed["memories"]} exact={c["memories"]}')
+
+# ---------------- /count filters ----------------
+epoch = httpx.get(
+    f"{HUB_URL}/count?table=memories&since=1970-01-01T00:00:00Z", headers=AUTH
+).json()
+check("since=epoch counts everything",
+      epoch["memories"]["total"] == c["memories"]["total"], str(epoch))
+future = httpx.get(
+    f"{HUB_URL}/count?table=memories&since=2099-01-01T00:00:00Z", headers=AUTH
+).json()
+check("since=future counts nothing", future["memories"]["total"] == 0, str(future))
+check("since is echoed back canonicalized",
+      epoch.get("since", "").endswith("+00:00"), str(epoch.get("since")))
+bad_since = httpx.get(f"{HUB_URL}/count?since=yesterday", headers=AUTH)
+check("count rejects an unparsable since", bad_since.status_code == 400, bad_since.text)
+
+grouped = httpx.get(f"{HUB_URL}/count?by=origin_node&table=memories", headers=AUTH).json()
+check("by=origin_node matches the stats breakdown",
+      grouped["by_origin_node"] == stats["memories"]["by_origin_node"],
+      f'count={grouped.get("by_origin_node")} stats={stats["memories"]["by_origin_node"]}')
+check("count rejects an unknown grouping",
+      httpx.get(f"{HUB_URL}/count?by=category", headers=AUTH).status_code == 400)
+check("approx refuses filters it cannot honour",
+      httpx.get(f"{HUB_URL}/count?approx=1&since=1970-01-01T00:00:00Z",
+                headers=AUTH).status_code == 400)
+
+# ---------------- X-Hub-Version header ----------------
+# Middleware, so it must be on responses with no JSON body carrying it too --
+# that is the whole reason it exists as a header.
+for label, resp in (
+    ("health", httpx.get(f"{HUB_URL}/health")),
+    ("pull", httpx.get(f"{HUB_URL}/sync/pull", headers=AUTH)),
+    ("401", httpx.get(f"{HUB_URL}/count")),
+    ("404", httpx.get(f"{HUB_URL}/no-such-route")),
+):
+    check(f"X-Hub-Version present on {label} ({resp.status_code})",
+          resp.headers.get("X-Hub-Version") == health["version"],
+          str(resp.headers.get("X-Hub-Version")))
+
+# ---------------- /metrics ----------------
+# Enabled via REMIND_ME_HUB_METRICS_ENABLED on the hub under test; when it is
+# off the route is a 404, which is also a valid state to observe here.
+m = httpx.get(f"{HUB_URL}/metrics", headers=AUTH)
+if m.status_code == 404:
+    print("[SKIP] /metrics — REMIND_ME_HUB_METRICS_ENABLED is not set on this hub")
+else:
+    check("metrics requires auth",
+          httpx.get(f"{HUB_URL}/metrics").status_code == 401)
+    check("metrics reports the build",
+          f'remind_me_hub_build_info{{version="{health["version"]}"}} 1' in m.text,
+          m.text[:200])
+    check("metrics agrees with count on live memories",
+          f'remind_me_hub_memories{{state="live"}} {c["memories"]["live"]}' in m.text,
+          m.text)
 
 print("\nALL CHECKS PASSED")

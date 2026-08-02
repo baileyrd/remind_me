@@ -80,6 +80,21 @@ wait_for_postgres() {
     die "Postgres did not become ready within 60s — check: journalctl --user -u $PG_SERVICE"
 }
 
+# Pull "version" out of a /health body on stdin. Deliberately sed, not a
+# JSON parser: this script's only hard dependencies are podman, systemctl and
+# curl (checked in install), and adding jq or python for one field would be a
+# new install requirement on the server for a diagnostic.
+version_from_health() {
+    sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+}
+
+# The version the running hub reports, or empty when it isn't answering or
+# predates version reporting. Never fails the caller -- every use is a
+# diagnostic, and losing one is not a reason to abort a deploy.
+live_hub_version() {
+    curl -fsS --max-time 3 "$HEALTH_URL" 2>/dev/null | version_from_health || true
+}
+
 wait_for_hub() {
     log "Waiting for the hub to answer $HEALTH_URL"
     for _ in $(seq 1 60); do
@@ -177,9 +192,29 @@ install_quadlets() {
               "$QUADLET_DIR/"
 }
 
+# Read HUB_VERSION out of main.py. Anchored at column 0 so the same string
+# inside that file's own docstrings can't match.
+hub_version_from_source() {
+    sed -n 's/^HUB_VERSION[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+        "$HUB_DIR/main.py" | head -n 1
+}
+
 build_image() {
-    log "Building the hub image"
-    run podman build -q -t remind-me-hub:latest "$HUB_DIR"
+    local version
+    version=$(hub_version_from_source)
+    [[ -n "$version" ]] || die "could not read HUB_VERSION from $HUB_DIR/main.py"
+
+    # Tagged with the version as well as latest, for two reasons: `podman
+    # image ls` can then tell you what you have without starting anything,
+    # and the previous build survives an update instead of being overwritten
+    # -- so a rollback is a retag rather than a rebuild from an older
+    # checkout, under exactly the time pressure that makes that unpleasant.
+    log "Building the hub image (version $version)"
+    run podman build -q \
+        --build-arg "HUB_VERSION=$version" \
+        -t "remind-me-hub:$version" \
+        -t remind-me-hub:latest \
+        "$HUB_DIR"
 }
 
 start_services() {
@@ -304,7 +339,10 @@ cmd_status() {
         printf '%-32s %s\n' "$svc" "${state:-unknown}"
     done
 
-    if curl -fsS --max-time 3 "$HEALTH_URL" 2>/dev/null; then
+    local health
+    if health=$(curl -fsS --max-time 3 "$HEALTH_URL" 2>/dev/null); then
+        printf '%-32s %s\n' "hub version" "$(printf '%s' "$health" | version_from_health)"
+        echo "$health"
         echo
     else
         warn "hub is not answering $HEALTH_URL"
@@ -323,6 +361,9 @@ cmd_status() {
 # ---------------------------------------------------------------------------
 
 cmd_update() {
+    local before
+    before=$(live_hub_version)
+
     log "Pulling latest changes"
     run git -C "$REPO_DIR" pull --ff-only
     build_image
@@ -330,7 +371,30 @@ cmd_update() {
     run systemctl --user restart "$HUB_SERVICE"
     if ! (( DRY_RUN )); then
         wait_for_hub
-        log "Hub updated and healthy"
+
+        # wait_for_hub only proves *something* answers /health -- it cannot
+        # tell the new container from the old one still serving. That is the
+        # classic bad deploy: the build fails or the restart silently no-ops,
+        # /health keeps answering from the old process, the script reports
+        # success, and everything downstream is debugged against the wrong
+        # code. Compare against the version just pulled, not against `before`:
+        # an update that brought no hub change is *expected* to leave it
+        # unchanged, and treating that as failure would be its own false alarm.
+        local expected live
+        expected=$(hub_version_from_source)
+        live=$(live_hub_version)
+        if [[ -z "$live" ]]; then
+            warn "hub /health reports no version — it predates version reporting;" \
+                 "cannot verify the rollover"
+        elif [[ "$live" != "$expected" ]]; then
+            die "hub still reports $live, expected $expected — the new image is not serving. Check: journalctl --user -u $HUB_SERVICE"
+        fi
+
+        if [[ -n "$before" && -n "$live" && "$before" != "$live" ]]; then
+            log "Hub updated and healthy ($before -> $live)"
+        else
+            log "Hub updated and healthy (version $live)"
+        fi
     fi
 }
 

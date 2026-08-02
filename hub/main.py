@@ -48,12 +48,35 @@ from typing import Annotated, Any
 
 import psycopg
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 log = logging.getLogger("remind_me_hub")
 logging.basicConfig(level=logging.INFO)
+
+HUB_VERSION = "1.5.0"
+"""Version of the hub server, reported by /health, /count and /stats.
+
+Versioned independently of the ``remind-me-mcp`` package rather than tracking
+its version. The two are separate deployables on separate release cadences:
+the package ships to nodes via ``pip install -e .`` and bumps on every client
+change, while the hub is a container built from this one file and changes
+maybe a handful of times a year. Tying them together would mean the deployed
+hub's reported version churned on releases that never touched hub code --
+worse than useless for the question this answers, which is "does the hub I'm
+talking to have the endpoint I need?".
+
+There is no build metadata to derive it from either: the Containerfile copies
+``main.py`` alone, with no ``pyproject.toml`` or git checkout in the image, so
+a literal constant is the only thing that survives into the running container.
+
+Bump it (semver) whenever the hub's observable behaviour changes: MAJOR for a
+wire-protocol break, MINOR for a new endpoint or response field, PATCH for a
+fix that changes nothing a client can key off. Clients that need to know
+whether a capability exists should still probe for the 404 (as
+``sync.reconcile_with_hub`` does for /stats) rather than compare versions --
+this is a diagnostic, not a feature-negotiation channel."""
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 SYNC_SECRET = os.environ.get("SYNC_SECRET", "")
@@ -311,7 +334,53 @@ async def _lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(lifespan=_lifespan)
+app = FastAPI(
+    title="remind-me sync hub",
+    # FastAPI's own metadata, not a second version to keep in step: the
+    # interactive docs are off below, but this is what any future OpenAPI
+    # export reports, and a placeholder "0.1.0" contradicting HUB_VERSION is
+    # exactly the sort of stale-version-that-looks-authoritative the constant
+    # exists to prevent.
+    version=HUB_VERSION,
+    lifespan=_lifespan,
+    # All three of FastAPI's documentation routes are disabled deliberately.
+    # They default to ON and UNAUTHENTICATED, which quietly undoes this file's
+    # otherwise careful auth posture: /openapi.json publishes every route --
+    # including POST /admin/compact_tombstones, which hard-deletes rows --
+    # with full request/response schemas, to anyone who can reach the port.
+    # The hub is documented as commonly fronted by a tunnel reachable from
+    # the open internet, so that is a real exposure, not a theoretical one.
+    #
+    # Disabled rather than auth-gated because nothing consumes them: the hub
+    # has exactly one client (remind_me_mcp/sync.py) against a wire protocol
+    # documented in hub/README.md. Should an interactive explorer ever be
+    # wanted, add a custom /openapi.json behind Depends(_require_auth) rather
+    # than re-enabling these.
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
+
+
+@app.middleware("http")
+async def _stamp_version(request: Request, call_next):
+    """Put HUB_VERSION on every response, including errors (issue #209).
+
+    Middleware rather than per-route, and the reason is the point: the value
+    of this header is that it covers the routes nobody remembered to
+    annotate. A client doing ordinary work (/sync/push, /sync/pull) would
+    otherwise have to make a second, unrelated request to /health to learn
+    which build answered it -- so the version was readable exactly where it
+    was least needed and absent everywhere else.
+
+    Errors are covered deliberately. A 401 or a 500 is when "which build is
+    this?" matters most, and those responses never carry a JSON body with the
+    version in it. It also makes HEAD and header-only monitoring probes work,
+    which cannot read a body at all.
+    """
+    response = await call_next(request)
+    response.headers["X-Hub-Version"] = HUB_VERSION
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +430,15 @@ def health() -> JSONResponse:
     README, commonly fronted by a tunnel reachable from the open
     internet). The full exception is still logged server-side for
     debugging.
+
+    ``version`` is public for the same reason ``role`` already is: verifying
+    that a deploy actually rolled over is a job for whoever is holding the
+    curl, and requiring the sync secret for it would push operators toward
+    keeping that secret in their shell history. It is a static build
+    identifier -- unlike ``db``, no request-time state can leak through it,
+    and unlike ``/count``/``/stats`` below it says nothing about content.
+    The cost is fingerprinting, which is why it is a bare version string
+    with no dependency, commit, or platform detail attached.
     """
     db_status = "ok"
     try:
@@ -375,6 +453,7 @@ def health() -> JSONResponse:
         content={
             "status": "ok" if healthy else "degraded",
             "role": "hub",
+            "version": HUB_VERSION,
             "db": db_status,
             "time": datetime.now(UTC).isoformat(),
         },
@@ -443,6 +522,7 @@ def stats() -> JSONResponse:
     return JSONResponse(
         content={
             "role": "hub",
+            "version": HUB_VERSION,
             "memories": {
                 "total": totals["total"],
                 "tombstones": totals["tombstones"],
@@ -458,6 +538,327 @@ def stats() -> JSONResponse:
             "entity_relations": relations["count"],
             "time": datetime.now(UTC).isoformat(),
         },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Count
+# ---------------------------------------------------------------------------
+
+_COUNTABLE = ("memories", "entities", "memory_entities", "entity_relations")
+"""Tables /count will report, and the only values its ``table`` filter
+accepts. An allowlist rather than a validated identifier because the name is
+interpolated straight into the SQL text -- ``COUNT(*) FROM %s`` is not a
+parameterizable position in Postgres, so the value must never come from the
+request itself."""
+
+
+def _approx_count_tables(
+    conn: psycopg.Connection, wanted: tuple[str, ...]
+) -> dict[str, Any]:
+    """O(1) row estimates from the planner's statistics (issue #214).
+
+    Postgres cannot answer an unqualified ``COUNT(*)`` without scanning:
+    MVCC means visibility is per-transaction, so there is no stored row count
+    to read. /count exists to be polled, and a per-minute scrape of a large
+    memories table is a standing load that dropping /stats' GROUP BY only
+    partly addressed. ``pg_class.reltuples`` is maintained by autovacuum and
+    ANALYZE and costs a single catalog lookup.
+
+    ``memories`` reports ``total`` only -- deliberately no live/tombstone
+    split. That split needs a filtered scan, which is the very thing being
+    avoided; estimating it would mean inventing a number, and the whole
+    contract here is "fast and honestly approximate", not "fast and made up".
+
+    A never-analysed table reports -1 in the catalog, which is normalized to
+    0 rather than passed through as a nonsense count.
+    """
+    rows = conn.execute(
+        """
+        SELECT relname, GREATEST(reltuples, 0)::bigint AS estimate
+          FROM pg_class
+         WHERE relname = ANY(%s)
+           AND relkind = 'r'
+        """,
+        (list(wanted),),
+    ).fetchall()
+    estimates = {r["relname"]: r["estimate"] for r in rows}
+
+    counts: dict[str, Any] = {}
+    for name in wanted:
+        estimate = estimates.get(name, 0)
+        counts[name] = {"total": estimate} if name == "memories" else estimate
+    return counts
+
+
+def _count_tables(
+    conn: psycopg.Connection, wanted: tuple[str, ...]
+) -> dict[str, Any]:
+    """Scalar counts for *wanted* tables, which must come from _COUNTABLE.
+
+    Shared by /count and /metrics so the two can never disagree about the
+    same records -- a second copy of these queries is exactly how a metric
+    quietly drifts from the endpoint it is supposed to mirror.
+    """
+    counts: dict[str, Any] = {}
+    for name in wanted:
+        if name == "memories":
+            (row,) = conn.execute(
+                """
+                SELECT COUNT(*)                                       AS total,
+                       COUNT(*) FILTER (WHERE deleted_at IS NOT NULL) AS tombstones
+                  FROM memories
+                """
+            ).fetchall()
+            counts["memories"] = {
+                "total": row["total"],
+                # Named to match what a node reports for itself: its
+                # user-visible count filters deleted_at IS NULL, so `live`
+                # is the figure that should agree across sides, and `total`
+                # the one that agrees with /stats.
+                "live": row["total"] - row["tombstones"],
+                "tombstones": row["tombstones"],
+            }
+        else:
+            (row,) = conn.execute(f"SELECT COUNT(*) AS count FROM {name}").fetchall()
+            counts[name] = row["count"]
+    return counts
+
+
+def _count_tables_since(
+    conn: psycopg.Connection, wanted: tuple[str, ...], since: str
+) -> dict[str, Any]:
+    """Counts restricted to records touched since *since* (issue #217).
+
+    Only ``memories`` has an ``updated_at`` to filter on; the graph tables
+    are immutable insert-or-ignore edges stamped with ``created_at``, so
+    "changed since" is the same question as "created since" for them and is
+    answered from that column instead. Both are index-backed
+    (``idx_memories_updated_at_id``, ``idx_links_created_at``,
+    ``idx_entity_relations_created_at_id``).
+
+    ``since`` is a bound parameter, never interpolated -- unlike the table
+    name, a timestamp *is* a parameterizable position, so there is no reason
+    for it to go anywhere near the SQL text.
+    """
+    column = {
+        "memories": "updated_at",
+        "entities": "updated_at",
+        "memory_entities": "created_at",
+        "entity_relations": "created_at",
+    }
+    counts: dict[str, Any] = {}
+    for name in wanted:
+        (row,) = conn.execute(
+            f"SELECT COUNT(*) AS count FROM {name} WHERE {column[name]} > %s",
+            (since,),
+        ).fetchall()
+        if name == "memories":
+            # No live/tombstone split here on purpose: a tombstone written in
+            # the window is a record that *changed* in the window, which is
+            # what this filter is asking about. Splitting it would invite
+            # reading the result as a live-record delta, which it is not.
+            counts["memories"] = {"total": row["count"]}
+        else:
+            counts[name] = row["count"]
+    return counts
+
+
+def _count_by_origin_node(
+    conn: psycopg.Connection, since: str | None
+) -> dict[str, int]:
+    """Per-pushing-node memory counts -- the one hub-only breakdown.
+
+    ``origin_node`` is set by /sync/push and never crosses the wire, so no
+    node can compute this for itself. Honours ``since`` when given, which is
+    what turns it into "who has pushed anything lately", i.e. the actual
+    question behind "which node stopped syncing".
+    """
+    clause = "WHERE updated_at > %s" if since else ""
+    params = (since,) if since else ()
+    rows = conn.execute(
+        f"""
+        SELECT COALESCE(NULLIF(origin_node, ''), '(unattributed)') AS origin_node,
+               COUNT(*)                                            AS count
+          FROM memories
+          {clause}
+         GROUP BY 1
+         ORDER BY 2 DESC
+        """,
+        params,
+    ).fetchall()
+    return {r["origin_node"]: r["count"] for r in rows}
+
+
+@app.get("/count", dependencies=[Depends(_require_auth)])
+def count(
+    table: str | None = None,
+    approx: bool = False,
+    since: str | None = None,
+    by: str | None = None,
+) -> JSONResponse:
+    """Scalar record counts — the cheap subset of /stats, safe to poll.
+
+    /stats answers "how does my node differ from the hub, and where?", and
+    pays for it with two GROUP BY passes over the whole memories table plus
+    MIN/MAX. That is the right cost once per reconcile, and the wrong cost
+    for the thing operators actually reach for most often: "is the number
+    going up?" -- a dashboard tile, a cron drift alarm, a check right after
+    an import. Those want one number, every minute, and before this endpoint
+    the only way to get it was the full /stats aggregate.
+
+    So this route is deliberately query-shaped, not response-shaped: it never
+    groups, and ``?table=memories`` narrows it to a single COUNT so a poller
+    doesn't scan the graph tables it isn't watching. The memories entry keeps
+    the live/tombstone split (a plain total silently drifts against a node,
+    whose user-visible count excludes tombstones) but that split rides along
+    on the same scan, costing nothing extra.
+
+    Auth-gated, matching /stats: a bare total is less revealing than a
+    category breakdown but still leaks how much the operator has stored and
+    how fast it grows, which is exactly the kind of thing an unauthenticated
+    poller should not be able to graph. /health stays the public route, and
+    stays count-free.
+
+    ``?approx=1`` swaps the COUNT scans for planner estimates (issue #214) --
+    O(1), accurate to a fraction of a percent on an analysed table, and
+    plenty for a trend line. Exact stays the default because reconciliation
+    and the /count-vs-/stats agreement check both need real numbers, and a
+    silently-estimated total would be worse than a slow one. The response
+    says which it gave you.
+
+    Two filters (issue #217), both memories-only, since neither question has
+    a meaning for the graph tables:
+
+    - ``?since=<ISO timestamp>`` counts records touched since then, so
+      "how many landed in the last hour?" is one request rather than two
+      samples and client-side state to subtract them. Index-backed by
+      ``idx_memories_updated_at_id``.
+    - ``?by=origin_node`` returns the per-node breakdown. This is the one
+      genuinely hub-only fact -- ``origin_node`` never crosses the wire, so
+      no node can compute it -- and until now reading it meant paying for
+      /stats' whole aggregate, including the category pass the caller didn't
+      ask for. Opt-in precisely because it reintroduces a GROUP BY: the
+      default path stays scan-only, which is what the endpoint is for.
+    """
+    if table is not None and table not in _COUNTABLE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown table {table!r}; expected one of {', '.join(_COUNTABLE)}",
+        )
+    if by is not None and by != "origin_node":
+        raise HTTPException(
+            status_code=400, detail=f"unknown grouping {by!r}; expected origin_node"
+        )
+    if since is not None:
+        try:
+            since = _canon_ts(since)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"invalid since timestamp {since!r}; expected ISO-8601",
+            ) from None
+    if approx and (since or by):
+        # The estimate is a whole-table row count -- there is no filtered or
+        # grouped equivalent in the catalog. Rejecting beats silently
+        # ignoring the filter and returning a number that answers a different
+        # question than the one asked.
+        raise HTTPException(
+            status_code=400,
+            detail="approx=1 cannot be combined with since or by; "
+            "planner estimates are whole-table only",
+        )
+
+    wanted = (table,) if table else _COUNTABLE
+
+    with _connect() as conn:
+        if approx:
+            counts = _approx_count_tables(conn, wanted)
+        elif since:
+            counts = _count_tables_since(conn, wanted, since)
+        else:
+            counts = _count_tables(conn, wanted)
+        by_origin = _count_by_origin_node(conn, since) if by else None
+
+    return JSONResponse(
+        content={
+            "role": "hub",
+            "version": HUB_VERSION,
+            **({"since": since} if since else {}),
+            **({"by_origin_node": by_origin} if by_origin is not None else {}),
+            # Always present, not only when true: a caller that forgot to ask
+            # would otherwise have to infer exactness from the absence of a
+            # key, and "no live/tombstone split" is too quiet a signal to
+            # hang correctness on.
+            "approximate": approx,
+            **counts,
+            "time": datetime.now(UTC).isoformat(),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Metrics (issue #210)
+# ---------------------------------------------------------------------------
+
+HUB_METRICS_ENABLED = os.environ.get("REMIND_ME_HUB_METRICS_ENABLED", "").lower() in (
+    "1", "true", "yes",
+)
+"""Whether GET /metrics is served. Off by default, mirroring the client's
+REMIND_ME_METRICS_ENABLED: instrumentation surface is opt-in, and a route
+that is off returns a plain 404 rather than a 403, so "disabled" is
+indistinguishable from "this build doesn't have it" -- which is what a
+scrape config should treat them as anyway."""
+
+
+@app.get("/metrics", dependencies=[Depends(_require_auth)])
+def metrics() -> Response:
+    """Prometheus text exposition for the hub.
+
+    **Auth stance: bearer-gated, unlike the dashboard's /metrics.** That
+    route (issue #197) argued itself into being unauthenticated because
+    Prometheus scrape configs typically send no custom headers, so requiring
+    one would push most operators into hand-rolling a bearer scrape_config
+    for a single target. That reasoning does not transfer here: anyone
+    scraping the hub is already the operator who provisioned SYNC_SECRET for
+    it, so the credential is in hand rather than newly invented. And the
+    payload is the same aggregate /count and /stats are gated on -- shipping
+    it unauthenticated would route around that gate rather than reconsider
+    it, which is the wrong way to arrive at a security posture.
+
+    Counts come from the same _count_tables() helper /count uses, so the two
+    can't drift apart.
+    """
+    if not HUB_METRICS_ENABLED:
+        raise HTTPException(status_code=404, detail="metrics are not enabled")
+
+    with _connect() as conn:
+        counts = _count_tables(conn, _COUNTABLE)
+
+    memories = counts["memories"]
+    lines = [
+        "# HELP remind_me_hub_build_info Build metadata; the value is always 1, the labels carry the information.",
+        "# TYPE remind_me_hub_build_info gauge",
+        f'remind_me_hub_build_info{{version="{HUB_VERSION}"}} 1',
+        "# HELP remind_me_hub_memories Memory records on the hub, by state.",
+        "# TYPE remind_me_hub_memories gauge",
+        f'remind_me_hub_memories{{state="live"}} {memories["live"]}',
+        f'remind_me_hub_memories{{state="tombstoned"}} {memories["tombstones"]}',
+        "# HELP remind_me_hub_entities Entity records on the hub.",
+        "# TYPE remind_me_hub_entities gauge",
+        f"remind_me_hub_entities {counts['entities']}",
+        "# HELP remind_me_hub_memory_entities Memory-entity link records on the hub.",
+        "# TYPE remind_me_hub_memory_entities gauge",
+        f"remind_me_hub_memory_entities {counts['memory_entities']}",
+        "# HELP remind_me_hub_entity_relations Typed entity-to-entity edges on the hub.",
+        "# TYPE remind_me_hub_entity_relations gauge",
+        f"remind_me_hub_entity_relations {counts['entity_relations']}",
+    ]
+    # Live/tombstoned are separate label values rather than separate metrics
+    # so a dashboard can sum them for the total without knowing both names.
+    return Response(
+        "\n".join(lines) + "\n",
+        media_type="text/plain; version=0.0.4",
     )
 
 

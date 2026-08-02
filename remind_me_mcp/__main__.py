@@ -517,6 +517,9 @@ def main() -> None:
     # -- Status check mode --
     if args.status:
         server_status = get_server_status()
+        # Printed here as well as by --version so "what's running, and which
+        # build is it?" is one command rather than two.
+        print(f"remind-me-mcp {server_status['version']}")
         if server_status["ui_server"] == "running":
             print(f"\u2713 Dashboard running at {server_status['ui_url']} (PID {server_status['ui_pid']})")
         else:

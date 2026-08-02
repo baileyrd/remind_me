@@ -30,7 +30,8 @@ from urllib.parse import parse_qs, urlparse
 
 from remind_me_mcp.config import NODE_ID, PEER_BIND, PEER_PORT, SYNC_SECRET
 from remind_me_mcp.db import _get_db
-from remind_me_mcp.sync import _upsert_records
+from remind_me_mcp.sync import _local_counts, _upsert_records
+from remind_me_mcp.version import __version__
 
 log = logging.getLogger("remind_me_mcp.peer_server")
 
@@ -99,9 +100,51 @@ class PeerHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
 
         if parsed.path == "/health":
+            # `version` lets a peer see which build it is talking to, which is
+            # what makes the 404-tolerant capability probing above (a new peer
+            # pulling entity tables from an old server) diagnosable instead of
+            # silently degraded. Auth-gated like every other route here --
+            # unlike the hub's and dashboard's /health, this one already sits
+            # behind _auth(), and the peer port defaults to binding all
+            # interfaces, so there is no reason to widen it.
             self._send_json(200, {
                 "status": "ok",
+                "role": "peer",
+                "version": __version__,
                 "node_id": NODE_ID,
+                "time": datetime.now(UTC).isoformat(),
+            })
+            return
+
+        if parsed.path == "/count":
+            # Mirrors the hub's GET /count field-for-field (issue #216) so one
+            # client-side comparator serves both -- a peer-shaped variant
+            # would mean a second copy of the diff logic, which is how the
+            # two would eventually disagree about what "drift" means.
+            #
+            # Counts come from sync._local_counts, the same function the
+            # client uses for its own side of a reconcile. That is the whole
+            # point: both ends of the comparison count identically, including
+            # the deliberate choice not to filter deleted_at (the hub counts
+            # every row and reports tombstones separately, so filtering here
+            # would make a healthy peer look permanently behind).
+            local = _local_counts(_get_db())
+            self._send_json(200, {
+                "role": "peer",
+                "version": __version__,
+                "node_id": NODE_ID,
+                # Always present, matching the hub: a peer has no planner
+                # estimates to offer, but a caller shouldn't have to know
+                # which remote it is talking to in order to read the answer.
+                "approximate": False,
+                "memories": {
+                    "total": local["total"],
+                    "live": local["total"] - local["tombstones"],
+                    "tombstones": local["tombstones"],
+                },
+                "entities": local["entities"],
+                "memory_entities": local["memory_entities"],
+                "entity_relations": local["entity_relations"],
                 "time": datetime.now(UTC).isoformat(),
             })
             return

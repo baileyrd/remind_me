@@ -16,6 +16,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from remind_me_mcp.api import _build_api_app
+from remind_me_mcp.version import __version__
 
 # ---------------------------------------------------------------------------
 # Client fixture
@@ -1333,15 +1334,20 @@ def test_health_route_open_without_auth(client_with_auth: TestClient) -> None:
     """SE-04: /health returns 200 with no token even when auth is enabled."""
     r = client_with_auth.get("/health")
     assert r.status_code == 200
-    assert r.json() == {"status": "ok"}
+    assert r.json() == {"status": "ok", "role": "node", "version": __version__}
 
 
 def test_health_route_reveals_no_data(client: TestClient, memory_factory) -> None:
-    """SE-04: /health is a pure liveness probe — no memory data in the body."""
+    """SE-04: /health is a pure liveness probe — no memory data in the body.
+
+    Asserted as an exact body, not a subset: the point of the check is that
+    nothing derived from the store can ever appear here, which a subset match
+    would let through. The version is a static build identifier, not data.
+    """
     memory_factory(content="secret memory content")
     r = client.get("/health")
     assert r.status_code == 200
-    assert r.json() == {"status": "ok"}
+    assert r.json() == {"status": "ok", "role": "node", "version": __version__}
 
 
 def test_auth_does_not_block_cors_preflight(client_with_auth: TestClient) -> None:

@@ -146,8 +146,148 @@ the hub, permanently excluded by its own `exclude_node`. Point a client with
 an empty local `memories` table at `full=1` to recover its full history back
 from the hub.
 
+### Observability: `/health`, `/count`, `/stats`
+
+Three read-only routes, in increasing cost. Pick the cheapest one that
+answers your question — they are not interchangeable.
+
+| Route | Auth | Cost | Answers |
+|-------|------|------|---------|
+| `GET /health` | none | no query beyond `SELECT 1` | is the hub up, can it reach Postgres, **which version is deployed** |
+| `GET /count` | bearer | one `COUNT(*)` per table | how many records are there |
+| `GET /stats` | bearer | two `GROUP BY` passes + `MIN`/`MAX` | how do the counts break down by node and category |
+
+```bash
+curl -s http://127.0.0.1:8765/health
+# {"status":"ok","role":"hub","version":"1.5.0","db":"ok","time":"..."}
+
+curl -s -H "Authorization: Bearer $SYNC_SECRET" http://127.0.0.1:8765/count
+# {"role":"hub","version":"1.5.0",
+#  "memories":{"total":812,"live":790,"tombstones":22},
+#  "entities":143,"memory_entities":901,"entity_relations":37,"time":"..."}
+
+# Narrow to one table when a poller only watches one:
+curl -s -H "Authorization: Bearer $SYNC_SECRET" \
+     'http://127.0.0.1:8765/count?table=memories'
+```
+
+`/count` is the one to poll — a dashboard tile, a cron drift alarm, a check
+right after a bulk import. `/stats` exists for reconciliation (it is what
+`remind_me_sync_reconcile` reads) and pays for its breakdowns with full
+table scans, which is the right cost once per reconcile and the wrong cost
+once per minute. `table=` accepts `memories`, `entities`, `memory_entities`
+or `entity_relations`; anything else is a `400`.
+
+Two filters, both memories-oriented:
+
+```bash
+# How many records changed in the last hour? One request, no client state.
+curl -s -H "Authorization: Bearer $SYNC_SECRET" \
+     "http://127.0.0.1:8765/count?since=$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)"
+
+# Which node pushed what — the one fact no node can compute for itself.
+curl -s -H "Authorization: Bearer $SYNC_SECRET" \
+     'http://127.0.0.1:8765/count?by=origin_node&table=memories'
+```
+
+`since=` takes any ISO-8601 timestamp and is index-backed. It counts records
+*touched* in the window, tombstones included — a delete is a change — so it
+reports a `total` with no live/tombstone split, which would invite reading it
+as a live-record delta.
+
+`by=origin_node` is opt-in because it reintroduces a `GROUP BY`; the default
+path stays scan-only. Combine it with `since=` for "who has pushed anything
+lately", i.e. the real question behind "which node stopped syncing".
+
+Filters can't be combined with `approx=1` (a `400`): planner estimates are
+whole-table, and silently ignoring the filter would answer a different
+question than the one asked.
+
+For a purely trend-shaped question — a graph that only needs to go up and to
+the right — add `?approx=1`:
+
+```bash
+curl -s -H "Authorization: Bearer $SYNC_SECRET" \
+     'http://127.0.0.1:8765/count?approx=1'
+# {"role":"hub","version":"1.5.0","approximate":true,
+#  "memories":{"total":812},"entities":143,...}
+```
+
+Postgres cannot answer an unqualified `COUNT(*)` without scanning — MVCC
+means there is no stored row count to read — so even `/count` is O(rows).
+`approx=1` reads `pg_class.reltuples` instead: one catalog lookup, maintained
+by autovacuum/ANALYZE, typically within a fraction of a percent. **A table
+that hasn't been analysed recently can be materially off**, which is fine for
+a trend line and not fine for reconciliation, so exact remains the default
+and every response says which it gave you (`approximate`). Approximate
+`memories` reports `total` only: the live/tombstone split needs a filtered
+scan, and estimating it would mean inventing a number.
+
+`memories.live` is `total - tombstones`, and it is the number that should
+agree with a node — a node's user-visible count excludes tombstones while
+the hub retains them until `/admin/compact_tombstones` runs, so comparing
+raw totals across the two looks like permanent drift.
+
+Both counting routes are bearer-authenticated: totals and category names
+leak how much is stored and how fast it grows. `/health` stays public
+because deploy healthchecks need it, and it stays free of counts.
+
+Every response — every route, including errors and `401`s — also carries an
+`X-Hub-Version` header, so a client doing ordinary `/sync/push`/`/sync/pull`
+work learns the build without a second request, and `curl -I` works as a
+deploy check. `remind_me_mcp/sync.py` records it from whatever the hub
+answers, which is where `remind_me_sync_status`'s `hub_version` comes from
+(no network call of its own — it reports what the last sync cycle saw).
+
+### Metrics
+
+`GET /metrics` serves Prometheus text exposition — build info plus record
+gauges (`remind_me_hub_memories{state="live"|"tombstoned"}`,
+`remind_me_hub_entities`, `remind_me_hub_memory_entities`,
+`remind_me_hub_entity_relations`). Counts come from the same helper `/count`
+uses, so the graph and the endpoint can't disagree.
+
+Off by default: set `REMIND_ME_HUB_METRICS_ENABLED=1`. While off the route is
+a plain `404`, not a `403` — "disabled" and "this build doesn't have it"
+should look the same to a scrape config.
+
+**Bearer-authenticated, unlike the dashboard's `/metrics`.** That route is
+deliberately open because Prometheus scrape configs typically send no custom
+headers, and requiring one would mean hand-rolling a bearer `scrape_config`
+for a single target. That argument doesn't carry here: anyone scraping the
+hub is the operator who provisioned `SYNC_SECRET` for it, and the payload is
+the same aggregate `/count` and `/stats` are gated on — serving it open would
+route around that gate rather than reconsider it.
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: remind-me-hub
+    authorization:
+      credentials: <SYNC_SECRET>
+    static_configs:
+      - targets: ["127.0.0.1:8765"]
+```
+
+**Versioning.** `HUB_VERSION` in `main.py` is a literal string, bumped by
+hand — the container image contains `main.py` and nothing else (no
+`pyproject.toml`, no git checkout), so there is nothing to derive it from at
+runtime. It is versioned independently of the `remind-me-mcp` package, whose
+version tracks client releases the hub never participates in. Bump MAJOR for
+a wire-protocol break, MINOR for a new endpoint or response field, PATCH for
+a fix nothing can key off. Clients should still probe for a `404` to detect
+a capability (as `sync.reconcile_with_hub` does for `/stats`) rather than
+compare version strings — this is a diagnostic, not feature negotiation.
+
 ### Hardening
 
+- **FastAPI's interactive docs are disabled.** `/docs`, `/redoc` and
+  `/openapi.json` are ON and unauthenticated by default, and publish every
+  route — including `POST /admin/compact_tombstones`, which hard-deletes
+  rows — with full schemas to anyone who can reach the port. The app passes
+  `docs_url=None, redoc_url=None, openapi_url=None`; the wire protocol is
+  documented above instead. FastAPI's own `version=` is wired to
+  `HUB_VERSION` so nothing reports the framework's `0.1.0` placeholder.
 - **Auth comparison is byte-safe.** `_require_auth` compares UTF-8-encoded
   bytes, not `str` — `hmac.compare_digest` raises `TypeError` on a non-ASCII
   `str`, which a crafted `Authorization` header could trigger to get an
@@ -237,7 +377,7 @@ systemctl --user daemon-reload
 systemctl --user start remind-me-postgres.service
 systemctl --user start remind-me-hub.service
 curl -s http://127.0.0.1:8765/health
-# {"status":"ok","role":"hub","db":"ok","time":"..."}
+# {"status":"ok","role":"hub","version":"1.5.0","db":"ok","time":"..."}
 ```
 
 The hub creates (or migrates) the database schema itself at startup, and
@@ -470,6 +610,9 @@ journalctl --user -u remind-me-hub.service -f
 journalctl --user -u remind-me-postgres.service -f
 
 # Update after a code change (pull, rebuild, restart)
+# Fails loudly if the new build isn't the one actually serving afterwards —
+# `/health` answering only proves *something* is up, which is how a failed
+# build or a no-op restart otherwise gets reported as a successful deploy.
 ~/remind_me/hub/setup.sh update
 
 # Backup
@@ -479,6 +622,31 @@ podman exec remind-me-postgres pg_dump -U remindme remindme \
 # Poke at the data
 podman exec -it remind-me-postgres psql -U remindme -d remindme
 ```
+
+### Rolling back a hub build
+
+`setup.sh` tags every build twice — `remind-me-hub:latest` (what the Quadlet
+runs) and `remind-me-hub:$HUB_VERSION` — so previous builds stay on disk
+instead of being overwritten. A rollback is then a retag, not a rebuild from
+an older checkout:
+
+```bash
+podman image ls remind-me-hub                       # what's available
+podman tag localhost/remind-me-hub:1.2.0 localhost/remind-me-hub:latest
+systemctl --user restart remind-me-hub.service
+curl -s http://127.0.0.1:8765/health                # confirm the version
+```
+
+The image also carries `org.opencontainers.image.version`, so a build can be
+identified while stopped or crash-looping — when `/health` can't answer:
+
+```bash
+podman inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' \
+  localhost/remind-me-hub:latest
+```
+
+An image built by hand without `--build-arg HUB_VERSION=...` reports
+`unknown` rather than guessing.
 
 Useful queries:
 
