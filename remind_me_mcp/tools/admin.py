@@ -14,7 +14,12 @@ import json
 import sqlite3
 from typing import Any
 
-from remind_me_mcp import ann_index, config
+from remind_me_mcp import (
+    ann_index,
+    config,
+    image_import,  # noqa: F401 — registers the "image" import kind (FT-19)
+    pdf_import,  # noqa: F401 — registers the "pdf" import kind (FT-19)
+)
 from remind_me_mcp import tools as _pkg
 from remind_me_mcp.config import EMBED_BATCH_SIZE, SYNC_ENABLED
 from remind_me_mcp.db import _now_iso
@@ -57,13 +62,19 @@ except ImportError:
     },
 )
 async def memory_import_chat(params: ChatImportInput) -> str:
-    """Import a chat export (JSON, JSONL, or Markdown) or a document/notes file into memory.
+    """Import a chat export (JSON, JSONL, or Markdown), a document/notes file,
+    a PDF, or an image into memory.
 
     Supports Claude's export format, OpenAI's export format, and generic {role, content} message
     arrays — plus generic documents (FT-02): Markdown notes are chunked per-section (heading
-    context kept with each chunk and stored as metadata), plain text per-paragraph. With the
-    default kind='auto', chat-style markdown imports as chat and notes files as documents.
-    Deduplicates by file hash — re-importing the same file is a no-op.
+    context kept with each chunk and stored as metadata), plain text per-paragraph. Also PDFs
+    and images (FT-19): a .pdf is chunked per-page (page number kept as metadata, mirroring the
+    document connector's heading context) via the optional 'pdf' extra; a .png/.jpg/.jpeg is
+    OCR'd into a single memory via the optional 'image' extra — importing either kind without
+    its extra installed returns a clear error naming the exact `pip install` command, not a
+    traceback. With the default kind='auto', chat-style markdown imports as chat, notes files
+    as documents, .pdf as pdf, and .png/.jpg/.jpeg as image. Deduplicates by file hash —
+    re-importing the same file is a no-op.
 
     Args:
         params (ChatImportInput): File path, import kind, extraction mode, and tagging options.
@@ -93,6 +104,13 @@ async def memory_import_chat(params: ChatImportInput) -> str:
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
         log.error("Import parse error for %s: %s", params.file_path, e)
         return json.dumps({"status": "error", "error": f"Failed to parse file: {e}"})
+    except RuntimeError as e:
+        # FT-19: the pdf/image connectors raise RuntimeError (not a bare
+        # ImportError traceback) for a missing optional extra or an
+        # unparseable file — already an actionable, user-facing message
+        # (see pdf_import.PDF_EXTRA_INSTALL_MSG / image_import.IMAGE_EXTRA_INSTALL_MSG).
+        log.warning("Import failed for %s: %s", params.file_path, e)
+        return json.dumps({"status": "error", "error": str(e)})
     return json.dumps(result, indent=2)
 
 
@@ -107,11 +125,15 @@ async def memory_import_chat(params: ChatImportInput) -> str:
     },
 )
 async def memory_import_directory(params: BulkImportDirInput) -> str:
-    """Bulk import all chat export and document files from a directory.
+    """Bulk import all chat export, document, PDF, and image files from a directory.
 
-    Scans for .json, .jsonl, .md, .markdown, and .txt files. With the default
-    kind='auto' each file is routed individually: chat exports are chunked
-    per-message, documents per-section/paragraph (FT-02). Skips
+    Scans for .json, .jsonl, .md, .markdown, .txt, .pdf, .png, .jpg, and
+    .jpeg files (FT-19 added the last four). With the default kind='auto'
+    each file is routed individually: chat exports are chunked per-message,
+    documents per-section/paragraph (FT-02), PDFs per-page, and images OCR'd
+    into a single memory (FT-19; require the optional 'pdf'/'image' extras
+    respectively — a file needing a missing extra is reported as a per-file
+    error in the result, the rest of the batch still imports). Skips
     already-imported files (hash-based deduplication). Delegates to the
     shared import_directory() function in importer.py (DRY).
 

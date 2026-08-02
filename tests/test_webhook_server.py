@@ -325,10 +325,12 @@ def test_ingest_invalid_max_length_400(webhook_url: str) -> None:
 
 def test_ingest_unsupported_suffix_returns_422(webhook_url: str) -> None:
     """A validation error surfaced from import_content (not the handler's
-    own up-front checks) comes back as 422, carrying the importer's reason."""
+    own up-front checks) comes back as 422, carrying the importer's reason.
+
+    .docx (not .pdf -- FT-19 made that a supported, first-class kind)."""
     resp = httpx.post(
         f"{webhook_url}/ingest",
-        json=chat_payload(filename="notes.pdf"),
+        json=chat_payload(filename="notes.docx"),
         headers=AUTH,
     )
     assert resp.status_code == 422

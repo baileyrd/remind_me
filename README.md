@@ -9,7 +9,8 @@ Persistent, searchable memory that works across **Claude.ai**, **Claude Code**, 
 **Capture & import**
 - **Chat export import** — ingest JSON, JSONL, or Markdown exports from Claude, ChatGPT, or custom formats
 - **Document ingestion** — import Markdown notes and plain-text files, chunked per-section (heading context preserved) or per-paragraph; `kind=auto` detects chat vs document per file
-- **Bulk directory import** — point at a folder of exports/notes and import them all
+- **PDF and image (OCR) ingestion** — import `.pdf` files (chunked per-page, page number kept as metadata) and `.png`/`.jpg`/`.jpeg` images (OCR'd into a single memory); `kind=auto` routes both automatically. Requires the optional `pdf`/`image` extras — see [PDF and Image Import](#pdf-and-image-import)
+- **Bulk directory import** — point at a folder of exports/notes/PDFs/images and import them all
 - **Watched folders** — set `REMIND_ME_WATCH_DIRS` and new or changed files auto-ingest in the background; changed files supersede their previous import
 - **Push/webhook ingestion** — set `REMIND_ME_WEBHOOK_SECRET` and `POST /ingest` accepts content directly over the network, no filesystem staging required
 - **Ingest-time normalization** — `remind_me_normalize_batch`/`remind_me_normalize_apply` distill noisy raw imports into clean `{question, summary, resolution?}` memories, non-destructively linked back to the source
@@ -400,8 +401,8 @@ The stats view replaces the main content area with summary cards, horizontal bar
 
 | Tool | Description |
 |------|-------------|
-| `remind_me_import_chat` | Import a single chat export or document file (`kind`: auto/chat/document) |
-| `remind_me_import_directory` | Bulk import all exports/documents from a directory |
+| `remind_me_import_chat` | Import a single chat export, document, PDF, or image file (`kind`: auto/chat/document/pdf/image) |
+| `remind_me_import_directory` | Bulk import all exports/documents/PDFs/images from a directory |
 | `remind_me_import_mempalace` | Bulk-import memories from a MemPalace ChromaDB store, one page at a time (requires the optional `mempalace` extra) |
 | `remind_me_import_dbs` | Bulk-import memories from a [dbs](https://github.com/baileyrd/daily-backup-system) SQLite store, one page at a time — source and tags land as knowledge-graph entities, not flattened prose |
 | `remind_me_list_connectors` | List every registered import connector (built-in and third-party) and which are valid `remind_me_import_chat` kinds |
@@ -586,6 +587,34 @@ Switching `REMIND_ME_EMBEDDING_MODEL`, `REMIND_ME_EMBEDDING_DIM`, or `REMIND_ME_
 ### Checking Status
 
 Use `remind_me_server_status` to see how many memories have embeddings and whether the model is loaded.
+
+## PDF and Image Import
+
+Two more import kinds, `pdf` and `image`, sit alongside `chat`/`document` — same `remind_me_import_chat`/`remind_me_import_directory` tools, same hash-dedup and `kind=auto` routing, just two more optional extras so a base install doesn't pull in PDF/OCR dependencies.
+
+### Enabling PDF Import
+
+```bash
+pip install pypdf
+# Or with uv:
+uv pip install "remind-me-mcp[pdf]"
+```
+
+A `.pdf` file is chunked **per page** via [`pypdf`](https://pypdf.readthedocs.io/) (pure-Python — no system binary like poppler-utils required); each chunk's metadata carries a `page` number, the same role the `document` connector's Markdown heading breadcrumb plays. A page too long for one memory is split further, with every resulting sub-chunk still tagged with that page's number.
+
+### Enabling Image (OCR) Import
+
+```bash
+pip install rapidocr-onnxruntime
+# Or with uv:
+uv pip install "remind-me-mcp[image]"
+```
+
+A `.png`/`.jpg`/`.jpeg` file is OCR'd via [RapidOCR](https://github.com/RapidAI/RapidOCR) into a single memory (whole image as one chunk). **Why RapidOCR over `pytesseract`:** this server already depends on `onnxruntime` for the embedder/reranker, so an ONNX-based OCR engine reuses infrastructure already present rather than adding a new runtime family — and RapidOCR's detection/recognition models ship *inside* the pip package itself, so OCR works fully offline with no HuggingFace download (unlike the embedder/reranker). `pytesseract` was considered and rejected: it additionally requires the system `tesseract` binary, which pip can't install and which isn't present in this project's CI/dev images.
+
+### Without These Extras
+
+Importing a `.pdf`/image file without its extra installed returns a clear, actionable error (e.g. *"PDF import requires the 'pdf' extra: pip install remind-me-mcp[pdf]"*) — not a bare `ModuleNotFoundError` traceback. Every other import kind, and the rest of the server, is completely unaffected either way.
 
 ## CLI
 

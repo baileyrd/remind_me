@@ -519,16 +519,19 @@ class DigestInput(BaseModel):
 
 
 class ImportKind(StrEnum):
-    """How to parse an imported file (FT-02).
+    """How to parse an imported file (FT-02, extended by FT-19).
 
     AUTO routes by extension and content sniffing: .json/.jsonl always import
-    as chat; .md/.markdown/.txt import as chat when they contain chat role
+    as chat; .pdf always imports as pdf; .png/.jpg/.jpeg always import as
+    image; .md/.markdown/.txt import as chat when they contain chat role
     markers (e.g. '**User:**', '## Assistant'), otherwise as a document.
     """
 
     AUTO = "auto"
     CHAT = "chat"
     DOCUMENT = "document"
+    PDF = "pdf"
+    IMAGE = "image"
 
 
 class ChatImportInput(BaseModel):
@@ -574,12 +577,17 @@ class ChatImportInput(BaseModel):
     kind: ImportKind = Field(
         default=ImportKind.AUTO,
         description=(
-            "How to parse the file (FT-02): "
+            "How to parse the file (FT-02, extended by FT-19): "
             "'auto' — detect by extension/content (chat-style markdown imports "
-            "as chat, notes markdown/text as a document), "
+            "as chat, notes markdown/text as a document, .pdf as pdf, "
+            "image extensions as image), "
             "'chat' — force the chat-export parser, "
             "'document' — force per-section/paragraph document chunking "
-            "(.md/.markdown/.txt only)"
+            "(.md/.markdown/.txt only), "
+            "'pdf' — force per-page PDF chunking (.pdf only; requires the "
+            "optional 'pdf' extra), "
+            "'image' — force OCR of an image into a single memory "
+            "(.png/.jpg/.jpeg only; requires the optional 'image' extra)"
         ),
     )
 
@@ -597,9 +605,11 @@ class ChatImportInput(BaseModel):
             raise ValueError(f"Path not in allowed import roots: {p}")
         if not p.exists():
             raise ValueError(f"File not found: {p}")
-        if p.suffix.lower() not in (".json", ".jsonl", ".md", ".markdown", ".txt"):
+        if p.suffix.lower() not in (
+            ".json", ".jsonl", ".md", ".markdown", ".txt", ".pdf", ".png", ".jpg", ".jpeg",
+        ):
             raise ValueError(
-                f"Unsupported file type: {p.suffix}. Use .json, .jsonl, or .md"
+                f"Unsupported file type: {p.suffix}. Use .json, .jsonl, .md, .pdf, or an image"
             )
         return str(p)
 
@@ -703,8 +713,9 @@ class BulkImportDirInput(BaseModel):
     kind: ImportKind = Field(
         default=ImportKind.AUTO,
         description=(
-            "Per-file parsing mode (FT-02): 'auto' (detect chat vs document "
-            "per file), 'chat', or 'document'"
+            "Per-file parsing mode (FT-02, extended by FT-19): 'auto' "
+            "(detect chat/document/pdf/image per file), 'chat', 'document', "
+            "'pdf', or 'image'"
         ),
     )
 

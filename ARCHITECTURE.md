@@ -24,7 +24,7 @@ predict a second one).
 | `EntityUpserter` / `MemoryEntityLinker` / `EntityRelationUpserter` / `EntityResolver` / `EntityProfileReader` | SQLite (`db.py`) | entity graph reads/writes (FT-04); no second implementation exists, Protocol exists for interface discipline |
 | `VectorSearcher` / `ChunkEmbedder` / `ChunkBatchEmbedder` | SQLite + sqlite-vec, ONNX embedder | `vec_search_available()` gates on the `memories_vec` table actually existing, separately from whether the embedder loaded — the two can split if the native extension fails |
 | `OrphanChunkPruner` | SQLite (`db.py`) | chunk lifecycle cleanup after a memory is deleted/superseded |
-| Import connector (`register_connector`, `importer.py`) | `chat`, `document` (built-in), `mempalace` (`mempalace_import.py`), `dbs` (`dbs_import.py`) | kind-string registry, not a hardcoded dispatch; third-party modules register more without touching `importer.py` |
+| Import connector (`register_connector`, `importer.py`) | `chat`, `document`, `pdf` (`pdf_import.py`), `image` (`image_import.py`) (built-in), `mempalace` (`mempalace_import.py`), `dbs` (`dbs_import.py`) | kind-string registry, not a hardcoded dispatch; third-party modules register more without touching `importer.py`. `pdf`/`image` are binary formats — `importer.py` threads the undecoded file bytes through `meta["raw_bytes"]` alongside the lossily-UTF-8-decoded `raw` text every connector receives, since a PDF/image would be corrupted by that decode |
 | Sync backend | Postgres hub, peer-to-peer over Tailscale | both drive the same wire format (JSON records tagged with a `record_type` discriminator) |
 
 ## Structure

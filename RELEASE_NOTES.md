@@ -1,5 +1,14 @@
 # Release Notes
 
+## v1.38.0 — 2026-08-02
+
+### New Features
+
+- **PDF and image (OCR) import connectors (FT-19, #181)** — two new built-in import kinds, `pdf` and `image`, registered from their own modules (`remind_me_mcp/pdf_import.py`, `remind_me_mcp/image_import.py`) exactly like `mempalace_import.py`/`dbs_import.py` register theirs — never inlined into `importer.py`. A `.pdf` is chunked per-page via [`pypdf`](https://pypdf.readthedocs.io/) (pure-Python, no system binary dependency), with the page number recorded on each chunk's metadata the same way the `document` connector records its Markdown heading breadcrumb; a page whose text is too long for one memory is further split, every sub-chunk still carrying that page's number. A `.png`/`.jpg`/`.jpeg` is OCR'd via [RapidOCR](https://github.com/RapidAI/RapidOCR) (`rapidocr-onnxruntime`) into a single memory.
+- **`kind=auto` now recognizes both new kinds** — `.pdf` routes to the pdf connector and `.png`/`.jpg`/`.jpeg` to the image connector, alongside the existing chat/document extension and content sniffing; `remind_me_import_directory` and the folder watcher (`REMIND_ME_WATCH_DIRS`) pick up the same extensions automatically. Both connectors funnel through the exact same `_ingest_parsed` pipeline as every other kind — hash dedup, chunk storage, and batched embedding are unchanged and unduplicated.
+- **Two new optional extras, `pdf` and `image`** — a base install pulls in neither; `pip install remind-me-mcp[pdf]` / `[image]` (or both) opt in. Importing a `.pdf`/image file without its extra installed raises a clear, actionable `RuntimeError` (e.g. *"PDF import requires the 'pdf' extra: pip install remind-me-mcp[pdf]"*, matching `embeddings.py`/`reranker.py`'s existing "install this extra" phrasing) — `tools/admin.py`'s `remind_me_import_chat` catches it and returns a clean error response, never a raw traceback; a directory/watcher import reports it as a per-file error without aborting the rest of the batch.
+- **Why RapidOCR over `pytesseract`**: this codebase already depends on `onnxruntime` for the embedder and reranker, so an ONNX-based OCR engine reuses infrastructure already present rather than adding a new runtime family. RapidOCR's detection/recognition models ship *inside* the pip package itself (unlike the embedder/reranker, which download from HuggingFace Hub on first use) — no network access needed at OCR time. `pytesseract` was considered and rejected: it additionally requires the system `tesseract` binary, which isn't installable via pip and isn't present in this project's CI/dev images, making it a strictly heavier install for equivalent capability here.
+
 ## v1.37.0 — 2026-08-02
 
 ### New Features

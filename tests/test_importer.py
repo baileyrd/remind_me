@@ -879,14 +879,21 @@ def test_import_different_files_get_different_doc_ids(
 def test_builtin_connectors_registered() -> None:
     assert "chat" in _importer_mod._CONNECTORS
     assert "document" in _importer_mod._CONNECTORS
+    # pdf/image (FT-19) register from their own modules (pdf_import.py/
+    # image_import.py), imported for their registration side effect by
+    # tools/admin.py -- which every test process loads transitively via
+    # remind_me_mcp/__init__.py's `import remind_me_mcp.tools`.
+    assert "pdf" in _importer_mod._CONNECTORS
+    assert "image" in _importer_mod._CONNECTORS
 
 
 def test_import_kinds_narrower_than_connector_registry() -> None:
     """IMPORT_KINDS (what import_chat_file accepts) is deliberately not
     derived from the full _CONNECTORS registry -- a connector can be
     registered purely for discovery without becoming a valid file-import
-    kind (see mempalace_import.py)."""
-    assert set(_importer_mod.IMPORT_KINDS) == {"auto", "chat", "document"}
+    kind (see mempalace_import.py). pdf/image (FT-19) ARE file-import kinds,
+    unlike mempalace/dbs, so they belong in this set."""
+    assert set(_importer_mod.IMPORT_KINDS) == {"auto", "chat", "document", "pdf", "image"}
     assert set(_importer_mod.IMPORT_KINDS) <= (set(_importer_mod._CONNECTORS) | {"auto"})
 
 
@@ -1060,7 +1067,8 @@ def test_import_content_invalid_kind_returns_error(db_conn: sqlite3.Connection) 
 
 
 def test_import_content_unsupported_suffix_returns_error(db_conn: sqlite3.Connection) -> None:
-    result = import_content(b"whatever", "f.pdf", "test", [], "assistant_messages", 10000)
+    # .docx (not .pdf -- FT-19 made that a supported, first-class kind).
+    result = import_content(b"whatever", "f.docx", "test", [], "assistant_messages", 10000)
     assert result["status"] == "error"
     assert "unsupported format" in result["reason"]
 
