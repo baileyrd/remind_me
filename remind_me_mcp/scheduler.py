@@ -31,6 +31,18 @@ zero-config server nothing extra per tick, while a second thread would add
 its own lifecycle (start/stop/join, another daemon thread name, another
 failure mode to log) purely to poll something on a much longer timescale
 that this thread already wakes up for anyway.
+
+Edit-history revision compaction (issue #187, ``db._compact_revisions``)
+piggybacks on this same loop for the same reason, but for a different
+reason than the digest check: ``sync._compact_tombstones`` (the closest
+precedent) only ever runs from ``sync.py``'s loop because that loop is
+gated on ``config.SYNC_ENABLED`` -- a non-syncing node hard-deletes
+immediately and never accumulates tombstones to compact. Revisions,
+however, are captured on every genuine content edit regardless of whether
+sync is configured at all, so gating their pruning on sync being enabled
+would leave a single, never-synced device's ``memory_revisions`` table
+growing forever. This loop runs unconditionally (unlike ``sync.py``'s),
+which is exactly the property revision compaction needs.
 """
 
 from __future__ import annotations
@@ -41,7 +53,7 @@ from typing import TYPE_CHECKING, Any
 
 from remind_me_mcp import notifications
 from remind_me_mcp.config import REMINDER_POLL_INTERVAL
-from remind_me_mcp.db import _get_db, _now_iso, _row_to_dict
+from remind_me_mcp.db import _compact_revisions, _get_db, _now_iso, _row_to_dict
 
 if TYPE_CHECKING:
     import sqlite3
@@ -174,6 +186,10 @@ def start_scheduler() -> threading.Thread:
                     maybe_send_scheduled_digest()
                 except Exception as e:
                     log.error("Scheduled digest check failed: %s", e, exc_info=True)
+                try:
+                    _compact_revisions(_get_db())
+                except Exception as e:
+                    log.error("Revision compaction failed: %s", e, exc_info=True)
                 _stop.wait(REMINDER_POLL_INTERVAL)
             log.info("Reminder scheduler thread stopped")
 

@@ -602,6 +602,21 @@ folder watcher, the scheduler always runs -- this only tunes how often it
 checks, not whether it's enabled."""
 
 # ---------------------------------------------------------------------------
+# Edit history (issue #187)
+# ---------------------------------------------------------------------------
+
+REVISION_RETENTION_DAYS = _env_int("REMIND_ME_REVISION_RETENTION_DAYS", 90)
+"""How many days a pre-edit memory_revisions snapshot (issue #187) is kept
+before db._compact_revisions hard-deletes it. Purely time-based, mirroring
+TOMBSTONE_RETENTION_DAYS -- no cross-device acknowledgment tracking, since
+memory_revisions is a local-only audit table that is never synced (see the
+v23->v24 migration docstring). Deliberately shorter than
+TOMBSTONE_RETENTION_DAYS's 180-day default: losing an old revision snapshot
+only narrows how far back remind_me_revert can reach, not the same class of
+risk as resurrecting a deleted memory that TOMBSTONE_RETENTION_DAYS's longer
+window guards against."""
+
+# ---------------------------------------------------------------------------
 # Notifications (issue #180)
 # ---------------------------------------------------------------------------
 
@@ -801,6 +816,7 @@ __all__ = [
     "WATCH_INTERVAL",
     "WATCH_GRACE",
     "REMINDER_POLL_INTERVAL",
+    "REVISION_RETENTION_DAYS",
     "NOTIFY_WEBHOOK_URL",
     "NOTIFY_WEBHOOK_TIMEOUT",
     "NOTIFY_SMTP_HOST",

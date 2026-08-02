@@ -448,6 +448,55 @@ class ListRemindersInput(BaseModel):
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
 
 
+# ---------------------------------------------------------------------------
+# Edit history models (issue #187)
+# ---------------------------------------------------------------------------
+
+
+class RevisionHistoryInput(BaseModel):
+    """Input for remind_me_history: list a memory's prior content revisions."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    memory_id: str = Field(
+        ..., description="The ID of the memory to list revision history for", min_length=1
+    )
+    limit: int = Field(
+        default=10,
+        ge=1,
+        le=100,
+        description="Maximum number of revisions to return, newest first.",
+    )
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
+
+
+class RevertInput(BaseModel):
+    """Input for remind_me_revert: restore a memory to a prior revision."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    memory_id: str = Field(
+        ..., description="The ID of the memory to revert", min_length=1
+    )
+    revision_id: int = Field(
+        ...,
+        description=(
+            "The revision id to restore, from remind_me_history's output. "
+            "Must belong to this memory_id."
+        ),
+    )
+    reason: str | None = Field(
+        default=None,
+        description=(
+            "Optional free-text note for why this revert happened, stored "
+            "on the new revision this revert itself creates (a revert is "
+            "just another edit — it snapshots the pre-revert state too, so "
+            "it can itself be undone)."
+        ),
+        max_length=500,
+    )
+
+
 class DigestInput(BaseModel):
     """Input for remind_me_digest: a synthesized vault snapshot (issue #188).
 

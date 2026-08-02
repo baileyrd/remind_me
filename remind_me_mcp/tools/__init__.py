@@ -111,6 +111,7 @@ from remind_me_mcp.tools import (
     capture,
     crud,
     entity,
+    history,
     lifecycle,
     normalize,
     prompts,
@@ -168,6 +169,10 @@ from remind_me_mcp.tools.entity import (
     _expand_via_entity_relations,
     remind_me_entity,
     remind_me_entity_traverse,
+)
+from remind_me_mcp.tools.history import (
+    remind_me_history,
+    remind_me_revert,
 )
 from remind_me_mcp.tools.lifecycle import (
     remind_me_consolidate,
@@ -256,6 +261,8 @@ __all__ = [
     "memory_get",
     "memory_update",
     "memory_delete",
+    "remind_me_history",
+    "remind_me_revert",
     "remind_me_set_reminder",
     "remind_me_list_reminders",
     "remind_me_reminders_ics_url",

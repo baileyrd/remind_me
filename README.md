@@ -306,6 +306,8 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_get` | Retrieve a single memory by ID |
 | `remind_me_update` | Update a memory's content, category, tags, or metadata |
 | `remind_me_delete` | Permanently delete a memory |
+| `remind_me_history` | List a memory's prior content revisions, newest first — see [Edit History](#edit-history) |
+| `remind_me_revert` | Restore a memory to a prior revision — see [Edit History](#edit-history) |
 
 ### Reminders
 
@@ -808,6 +810,18 @@ Two wiring points, both optional in the sense that they're no-ops with nothing c
 
 Deliberately *not* wired into `remind_me_server_status`'s maintenance-backlog nudges or the feedback hint — those are in-band by design (surfaced only inside a live tool response), not outbound alerts.
 
+## Edit History
+
+`remind_me_update` overwrites a memory's content/category/tags/metadata in place — issue #187 gives it the same "don't lose data on a destructive-looking operation" treatment [deletion already gets](#deletion-propagates-too) from `deleted_at` tombstones, applied to edits instead of deletes.
+
+- **`remind_me_history`** — lists a memory's prior revisions, newest first, each with a timestamp and a short content preview. `limit` (default 10) caps how many come back; `response_format` supports `markdown` or `json`.
+- **`remind_me_revert`** — restores a memory's content/category/tags/metadata to a prior revision by `revision_id` (from `remind_me_history`'s output). A `revision_id` that doesn't exist, or belongs to a different memory, fails with a clear error instead of silently doing nothing or reverting the wrong thing.
+- **A revision is captured automatically** whenever `remind_me_update` (or a revert) genuinely changes tracked content — a no-op update (setting a field to the value it already has) creates no revision, mirroring how sync only propagates genuine content changes.
+- **A revert is itself an edit, not a raw overwrite** — it's implemented by calling the exact same internal update path `remind_me_update` uses, so it bumps `updated_at`, rides the normal sync outbox trigger like any other change, and — because it's just another edit through that path — automatically snapshots the state just before the revert. That means reverting is itself undoable, with no special-case code for it.
+- **Scope: content fields only.** What's tracked is exactly what `remind_me_update` can change (`content`, `category`, `tags`, `metadata`) — not `remind_at` or the vitality/classification columns. `remind_me_set_reminder` happens to funnel through the same shared internal update helper, but since it only ever touches `remind_at`, it never produces a revision.
+- **Local only, never synced** — like `reminder_deliveries` and the wiki index tables, `memory_revisions` carries no sync outbox trigger. Edit history is per-device audit trail, not a replicated entity; a revert on one device does not (yet) merge with another device's edit history for the same memory.
+- **Retention** — `REMIND_ME_REVISION_RETENTION_DAYS` (default 90) bounds how far back `remind_me_revert` can reach. Old revisions are pruned by the always-on reminder-scheduler loop (not the sync loop — revisions accumulate regardless of whether sync is configured at all).
+
 ## Digest
 
 `remind_me_digest` (issue #188) is a compressed, one-read snapshot of the vault: recent additions, vault vitality, reminders, and sync health. It is pure synthesis — every section calls the exact same underlying function its own standalone tool already uses (`vitality.build_vitality_report`, the same function behind `remind_me_vitality_report` in [Lifecycle](#lifecycle); the reminders window logic behind [`remind_me_list_reminders`](#reminders); `sync.get_sync_status`, the same function behind `remind_me_sync_status` in [Multi-Machine Sync](#multi-machine-sync)), so the digest can never disagree with those tools' own numbers.
@@ -1225,6 +1239,7 @@ Every new memory used to start at a flat `base_weight=1.0` regardless of kind, s
 | `REMIND_ME_WATCH_INTERVAL` | `60` | Seconds between folder watcher scan passes |
 | `REMIND_ME_WATCH_GRACE` | `5` | Debounce grace period in seconds — files modified more recently than this are deferred until a scan sees a stable (mtime, size) |
 | `REMIND_ME_REMINDER_POLL_INTERVAL` | `60` | Seconds between the reminder scheduler's poll passes for due `remind_at` timestamps. The scheduler itself always runs — no separate enable switch |
+| `REMIND_ME_REVISION_RETENTION_DAYS` | `90` | An edit-history snapshot (see [Edit History](#edit-history)) older than this is hard-deleted by the reminder-scheduler loop — purely time-based, no per-peer acknowledgment tracking (`memory_revisions` is never synced). Bounds how far back `remind_me_revert` can reach |
 | `REMIND_ME_NOTIFY_WEBHOOK_URL` | *(unset)* | Webhook URL that receives a generic `{"subject", "body", "source": "remind-me"}` JSON POST per notification. Empty disables the webhook notifier — gated on config presence, no separate enable flag |
 | `REMIND_ME_NOTIFY_WEBHOOK_TIMEOUT` | `5` | Seconds to wait for the webhook POST before giving up, so a hung endpoint can't block the reminder scheduler or sync thread |
 | `REMIND_ME_NOTIFY_SMTP_HOST` | *(unset)* | SMTP server host. Empty (with no recipients) disables the email notifier |

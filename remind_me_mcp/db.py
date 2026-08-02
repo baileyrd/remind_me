@@ -53,6 +53,13 @@ Current schema versions:
             already fired, so a reminder that comes due while the server is
             offline still fires exactly once on the next poll instead of
             repeating forever or being silently dropped.
+  23 -> 24: edit history (issue #187) -- memory_revisions table capturing a
+            memory's pre-edit content/category/tags/metadata each time
+            remind_me_update (or a revert) genuinely changes one of them, so
+            a bad edit can be inspected (remind_me_history) and undone
+            (remind_me_revert). Purely additive and, like reminder_deliveries
+            and wiki_pages, deliberately NOT synced -- see that migration's
+            docstring for why.
 """
 
 from __future__ import annotations
@@ -76,6 +83,7 @@ from remind_me_mcp.config import (
     EMBEDDING_BACKEND,
     EMBEDDING_DIM,
     EMBEDDING_MODEL,
+    REVISION_RETENTION_DAYS,
 )
 from remind_me_mcp.embeddings import _get_embedder, chunk_text
 
@@ -283,7 +291,7 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 # Current target schema version.  Increment when adding a new migration step.
-_SCHEMA_VERSION = 23
+_SCHEMA_VERSION = 24
 
 
 
@@ -461,6 +469,11 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         _migrate_v22_to_v23(db)
         db.execute("PRAGMA user_version = 23")
         current_version = 23
+
+    if current_version < 24:
+        _migrate_v23_to_v24(db)
+        db.execute("PRAGMA user_version = 24")
+        current_version = 24
 
     db.commit()
 
@@ -1833,6 +1846,65 @@ def _migrate_v22_to_v23(db: sqlite3.Connection) -> None:
     """)
 
 
+def _migrate_v23_to_v24(db: sqlite3.Connection) -> None:
+    """v23 -> v24: edit history -- memory_revisions table (issue #187).
+
+    Follows the same "don't lose data on a destructive-looking operation"
+    precedent ARCHITECTURE.md documents for deletion (v15->v16's
+    ``deleted_at`` tombstone), applied to *edits* instead: ``remind_me_update``
+    overwrites a memory's content/category/tags/metadata in place with no way
+    to recover the previous value. ``memory_revisions`` snapshots that
+    pre-edit state before every genuine content-changing write, so
+    ``remind_me_history`` can show what changed and ``remind_me_revert`` can
+    undo it.
+
+    Scope of what's captured is deliberately narrower than "every column
+    ``memories`` has" -- it's exactly the fields ``MemoryUpdateInput`` can
+    change (``content``, ``category``, ``tags``, ``metadata``), not
+    ``remind_at``/``superseded_by``/vitality columns/etc. See
+    ``tools/crud.py``'s ``_apply_memory_field_update`` docstring for why the
+    snapshot lives at that shared choke point rather than duplicated across
+    ``remind_me_update`` and ``remind_me_revert``, and why that choice
+    naturally excludes reminder-only edits (``remind_me_set_reminder`` also
+    funnels through the same helper, but only ever touches ``remind_at``,
+    which isn't a tracked column) without special-casing them.
+
+    No new column on ``memories`` itself -- this is a purely additive side
+    table, unlike v22->v23's ``remind_at`` column, because nothing about
+    "what the current state is" changes; only a new place to look up what an
+    earlier state *was*.
+
+    Deliberately NO sync outbox trigger, the same scope decision v10->v11
+    (wiki tables), v16->v17 (``memory_feedback``), v18->v19
+    (``memory_associations``), and v22->v23 (``reminder_deliveries``) already
+    made for their own local-only tables: this is a local audit log of edits
+    made on *this* device, not a synced entity, so a revision captured here
+    does not (yet) propagate to or merge with another device's edit history
+    for the same memory.
+
+    An index on ``(memory_id, edited_at)`` supports the "list revisions for
+    this memory, newest first" query ``remind_me_history`` runs.
+
+    Args:
+        db: An open SQLite connection.
+    """
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS memory_revisions (
+            id              INTEGER PRIMARY KEY,
+            memory_id       TEXT NOT NULL,
+            content         TEXT,
+            category        TEXT,
+            tags            TEXT,
+            metadata        TEXT,
+            edited_at       TEXT NOT NULL,
+            revision_reason TEXT DEFAULT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_memory_revisions_memory_edited
+            ON memory_revisions(memory_id, edited_at);
+    """)
+
+
 def embedding_mismatch_info(db: sqlite3.Connection) -> dict[str, str] | None:
     """Read-only check: do the stored vectors' model/dim/backend differ from
     the currently configured ``EMBEDDING_MODEL``/``EMBEDDING_DIM``/
@@ -2143,6 +2215,41 @@ def _purge_memory(
     else:
         db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
     return removed_vec_rowids
+
+
+# ---------------------------------------------------------------------------
+# Revision retention (issue #187)
+# ---------------------------------------------------------------------------
+
+
+def _compact_revisions(db: sqlite3.Connection) -> int:
+    """Hard-delete memory_revisions rows older than REVISION_RETENTION_DAYS.
+
+    Purely time-based, mirroring sync._compact_tombstones's shape -- no
+    per-peer acknowledgment tracking, because memory_revisions is a
+    local-only audit table with no sync counterpart to stay consistent with
+    (see the v23->v24 migration docstring). That is also why this is called
+    from remind_me_mcp.scheduler's always-on reminder-poll loop rather than
+    sync.py's loop the way _compact_tombstones is: tombstone compaction is
+    gated on config.SYNC_ENABLED because a non-syncing node hard-deletes
+    immediately and never accumulates tombstones to compact, but revisions
+    are captured on every genuine content edit regardless of whether sync is
+    configured at all -- gating their pruning on sync being enabled would
+    mean a single, never-synced device's revision table grows forever.
+
+    Args:
+        db: An open SQLite connection.
+
+    Returns:
+        The number of pruned revision rows.
+    """
+    cutoff = (datetime.now(UTC) - timedelta(days=REVISION_RETENTION_DAYS)).isoformat()
+    cur = db.execute("DELETE FROM memory_revisions WHERE edited_at < ?", (cutoff,))
+    db.commit()
+    removed = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+    if removed:
+        log.debug("Compacted %d memory revision(s)", removed)
+    return removed
 
 
 def _embed_and_store_rows(rows: list[tuple[int, str]]) -> int:
@@ -3111,6 +3218,7 @@ __all__ = [
     "_embed_and_store_batch",
     "_prune_orphan_chunks",
     "_purge_memory",
+    "_compact_revisions",
     "_fuse_query_embedding",
     "_semantic_search",
     "_hydrate_ann_hits",
