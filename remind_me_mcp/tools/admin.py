@@ -18,6 +18,7 @@ from remind_me_mcp import (
     ann_index,
     config,
     image_import,  # noqa: F401 — registers the "image" import kind (FT-19)
+    obsidian_import,  # noqa: F401 — registers the "obsidian" import kind (FT-31)
     pdf_import,  # noqa: F401 — registers the "pdf" import kind (FT-19)
     readwise_import,  # noqa: F401 — registers the "readwise" import kind (FT-20)
 )

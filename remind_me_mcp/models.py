@@ -615,7 +615,7 @@ class SaveSearchInput(BaseModel):
 
 
 class ImportKind(StrEnum):
-    """How to parse an imported file (FT-02, extended by FT-19 and FT-20).
+    """How to parse an imported file (FT-02, extended by FT-19, FT-20, FT-31).
 
     AUTO routes by extension and content sniffing: .json/.jsonl always import
     as chat; .pdf always imports as pdf; .png/.jpg/.jpeg always import as
@@ -625,6 +625,15 @@ class ImportKind(StrEnum):
     deliberately NOT reachable through AUTO — a Readwise export and a chat
     export are both plain .json with no reliable content-sniff to tell them
     apart, so it must be requested explicitly (see readwise_import.py).
+    OBSIDIAN (frontmatter/wikilink/inline-tag-aware Markdown, one note's
+    sections chunked like a document — see obsidian_import.py) is likewise
+    never chosen by AUTO's *content* sniffing (frontmatter delimiters and
+    double-bracket text both have legitimate non-Obsidian uses), but a
+    caller that resolves the kind through
+    remind_me_mcp.config.resolve_import_kind first — as the folder watcher
+    and remind_me_import_directory both do — gets it automatically for a
+    .md/.markdown file inside a detected Obsidian vault (a `.obsidian/`
+    directory at or above the watched/imported root).
     """
 
     AUTO = "auto"
@@ -633,6 +642,7 @@ class ImportKind(StrEnum):
     PDF = "pdf"
     IMAGE = "image"
     READWISE = "readwise"
+    OBSIDIAN = "obsidian"
 
 
 class ChatImportInput(BaseModel):
@@ -678,10 +688,13 @@ class ChatImportInput(BaseModel):
     kind: ImportKind = Field(
         default=ImportKind.AUTO,
         description=(
-            "How to parse the file (FT-02, extended by FT-19 and FT-20): "
+            "How to parse the file (FT-02, extended by FT-19, FT-20, FT-31): "
             "'auto' — detect by extension/content (chat-style markdown imports "
             "as chat, notes markdown/text as a document, .pdf as pdf, "
-            "image extensions as image; never resolves to 'readwise' — see below), "
+            "image extensions as image; never resolves to 'readwise' by content "
+            "— see below — but DOES resolve to 'obsidian' for a .md/.markdown "
+            "file inside a detected Obsidian vault, i.e. a `.obsidian/` "
+            "directory at or above an ancestor import root), "
             "'chat' — force the chat-export parser, "
             "'document' — force per-section/paragraph document chunking "
             "(.md/.markdown/.txt only), "
@@ -692,7 +705,11 @@ class ChatImportInput(BaseModel):
             "'readwise' — force a Readwise 'Export' JSON file into one memory "
             "per highlight (.json only; must be requested explicitly — 'auto' "
             "never picks it, since a Readwise export and a chat export are both "
-            "indistinguishable-by-extension .json files)"
+            "indistinguishable-by-extension .json files), "
+            "'obsidian' — force frontmatter/wikilink/inline-#tag-aware Markdown "
+            "import (.md/.markdown only): frontmatter 'tags' and inline '#tag' "
+            "syntax become memory tags, and '[[wikilinks]]' resolve to entities "
+            "linked to the memory via the existing knowledge-graph machinery"
         ),
     )
 
@@ -818,10 +835,12 @@ class BulkImportDirInput(BaseModel):
     kind: ImportKind = Field(
         default=ImportKind.AUTO,
         description=(
-            "Per-file parsing mode (FT-02, extended by FT-19 and FT-20): 'auto' "
+            "Per-file parsing mode (FT-02, extended by FT-19, FT-20, FT-31): 'auto' "
             "(detect chat/document/pdf/image per file — never 'readwise', which "
             "must be forced explicitly and then applies to every .json file in "
-            "the directory), 'chat', 'document', 'pdf', 'image', or 'readwise'"
+            "the directory; DOES resolve to 'obsidian' per .md/.markdown file "
+            "inside a detected Obsidian vault), "
+            "'chat', 'document', 'pdf', 'image', 'readwise', or 'obsidian'"
         ),
     )
 

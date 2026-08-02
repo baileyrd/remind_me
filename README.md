@@ -11,6 +11,7 @@ Persistent, searchable memory that works across **Claude.ai**, **Claude Code**, 
 - **Document ingestion** — import Markdown notes and plain-text files, chunked per-section (heading context preserved) or per-paragraph; `kind=auto` detects chat vs document per file
 - **PDF and image (OCR) ingestion** — import `.pdf` files (chunked per-page, page number kept as metadata) and `.png`/`.jpg`/`.jpeg` images (OCR'd into a single memory); `kind=auto` routes both automatically. Requires the optional `pdf`/`image` extras — see [PDF and Image Import](#pdf-and-image-import)
 - **Readwise highlights import** — import a Readwise "Export" JSON file as one memory per highlight (book/article title, author, category, and the highlight's own note all kept as metadata/content); requires explicit `kind=readwise` — see [Importing from Readwise](#importing-from-readwise)
+- **Obsidian vault import** — frontmatter `tags:`, inline `#tags`, and `[[wikilinks]]` (resolved into knowledge-graph entities) are understood, not flattened into prose; a `.obsidian/` directory at or above a watched/imported path auto-detects the vault with zero configuration — see [Importing from Obsidian](#importing-from-obsidian)
 - **Bulk directory import** — point at a folder of exports/notes/PDFs/images and import them all
 - **Watched folders** — set `REMIND_ME_WATCH_DIRS` and new or changed files auto-ingest in the background; changed files supersede their previous import
 - **Push/webhook ingestion** — set `REMIND_ME_WEBHOOK_SECRET` and `POST /ingest` accepts content directly over the network, no filesystem staging required
@@ -745,12 +746,13 @@ The import tools (`remind_me_import_chat`, `remind_me_import_directory`, `POST /
 
 | Kind | Behavior |
 |------|----------|
-| `auto` *(default)* | `.json`/`.jsonl` always parse as chat. `.pdf` always parses as pdf; `.png`/`.jpg`/`.jpeg` always parses as image. `.md`/`.markdown`/`.txt` are content-sniffed: files with chat role markers (`**User:**`, `## Assistant`, …) import as chat, everything else as a document. **Never** resolves to `readwise` — see below |
+| `auto` *(default)* | `.json`/`.jsonl` always parse as chat. `.pdf` always parses as pdf; `.png`/`.jpg`/`.jpeg` always parses as image. `.md`/`.markdown`/`.txt` are content-sniffed: files with chat role markers (`**User:**`, `## Assistant`, …) import as chat, everything else as a document. **Never** resolves to `readwise` by content sniffing — see below. **Does** resolve to `obsidian` for a `.md`/`.markdown` file inside a detected Obsidian vault (directory context, not content sniffing) — see [Importing from Obsidian](#importing-from-obsidian) |
 | `chat` | Force the chat-export parser (chunked per-message) |
 | `document` | Force document chunking (`.md`/`.markdown`/`.txt` only) |
 | `pdf` | Force per-page PDF chunking (`.pdf` only; requires the optional `pdf` extra) — see [PDF and Image Import](#pdf-and-image-import) |
 | `image` | Force OCR of an image into a single memory (`.png`/`.jpg`/`.jpeg` only; requires the optional `image` extra) — see [PDF and Image Import](#pdf-and-image-import) |
 | `readwise` | Force a Readwise "Export" JSON file into one memory per highlight (`.json` only, must be requested explicitly — never chosen by `auto`) — see [Importing from Readwise](#importing-from-readwise) |
+| `obsidian` | Force frontmatter/wikilink/inline-`#tag`-aware Markdown import (`.md`/`.markdown` only) — see [Importing from Obsidian](#importing-from-obsidian) |
 
 Document imports chunk Markdown per-section (the heading context is kept with each chunk and stored in metadata) and plain text per-paragraph. They get `source: document_import` and default to category `document`.
 
@@ -758,7 +760,7 @@ Imports are restricted to paths inside `REMIND_ME_IMPORT_ROOTS` (default: your h
 
 ### Pluggable Connectors
 
-Every import kind — including the built-in `chat`, `document`, `pdf`, `image`, and `readwise` — is a plain parser function registered by kind string in `remind_me_mcp/importer.py`, not a hardcoded dispatch. `remind_me_import_chat`/`remind_me_import_directory`/`POST /api/import` resolve the effective kind (by extension, or by content-sniffing for `auto`, or by whatever the caller forced) and then look it up in one registry. A third-party module can register more kinds **without touching `importer.py` at all** — this is the whole point of the registry, and it's meant to be actually used by someone outside this codebase, not just an internal implementation detail. What follows is the contract, not just a pointer to source.
+Every import kind — including the built-in `chat`, `document`, `pdf`, `image`, `readwise`, and `obsidian` — is a plain parser function registered by kind string in `remind_me_mcp/importer.py`, not a hardcoded dispatch. `remind_me_import_chat`/`remind_me_import_directory`/`POST /api/import` resolve the effective kind (by extension, or by content-sniffing for `auto`, or by whatever the caller forced) and then look it up in one registry. A third-party module can register more kinds **without touching `importer.py` at all** — this is the whole point of the registry, and it's meant to be actually used by someone outside this codebase, not just an internal implementation detail. What follows is the contract, not just a pointer to source.
 
 **Registering a connector.** Call `register_connector(kind, parser)` at import time (module-level, right after defining `parser` — see every built-in below):
 
@@ -781,6 +783,7 @@ register_connector("my_kind", my_connector)
 **Reference implementations**, roughly in order of how much of the shared pipeline they use:
 
 - `remind_me_mcp/readwise_import.py` — the fullest example of "just implement the parser": turns a Readwise export into one `(highlight_text[+note], {book/author/... metadata})` pair per highlight, and nothing else — dedup, chunking, and embedding are entirely `_ingest_parsed`'s job. Also the best example of *deliberately not* joining `kind="auto"`'s content-sniffing (documented in its own module docstring) when a format shares a suffix with an existing kind and can't be told apart reliably.
+- `remind_me_mcp/obsidian_import.py` — the best example of a connector *wrapping* another connector's chunker (`_parse_document`) instead of reimplementing chunking, and of the two reserved chunk-metadata keys, `extra_tags`/`mention_entities`, that let a connector hook into tag/entity handling generically rather than duplicating it. Also the reference for reaching `kind="auto"` through *directory* context (`config.resolve_import_kind`) instead of content-sniffing when content-sniffing alone would be unreliable.
 - `remind_me_mcp/dbs_import.py` — a connector registered purely for discovery (`remind_me_list_connectors`), with its own dedicated tool (`remind_me_import_dbs`) and bespoke per-item dedup/supersession loop, because dbs items arrive individually from a live SQLite read rather than as one file. Read this one if your source is a live store you'd page through, not a static export file.
 - `remind_me_mcp/mempalace_import.py` — the same discovery-only pattern as `dbs_import.py`, for a ChromaDB-backed store.
 
@@ -815,6 +818,24 @@ Use remind_me_import_chat with:
 - **A highlight's own note is appended to its content**, not discarded — `"{highlight text}\n\nNote: {your note}"` — since the note is often the actual reason you highlighted the passage, and only memory content participates in full-text search.
 - Same hash-based dedup, chunking, and embedding as every other import kind (it flows through the same shared pipeline) — re-importing the same export file is a no-op.
 
+### Importing from Obsidian
+
+An [Obsidian](https://obsidian.md) vault is just a directory of Markdown files, so it works with the same watched-folder/bulk-directory-import machinery every other document import uses — the `obsidian` kind adds understanding of Obsidian's own conventions on top:
+
+```
+Use remind_me_import_directory with:
+  directory: ~/Documents/MyVault
+```
+
+That's it — **no `kind` argument needed**. `remind_me_import_directory` (and the folder watcher, if you point `REMIND_ME_WATCH_DIRS` at the vault instead) auto-detects the vault by the `.obsidian/` directory Obsidian itself already creates at the vault's root, and imports every `.md`/`.markdown` file with the `obsidian` kind automatically. You can also force it explicitly on a single file (`kind: obsidian`) for a note outside any detected vault.
+
+- **YAML frontmatter.** A leading ```---\n...\n---``` block's `tags:` field (list or a single comma-separated string) becomes memory tags; every other field lands under `metadata.obsidian_frontmatter`. Frontmatter this codebase's parser can't represent (nested/flow mappings, anchors, block scalars — real Obsidian frontmatter is almost always flatter than this) degrades to "skip frontmatter, ingest the body" rather than crashing; the delimited block is still stripped from the stored content either way.
+- **`[[Wikilinks]]`.** `[[Note]]`, `[[Note|Display Text]]`, and `[[Note#Heading]]` are all recognized. Each resolves to a knowledge-graph entity for the linked note's *title* — created or matched via the same entity-upsert machinery `remind_me_entity`/FT-04 already use — and the memory is linked to it as a mention, so `remind_me_entity`/`remind_me_search`'s `entity:"..."` syntax can find it. A link to a note title that hasn't been imported yet (or never will be) still resolves — order doesn't matter. **v1 limitation**: the `#Heading`/`^block-id` anchor is stripped, not tracked — `[[Note#Overview]]` resolves to the same entity a plain `[[Note]]` would, not to a specific section.
+- **Inline `#tags`.** Distinct from a Markdown heading (`# Heading` has a space after the `#`; a tag doesn't) and from a wikilink's own heading anchor. Extracted from the body and merged into the memory's tags, deduplicated (case-insensitively) against frontmatter tags. A `#tag` inside a fenced code block or an inline code span is never mistaken for a real tag.
+- **Why frontmatter parsing is hand-rolled, not `pyyaml`.** `pyyaml` isn't a direct, always-installed dependency of this project's base install (it only shows up transitively through optional extras like `semantic`/`image`), and this codebase consistently prefers hand-rolling small, bounded formats over adding a dependency for them (`rate_limit.py`, `telemetry.py`, `metrics.py`'s Prometheus exposition format). Real Obsidian frontmatter is overwhelmingly flat `key: value`/`key: [list]`/block-list shapes, which the built-in parser covers directly.
+- **Why a separate `obsidian` kind, not a `document` enhancement.** Keeping it a distinct kind (mirroring `pdf`/`image`/`readwise`) means an ordinary, non-Obsidian Markdown `document` import is completely unaffected. Chunking itself isn't reimplemented — the connector strips frontmatter and hands the body to the same per-section chunker `document` uses.
+- **`.obsidian/` is never scanned for content.** It's Obsidian's own internal config folder (plugin settings, workspace state) — the folder watcher's existing hidden-directory skip already excludes it, same as any other dot-directory.
+
 ### Claude Export Format
 
 Export your Claude conversations from claude.ai (Settings → Export Data), then:
@@ -843,6 +864,7 @@ Use remind_me_import_directory with:
 - **Markdown**: Chat exports (headings or bold markers for roles: `## Human`, `**Assistant:**`, …) or plain notes (imported as documents)
 - **Plain text** (`.txt`): imported as documents, chunked per-paragraph
 - **Readwise export** (`.json`, `kind=readwise` required — see [Importing from Readwise](#importing-from-readwise)): one memory per highlight
+- **Obsidian vault notes** (`.md`/`.markdown`, `kind=obsidian` — auto-detected for a `.obsidian/`-marked directory, see [Importing from Obsidian](#importing-from-obsidian)): frontmatter tags, `[[wikilinks]]` resolved to entities, and inline `#tags`, chunked per-section like `document`
 
 ## Exporting & Backup
 
@@ -878,6 +900,7 @@ $env:REMIND_ME_WATCH_DIRS = "C:\notes;C:\Downloads\exports"
 - **Changed files supersede** — a changed file has a new hash, so it imports fresh; the watcher then marks every memory from the file's previous import as superseded (`superseded_by` = the new import id). Stale chunks drop out of search results (which filter `superseded_by IS NULL`) but remain in the database for audit.
 - **Status** — the `remind_me_watch_status` tool reports watched dirs, scan counters, ingest/skip/supersede counts, and recent errors; `remind_me_server_status` includes a watcher summary too.
 - **Wiki is downstream, not automatic** — the watcher feeds the **memory store**, not the wiki. Synthesis into wiki pages is a separate LLM-driven step (`remind_me_wiki_compile`). So both status tools also report `pending_wiki_compile` — the count of non-superseded memories created since the last compile watermark — as a nudge that newly ingested files are waiting to be folded into the wiki.
+- **Obsidian vaults auto-detect, no extra config** — if a watched directory (or any of its ancestors, bounded by `REMIND_ME_IMPORT_ROOTS`) contains a `.obsidian/` directory, the watcher treats it as an Obsidian vault: every `.md`/`.markdown` file is imported with the frontmatter/wikilink/inline-`#tag`-aware `obsidian` kind instead of plain `document` — see [Importing from Obsidian](#importing-from-obsidian). `.obsidian/` itself (Obsidian's internal plugin-settings/workspace-state folder, never real notes) is never scanned — it's excluded by the same dot-directory skip that already keeps any hidden folder out of the watcher's scans.
 - **Example upstream feed** — [dbs](https://github.com/baileyrd/daily-backup-system) (a personal-data archiver for Reddit/YouTube/Raindrop/etc.) can write one Markdown note per backed-up item straight into a watched directory via `dbs export-notes --out-dir DIR`, incrementally, after each `dbs backup`. See [docs/dbs-integration-review-2026-07-21.md](docs/dbs-integration-review-2026-07-21.md) for the full setup and rationale.
 
 ## Push/Webhook Ingestion

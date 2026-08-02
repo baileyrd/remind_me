@@ -627,6 +627,82 @@ WATCH_GRACE = _env_int("REMIND_ME_WATCH_GRACE", 5)
 is deferred until a later scan observes the same (mtime, size) signature, so
 partially-written files are never ingested mid-write."""
 
+
+def is_obsidian_vault(root: Path) -> bool:
+    """Return True when *root* is (or sits inside) an Obsidian vault (FT-31).
+
+    An Obsidian vault is, structurally, just a directory tree of Markdown
+    files with one reliable, zero-configuration signal: the app itself
+    creates a ``.obsidian/`` subdirectory (plugin settings, workspace state)
+    at the vault's root the first time it opens that folder. Checking for it
+    means an existing Obsidian user gets vault-aware import
+    (frontmatter/wikilink/inline-tag parsing — see ``obsidian_import.py``)
+    with zero new configuration, which is preferable to a new
+    ``REMIND_ME_*_IS_VAULT`` env var that every such user would otherwise
+    have to discover and set.
+
+    Checks *root* itself and its ancestors — "at or above a watched path's
+    root" — because a watched/imported directory may be a *subfolder* of a
+    larger vault (e.g. ``REMIND_ME_WATCH_DIRS=~/vault/Projects`` while
+    ``.obsidian/`` sits at ``~/vault``) rather than the vault root itself.
+    The ancestor walk is bounded to stay within :data:`IMPORT_ROOTS`
+    (:func:`is_in_import_roots`) — the same SE-02 containment boundary
+    already enforced on watch/import directories — so this can never walk
+    all the way up to an unrelated ``.obsidian/`` directory that happens to
+    exist somewhere further up an unrelated part of the filesystem.
+
+    Args:
+        root: An already ``expanduser().resolve()``-ed directory.
+
+    Returns:
+        True if ``.obsidian/`` exists at *root* or a bounded ancestor.
+    """
+    for candidate in (root, *root.parents):
+        if not is_in_import_roots(candidate):
+            break
+        try:
+            if (candidate / ".obsidian").is_dir():
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def resolve_import_kind(path: Path, requested_kind: str) -> str:
+    """Upgrade ``kind="auto"`` to ``"obsidian"`` for a vault-resident Markdown file.
+
+    Deliberately placed here rather than in ``importer.py``/``obsidian_import.py``:
+    ``obsidian_import.py`` registers its connector by importing FROM
+    ``importer.py`` (mirroring ``pdf_import.py``/``readwise_import.py``'s
+    existing one-directional dependency), so ``importer.py`` cannot import
+    FROM ``obsidian_import.py`` at module level without creating an import
+    cycle. ``config.py`` sits below both — this function only needs a path
+    and a kind string, no connector-specific logic — so both ``watcher.py``
+    and ``importer.import_directory`` can call it without introducing one.
+
+    Only ever changes ``"auto"`` — an explicitly requested kind (including an
+    explicit ``"obsidian"`` for a note outside any detected vault) always
+    passes through unchanged, matching every other kind's forcing semantics.
+
+    Args:
+        path: The file being imported (its suffix and parent directory are
+            what matter here).
+        requested_kind: The caller's ``kind`` argument.
+
+    Returns:
+        ``"obsidian"`` when *requested_kind* is ``"auto"``, the suffix is
+        ``.md``/``.markdown``, and :func:`is_obsidian_vault` says the file's
+        parent directory is inside a detected vault; *requested_kind*
+        unchanged otherwise.
+    """
+    if (
+        requested_kind == "auto"
+        and path.suffix.lower() in (".md", ".markdown")
+        and is_obsidian_vault(path.parent)
+    ):
+        return "obsidian"
+    return requested_kind
+
 # ---------------------------------------------------------------------------
 # Reminders (issue #179)
 # ---------------------------------------------------------------------------
@@ -969,6 +1045,8 @@ __all__ = [
     "WATCH_DIRS",
     "WATCH_INTERVAL",
     "WATCH_GRACE",
+    "is_obsidian_vault",
+    "resolve_import_kind",
     "REMINDER_POLL_INTERVAL",
     "REVISION_RETENTION_DAYS",
     "ANALYTICS_RETENTION_DAYS",

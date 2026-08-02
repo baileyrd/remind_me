@@ -891,10 +891,11 @@ def test_import_kinds_narrower_than_connector_registry() -> None:
     """IMPORT_KINDS (what import_chat_file accepts) is deliberately not
     derived from the full _CONNECTORS registry -- a connector can be
     registered purely for discovery without becoming a valid file-import
-    kind (see mempalace_import.py). pdf/image (FT-19) and readwise (FT-20)
-    ARE file-import kinds, unlike mempalace/dbs, so they belong in this set."""
+    kind (see mempalace_import.py). pdf/image (FT-19), readwise (FT-20), and
+    obsidian (FT-31) ARE file-import kinds, unlike mempalace/dbs, so they
+    belong in this set."""
     assert set(_importer_mod.IMPORT_KINDS) == {
-        "auto", "chat", "document", "pdf", "image", "readwise",
+        "auto", "chat", "document", "pdf", "image", "readwise", "obsidian",
     }
     assert set(_importer_mod.IMPORT_KINDS) <= (set(_importer_mod._CONNECTORS) | {"auto"})
 
