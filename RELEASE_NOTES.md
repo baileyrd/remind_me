@@ -1,5 +1,15 @@
 # Release Notes
 
+## v1.37.0 — 2026-08-02
+
+### New Features
+
+- **`add`/`search`/`list` CLI subcommands (#189)** — `remind-me-mcp` gained direct terminal access to the memory store: `remind-me-mcp add "content" [--category CAT] [--tags a,b,c]`, `remind-me-mcp search "query" [--limit N] [--json]`, and `remind-me-mcp list [--limit N] [--category CAT] [--json]`. Useful for scripting, cron jobs, or a quick lookup without going through an MCP client at all.
+- **Dispatch is a separate code path, not a change to the existing flag parser.** A new `remind_me_mcp/cli.py` is invoked from `__main__.main()` by checking `sys.argv[1]` against a fixed subcommand set *before* the existing `argparse.ArgumentParser` (`--serve-ui`/`--serve-remote`/`--status`/`--version`/`--check-update`/`--update`/`--list-backups`/`--restore`) is even built — none of those flags collide with `add`/`search`/`list`, and every one of their existing invocations keeps parsing exactly as before (unchanged, still covered by `tests/test_main.py`).
+- **No reimplemented retrieval or add logic.** `@mcp.tool(...)` (the FastMCP decorator every tool handler carries) returns the original function unchanged, so `memory_add`/`memory_search`/`memory_list` are already plain `async def` functions with no FastMCP-call-machinery coupling — the CLI calls them directly via `asyncio.run()`, the same code path an MCP client's tool call runs. `search`/`list --json` emit the exact same JSON envelope the MCP tools already produce.
+- **The CLI never touches the server's single-instance lock** (`pid._acquire_mcp_lock`/`MCP_PID_FILE`, issue #126) — that lock exists specifically to stop two *server* processes (each starting their own sync thread, folder watcher, reminder scheduler) from racing each other, not to serialize all access to the database file. A CLI command opens an ordinary WAL-mode connection (the identical `db._get_db()` every server request uses), does its one read or write, and closes it — safe to run whether or not a server is currently up, under the same WAL-mode-plus-`busy_timeout` contract the README already documents for concurrent reads: a second writer queues briefly instead of corrupting anything.
+- **First run auto-initializes exactly like the server's own first start** — `db._get_db()` creates `REMIND_ME_MCP_DIR`/`memory.db` and runs schema migrations on first connection regardless of caller, so there is no separate "run the server once first" step and no second config-resolution path (`config.py`'s existing `REMIND_ME_MCP_DIR` resolution is reused unchanged).
+
 ## v1.36.0 — 2026-08-02
 
 ### New Features

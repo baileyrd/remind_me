@@ -587,6 +587,22 @@ Switching `REMIND_ME_EMBEDDING_MODEL`, `REMIND_ME_EMBEDDING_DIM`, or `REMIND_ME_
 
 Use `remind_me_server_status` to see how many memories have embeddings and whether the model is loaded.
 
+## CLI
+
+For quick one-shot access without going through an MCP client — scripting, cron jobs, or just checking something from a terminal — `remind-me-mcp` also accepts three direct subcommands, alongside its existing flags:
+
+```bash
+remind-me-mcp add "buy oat milk on the way home" [--category CAT] [--tags a,b,c]
+remind-me-mcp search "wifi password" [--limit N] [--json]
+remind-me-mcp list [--limit N] [--category CAT] [--json]
+```
+
+- `add` stores a memory and prints its id — the same `remind_me_add` logic an MCP client would trigger, not a separate implementation.
+- `search` runs the same hybrid FTS5 + semantic retrieval as `remind_me_search`, printing Markdown by default or JSON with `--json`.
+- `list` browses by filter (no ranking) exactly like `remind_me_list`, same output options.
+
+These operate on the exact same `REMIND_ME_MCP_DIR` (and therefore the exact same `memory.db`) as the server — set the env var the same way for both, or rely on the shared `~/.remind-me` default. A CLI command can run safely at any time, whether or not a server is currently running: it opens an ordinary WAL-mode SQLite connection (the same one the server itself opens) and closes it when done, and it deliberately never touches the server's own single-instance lock file (`MCP_PID_FILE`, issue #126) — that lock only prevents two *server* processes (each running background sync/watcher/scheduler threads) from racing each other, not a short-lived CLI read or write. A first invocation against a fresh `REMIND_ME_MCP_DIR` auto-initializes the database exactly like a fresh server start does — there is no separate "init" step.
+
 ## Backups
 
 For a single-user app where one SQLite file holds someone's entire memory store, a failed or buggy migration (or just wanting a checkpoint before a risky bulk edit) needs a real safety net, not a reminder to "remember to copy the file."

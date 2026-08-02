@@ -10,11 +10,20 @@ Supports multiple execution modes:
   - Version mode (--version): prints the installed version and exits
   - Check-update mode (--check-update): checks for updates and exits
   - Update mode (--update): pulls latest changes and reinstalls
+  - CLI subcommands (add/search/list, issue #189): direct one-shot access to
+    the memory store, e.g. `remind-me-mcp add "..."` or
+    `remind-me-mcp search "..."` — see remind_me_mcp.cli. Dispatched BEFORE
+    the flag parser below (by checking sys.argv[1] against a fixed set of
+    subcommand names) so the existing flag-based invocations below are
+    parsed exactly as before, unmodified.
 
 Usage:
   python -m remind_me_mcp [--serve-ui] [--ui-port PORT] [--ui-host HOST]
                            [--serve-remote] [--remote-port PORT] [--remote-host HOST]
                            [--status] [--version] [--check-update] [--update]
+  python -m remind_me_mcp add "content" [--category CAT] [--tags a,b,c]
+  python -m remind_me_mcp search "query" [--limit N] [--json]
+  python -m remind_me_mcp list [--limit N] [--category CAT] [--json]
 """
 
 from __future__ import annotations
@@ -27,6 +36,7 @@ import sys
 from typing import TYPE_CHECKING
 
 import remind_me_mcp.tools  # noqa: F401 — ensure tools are registered before mcp.run()
+from remind_me_mcp import cli
 from remind_me_mcp.api import _build_api_app
 from remind_me_mcp.config import (
     MCP_HTTP_HOST,
@@ -304,6 +314,18 @@ def main() -> None:
     logging.basicConfig(
         stream=sys.stderr, level=logging.INFO, format="%(levelname)s | %(message)s"
     )
+
+    # -- add/search/list subcommands (issue #189) --
+    # Checked BEFORE the flag-based parser below, by inspecting sys.argv[1]
+    # directly rather than grafting argparse subparsers onto `parser` --
+    # every existing flag invocation (--serve-ui, --status, --version, ...)
+    # must keep parsing exactly as before, and a separate dispatch guarantees
+    # that with zero changes to the parser those flags already go through.
+    # None of "add"/"search"/"list" collides with an existing flag name or
+    # positional argument (the flag parser below takes no positional args at
+    # all), so this is unambiguous in both directions.
+    if len(sys.argv) > 1 and sys.argv[1] in cli.SUBCOMMANDS:
+        sys.exit(cli.run_cli(sys.argv[1:]))
 
     parser = argparse.ArgumentParser(description="Remind Me MCP Server")
     parser.add_argument(
