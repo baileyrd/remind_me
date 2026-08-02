@@ -1,5 +1,12 @@
 # Release Notes
 
+## v1.31.0 — 2026-08-02
+
+### New Features
+
+- **Calendar export for reminders (#190)** — a new `remind_me_mcp.ics_export` module hand-rolls RFC 5545 ICS generation (no new dependency, matching this codebase's minimal-dependency bias for small formats): a pure `build_ics()` function with correct text escaping (backslash/comma/semicolon/newline, §3.3.11) and correct 75-octet line folding on UTF-8 character boundaries (§3.1) — the two details that make a naive ICS generator produce a feed real calendar clients reject or corrupt. `GET /api/reminders/{token}.ics` serves the feed as a subscribable URL for Google/Apple/Outlook calendar's "subscribe by URL" feature; `remind_me_reminders_ics_url` (MCP tool) hands back the full URL. Each VEVENT's UID is derived deterministically from `{memory_id}-{remind_at}` rather than a random UUID, so an unchanged reminder updates in place across the calendar provider's own polling schedule instead of duplicating.
+- **Secret-path auth for the feed, not the usual bearer header** — a calendar subscription is polled unauthenticated by the provider's own servers, with no way to attach an `Authorization` header, so this one route can't use the bearer scheme the rest of `/api/*` uses. A new `REMIND_ME_ICS_TOKEN` config var (`config.resolve_ics_token()`) is generated and persisted exactly like the dashboard API key (SE-01) on first use; the token itself is the URL path segment, checked with `hmac.compare_digest`. `BearerAuthMiddleware` (api.py) gained an `allow_prefixes` parameter — mirroring `remote.py`'s `SecretPathMiddleware` — so this one path bypasses the header requirement while the rest of `/api/*` stays gated.
+
 ## v1.30.0 — 2026-08-02
 
 ### New Features

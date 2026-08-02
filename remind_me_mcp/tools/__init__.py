@@ -13,7 +13,8 @@ Formerly a single ~2000-line module; split into submodules (HY-02):
   - ``capture``   — auto_capture / get_capture / decompose(+batch)
   - ``entity``    — remind_me_entity knowledge-graph lookup (FT-04)
   - ``lifecycle`` — vitality_report / reclassify(+batch) / consolidate
-  - ``reminders`` — remind_me_set_reminder / remind_me_list_reminders (issue #179)
+  - ``reminders`` — remind_me_set_reminder / remind_me_list_reminders (issue #179),
+    remind_me_reminders_ics_url (issue #190)
   - ``wiki``      — LLM Wiki: page read/write/list/search/load/delete + compile (FT-08)
   - ``admin``     — stats / reindex / server_status / updates / imports / resources
   - ``prompts``   — MCP prompts driving the multi-step maintenance loops
@@ -188,6 +189,7 @@ from remind_me_mcp.tools.prompts import (
 )
 from remind_me_mcp.tools.reminders import (
     remind_me_list_reminders,
+    remind_me_reminders_ics_url,
     remind_me_set_reminder,
 )
 from remind_me_mcp.tools.search import (
@@ -255,6 +257,7 @@ __all__ = [
     "memory_delete",
     "remind_me_set_reminder",
     "remind_me_list_reminders",
+    "remind_me_reminders_ics_url",
     "memory_export",
     "memory_import_chat",
     "memory_import_directory",

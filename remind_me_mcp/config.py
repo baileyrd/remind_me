@@ -433,6 +433,77 @@ def resolve_connector_token() -> str:
         return token
 
 
+# ---------------------------------------------------------------------------
+# Reminders calendar feed (issue #190)
+# ---------------------------------------------------------------------------
+
+ICS_TOKEN: str | None = os.environ.get("REMIND_ME_ICS_TOKEN") or None
+"""Secret path token for the ``GET /api/reminders/{token}.ics`` calendar feed,
+from the REMIND_ME_ICS_TOKEN env var.
+
+When unset, a token is auto-generated on first use and persisted under
+MEMORY_DIR (see resolve_ics_token) -- mirroring resolve_connector_token, not
+resolve_api_key: there is no 'disabled' opt-out, because the token doubles as
+the URL path itself (the feed cannot use the Authorization-header bearer
+scheme the rest of /api/* uses -- a calendar app's "subscribe by URL" feature
+polls the URL from the provider's own servers on a schedule the user doesn't
+control, with no way to attach custom headers), so the endpoint must never
+fall open."""
+
+ICS_TOKEN_FILE = MEMORY_DIR / "ics_token"
+"""Location of the auto-generated reminders-feed token (0600 perms). Delete
+the file to rotate: a fresh token is generated on next resolution, which
+also changes the subscribe URL every calendar app must be re-pointed at."""
+
+
+def resolve_ics_token() -> str:
+    """Return the effective reminders-feed secret-path token (issue #190).
+
+    Resolution order mirrors :func:`resolve_connector_token` (FT-05):
+      1. ``REMIND_ME_ICS_TOKEN`` env var — always wins when set.
+      2. The token persisted at ``MEMORY_DIR/ics_token``.
+      3. First use: generate a new token, persist it with 0600 permissions,
+         and log the resulting feed path once (the only time the full token
+         is logged).
+
+    If the token file can be neither read nor written, an ephemeral token is
+    generated for this process (and logged) so the feed never falls open.
+
+    Reads module attributes at call time so tests can monkeypatch
+    ``ICS_TOKEN`` / ``MEMORY_DIR``.
+    """
+    if ICS_TOKEN is not None:
+        return ICS_TOKEN.strip()
+    token_file = MEMORY_DIR / "ics_token"
+    try:
+        if token_file.is_file():
+            existing = token_file.read_text(encoding="utf-8").strip()
+            if existing:
+                return existing
+        token = secrets.token_urlsafe(32)
+        token_file.touch(mode=0o600, exist_ok=True)
+        restrict_to_owner(token_file)
+        token_file.write_text(token + "\n", encoding="utf-8")
+        log.info(
+            "Generated reminders calendar feed token — stored at %s. Feed "
+            "path: /api/reminders/%s.ics (treat this URL like a password; "
+            "rotate by deleting the file).",
+            token_file,
+            token,
+        )
+        return token
+    except OSError as exc:
+        token = secrets.token_urlsafe(32)
+        log.warning(
+            "Could not persist reminders feed token at %s (%s); using an "
+            "ephemeral token for this run: %s",
+            token_file,
+            exc,
+            token,
+        )
+        return token
+
+
 _import_roots_env: str | None = os.environ.get("REMIND_ME_IMPORT_ROOTS")
 IMPORT_ROOTS: list[Path] = (
     [Path(r.strip()).expanduser().resolve() for r in _import_roots_env.split(os.pathsep) if r.strip()]
@@ -649,6 +720,9 @@ __all__ = [
     "REMOTE_MCP_ISSUER",
     "OAUTH_STATE_FILE",
     "resolve_connector_token",
+    "ICS_TOKEN",
+    "ICS_TOKEN_FILE",
+    "resolve_ics_token",
     "IMPORT_ROOTS",
     "is_in_import_roots",
     "EXPORT_ROOTS",

@@ -782,6 +782,15 @@ A memory can carry an optional future `remind_at` timestamp. A background schedu
 - **Delivery is a log line today** — outbound notification channels (email, push, etc.) are tracked separately; the scheduler's due-reminder logic is already structured with a swappable delivery hook so a real channel can plug in without changing how due reminders are found.
 - **Configuration** — `REMIND_ME_REMINDER_POLL_INTERVAL` (default 60 seconds). The scheduler itself always runs; there is no separate enable switch.
 
+## Calendar Export
+
+`GET /api/reminders/{token}.ics` (issue #190) is a subscribable ICS feed of every `upcoming`/`overdue`-and-undelivered reminder — paste it into Google/Apple/Outlook calendar's "subscribe by URL" feature to see reminders alongside the rest of your calendar, refreshed on whatever poll interval the calendar provider itself uses.
+
+- **`remind_me_reminders_ics_url`** (MCP tool) — returns the full feed URL (scheme/host/port from the running dashboard server) so you don't need filesystem or env access to read the token yourself. Returns a placeholder explaining how to enable the HTTP surface if the current MCP connection is stdio-only (there is no server to serve the feed from in that mode).
+- **Secret-path auth, not a bearer header** — a calendar subscription is polled unauthenticated by the provider's own servers on a schedule you don't control, with no way to attach an `Authorization` header, so this route can't use the same bearer-token scheme the rest of `/api/*` uses. Instead the token lives in the URL path itself (`REMIND_ME_ICS_TOKEN`, auto-generated and persisted at `~/.remind-me/ics_token` on first use, exactly like the dashboard API key — SE-01) and is checked with `hmac.compare_digest`. **⚠ Treat this URL like a password** — whoever holds it can read every reminder's content — same caveat the [Claude.ai Custom Connector](#claudeai-custom-connector-remote-mcp) section already states for its own secret-path fallback. Rotate by deleting the token file; every calendar app subscribed to the old URL then gets a 404 and needs re-pointing at the new one.
+- **Stable event identity** — each VEVENT's `UID` is derived deterministically from the memory id and `remind_at` (not a random UUID per fetch), so an unchanged reminder updates in place across polls instead of piling up duplicate events; changing `remind_at` mints a new UID for what is genuinely a new occurrence.
+- **No new dependency** — ICS generation is hand-rolled (`remind_me_mcp/ics_export.py`), including RFC 5545 text escaping and 75-octet line folding, rather than pulling in a third-party iCalendar library for a format this small (same minimal-dependency bias as the `[semantic]`/`[ann]`/etc. optional extras).
+
 ## Notifications
 
 Optional outbound notification channels (issue #180) that a fired reminder or a faulted sync status can push out, instead of only being visible to whoever happens to be reading logs or calling a status tool. Each channel is gated on its own config being present — no separate enable flag, and no channel configured means `remind_me_mcp.notifications.notify()` is a safe no-op everywhere it's called.

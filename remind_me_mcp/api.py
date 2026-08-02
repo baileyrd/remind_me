@@ -26,6 +26,7 @@ from remind_me_mcp.config import (
     is_in_export_roots,
     is_in_import_roots,
     resolve_api_key,
+    resolve_ics_token,
 )
 from remind_me_mcp.db import (
     _embed_and_store,
@@ -41,6 +42,7 @@ from remind_me_mcp.db import (
     _row_to_dict,
 )
 from remind_me_mcp.exporter import EXPORT_FORMATS, collect_export_records, export_memories, render_export
+from remind_me_mcp.ics_export import build_ics
 from remind_me_mcp.importer import IMPORT_KINDS, import_chat_file, import_directory
 from remind_me_mcp.vitality import DECAY_RATES, build_vitality_report
 
@@ -108,6 +110,13 @@ class BearerAuthMiddleware:
         secret: The expected bearer token; ``None`` disables auth entirely.
         protect_prefix: Only paths starting with this prefix are gated.
         allow_paths: Exact paths that always pass (e.g. ``/health``).
+        allow_prefixes: Path prefixes that always pass regardless of
+            ``protect_prefix`` (issue #190: the ``/api/reminders/{token}.ics``
+            calendar feed can't use this header-based scheme at all — a
+            calendar app's "subscribe by URL" poller has no way to attach an
+            Authorization header — so it authenticates itself via its own
+            path token instead; mirrors remote.py's SecretPathMiddleware
+            ``allow_prefixes``).
     """
 
     def __init__(
@@ -116,11 +125,13 @@ class BearerAuthMiddleware:
         secret: str | None,
         protect_prefix: str = "/",
         allow_paths: tuple[str, ...] = (),
+        allow_prefixes: tuple[str, ...] = (),
     ) -> None:
         self.app = app
         self.secret = secret
         self.protect_prefix = protect_prefix
         self.allow_paths = allow_paths
+        self.allow_prefixes = allow_prefixes
 
     async def __call__(self, scope: _Scope, receive: _Receive, send: _Send) -> None:
         """Enforce bearer auth on protected HTTP paths; pass everything else through."""
@@ -128,7 +139,11 @@ class BearerAuthMiddleware:
             await self.app(scope, receive, send)
             return
         path = scope.get("path", "")
-        if path in self.allow_paths or not path.startswith(self.protect_prefix):
+        if (
+            path in self.allow_paths
+            or any(path.startswith(p) for p in self.allow_prefixes)
+            or not path.startswith(self.protect_prefix)
+        ):
             await self.app(scope, receive, send)
             return
         auth = _header(scope, b"authorization")
@@ -1137,6 +1152,54 @@ def _build_api_app() -> Starlette:
 
         return await asyncio.to_thread(_work)
 
+    async def api_reminders_ics(request: Request) -> Response:
+        """Subscribable ICS calendar feed of reminders (issue #190).
+
+        ``GET /api/reminders/{token}.ics`` — unauthenticated by the normal
+        Authorization-header bearer scheme every other ``/api/*`` route
+        uses: a calendar app's "subscribe by URL" feature polls this URL
+        from the provider's own servers on a schedule the user doesn't
+        control, with no way to attach custom headers. Auth instead lives
+        in the URL itself — the ``token`` path segment must match
+        ``config.resolve_ics_token()`` (REMIND_ME_ICS_TOKEN), compared with
+        ``hmac.compare_digest`` to avoid a timing side channel — same
+        secret-path pattern as the FT-05 remote-connector fallback
+        (remote.py's SecretPathMiddleware). A wrong token gets a bare 404,
+        not a 401 or any error revealing the token was even checked, so a
+        probe can't distinguish "wrong token" from "route doesn't exist".
+
+        WARNING: whoever holds this URL can read every reminder's content —
+        treat it exactly like a password (same caveat the README already
+        states for the remote-connector secret-path URL).
+
+        Includes every reminder remind_me_list_reminders' ``all`` window
+        would (upcoming + overdue-but-undelivered), same query shape.
+        """
+        token = request.path_params["token"]
+        expected = resolve_ics_token()
+        if not hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8")):
+            return _json_err("Not found", 404)
+
+        def _work() -> Response:
+            db = _get_db()
+            now = _now_iso()
+            not_delivered = (
+                "NOT EXISTS (SELECT 1 FROM reminder_deliveries rd "
+                "WHERE rd.memory_id = m.id AND rd.remind_at = m.remind_at)"
+            )
+            rows = db.execute(
+                f"""SELECT m.* FROM memories m
+                     WHERE m.remind_at IS NOT NULL
+                       AND m.deleted_at IS NULL
+                       AND (m.remind_at > ? OR (m.remind_at <= ? AND {not_delivered}))
+                     ORDER BY m.remind_at ASC""",
+                [now, now],
+            ).fetchall()
+            reminders = [_row_to_dict(r) for r in rows]
+            return Response(build_ics(reminders), media_type="text/calendar")
+
+        return await asyncio.to_thread(_work)
+
     async def index(request: Request) -> HTMLResponse:
         """Serve the dashboard UI as a single-page app."""
         return HTMLResponse(_build_dashboard_html())
@@ -1157,6 +1220,10 @@ def _build_api_app() -> Starlette:
         Route("/api/memories/{memory_id}", api_delete, methods=["DELETE"]),
         Route("/api/import", api_import, methods=["POST"]),
         Route("/api/export", api_export, methods=["GET"]),
+        # Secret-path auth (see api_reminders_ics docstring), not the
+        # Authorization-header bearer scheme every other /api/* route below
+        # uses — must precede the BearerAuthMiddleware allow_prefixes check.
+        Route("/api/reminders/{token}.ics", api_reminders_ics, methods=["GET"]),
         Route("/api/entity", api_entity, methods=["GET"]),
         Route("/api/entities", api_entities, methods=["GET"]),
         Route("/api/entity/traverse", api_entity_traverse, methods=["GET"]),
@@ -1182,7 +1249,12 @@ def _build_api_app() -> Starlette:
             allow_methods=["*"],
             allow_headers=["*"],
         ),
-        Middleware(BearerAuthMiddleware, secret=api_key, protect_prefix="/api/"),
+        Middleware(
+            BearerAuthMiddleware,
+            secret=api_key,
+            protect_prefix="/api/",
+            allow_prefixes=("/api/reminders/",),
+        ),
         Middleware(JSONContentTypeMiddleware),
     ]
 
