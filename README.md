@@ -1286,10 +1286,16 @@ Each node runs a small HTTP server (default port 8766, bind via `REMIND_ME_PEER_
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/health` | Node liveness + node_id + installed version |
+| `GET` | `/count` | Record counts in the hub's `/count` shape, so one comparator serves both — what `remind_me_sync_reconcile_peer` reads |
 | `GET` | `/sync/pull?since=&since_id=&exclude_node=&limit=` | Pull memory records (keyset cursor on `(updated_at, id)` when `since_id` is sent) |
 | `POST` | `/sync/push` | Push records (responds with `processed_ids`) |
 | `GET` | `/sync/pull_entities?since=&since_id=&limit=` | Pull entity records (404 on pre-entity-graph peers is treated as "no entity support") |
 | `GET` | `/sync/pull_links?since=&since_id=&limit=` | Pull memory-entity link records |
+
+`remind_me_sync_reconcile_peer <node_id>` diffs this node against a peer,
+using the same four verdicts as the hub reconcile. Totals only — a peer serves
+no `/stats`, so there is no per-category breakdown to fetch, and the result
+says `checked: "totals"` rather than leaving that limit implicit.
 
 The sync hub (`hub/`) implements the same wire protocol against Postgres, plus a few hub-only extensions not present here (an opt-in `since_seq` cursor immune to late-push-from-an-offline-node ordering bugs, a `full=1` re-seed mode, request timeouts, a push size cap, and a tombstone-purge endpoint) — see [`hub/README.md`](hub/README.md#protocol) for the details.
 

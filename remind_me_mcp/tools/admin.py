@@ -1277,6 +1277,49 @@ async def remind_me_sync_reconcile(quick: bool = False) -> str:
 
 
 @mcp.tool(
+    name="remind_me_sync_reconcile_peer",
+    annotations={
+        "title": "Reconcile Against a Peer",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def remind_me_sync_reconcile_peer(node_id: str) -> str:
+    """Diff this node's record counts against one peer's (issue #216).
+
+    The peer-to-peer counterpart of ``remind_me_sync_reconcile``. Peer sync
+    carries the same records hub sync does, but only the hub could be
+    reconciled against — so "did my records actually reach that machine?" had
+    no answer short of shell access to it.
+
+    Verdicts are the same four (``in-sync`` / ``pull-lag`` / ``node-ahead`` /
+    ``fault``), from the same classifier, since "local > remote means pushes
+    aren't landing" doesn't depend on which remote is on the other end.
+
+    Compares totals only — a peer serves no ``/stats``, so there is no
+    per-category breakdown to fetch — which means an offsetting
+    recategorization (one category up, another down, total unchanged) is
+    invisible here. The result says ``checked: "totals"`` so that limit is
+    visible rather than assumed.
+
+    Args:
+        node_id: The peer to reconcile against, as it appears in
+            ``remind_me_sync_status``'s ``remotes`` list.
+
+    Returns:
+        str: JSON — verdict with hints, per-record-type totals with deltas,
+        outbox depth, last-pull age, and the peer's version. When the peer
+        isn't discoverable, can't be reached, or is too old to have
+        ``/count``, returns a status and hint instead of a verdict.
+    """
+    from remind_me_mcp.sync import reconcile_with_peer
+
+    return json.dumps(await reconcile_with_peer(node_id), indent=2)
+
+
+@mcp.tool(
     name="remind_me_sync_repair",
     annotations={
         "title": "Repair a Stuck Sync Cursor",

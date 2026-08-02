@@ -745,3 +745,51 @@ def test_push_entity_and_link_records(
     assert ent["kind"] == "tool"
     link = peer_db.execute("SELECT * FROM memory_entities").fetchone()
     assert (link["memory_id"], link["entity_id"]) == ("mem-x", eid)
+
+
+# ---------------------------------------------------------------------------
+# GET /count (issue #216)
+# ---------------------------------------------------------------------------
+
+
+def test_count_mirrors_the_hub_response_shape(peer_url: str, peer_db) -> None:
+    """One client-side comparator must serve hub and peer alike.
+
+    A peer-shaped variant would mean a second copy of the diff logic, which
+    is how the two would eventually disagree about what drift means.
+    """
+    resp = httpx.get(f"{peer_url}/count", headers=AUTH)
+    assert resp.status_code == 200
+    body = resp.json()
+
+    assert body["role"] == "peer"
+    assert body["version"] == __version__
+    assert body["approximate"] is False
+    assert set(body["memories"]) == {"total", "live", "tombstones"}
+    for key in ("entities", "memory_entities", "entity_relations"):
+        assert isinstance(body[key], int)
+
+
+def test_count_counts_tombstones_like_the_hub(peer_url: str, peer_db) -> None:
+    """Totals include tombstones; live excludes them.
+
+    The hub counts every row and reports tombstones separately, so a peer
+    that filtered them out would look permanently behind in a reconcile.
+    """
+    now = _now_iso()
+    peer_db.execute(
+        "INSERT INTO memories (id, content, created_at, updated_at, accessed_at) "
+        "VALUES ('live-1', 'x', ?, ?, ?)", (now, now, now),
+    )
+    peer_db.execute(
+        "INSERT INTO memories (id, content, created_at, updated_at, accessed_at, deleted_at) "
+        "VALUES ('dead-1', 'y', ?, ?, ?, ?)", (now, now, now, now),
+    )
+    peer_db.commit()
+
+    body = httpx.get(f"{peer_url}/count", headers=AUTH).json()
+    assert body["memories"] == {"total": 2, "live": 1, "tombstones": 1}
+
+
+def test_count_requires_the_secret(peer_url: str) -> None:
+    assert httpx.get(f"{peer_url}/count").status_code == 401

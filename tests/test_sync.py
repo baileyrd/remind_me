@@ -3333,3 +3333,106 @@ async def test_default_is_the_full_comparison(
     # Totals match exactly; only the breakdown reveals the drift.
     assert result["memories"]["delta"] == 0
     assert {c["category"] for c in result["categories_with_drift"]} == {"fact", "general"}
+
+
+# ---------------------------------------------------------------------------
+# reconcile_with_peer (issue #216)
+# ---------------------------------------------------------------------------
+
+
+def peer_count(
+    *, total: int, tombstones: int = 0, entities: int = 0,
+    memory_entities: int = 0, entity_relations: int = 0, version: str = "1.52.0",
+) -> dict[str, Any]:
+    """A peer GET /count payload, in the shape peer_server.py returns."""
+    return {
+        "role": "peer",
+        "version": version,
+        "node_id": "peer-1",
+        "approximate": False,
+        "memories": {
+            "total": total, "live": total - tombstones, "tombstones": tombstones,
+        },
+        "entities": entities,
+        "memory_entities": memory_entities,
+        "entity_relations": entity_relations,
+        "time": _now_iso(),
+    }
+
+
+@pytest.fixture()
+def one_peer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make exactly one peer discoverable, without touching Tailscale."""
+    async def _peers() -> list[dict[str, str]]:
+        return [{"node_id": "peer-1", "url": "http://peer-1.example"}]
+
+    monkeypatch.setattr(sync, "_discover_peers", _peers)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_peer_reports_in_sync_when_totals_match(
+    sync_db: sqlite3.Connection, status_enabled: None, one_peer: None
+) -> None:
+    """The gap this closes: peer drift previously had no answer at all."""
+    insert_memory(sync_db, "m1")
+    recorder = RequestRecorder({"/count": peer_count(total=1)})
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_peer("peer-1", client)
+
+    assert result["status"] == "ok"
+    assert result["verdict"] == "in-sync"
+    assert result["peer"] == "peer-1"
+    assert result["peer_version"] == "1.52.0"
+    # Says what it compared: a peer serves no /stats, so there is no
+    # per-category breakdown to be had — that limit should be visible.
+    assert result["checked"] == "totals"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_peer_flags_node_ahead(
+    sync_db: sqlite3.Connection, status_enabled: None, one_peer: None
+) -> None:
+    """Local > remote means pushes aren't landing — same judgment as the hub.
+
+    Reusing _verdict is the point: a second copy would be a second place for
+    the two paths to disagree about what drift means.
+    """
+    for i in range(4):
+        insert_memory(sync_db, f"m{i}")
+    recorder = RequestRecorder({"/count": peer_count(total=1)})
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_peer("peer-1", client)
+
+    assert result["verdict"] == "node-ahead"
+    assert result["memories"]["delta"] == -3
+
+
+@pytest.mark.asyncio
+async def test_reconcile_peer_names_visible_peers_when_unknown(
+    sync_db: sqlite3.Connection, status_enabled: None, one_peer: None
+) -> None:
+    """"Wrong name" and "peer is offline" must be distinguishable."""
+    recorder = RequestRecorder()
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_peer("typo-node", client)
+
+    assert result["status"] == "unknown-peer"
+    assert "peer-1" in result["hint"]
+    assert recorder.requests == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_peer_reports_unsupported_on_an_older_peer(
+    sync_db: sqlite3.Connection, status_enabled: None, one_peer: None
+) -> None:
+    """A peer predating /count 404s — an upgrade, not an outage."""
+    recorder = RequestRecorder()  # 404s everything unknown
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_peer("peer-1", client)
+
+    assert result["status"] == "unsupported"
+    assert "verdict" not in result

@@ -1626,6 +1626,164 @@ async def _hub_totals_agree(
     )
 
 
+async def reconcile_with_peer(
+    node_id: str, client: httpx.AsyncClient | None = None
+) -> dict[str, Any]:
+    """Diff this node's record counts against one peer's (issue #216).
+
+    Peer sync carries the same records the hub does, but until now only the
+    hub could be reconciled against -- so "did my records actually reach that
+    machine?" had no answer short of shell access to it. This closes that
+    asymmetry using the peer's new ``GET /count``.
+
+    Totals only, deliberately, and not the same compromise ``quick`` makes on
+    the hub path: a peer has no ``/stats`` to fall back to, so a per-category
+    breakdown isn't a cheaper-or-fuller choice, it simply does not exist on
+    that side. The result says ``checked: "totals"`` for exactly that reason,
+    and the same caveat applies -- an offsetting recategorization is
+    invisible to any totals comparison.
+
+    The verdict logic is :func:`_verdict`, unchanged and shared with the hub
+    path: "local > remote means pushes aren't landing" is the same judgment
+    regardless of which remote is on the other end, and a second copy of it
+    would be a second place for the two to disagree.
+
+    Args:
+        node_id: The peer to reconcile against, as it appears in
+            ``remind_me_sync_status``'s ``remotes``.
+        client: Optional httpx client, for tests.
+
+    Returns:
+        A JSON-serializable dict, shaped like :func:`reconcile_with_hub`'s
+        with ``peer``/``peer_version`` in place of the hub fields. ``status``
+        is ``ok`` when the peer answered; otherwise ``disabled`` /
+        ``unknown-peer`` / ``unsupported`` / ``unauthorized`` /
+        ``unreachable`` / ``error`` with a hint, and no verdict.
+    """
+    if not SYNC_ENABLED:
+        return {
+            "status": "disabled",
+            "hint": "sync is not configured — see remind_me_sync_status",
+        }
+
+    peers = {p["node_id"]: p["url"] for p in await _discover_peers()}
+    if node_id not in peers:
+        return {
+            "status": "unknown-peer",
+            "peer": node_id,
+            # Naming the peers we *can* see turns "wrong name" and "peer is
+            # offline" into distinguishable situations rather than one
+            # unhelpful error.
+            "hint": (
+                "no such peer is currently discoverable; visible peers: "
+                + (", ".join(sorted(peers)) or "(none)")
+            ),
+        }
+    url = peers[node_id]
+
+    owns_client = client is None
+    client = client or httpx.AsyncClient()
+    try:
+        resp = await client.get(f"{url}/count", headers=HEADERS, timeout=15)
+        if resp.status_code == 404:
+            return {
+                "status": "unsupported",
+                "peer": node_id,
+                "hint": (
+                    "this peer has no GET /count endpoint — upgrade it to "
+                    "reconcile against it"
+                ),
+            }
+        if resp.status_code in (401, 403):
+            return {
+                "status": "unauthorized",
+                "peer": node_id,
+                "hint": "the peer rejected our bearer token — SYNC_SECRET mismatch",
+            }
+        resp.raise_for_status()
+        remote = resp.json()
+    except httpx.ConnectError as e:
+        return {"status": "unreachable", "peer": node_id, "hint": str(e)}
+    except Exception as e:  # noqa: BLE001 — a status call must never raise
+        return {"status": "error", "peer": node_id, "hint": f"{type(e).__name__}: {e}"}
+    finally:
+        if owns_client:
+            await client.aclose()
+
+    db = _get_db()
+    local = _local_counts(db)
+    remote_memories = remote.get("memories") or {}
+
+    # One synthetic "category" row per record type, which is the shape
+    # _verdict reads. The same trick _graph_verdict already uses for the
+    # entity-graph cursors -- the labels are record types rather than
+    # categories, and the judgment is identical either way.
+    rows = []
+    for label, remote_value, local_value in (
+        ("memories", remote_memories.get("total"), local["total"]),
+        ("tombstones", remote_memories.get("tombstones"), local["tombstones"]),
+        ("entities", remote.get("entities"), local["entities"]),
+        ("memory_entities", remote.get("memory_entities"), local["memory_entities"]),
+        ("entity_relations", remote.get("entity_relations"), local["entity_relations"]),
+    ):
+        remote_n = remote_value if isinstance(remote_value, int) else 0
+        if remote_n != local_value:
+            rows.append(
+                {
+                    "category": label,
+                    "hub": remote_n,
+                    "local": local_value,
+                    "delta": remote_n - local_value,
+                }
+            )
+
+    row = db.execute(
+        "SELECT last_pull_at, last_pull, last_pull_id FROM sync_log WHERE remote_id = ?",
+        (node_id,),
+    ).fetchone()
+    last_pull_at = row["last_pull_at"] if row else None
+    last_pull_age: float | None = None
+    if last_pull_at and last_pull_at != _EPOCH:
+        try:
+            last_pull_age = (
+                datetime.now(UTC) - datetime.fromisoformat(_canon_ts(last_pull_at))
+            ).total_seconds()
+        except (ValueError, TypeError):
+            last_pull_age = None
+
+    watermark = (row["last_pull"], row["last_pull_id"]) if row else None
+    cursor_stalled = bool(rows) and _cursor_progress(db, node_id, watermark)
+    verdict, hints = _verdict(rows, last_pull_age, cursor_stalled)
+
+    return {
+        "status": "ok",
+        "verdict": verdict,
+        "hints": hints,
+        # Totals are all a peer serves -- see the docstring; this is not the
+        # hub path's opt-in shortcut.
+        "checked": "totals",
+        "node_id": NODE_ID,
+        "version": __version__,
+        "peer": node_id,
+        "peer_url": url,
+        "peer_version": remote.get("version"),
+        "last_pull_at": last_pull_at,
+        "last_pull_age_seconds": (
+            round(last_pull_age) if last_pull_age is not None else None
+        ),
+        "outbox_pending": _pending_to_remote(db, node_id)[0],
+        "memories": _cmp_counts(remote_memories.get("total"), local["total"]),
+        "tombstones": _cmp_counts(remote_memories.get("tombstones"), local["tombstones"]),
+        "entities": _cmp_counts(remote.get("entities"), local["entities"]),
+        "memory_entities": _cmp_counts(
+            remote.get("memory_entities"), local["memory_entities"]
+        ),
+        "entity_relations": _cmp_counts(
+            remote.get("entity_relations"), local["entity_relations"]
+        ),
+    }
+
+
 async def reconcile_with_hub(
     client: httpx.AsyncClient | None = None, quick: bool = False
 ) -> dict[str, Any]:
