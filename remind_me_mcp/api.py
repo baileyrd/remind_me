@@ -1063,11 +1063,14 @@ def _build_api_app() -> Starlette:
         """Export memories as JSON or JSONL (FT-01).
 
         Query parameters: ``format`` (json|jsonl, default json), ``category``,
-        ``tags`` (comma-separated, memory must have ALL), ``file_path``, and
+        ``tags`` (comma-separated, memory must have ALL), ``file_path``,
         ``include_graph`` (default true — entities, memory-entity links, and
         entity-to-entity relations follow the memories as record_type-tagged
-        records, FT-06/Phase 3; pass false/0/no for a memories-only export).
-        Without ``file_path`` the
+        records, FT-06/Phase 3; pass false/0/no for a memories-only export),
+        and ``include_deleted`` (default false — soft-deleted/superseded
+        memories are excluded, since re-importing them would resurrect
+        tombstoned/stale content as fresh live memories; pass true/1/yes
+        for a genuine full-backup/audit export). Without ``file_path`` the
         export payload is returned as the response body
         (``curl .../api/export > backup.json``); with it, the export is
         written server-side to a path inside EXPORT_ROOTS and a JSON summary
@@ -1086,6 +1089,10 @@ def _build_api_app() -> Starlette:
         include_graph = (
             (params.get("include_graph") or "true").strip().lower()
             not in ("0", "false", "no")
+        )
+        include_deleted = (
+            (params.get("include_deleted") or "false").strip().lower()
+            in ("1", "true", "yes")
         )
 
         if file_path:
@@ -1108,6 +1115,7 @@ def _build_api_app() -> Starlette:
                             tags=tags,
                             file_path=str(p),
                             include_graph=include_graph,
+                            include_deleted=include_deleted,
                         )
                     )
                 except OSError as e:
@@ -1118,7 +1126,10 @@ def _build_api_app() -> Starlette:
 
         def _work() -> Response:
             records = collect_export_records(
-                category=category, tags=tags, include_graph=include_graph
+                category=category,
+                tags=tags,
+                include_graph=include_graph,
+                include_deleted=include_deleted,
             )
             payload = render_export(records, fmt)
             media = "application/json" if fmt == "json" else "application/x-ndjson"

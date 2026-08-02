@@ -866,6 +866,45 @@ def test_build_vitality_report_dormant_memory_counted(db_conn: sqlite3.Connectio
     assert report["vitality_buckets"]["0.00-0.05"] == 1
 
 
+def test_build_vitality_report_excludes_soft_deleted_memories(
+    db_conn: sqlite3.Connection,
+) -> None:
+    """Regression guard for issue #154.
+
+    build_vitality_report used to count every row in `memories` with no
+    deleted_at filter, unlike api_stats which does filter. A deleted
+    memory's very old/never-refreshed accessed_at made it read as dormant,
+    so deleting memories permanently depressed vault_health_score with data
+    the user deliberately removed -- a score that could never recover,
+    since tombstones only accumulate.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    _insert_access_row(db_conn, "still-alive")
+
+    # A long-dormant memory that's ALSO soft-deleted -- would inflate
+    # dormant_count and depress vault_health_score if not filtered out.
+    old = (datetime.now(UTC) - timedelta(days=3650)).isoformat()
+    mem_id = _make_id("deleted-long-dormant")
+    db_conn.execute(
+        """INSERT INTO memories (id, content, category, tags, source, metadata,
+           created_at, updated_at, accessed_at, access_count, decay_rate, vitality,
+           base_weight, status, memory_type, deleted_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (mem_id, "deleted long dormant", "general", "[]", "manual", "{}",
+         old, old, old, 0, 0.1, 1.0, 1.0, "active", "unclassified", old),
+    )
+    db_conn.commit()
+
+    report = build_vitality_report(db_conn)
+
+    # Only the one live memory counts -- the deleted one is invisible.
+    assert report["total_memories"] == 1
+    assert report["active_count"] == 1
+    assert report["dormant_count"] == 0
+    assert report["vault_health_score"] == "100%"
+
+
 def test_build_vitality_report_decay_distribution_by_type(db_conn: sqlite3.Connection) -> None:
     mem_id = _insert_access_row(db_conn, "decision-report-test")
     db_conn.execute("UPDATE memories SET memory_type = 'decision' WHERE id = ?", (mem_id,))

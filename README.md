@@ -549,6 +549,12 @@ For a single-user app where one SQLite file holds someone's entire memory store,
 - **Pre-migration snapshot** — every server startup that has a pending schema migration takes an automatic snapshot first, so a migration that fails outright, or completes but is semantically wrong, can be rolled back by restoring it. Skipped for a brand-new, empty database (nothing to protect yet). A snapshot failure (e.g. disk full) is logged and never blocks the migration itself.
 - **Retention** — only the most recent `REMIND_ME_BACKUP_RETENTION_COUNT` backups (default 10, manual and pre-migration combined) are kept; older ones are pruned automatically after each new backup.
 - Check `remind_me_server_status` for the current backup count and most recent backup timestamp.
+- **Restoring** — with the server stopped:
+  ```bash
+  python -m remind_me_mcp --list-backups
+  python -m remind_me_mcp --restore pre-migration-v12-20260101T000000Z.db --yes
+  ```
+  Validates the backup (`PRAGMA integrity_check` plus a sanity check that it's actually a remind-me database) before touching anything, and snapshots the *current* database first so a bad restore is itself recoverable. Refuses to run while an MCP server is holding the lock on this database. `--restore` accepts either a bare filename (resolved against the backups directory) or a full path to any valid backup file.
 
 ## Importing Chats & Documents
 

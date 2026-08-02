@@ -64,6 +64,7 @@ from mcp.server.auth.provider import (
     AuthorizationCode,
     AuthorizationParams,
     RefreshToken,
+    RegistrationError,
     construct_redirect_uri,
 )
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
@@ -98,6 +99,15 @@ CONSENT_PATH = "/consent"
 OWNER_CLIENT_ID = "owner"
 """Synthetic client_id reported for requests authenticated with the legacy
 connector token. Never collides with registered clients (those get UUIDs)."""
+
+MAX_REGISTERED_CLIENTS = 100
+"""Cap on dynamically-registered clients (issue #158). /register has no
+built-in rate limit and each call is a full read-modify-write of the state
+file, so an unbounded number of registrations grows both the file and the
+O(n) cost of every read/write on it without limit. 100 is generous for a
+single-user server (each real client -- claude.ai, Claude Desktop, ... --
+registers once and reuses its client_id) while still bounding runaway
+growth from a misbehaving or malicious caller reaching the tunnel URL."""
 
 
 def _now() -> float:
@@ -380,11 +390,28 @@ class SingleUserOAuthProvider:
         client is told "none" up front and never expects to present a
         secret it was never given.
         """
+        # issue #158: /register has no built-in rate limit, and each call is
+        # a full read-modify-write of the state file -- cap registrations
+        # so a misbehaving or malicious caller reaching the tunnel URL can't
+        # grow the file (and the O(n) cost of every read/write on it)
+        # without bound. Existing clients can still re-register (an update,
+        # not growth) even once the cap is hit.
+        client_id = client_info.client_id or ""
+        existing_ids = {c["client_id"] for c in self.store.list_clients()}
+        if client_id not in existing_ids and len(existing_ids) >= MAX_REGISTERED_CLIENTS:
+            raise RegistrationError(
+                error="invalid_client_metadata",
+                error_description=(
+                    f"registered client limit reached ({MAX_REGISTERED_CLIENTS}); "
+                    "revoke unused clients with remind_me_revoke_clients before "
+                    "registering another"
+                ),
+            )
+
         client_info.token_endpoint_auth_method = "none"
         client_info.client_secret = None
         client_info.client_secret_expires_at = None
 
-        client_id = client_info.client_id or ""
         self.store.put_client(client_id, client_info.model_dump(mode="json"))
         log.info(
             "Registered OAuth client %s (%s) — redirect_uris=%s",
@@ -411,6 +438,20 @@ class SingleUserOAuthProvider:
         cutoff = _now()
         for txn in [t for t, p in self._pending.items() if p.expires_at < cutoff]:
             del self._pending[txn]
+
+    def _prune_codes(self) -> None:
+        """Drop expired authorization codes (lazy GC, issue #158).
+
+        Mirrors ``_prune_pending``: an approved-but-never-exchanged code
+        (the user closes the tab, the client crashes before the token
+        exchange, ...) previously stayed in ``self._codes`` forever --
+        nothing ever popped it except a successful exchange. Called before
+        minting a new code, the same lazy-GC placement as ``_prune_pending``
+        uses before minting a new pending transaction.
+        """
+        cutoff = _now()
+        for code in [c for c, ac in self._codes.items() if ac.expires_at < cutoff]:
+            del self._codes[code]
 
     async def handle_consent_page(self, request: Request) -> Response:
         """GET /consent — render the owner-credential approval form."""
@@ -459,6 +500,7 @@ class SingleUserOAuthProvider:
                 headers={"Cache-Control": "no-store"},
             )
 
+        self._prune_codes()
         code = secrets.token_urlsafe(32)
         self._codes[code] = AuthorizationCode(
             code=code,
@@ -525,8 +567,19 @@ class SingleUserOAuthProvider:
         refresh_token: RefreshToken,
         scopes: list[str],
     ) -> OAuthToken:
-        """Rotate: retire the presented refresh token, issue a fresh pair."""
-        self.store.delete_token("refresh_tokens", refresh_token.token)
+        """Rotate: retire the client's existing tokens, issue a fresh pair.
+
+        Drops *all* of the client's tokens (issue #158), not just the
+        presented refresh token: deleting only the refresh token orphaned
+        its paired access-token hash in ``access_tokens`` forever -- it's
+        only ever removed if that exact (now-superseded) access token is
+        presented again, which after rotation it never is. At roughly one
+        refresh per hour per client that's ~720 dead hashes/month, forever.
+        Matches the single-session-per-client model ``revoke_token`` already
+        uses ("presenting either half of a client's credential pair kills
+        every token that client holds").
+        """
+        self.store.delete_tokens_for_client(refresh_token.client_id)
         return self._issue_tokens(client_id=refresh_token.client_id, scopes=scopes, resource=None)
 
     # -- bearer verification -------------------------------------------------

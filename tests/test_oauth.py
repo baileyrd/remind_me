@@ -448,6 +448,112 @@ def test_refresh_grant_rotates(oauth_client) -> None:
     assert replay.json()["error"] == "invalid_grant"
 
 
+def test_refresh_grant_kills_the_old_access_token_too(oauth_client) -> None:
+    """Rotation retires the WHOLE prior client session, not just the refresh token.
+
+    Regression guard for issue #158: exchange_refresh_token used to delete
+    only the presented refresh token, leaving its paired access token (and
+    any other still-live tokens for the client) in the store forever --
+    an orphaned-access-token leak with no way to reach it via revocation.
+    """
+    info = _register(oauth_client)
+    tokens = _obtain_tokens(oauth_client, info)
+
+    r = oauth_client.post(
+        "/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": tokens["refresh_token"],
+            "client_id": info["client_id"],
+        },
+    )
+    assert r.status_code == 200, r.text
+
+    # The access token minted alongside the now-retired refresh token is
+    # dead too -- not just no-longer-refreshable, but no longer usable.
+    r = oauth_client.post(
+        "/mcp",
+        json=_MCP_INITIALIZE,
+        headers={**_MCP_HEADERS, "Authorization": f"Bearer {tokens['access_token']}"},
+    )
+    assert r.status_code == 401
+
+
+def test_prune_codes_drops_expired_authorization_codes(tmp_path: Path) -> None:
+    """_prune_codes garbage-collects codes nobody ever exchanged (issue #158).
+
+    Unit-level (no HTTP round-trip needed): fabricate an already-expired
+    AuthorizationCode directly in the provider's in-memory dict, then confirm
+    _prune_codes evicts it while leaving a live one alone.
+    """
+    from mcp.server.auth.provider import AuthorizationCode
+
+    from remind_me_mcp.oauth import OAuthStateStore, SingleUserOAuthProvider
+
+    store = OAuthStateStore(tmp_path / "oauth.json")
+    provider = SingleUserOAuthProvider(owner_token=_OWNER, store=store)
+
+    def _code(code: str, expires_at: float) -> AuthorizationCode:
+        return AuthorizationCode(
+            code=code,
+            scopes=[],
+            expires_at=expires_at,
+            client_id="some-client",
+            code_challenge="challenge",
+            redirect_uri=_REDIRECT,
+            redirect_uri_provided_explicitly=True,
+            resource=None,
+        )
+
+    now = time.time()
+    provider._codes["expired"] = _code("expired", now - 1)
+    provider._codes["live"] = _code("live", now + 300)
+
+    provider._prune_codes()
+
+    assert "expired" not in provider._codes
+    assert "live" in provider._codes
+
+
+async def test_registration_cap_rejects_new_clients_but_allows_reregistration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MAX_REGISTERED_CLIENTS caps growth from new registrations (issue #158),
+    while an already-known client_id can still re-register at the cap.
+
+    Unit-level against the provider directly: the public /register endpoint
+    always assigns a fresh server-generated client_id (RFC 7591 handler
+    behavior -- it ignores any client_id the caller sends), so exercising
+    the "does this client_id already exist" branch in register_client
+    needs a call that supplies its own client_id.
+    """
+    from mcp.shared.auth import OAuthClientInformationFull
+
+    from remind_me_mcp.oauth import OAuthStateStore, RegistrationError, SingleUserOAuthProvider
+
+    monkeypatch.setattr(oauth_mod, "MAX_REGISTERED_CLIENTS", 2)
+    store = OAuthStateStore(tmp_path / "oauth.json")
+    provider = SingleUserOAuthProvider(owner_token=_OWNER, store=store)
+
+    def _client(client_id: str) -> OAuthClientInformationFull:
+        return OAuthClientInformationFull(
+            client_id=client_id,
+            redirect_uris=[_REDIRECT],
+            token_endpoint_auth_method="none",
+        )
+
+    await provider.register_client(_client("client-one"))
+    await provider.register_client(_client("client-two"))
+
+    with pytest.raises(RegistrationError) as exc_info:
+        await provider.register_client(_client("client-three"))
+    assert "limit reached" in (exc_info.value.error_description or "")
+
+    # Re-registering an already-known client_id is an update, not growth --
+    # still allowed once the cap is hit.
+    await provider.register_client(_client("client-one"))
+
+
 def test_expired_access_token_rejected(oauth_client, monkeypatch: pytest.MonkeyPatch) -> None:
     """An access token past ACCESS_TOKEN_TTL stops authenticating (frozen clock)."""
     info = _register(oauth_client)

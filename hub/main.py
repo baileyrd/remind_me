@@ -43,7 +43,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
 import psycopg
@@ -59,10 +59,28 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 SYNC_SECRET = os.environ.get("SYNC_SECRET", "")
 
 MAX_PULL_LIMIT = 500
+MAX_PUSH_BATCH = 1000
+"""Cap on records per /sync/push call (issue #165). A client bug that stops
+honoring processed_ids (retrying the same growing backlog) could otherwise
+post its entire outbox as one JSON body -- FastAPI fully materializes that
+into memory before validation runs, an OOM vector against the hub from a
+single misbehaving (not malicious) client."""
 _EPOCH = "1970-01-01T00:00:00+00:00"
 # Wait this long for Postgres to come up before giving up (systemd After=
 # only orders unit start, not server readiness).
 _DB_WAIT_SECONDS = 120
+
+# issue #162: every endpoint opens a fresh connection per request as a sync
+# def in the anyio threadpool (~40 slots). Without these, a Postgres host
+# that *hangs* (OOM, full disk, frozen host) rather than cleanly refusing
+# blocks each connect for roughly the OS TCP timeout (minutes); a handful
+# of polled /health checks plus a couple of pull/push cycles exhaust the
+# threadpool within about a minute, taking down every route including
+# /health -- the one route explicitly documented to survive a DB outage.
+# Bounding both connect time and query time keeps each request's worst
+# case in the single-digit seconds instead of unbounded.
+_CONNECT_TIMEOUT_SECONDS = 5
+_STATEMENT_TIMEOUT_MS = int(os.environ.get("REMIND_ME_HUB_STATEMENT_TIMEOUT_MS", "15000"))
 
 
 # ---------------------------------------------------------------------------
@@ -120,8 +138,11 @@ CREATE TABLE IF NOT EXISTS memories (
     "object"          TEXT,
     superseded_by     TEXT,
     deleted_at        TEXT COLLATE "C",
-    origin_node       TEXT
+    origin_node       TEXT,
+    hub_seq           BIGINT
 );
+
+CREATE SEQUENCE IF NOT EXISTS memories_hub_seq;
 
 CREATE TABLE IF NOT EXISTS entities (
     id          TEXT COLLATE "C" PRIMARY KEY,
@@ -154,6 +175,8 @@ CREATE TABLE IF NOT EXISTS entity_relations (
 
 CREATE INDEX IF NOT EXISTS idx_memories_updated_at_id
     ON memories (updated_at, id);
+CREATE INDEX IF NOT EXISTS idx_memories_hub_seq
+    ON memories (hub_seq);
 CREATE INDEX IF NOT EXISTS idx_entities_updated_at_id
     ON entities (updated_at, id);
 CREATE INDEX IF NOT EXISTS idx_links_created_at
@@ -187,6 +210,7 @@ _NEW_MEMORY_COLUMNS = (
     ('superseded_by', 'TEXT'),
     ('deleted_at', 'TEXT COLLATE "C"'),
     ('origin_node', 'TEXT'),
+    ('hub_seq', 'BIGINT'),
 )
 
 
@@ -233,11 +257,37 @@ def _migrate(conn: psycopg.Connection) -> None:
 
     conn.execute(_SCHEMA)
     conn.execute("ALTER TABLE entities ADD COLUMN IF NOT EXISTS origin_node TEXT")
+
+    # issue #160: backfill hub_seq for any pre-existing rows (a fresh CREATE
+    # TABLE never has any -- every row already goes through _upsert_memory,
+    # which always sets it). Assigned in (updated_at, id) order so a
+    # first-migration backfill doesn't itself reorder existing history; every
+    # write from here on gets a fresh value via nextval() regardless of its
+    # updated_at, which is exactly what decouples the pull cursor from
+    # client-authored timestamps.
+    conn.execute(
+        """
+        UPDATE memories m
+           SET hub_seq = sub.seq
+          FROM (
+                SELECT id, nextval('memories_hub_seq') AS seq
+                  FROM memories
+                 WHERE hub_seq IS NULL
+                 ORDER BY updated_at, id
+               ) sub
+         WHERE m.id = sub.id
+        """
+    )
     conn.commit()
 
 
 def _connect() -> psycopg.Connection:
-    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+    return psycopg.connect(
+        DATABASE_URL,
+        row_factory=dict_row,
+        connect_timeout=_CONNECT_TIMEOUT_SECONDS,
+        options=f"-c statement_timeout={_STATEMENT_TIMEOUT_MS}",
+    )
 
 
 @asynccontextmanager
@@ -269,9 +319,20 @@ app = FastAPI(lifespan=_lifespan)
 # ---------------------------------------------------------------------------
 
 def _require_auth(request: Request) -> None:
-    """Constant-time bearer check; always rejects when no secret is set."""
+    """Constant-time bearer check; always rejects when no secret is set.
+
+    Compares UTF-8-encoded bytes rather than str (issue #163):
+    ``hmac.compare_digest`` raises ``TypeError`` on a non-ASCII str, and
+    Starlette decodes headers as latin-1 (h11 permits obs-text bytes), so a
+    header like ``Authorization: Bearer \xc3\xa9`` arrives intact as a
+    non-ASCII str and would otherwise crash this check with an unhandled
+    500 instead of the intended 401. Encoding to bytes first sidesteps the
+    str restriction entirely -- latin-1 decode never produces surrogates,
+    so the round-trip through .encode() never raises.
+    """
     auth = request.headers.get("Authorization", "")
-    if not SYNC_SECRET or not hmac.compare_digest(auth, f"Bearer {SYNC_SECRET}"):
+    expected = f"Bearer {SYNC_SECRET}"
+    if not SYNC_SECRET or not hmac.compare_digest(auth.encode("utf-8"), expected.encode("utf-8")):
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
@@ -292,13 +353,22 @@ def health() -> JSONResponse:
     repo's deploy templates -- a transient DB blip shouldn't kill and
     restart an otherwise-healthy hub process, only block a *new* deploy from
     being promoted while the old one keeps serving.
+
+    The public ``db`` field never carries the raw exception text (issue
+    #164): psycopg's OperationalError typically embeds the host, resolved
+    IP, port, database name, username, and the specific auth-failure
+    reason, and this route is deliberately unauthenticated (and, per the
+    README, commonly fronted by a tunnel reachable from the open
+    internet). The full exception is still logged server-side for
+    debugging.
     """
     db_status = "ok"
     try:
         with _connect() as conn:
             conn.execute("SELECT 1")
     except Exception as e:
-        db_status = f"error: {e}"
+        log.warning("Health check DB connectivity failed: %s", e)
+        db_status = "unreachable"
     healthy = db_status == "ok"
     return JSONResponse(
         status_code=200 if healthy else 503,
@@ -392,6 +462,50 @@ def stats() -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# Tombstone retention (issue #165)
+# ---------------------------------------------------------------------------
+
+HUB_TOMBSTONE_RETENTION_DAYS = int(os.environ.get("REMIND_ME_HUB_TOMBSTONE_RETENTION_DAYS", "90"))
+"""Mirrors remind_me_mcp.config.TOMBSTONE_RETENTION_DAYS's tradeoff: purely
+time-based, no per-node cursor acknowledgment tracking (the hub doesn't
+track per-node pull cursors at all) -- a node offline longer than the
+retention window can miss a delete, the same accepted gap the client-side
+compaction already lives with. Operator-triggered (e.g. cron hitting this
+endpoint) rather than an automatic background loop, since the hub has no
+existing periodic-task infrastructure to hang one off of."""
+
+
+@app.post("/admin/compact_tombstones", dependencies=[Depends(_require_auth)])
+def compact_tombstones() -> dict:
+    """Hard-delete memories tombstoned longer than HUB_TOMBSTONE_RETENTION_DAYS ago.
+
+    Before this endpoint existed, tombstones accumulated on the hub forever
+    (issue #165) -- the client side already has this via
+    remind_me_mcp.sync._compact_tombstones, but nothing analogous ran
+    against the hub's own copy, so every newly provisioned node had to page
+    through the entire historical tombstone set (MAX_PULL_LIMIT rows at a
+    time) before it could see any live content.
+    """
+    cutoff = (datetime.now(UTC) - timedelta(days=HUB_TOMBSTONE_RETENTION_DAYS)).isoformat()
+    with _connect() as conn:
+        rows = conn.execute(
+            "DELETE FROM memories WHERE deleted_at IS NOT NULL AND deleted_at < %s RETURNING id",
+            (cutoff,),
+        ).fetchall()
+        ids = [r["id"] for r in rows]
+        if ids:
+            conn.execute(
+                "DELETE FROM memory_entities WHERE memory_id = ANY(%s)", (ids,)
+            )
+        conn.commit()
+    log.info(
+        "Compacted %d tombstoned memories older than %d days",
+        len(ids), HUB_TOMBSTONE_RETENTION_DAYS,
+    )
+    return {"purged": len(ids), "retention_days": HUB_TOMBSTONE_RETENTION_DAYS}
+
+
+# ---------------------------------------------------------------------------
 # Push — record-type dispatch, per-record isolation, LWW
 # ---------------------------------------------------------------------------
 
@@ -401,9 +515,11 @@ INSERT INTO memories
      created_at, updated_at, capture_id, node_id, client,
      accessed_at, access_count, decay_rate, vitality, base_weight,
      status, memory_type, source_capture_id,
-     subject, predicate, "object", superseded_by, deleted_at, origin_node)
+     subject, predicate, "object", superseded_by, deleted_at, origin_node,
+     hub_seq)
 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+        nextval('memories_hub_seq'))
 ON CONFLICT (id) DO UPDATE SET
     content           = EXCLUDED.content,
     category          = EXCLUDED.category,
@@ -427,7 +543,8 @@ ON CONFLICT (id) DO UPDATE SET
     "object"          = EXCLUDED."object",
     superseded_by     = EXCLUDED.superseded_by,
     deleted_at        = EXCLUDED.deleted_at,
-    origin_node       = EXCLUDED.origin_node
+    origin_node       = EXCLUDED.origin_node,
+    hub_seq           = nextval('memories_hub_seq')
 WHERE EXCLUDED.updated_at > memories.updated_at
 """
 
@@ -618,6 +735,11 @@ def sync_push(body: Annotated[dict, Body(...)]) -> dict:
     records = body.get("records", [])
     if not isinstance(records, list):
         raise HTTPException(status_code=400, detail="invalid push payload")
+    if len(records) > MAX_PUSH_BATCH:
+        raise HTTPException(
+            status_code=413,
+            detail=f"push batch of {len(records)} records exceeds the {MAX_PUSH_BATCH} limit",
+        )
 
     applied = 0
     failed = 0
@@ -672,7 +794,7 @@ _MEMORY_WIRE_COLUMNS = (
     'id, content, category, tags, source, metadata, created_at, updated_at, '
     'capture_id, node_id, client, accessed_at, access_count, decay_rate, '
     'vitality, base_weight, status, memory_type, source_capture_id, '
-    'subject, predicate, "object", superseded_by, deleted_at'
+    'subject, predicate, "object", superseded_by, deleted_at, hub_seq'
 )
 _ENTITY_WIRE_COLUMNS = "id, name, kind, aliases, created_at, updated_at, node_id"
 _ENTITY_RELATION_WIRE_COLUMNS = (
@@ -684,18 +806,48 @@ _ENTITY_RELATION_WIRE_COLUMNS = (
 def sync_pull(
     since: str = _EPOCH,
     since_id: str | None = None,
+    since_seq: int | None = None,
     exclude_node: str | None = None,
+    full: bool = False,
     limit: int = Query(default=MAX_PULL_LIMIT),
 ) -> dict:
-    # Keyset cursor when the client sends since_id (current clients always
-    # do); legacy strict updated_at comparison otherwise.
-    if since_id is not None:
+    """Pull memory records since a cursor.
+
+    Three cursor modes, in order of preference:
+
+    - ``since_seq`` (issue #160): keyset on the hub-assigned, monotonic
+      ``hub_seq`` column, bumped on every insert/update regardless of the
+      pushed record's own (client-authored) ``updated_at``. Immune to the
+      late-push-from-a-long-offline-node problem the legacy modes below
+      have: a node back online after two weeks pushes records still
+      stamped with old timestamps, which sort *behind* every
+      already-advanced ``updated_at`` cursor and are then permanently
+      invisible to other nodes. ``updated_at`` still drives LWW conflict
+      resolution -- this only changes what the *pull cursor* orders on.
+      Opt-in and additive: omitted, pull behaves exactly as before.
+    - ``since_id`` set (no ``since_seq``): legacy ``(updated_at, id)``
+      keyset cursor.
+    - neither set: legacy strict ``updated_at`` comparison.
+
+    ``full=True`` (issue #161) drops the ``exclude_node`` filter regardless
+    of whether it was also passed, so a node that lost its local database
+    can re-seed everything it originally authored -- normally permanently
+    unreachable, since ``exclude_node`` always excludes a node's own prior
+    pushes.
+    """
+    if since_seq is not None:
+        where = "hub_seq > %s"
+        params: list[Any] = [since_seq]
+        order_by = "hub_seq ASC"
+    elif since_id is not None:
         where = "(updated_at > %s OR (updated_at = %s AND id > %s))"
-        params: list[Any] = [since, since, since_id]
+        params = [since, since, since_id]
+        order_by = "updated_at ASC, id ASC"
     else:
         where = "updated_at > %s"
         params = [since]
-    if exclude_node:
+        order_by = "updated_at ASC, id ASC"
+    if exclude_node and not full:
         where += " AND (origin_node IS NULL OR origin_node != %s)"
         params.append(exclude_node)
     params.append(_clamp_limit(limit))
@@ -703,7 +855,7 @@ def sync_pull(
     with _connect() as conn:
         rows = conn.execute(
             f"SELECT {_MEMORY_WIRE_COLUMNS} FROM memories WHERE {where} "
-            f"ORDER BY updated_at ASC, id ASC LIMIT %s",
+            f"ORDER BY {order_by} LIMIT %s",
             params,
         ).fetchall()
 
@@ -715,11 +867,13 @@ def sync_pull_entities(
     since: str = _EPOCH,
     since_id: str = "",
     exclude_node: str | None = None,
+    full: bool = False,
     limit: int = Query(default=MAX_PULL_LIMIT),
 ) -> dict:
+    """See sync_pull's docstring for ``full`` (issue #161) -- same bypass."""
     where = "(updated_at > %s OR (updated_at = %s AND id > %s))"
     params: list[Any] = [since, since, since_id]
-    if exclude_node:
+    if exclude_node and not full:
         where += " AND (origin_node IS NULL OR origin_node != %s)"
         params.append(exclude_node)
     params.append(_clamp_limit(limit))

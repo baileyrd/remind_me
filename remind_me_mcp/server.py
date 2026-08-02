@@ -136,6 +136,12 @@ async def app_lifespan(app: FastMCP):
         # a no-op when usearch isn't installed or no search has run yet.
         from remind_me_mcp.ann_index import save_index
         save_index()
+        # Flush/shutdown the OTEL tracer (no-op unless tracing was ever
+        # enabled) so the final batch of spans isn't silently dropped —
+        # BatchSpanProcessor exports on a background thread that nothing
+        # else joins.
+        from remind_me_mcp import telemetry
+        telemetry.shutdown()
         # SE-07: always close every tracked connection, even when the body
         # raised — otherwise file descriptors leak and the WAL is never
         # checkpointed.

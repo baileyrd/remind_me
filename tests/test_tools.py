@@ -1975,6 +1975,38 @@ async def test_memory_delete_cleans_up_feedback_rows(
     ).fetchone()["n"] == 0
 
 
+async def test_memory_delete_cleans_up_co_retrieval_associations(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """Regression guard for issue #156.
+
+    _purge_memory is documented as "the single source of truth for 'delete
+    this memory correctly'" and its own docstring calls out a prior
+    incident where a derived-row table got missed during delete.
+    memory_associations (the co-retrieval reinforcement table) has no FK
+    and no ON DELETE behaviour, so a hard-deleted memory used to leave its
+    association rows behind forever -- invisible (search inner-joins
+    memories) but never cleaned up by anything.
+    """
+    from remind_me_mcp import vitality as vitality_mod
+
+    mem_a = memory_factory(id="assoc-cleanup-a", content="co-retrieval cleanup a")
+    mem_b = memory_factory(id="assoc-cleanup-b", content="co-retrieval cleanup b")
+    vitality_mod.record_co_retrieval([mem_a["id"], mem_b["id"]])
+
+    assert db_conn.execute(
+        "SELECT COUNT(*) AS n FROM memory_associations WHERE memory_id_a = ? OR memory_id_b = ?",
+        (mem_a["id"], mem_a["id"]),
+    ).fetchone()["n"] == 1
+
+    await memory_delete(MemoryDeleteInput(memory_id=mem_a["id"]))
+
+    assert db_conn.execute(
+        "SELECT COUNT(*) AS n FROM memory_associations WHERE memory_id_a = ? OR memory_id_b = ?",
+        (mem_a["id"], mem_a["id"]),
+    ).fetchone()["n"] == 0
+
+
 async def test_search_applies_query_contextual_feedback(
     db_conn: sqlite3.Connection, memory_factory
 ) -> None:

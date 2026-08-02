@@ -49,6 +49,7 @@ OTEL_SERVICE_NAME: str = os.environ.get("REMIND_ME_OTEL_SERVICE_NAME", "remind-m
 # ---------------------------------------------------------------------------
 
 _tracer: Any = None
+_provider: Any = None
 _init_attempted = False
 
 
@@ -64,7 +65,7 @@ def _get_tracer() -> Any:
     Returns:
         An OTEL ``Tracer``, or None when disabled/unavailable.
     """
-    global _tracer, _init_attempted
+    global _tracer, _provider, _init_attempted
     if _init_attempted:
         return _tracer
     _init_attempted = True
@@ -81,6 +82,7 @@ def _get_tracer() -> Any:
         exporter = OTLPSpanExporter(endpoint=OTEL_ENDPOINT) if OTEL_ENDPOINT else OTLPSpanExporter()
         provider.add_span_processor(BatchSpanProcessor(exporter))
         trace.set_tracer_provider(provider)
+        _provider = provider
         _tracer = trace.get_tracer("remind_me_mcp")
         log.info(
             "OpenTelemetry tracing enabled (service=%s, endpoint=%s)",
@@ -103,6 +105,29 @@ def is_enabled() -> bool:
     Triggers the same lazy, once-only initialization as :func:`maybe_span`.
     """
     return _get_tracer() is not None
+
+
+def shutdown() -> None:
+    """Flush and shut down the tracer provider, if one was ever created.
+
+    The BatchSpanProcessor added in :func:`_get_tracer` batches spans in
+    memory and exports them on a background thread -- without an explicit
+    shutdown, whatever spans were still buffered when the process exits
+    (every span from the final batch interval, up to the exporter's queue
+    size) are silently dropped, and the export thread is never joined.
+    Safe to call unconditionally: a no-op when tracing was never enabled or
+    never actually initialized. Best-effort, like the rest of this module --
+    a slow or unreachable collector must never hang or fail server shutdown.
+    """
+    global _provider
+    if _provider is None:
+        return
+    try:
+        _provider.shutdown()
+    except Exception as exc:  # noqa: BLE001 -- telemetry must never break shutdown
+        log.warning("OpenTelemetry shutdown failed (%s)", exc)
+    finally:
+        _provider = None
 
 
 # ---------------------------------------------------------------------------
@@ -153,4 +178,5 @@ __all__ = [
     "OTEL_SERVICE_NAME",
     "maybe_span",
     "is_enabled",
+    "shutdown",
 ]

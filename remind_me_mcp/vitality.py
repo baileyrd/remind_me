@@ -265,8 +265,13 @@ def build_vitality_report(db: sqlite3.Connection) -> dict:
         ``vitality_buckets`` (``{bucket_label: count}``).
     """
     # Effective (read-time) vitality per memory — the stored column is a
-    # stale at-access snapshot (DI-04).
-    rows = db.execute("SELECT * FROM memories").fetchall()
+    # stale at-access snapshot (DI-04). Excludes soft-deleted rows (issue
+    # #154), matching api_stats's convention: without this, every deleted
+    # memory (very old/null accessed_at) counted as dormant, permanently
+    # depressing vault_health_score with data the user deliberately
+    # removed -- a score that could never recover, since tombstones only
+    # accumulate.
+    rows = db.execute("SELECT * FROM memories WHERE deleted_at IS NULL").fetchall()
     total = len(rows)
     vitalities = [effective_vitality(_row_to_dict(r)) for r in rows]
 
@@ -279,7 +284,8 @@ def build_vitality_report(db: sqlite3.Connection) -> dict:
 
     # Decay distribution by memory_type
     type_rows = db.execute(
-        "SELECT memory_type, COUNT(*) as cnt FROM memories GROUP BY memory_type"
+        "SELECT memory_type, COUNT(*) as cnt FROM memories "
+        "WHERE deleted_at IS NULL GROUP BY memory_type"
     ).fetchall()
     decay_distribution = {r["memory_type"]: r["cnt"] for r in type_rows}
 
