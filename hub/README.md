@@ -159,10 +159,10 @@ answers your question — they are not interchangeable.
 
 ```bash
 curl -s http://127.0.0.1:8765/health
-# {"status":"ok","role":"hub","version":"1.2.0","db":"ok","time":"..."}
+# {"status":"ok","role":"hub","version":"1.3.0","db":"ok","time":"..."}
 
 curl -s -H "Authorization: Bearer $SYNC_SECRET" http://127.0.0.1:8765/count
-# {"role":"hub","version":"1.2.0",
+# {"role":"hub","version":"1.3.0",
 #  "memories":{"total":812,"live":790,"tombstones":22},
 #  "entities":143,"memory_entities":901,"entity_relations":37,"time":"..."}
 
@@ -193,6 +193,36 @@ work learns the build without a second request, and `curl -I` works as a
 deploy check. `remind_me_mcp/sync.py` records it from whatever the hub
 answers, which is where `remind_me_sync_status`'s `hub_version` comes from
 (no network call of its own — it reports what the last sync cycle saw).
+
+### Metrics
+
+`GET /metrics` serves Prometheus text exposition — build info plus record
+gauges (`remind_me_hub_memories{state="live"|"tombstoned"}`,
+`remind_me_hub_entities`, `remind_me_hub_memory_entities`,
+`remind_me_hub_entity_relations`). Counts come from the same helper `/count`
+uses, so the graph and the endpoint can't disagree.
+
+Off by default: set `REMIND_ME_HUB_METRICS_ENABLED=1`. While off the route is
+a plain `404`, not a `403` — "disabled" and "this build doesn't have it"
+should look the same to a scrape config.
+
+**Bearer-authenticated, unlike the dashboard's `/metrics`.** That route is
+deliberately open because Prometheus scrape configs typically send no custom
+headers, and requiring one would mean hand-rolling a bearer `scrape_config`
+for a single target. That argument doesn't carry here: anyone scraping the
+hub is the operator who provisioned `SYNC_SECRET` for it, and the payload is
+the same aggregate `/count` and `/stats` are gated on — serving it open would
+route around that gate rather than reconsider it.
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: remind-me-hub
+    authorization:
+      credentials: <SYNC_SECRET>
+    static_configs:
+      - targets: ["127.0.0.1:8765"]
+```
 
 **Versioning.** `HUB_VERSION` in `main.py` is a literal string, bumped by
 hand — the container image contains `main.py` and nothing else (no
@@ -302,7 +332,7 @@ systemctl --user daemon-reload
 systemctl --user start remind-me-postgres.service
 systemctl --user start remind-me-hub.service
 curl -s http://127.0.0.1:8765/health
-# {"status":"ok","role":"hub","version":"1.2.0","db":"ok","time":"..."}
+# {"status":"ok","role":"hub","version":"1.3.0","db":"ok","time":"..."}
 ```
 
 The hub creates (or migrates) the database schema itself at startup, and

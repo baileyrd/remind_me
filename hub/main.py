@@ -48,14 +48,14 @@ from typing import Annotated, Any
 
 import psycopg
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 log = logging.getLogger("remind_me_hub")
 logging.basicConfig(level=logging.INFO)
 
-HUB_VERSION = "1.2.0"
+HUB_VERSION = "1.3.0"
 """Version of the hub server, reported by /health, /count and /stats.
 
 Versioned independently of the ``remind-me-mcp`` package rather than tracking
@@ -553,6 +553,40 @@ parameterizable position in Postgres, so the value must never come from the
 request itself."""
 
 
+def _count_tables(
+    conn: psycopg.Connection, wanted: tuple[str, ...]
+) -> dict[str, Any]:
+    """Scalar counts for *wanted* tables, which must come from _COUNTABLE.
+
+    Shared by /count and /metrics so the two can never disagree about the
+    same records -- a second copy of these queries is exactly how a metric
+    quietly drifts from the endpoint it is supposed to mirror.
+    """
+    counts: dict[str, Any] = {}
+    for name in wanted:
+        if name == "memories":
+            (row,) = conn.execute(
+                """
+                SELECT COUNT(*)                                       AS total,
+                       COUNT(*) FILTER (WHERE deleted_at IS NOT NULL) AS tombstones
+                  FROM memories
+                """
+            ).fetchall()
+            counts["memories"] = {
+                "total": row["total"],
+                # Named to match what a node reports for itself: its
+                # user-visible count filters deleted_at IS NULL, so `live`
+                # is the figure that should agree across sides, and `total`
+                # the one that agrees with /stats.
+                "live": row["total"] - row["tombstones"],
+                "tombstones": row["tombstones"],
+            }
+        else:
+            (row,) = conn.execute(f"SELECT COUNT(*) AS count FROM {name}").fetchall()
+            counts[name] = row["count"]
+    return counts
+
+
 @app.get("/count", dependencies=[Depends(_require_auth)])
 def count(table: str | None = None) -> JSONResponse:
     """Scalar record counts — the cheap subset of /stats, safe to poll.
@@ -585,29 +619,8 @@ def count(table: str | None = None) -> JSONResponse:
         )
     wanted = (table,) if table else _COUNTABLE
 
-    counts: dict[str, Any] = {}
     with _connect() as conn:
-        for name in wanted:
-            if name == "memories":
-                (row,) = conn.execute(
-                    """
-                    SELECT COUNT(*)                                       AS total,
-                           COUNT(*) FILTER (WHERE deleted_at IS NOT NULL) AS tombstones
-                      FROM memories
-                    """
-                ).fetchall()
-                counts["memories"] = {
-                    "total": row["total"],
-                    # Named to match what a node reports for itself: its
-                    # user-visible count filters deleted_at IS NULL, so
-                    # `live` is the figure that should agree across sides,
-                    # and `total` the one that agrees with /stats.
-                    "live": row["total"] - row["tombstones"],
-                    "tombstones": row["tombstones"],
-                }
-            else:
-                (row,) = conn.execute(f"SELECT COUNT(*) AS count FROM {name}").fetchall()
-                counts[name] = row["count"]
+        counts = _count_tables(conn, wanted)
 
     return JSONResponse(
         content={
@@ -616,6 +629,71 @@ def count(table: str | None = None) -> JSONResponse:
             **counts,
             "time": datetime.now(UTC).isoformat(),
         },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Metrics (issue #210)
+# ---------------------------------------------------------------------------
+
+HUB_METRICS_ENABLED = os.environ.get("REMIND_ME_HUB_METRICS_ENABLED", "").lower() in (
+    "1", "true", "yes",
+)
+"""Whether GET /metrics is served. Off by default, mirroring the client's
+REMIND_ME_METRICS_ENABLED: instrumentation surface is opt-in, and a route
+that is off returns a plain 404 rather than a 403, so "disabled" is
+indistinguishable from "this build doesn't have it" -- which is what a
+scrape config should treat them as anyway."""
+
+
+@app.get("/metrics", dependencies=[Depends(_require_auth)])
+def metrics() -> Response:
+    """Prometheus text exposition for the hub.
+
+    **Auth stance: bearer-gated, unlike the dashboard's /metrics.** That
+    route (issue #197) argued itself into being unauthenticated because
+    Prometheus scrape configs typically send no custom headers, so requiring
+    one would push most operators into hand-rolling a bearer scrape_config
+    for a single target. That reasoning does not transfer here: anyone
+    scraping the hub is already the operator who provisioned SYNC_SECRET for
+    it, so the credential is in hand rather than newly invented. And the
+    payload is the same aggregate /count and /stats are gated on -- shipping
+    it unauthenticated would route around that gate rather than reconsider
+    it, which is the wrong way to arrive at a security posture.
+
+    Counts come from the same _count_tables() helper /count uses, so the two
+    can't drift apart.
+    """
+    if not HUB_METRICS_ENABLED:
+        raise HTTPException(status_code=404, detail="metrics are not enabled")
+
+    with _connect() as conn:
+        counts = _count_tables(conn, _COUNTABLE)
+
+    memories = counts["memories"]
+    lines = [
+        "# HELP remind_me_hub_build_info Build metadata; the value is always 1, the labels carry the information.",
+        "# TYPE remind_me_hub_build_info gauge",
+        f'remind_me_hub_build_info{{version="{HUB_VERSION}"}} 1',
+        "# HELP remind_me_hub_memories Memory records on the hub, by state.",
+        "# TYPE remind_me_hub_memories gauge",
+        f'remind_me_hub_memories{{state="live"}} {memories["live"]}',
+        f'remind_me_hub_memories{{state="tombstoned"}} {memories["tombstones"]}',
+        "# HELP remind_me_hub_entities Entity records on the hub.",
+        "# TYPE remind_me_hub_entities gauge",
+        f"remind_me_hub_entities {counts['entities']}",
+        "# HELP remind_me_hub_memory_entities Memory-entity link records on the hub.",
+        "# TYPE remind_me_hub_memory_entities gauge",
+        f"remind_me_hub_memory_entities {counts['memory_entities']}",
+        "# HELP remind_me_hub_entity_relations Typed entity-to-entity edges on the hub.",
+        "# TYPE remind_me_hub_entity_relations gauge",
+        f"remind_me_hub_entity_relations {counts['entity_relations']}",
+    ]
+    # Live/tombstoned are separate label values rather than separate metrics
+    # so a dashboard can sum them for the total without knowing both names.
+    return Response(
+        "\n".join(lines) + "\n",
+        media_type="text/plain; version=0.0.4",
     )
 
 

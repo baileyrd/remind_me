@@ -57,6 +57,22 @@ def _count_body() -> str:
     return "\n".join(ast.unparse(stmt) for stmt in body)
 
 
+def _count_sql() -> str:
+    """Every statement that actually produces /count's numbers.
+
+    The route delegates its queries to ``_count_tables`` (shared with
+    /metrics), so assertions about the SQL must look there as well as at the
+    handler — checking only the handler would leave them passing while
+    verifying nothing.
+    """
+    body = _count_body()
+    for node in ast.walk(ast.parse(_source())):
+        if isinstance(node, ast.FunctionDef) and node.name == "_count_tables":
+            stmts = node.body[1:] if ast.get_docstring(node) else node.body
+            return body + "\n" + "\n".join(ast.unparse(s) for s in stmts)
+    raise AssertionError("hub/main.py has no _count_tables helper")
+
+
 def _countable_tables() -> tuple[str, ...]:
     """The ``_COUNTABLE`` allowlist, read without importing hub.main."""
     for node in ast.walk(ast.parse(_source())):
@@ -92,7 +108,7 @@ def test_count_does_not_group() -> None:
     GROUP BY over the whole memories table would make it as expensive as the
     endpoint it exists to avoid, without anything visible changing.
     """
-    assert not re.search(r"GROUP\s+BY", _count_body(), re.IGNORECASE)
+    assert not re.search(r"GROUP\s+BY", _count_sql(), re.IGNORECASE)
 
 
 def test_count_covers_every_synced_record_type() -> None:
@@ -112,9 +128,46 @@ def test_count_splits_live_from_tombstones() -> None:
     A node's user-visible count filters ``deleted_at IS NULL`` while the hub
     retains tombstones, so a single number would look like permanent drift.
     """
-    body = _count_body()
-    assert "deleted_at IS NOT NULL" in body
-    assert "'live'" in body or '"live"' in body
+    sql = _count_sql()
+    assert "deleted_at IS NOT NULL" in sql
+    assert "'live'" in sql or '"live"' in sql
+
+
+def test_metrics_and_count_share_one_query_helper() -> None:
+    """Two copies of the counting SQL is how a metric drifts from its endpoint.
+
+    /metrics and /count report the same records; if they ever disagree, the
+    dashboard graph and the reconcile check are both suspect and there is no
+    way to tell which is right.
+    """
+    src = _source()
+    assert "_count_tables" in src, "counting must live in a shared helper"
+    assert "_count_tables(" in _count_body(), "/count must call the shared helper"
+
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "metrics":
+            assert "_count_tables(" in ast.unparse(node), (
+                "/metrics must call the shared helper, not its own COUNT queries"
+            )
+            return
+    raise AssertionError("hub/main.py has no /metrics route")
+
+
+def test_metrics_route_is_auth_gated() -> None:
+    """Diverges from the dashboard's unauthenticated /metrics, deliberately.
+
+    The payload is the same aggregate /count and /stats are gated on, and
+    anyone scraping the hub already holds SYNC_SECRET — so shipping it open
+    would route around that gate rather than reconsider it.
+    """
+    tree = ast.parse(_source())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "metrics":
+            decorators = [ast.unparse(d) for d in node.decorator_list]
+            assert any("_require_auth" in d for d in decorators)
+            return
+    raise AssertionError("hub/main.py has no /metrics route")
 
 
 def test_count_table_filter_is_an_allowlist() -> None:

@@ -62,6 +62,7 @@ import threading
 from typing import NamedTuple
 
 from remind_me_mcp import config as _config
+from remind_me_mcp.version import __version__
 
 _lock = threading.Lock()
 
@@ -202,6 +203,19 @@ def render_prometheus_text(gauges: list[GaugeSpec] | None = None) -> str:
         rejections = _rate_limit_rejections
 
     lines: list[str] = []
+
+    # Build info first (issue #210). The Prometheus idiom for metadata is a
+    # constant-1 gauge carrying it as labels, rather than a metric per fact:
+    # a panel then joins on it to annotate or group by version, which is what
+    # makes "latency changed" and "we upgraded" the same graph instead of two
+    # unrelated observations. Emitted unconditionally, including on a server
+    # that has never served a tool call -- an absent series would read as
+    # "scrape target down", not "idle".
+    lines.append(
+        "# HELP remind_me_build_info Build metadata; the value is always 1, the labels carry the information."
+    )
+    lines.append("# TYPE remind_me_build_info gauge")
+    lines.append(_format_metric("remind_me_build_info", 1, {"version": __version__}))
 
     lines.append("# HELP remind_me_tool_calls_total Total MCP tool calls, by tool name.")
     lines.append("# TYPE remind_me_tool_calls_total counter")
