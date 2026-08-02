@@ -10,9 +10,10 @@ Persistent, searchable memory that works across **Claude.ai**, **Claude Code**, 
 - **Chat export import** — ingest JSON, JSONL, or Markdown exports from Claude, ChatGPT, or custom formats
 - **Document ingestion** — import Markdown notes and plain-text files, chunked per-section (heading context preserved) or per-paragraph; `kind=auto` detects chat vs document per file
 - **PDF and image (OCR) ingestion** — import `.pdf` files (chunked per-page, page number kept as metadata) and `.png`/`.jpg`/`.jpeg` images (OCR'd into a single memory); `kind=auto` routes both automatically. Requires the optional `pdf`/`image` extras — see [PDF and Image Import](#pdf-and-image-import)
+- **Audio transcription ingestion** — import `.mp3`/`.m4a`/`.wav`/`.ogg` files, transcribed via a local Whisper model and chunked per transcript segment (start/end timestamp kept as metadata); `kind=auto` routes all four extensions automatically. Requires the optional `audio` extra — see [Audio Import](#audio-import)
 - **Readwise highlights import** — import a Readwise "Export" JSON file as one memory per highlight (book/article title, author, category, and the highlight's own note all kept as metadata/content); requires explicit `kind=readwise` — see [Importing from Readwise](#importing-from-readwise)
 - **Obsidian vault import** — frontmatter `tags:`, inline `#tags`, and `[[wikilinks]]` (resolved into knowledge-graph entities) are understood, not flattened into prose; a `.obsidian/` directory at or above a watched/imported path auto-detects the vault with zero configuration — see [Importing from Obsidian](#importing-from-obsidian)
-- **Bulk directory import** — point at a folder of exports/notes/PDFs/images and import them all
+- **Bulk directory import** — point at a folder of exports/notes/PDFs/images/audio and import them all
 - **Watched folders** — set `REMIND_ME_WATCH_DIRS` and new or changed files auto-ingest in the background; changed files supersede their previous import
 - **Push/webhook ingestion** — set `REMIND_ME_WEBHOOK_SECRET` and `POST /ingest` accepts content directly over the network, no filesystem staging required
 - **Ingest-time normalization** — `remind_me_normalize_batch`/`remind_me_normalize_apply` distill noisy raw imports into clean `{question, summary, resolution?}` memories, non-destructively linked back to the source
@@ -444,8 +445,8 @@ The stats view replaces the main content area with summary cards, horizontal bar
 
 | Tool | Description |
 |------|-------------|
-| `remind_me_import_chat` | Import a single chat export, document, PDF, or image file (`kind`: auto/chat/document/pdf/image) |
-| `remind_me_import_directory` | Bulk import all exports/documents/PDFs/images from a directory |
+| `remind_me_import_chat` | Import a single chat export, document, PDF, image, or audio file (`kind`: auto/chat/document/pdf/image/audio/readwise/obsidian) |
+| `remind_me_import_directory` | Bulk import all exports/documents/PDFs/images/audio from a directory |
 | `remind_me_import_mempalace` | Bulk-import memories from a MemPalace ChromaDB store, one page at a time (requires the optional `mempalace` extra) |
 | `remind_me_import_dbs` | Bulk-import memories from a [dbs](https://github.com/baileyrd/daily-backup-system) SQLite store, one page at a time — source and tags land as knowledge-graph entities, not flattened prose |
 | `remind_me_list_connectors` | List every registered import connector (built-in and third-party) and which are valid `remind_me_import_chat` kinds |
@@ -687,6 +688,39 @@ A `.png`/`.jpg`/`.jpeg` file is OCR'd via [RapidOCR](https://github.com/RapidAI/
 
 Importing a `.pdf`/image file without its extra installed returns a clear, actionable error (e.g. *"PDF import requires the 'pdf' extra: pip install remind-me-mcp[pdf]"*) — not a bare `ModuleNotFoundError` traceback. Every other import kind, and the rest of the server, is completely unaffected either way.
 
+## Audio Import
+
+A third import kind, `audio`, sits alongside `chat`/`document`/`pdf`/`image` — same `remind_me_import_chat`/`remind_me_import_directory` tools, same hash-dedup and `kind=auto` routing, one more optional extra so a base install doesn't pull in a Whisper runtime.
+
+### Enabling Audio Import
+
+```bash
+pip install faster-whisper
+# Or with uv:
+uv pip install "remind-me-mcp[audio]"
+```
+
+An `.mp3`/`.m4a`/`.wav`/`.ogg` file is transcribed via [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (a CTranslate2 re-implementation of OpenAI's Whisper) and chunked **per transcript segment** — Whisper's own sentence/phrase-level output unit — with each chunk's metadata carrying a `start`/`end` timestamp (seconds), the same role a PDF's `page` number plays. A segment too long for one memory is split further, with every resulting sub-chunk still tagged with that segment's full timestamp range.
+
+**Library choice.** This was researched and verified against real audio in a sandbox before committing to it, in order of preference:
+
+1. An ONNX-based option ([`onnx-asr`](https://github.com/istupakov/onnx-asr), which does support a Whisper model over `onnxruntime` — the same runtime this server already depends on for the embedder/reranker/OCR) was tried first, but rejected: it only accepts raw PCM WAV, with no built-in decoder for compressed containers at all — three of this feature's four required extensions (`.mp3`/`.m4a`/`.ogg`) would need a *second* new dependency just for decoding.
+2. [`pywhispercpp`](https://github.com/absadiki/pywhispercpp) (Python bindings for whisper.cpp — lighter-weight than a full CTranslate2/PyTorch runtime) was tried next. It worked fine on a plain 16kHz WAV, but failed reproducibly on `.mp3`: it shells out to a **system** `ffmpeg` binary for anything other than 16kHz mono WAV, and a sandbox with no `ffmpeg` installed hit `Exception: FFMPEG is not installed or not in PATH.` — reintroducing the exact class of dependency this project's own precedent already rejected once (`pdf_import.py` chose pure-Python `pypdf` over poppler-utils; `image_import.py` chose RapidOCR over pytesseract's system `tesseract` binary).
+3. **`faster-whisper` (chosen).** Verified end-to-end with a real synthesized speech clip, including a re-encoded `.mp3` of the same clip — the exact case that eliminated pywhispercpp. It decodes every common audio container out of the box via its own bundled [PyAV](https://github.com/PyAV-Org/PyAV) (`av`) dependency, which ships a statically-linked ffmpeg build inside its own wheel — no system `ffmpeg` binary required. It also already shares three of its four dependencies (`onnxruntime`, `huggingface-hub`, `tokenizers`) with this project's own `semantic` extra.
+4. `openai-whisper` (the heavier, plain-PyTorch reference implementation) was the documented last-resort fallback; not needed since faster-whisper worked cleanly.
+
+**Model size.** Defaults to `base` (~145MB int8-quantized, ~74M parameters) — deliberately smaller than Whisper's largest (`large-v3`, ~3GB), trading some transcription accuracy for a small download and fast CPU-only inference. Consistent with this being a local-first tool's DEFAULT, not its ceiling:
+
+| Variable | Default | Description |
+|---|---|---|
+| `REMIND_ME_AUDIO_MODEL` | `base` | Whisper model size/name (`tiny`/`base`/`small`/`medium`/`large-v2`/`large-v3`/`large-v3-turbo`/`distil-*`/etc., or a full HuggingFace repo id for a custom CTranslate2-converted model) — set to `small` or larger for noticeably better accuracy if you have the CPU/RAM/disk budget, no code change needed |
+
+The model downloads from HuggingFace Hub on first use and caches under `MODEL_DIR` (the same directory the embedder/reranker cache their own models in), and runs on CPU only, matching this server's other in-process models.
+
+### Without This Extra
+
+Importing an audio file without `faster-whisper` installed returns a clear, actionable error (*"Audio import requires the 'audio' extra: pip install remind-me-mcp[audio]"*) — not a bare `ModuleNotFoundError` traceback. Every other import kind, and the rest of the server, is completely unaffected either way.
+
 ## CLI
 
 For quick one-shot access without going through an MCP client — scripting, cron jobs, or just checking something from a terminal — `remind-me-mcp` also accepts three direct subcommands, alongside its existing flags:
@@ -746,11 +780,12 @@ The import tools (`remind_me_import_chat`, `remind_me_import_directory`, `POST /
 
 | Kind | Behavior |
 |------|----------|
-| `auto` *(default)* | `.json`/`.jsonl` always parse as chat. `.pdf` always parses as pdf; `.png`/`.jpg`/`.jpeg` always parses as image. `.md`/`.markdown`/`.txt` are content-sniffed: files with chat role markers (`**User:**`, `## Assistant`, …) import as chat, everything else as a document. **Never** resolves to `readwise` by content sniffing — see below. **Does** resolve to `obsidian` for a `.md`/`.markdown` file inside a detected Obsidian vault (directory context, not content sniffing) — see [Importing from Obsidian](#importing-from-obsidian) |
+| `auto` *(default)* | `.json`/`.jsonl` always parse as chat. `.pdf` always parses as pdf; `.png`/`.jpg`/`.jpeg` always parses as image; `.mp3`/`.m4a`/`.wav`/`.ogg` always parses as audio. `.md`/`.markdown`/`.txt` are content-sniffed: files with chat role markers (`**User:**`, `## Assistant`, …) import as chat, everything else as a document. **Never** resolves to `readwise` by content sniffing — see below. **Does** resolve to `obsidian` for a `.md`/`.markdown` file inside a detected Obsidian vault (directory context, not content sniffing) — see [Importing from Obsidian](#importing-from-obsidian) |
 | `chat` | Force the chat-export parser (chunked per-message) |
 | `document` | Force document chunking (`.md`/`.markdown`/`.txt` only) |
 | `pdf` | Force per-page PDF chunking (`.pdf` only; requires the optional `pdf` extra) — see [PDF and Image Import](#pdf-and-image-import) |
 | `image` | Force OCR of an image into a single memory (`.png`/`.jpg`/`.jpeg` only; requires the optional `image` extra) — see [PDF and Image Import](#pdf-and-image-import) |
+| `audio` | Force per-segment transcription of an audio file (`.mp3`/`.m4a`/`.wav`/`.ogg` only; requires the optional `audio` extra) — see [Audio Import](#audio-import) |
 | `readwise` | Force a Readwise "Export" JSON file into one memory per highlight (`.json` only, must be requested explicitly — never chosen by `auto`) — see [Importing from Readwise](#importing-from-readwise) |
 | `obsidian` | Force frontmatter/wikilink/inline-`#tag`-aware Markdown import (`.md`/`.markdown` only) — see [Importing from Obsidian](#importing-from-obsidian) |
 
@@ -1603,6 +1638,7 @@ This importance-staleness gap has a free-text-prose analog: `remind_me_contradic
 | `REMIND_ME_OCR_DET_MODEL_PATH` | *(unset)* | Path to an alternate ONNX text-detection model for image OCR (`RapidOCR(det_model_path=...)`) — see [Enabling Image (OCR) Import](#enabling-image-ocr-import) |
 | `REMIND_ME_OCR_CLS_MODEL_PATH` | *(unset)* | Path to an alternate ONNX text-orientation-classification model for image OCR (`RapidOCR(cls_model_path=...)`) |
 | `REMIND_ME_OCR_REC_MODEL_PATH` | *(unset)* | Path to an alternate ONNX text-recognition model for image OCR (`RapidOCR(rec_model_path=...)`) — determines which script(s) OCR can actually read; the bundled default only covers Chinese + English/Latin+digits |
+| `REMIND_ME_AUDIO_MODEL` | `base` | Whisper model size/name for audio transcription (`faster-whisper`) — see [Audio Import](#audio-import) |
 | `REMIND_ME_QUERY_EXPANSION` | *(unset)* | Set to `hyde` to expand queries with a hypothetical answer passage before vector search |
 | `REMIND_ME_HYDE_MODEL` | `llama3.2` | Ollama model that writes the HyDE passage |
 | `REMIND_ME_HYDE_TIMEOUT` | `15` | Seconds to wait for HyDE generation before falling back to the plain query |
@@ -1757,7 +1793,7 @@ The server uses:
 remind_me is local-first, single-user, and MCP-native by design — some capabilities other memory/knowledge systems offer are deliberately out of scope rather than missing, because building them would work against that center. Documented here so the reasoning doesn't have to be reconstructed from a GitHub issue thread:
 
 - **Pluggable vector/graph storage backends (Neo4j, Qdrant, etc.)** — not planned. remind_me stores everything in one SQLite file (+ `sqlite-vec` for vectors) so it stays zero-ops: no second service to run, back up, or lose sync with. `storage_interfaces.py` documents the storage operations as `Protocol`s (mypy-verified against the real SQLite implementation) purely so the seam is legible if this ever changes — it ships no second backend and implies no near-term plan to build one.
-- **Multimodal ingestion (images, audio)** — deferred entirely. Ingestion, chunking, embedding, FTS5, and the wiki are all text-native end to end; images would need a second embedding pipeline, binary storage, and a UI story, none of which serve the text-first "personal memory for Claude clients" center. Revisit only if a concrete use case emerges.
+- **Multimodal *retrieval* (visual/audio search over binary content itself)** — deferred; images and audio are extracted to plain text at import time instead (OCR for images since #181, Whisper transcription for audio since #192) and flow through the exact same text-native pipeline as every other memory: chunking, FTS5, embedding, the wiki. What's deliberately still out of scope is a *second* embedding pipeline over the binary content itself (e.g. CLIP-style image embeddings, audio fingerprinting) — extract-to-text has served every concrete use case so far, so a genuinely multimodal retrieval index hasn't been justified yet. Revisit only if a concrete use case emerges that extraction-to-text can't serve.
 - **Multi-tenant / cross-agent isolation** — deferred. remind_me is explicitly single-owner by design: one OAuth owner token, one SQLite file per node. Multi-tenancy is an architecture change orthogonal to "personal memory," not a gap in the current design — worth revisiting only if the project's scope deliberately shifts toward shared/team memory infrastructure.
 - **Client SDKs beyond MCP** — no hand-written TS/Rust/etc. SDKs (maintenance surface disproportionate to a single-user local tool whose real client is Claude via MCP). Instead, the existing `GET /api/*` REST surface is published as an [OpenAPI 3.0 spec](docs/openapi.yaml) so any language can generate a thin client for free.
 - **Cloud/managed & serverless hosting** — no managed hosting product. The per-user SQLite node is designed to stay local; the one component that's natural to host centrally (the sync hub) already had a Podman quadlet deploy path, and now also has [Docker Compose, Fly.io, and Railway templates](hub/deploy/) — deliberately still self-hosted, not a one-click managed service.

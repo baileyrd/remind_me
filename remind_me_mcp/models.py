@@ -615,12 +615,13 @@ class SaveSearchInput(BaseModel):
 
 
 class ImportKind(StrEnum):
-    """How to parse an imported file (FT-02, extended by FT-19, FT-20, FT-31).
+    """How to parse an imported file (FT-02, extended by FT-19, FT-20, FT-31, FT-32).
 
     AUTO routes by extension and content sniffing: .json/.jsonl always import
     as chat; .pdf always imports as pdf; .png/.jpg/.jpeg always import as
-    image; .md/.markdown/.txt import as chat when they contain chat role
-    markers (e.g. '**User:**', '## Assistant'), otherwise as a document.
+    image; .mp3/.m4a/.wav/.ogg always import as audio; .md/.markdown/.txt
+    import as chat when they contain chat role markers (e.g. '**User:**',
+    '## Assistant'), otherwise as a document.
     READWISE (a Readwise "Export" JSON file, one memory per highlight) is
     deliberately NOT reachable through AUTO — a Readwise export and a chat
     export are both plain .json with no reliable content-sniff to tell them
@@ -634,6 +635,10 @@ class ImportKind(StrEnum):
     and remind_me_import_directory both do — gets it automatically for a
     .md/.markdown file inside a detected Obsidian vault (a `.obsidian/`
     directory at or above the watched/imported root).
+    AUDIO (a transcribed .mp3/.m4a/.wav/.ogg file, chunked per transcript
+    segment with a start/end timestamp — see audio_import.py) IS reachable
+    through AUTO, unconditionally, like PDF/IMAGE: there is nothing to
+    content-sniff, a suffix on its list is always audio.
     """
 
     AUTO = "auto"
@@ -643,6 +648,7 @@ class ImportKind(StrEnum):
     IMAGE = "image"
     READWISE = "readwise"
     OBSIDIAN = "obsidian"
+    AUDIO = "audio"
 
 
 class ChatImportInput(BaseModel):
@@ -688,13 +694,14 @@ class ChatImportInput(BaseModel):
     kind: ImportKind = Field(
         default=ImportKind.AUTO,
         description=(
-            "How to parse the file (FT-02, extended by FT-19, FT-20, FT-31): "
+            "How to parse the file (FT-02, extended by FT-19, FT-20, FT-31, FT-32): "
             "'auto' — detect by extension/content (chat-style markdown imports "
             "as chat, notes markdown/text as a document, .pdf as pdf, "
-            "image extensions as image; never resolves to 'readwise' by content "
-            "— see below — but DOES resolve to 'obsidian' for a .md/.markdown "
-            "file inside a detected Obsidian vault, i.e. a `.obsidian/` "
-            "directory at or above an ancestor import root), "
+            "image extensions as image, audio extensions as audio; never "
+            "resolves to 'readwise' by content — see below — but DOES resolve "
+            "to 'obsidian' for a .md/.markdown file inside a detected Obsidian "
+            "vault, i.e. a `.obsidian/` directory at or above an ancestor "
+            "import root), "
             "'chat' — force the chat-export parser, "
             "'document' — force per-section/paragraph document chunking "
             "(.md/.markdown/.txt only), "
@@ -709,7 +716,10 @@ class ChatImportInput(BaseModel):
             "'obsidian' — force frontmatter/wikilink/inline-#tag-aware Markdown "
             "import (.md/.markdown only): frontmatter 'tags' and inline '#tag' "
             "syntax become memory tags, and '[[wikilinks]]' resolve to entities "
-            "linked to the memory via the existing knowledge-graph machinery"
+            "linked to the memory via the existing knowledge-graph machinery, "
+            "'audio' — force transcription of an audio file, chunked per "
+            "transcript segment with a start/end timestamp "
+            "(.mp3/.m4a/.wav/.ogg only; requires the optional 'audio' extra)"
         ),
     )
 
@@ -729,9 +739,10 @@ class ChatImportInput(BaseModel):
             raise ValueError(f"File not found: {p}")
         if p.suffix.lower() not in (
             ".json", ".jsonl", ".md", ".markdown", ".txt", ".pdf", ".png", ".jpg", ".jpeg",
+            ".mp3", ".m4a", ".wav", ".ogg",
         ):
             raise ValueError(
-                f"Unsupported file type: {p.suffix}. Use .json, .jsonl, .md, .pdf, or an image"
+                f"Unsupported file type: {p.suffix}. Use .json, .jsonl, .md, .pdf, an image, or audio"
             )
         return str(p)
 
@@ -835,12 +846,12 @@ class BulkImportDirInput(BaseModel):
     kind: ImportKind = Field(
         default=ImportKind.AUTO,
         description=(
-            "Per-file parsing mode (FT-02, extended by FT-19, FT-20, FT-31): 'auto' "
-            "(detect chat/document/pdf/image per file — never 'readwise', which "
+            "Per-file parsing mode (FT-02, extended by FT-19, FT-20, FT-31, FT-32): 'auto' "
+            "(detect chat/document/pdf/image/audio per file — never 'readwise', which "
             "must be forced explicitly and then applies to every .json file in "
             "the directory; DOES resolve to 'obsidian' per .md/.markdown file "
             "inside a detected Obsidian vault), "
-            "'chat', 'document', 'pdf', 'image', 'readwise', or 'obsidian'"
+            "'chat', 'document', 'pdf', 'image', 'readwise', 'obsidian', or 'audio'"
         ),
     )
 

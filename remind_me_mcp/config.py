@@ -966,6 +966,29 @@ RapidOCR's model zoo (https://github.com/RapidAI/RapidOCR) for a script the
 bundled ch_PP-OCRv4 model doesn't cover. Unset by default."""
 
 # ---------------------------------------------------------------------------
+# Audio transcription (audio import, issue #192)
+# ---------------------------------------------------------------------------
+
+AUDIO_MODEL_SIZE = os.environ.get("REMIND_ME_AUDIO_MODEL", "base")
+"""faster-whisper model size/name (``audio_import.py``, FT-32). One of
+Whisper's standard sizes (``tiny``/``tiny.en``/``base``/``base.en``/
+``small``/``small.en``/``medium``/``medium.en``/``large-v2``/``large-v3``/
+``large-v3-turbo``/``distil-*``), or a full HuggingFace repo id for a custom
+CTranslate2-converted model.
+
+Default ``base`` (~145MB int8, ~74M params) deliberately trades some
+accuracy for a small download and fast CPU inference -- consistent with this
+being a local-first tool's DEFAULT, not its ceiling: a user who wants
+noticeably better transcription and has the CPU/RAM/disk budget for it can
+set this to ``small`` or larger with no code change, exactly like
+``REMIND_ME_EMBEDDING_MODEL``/``REMIND_ME_RERANK_MODEL`` let a user opt into
+a stronger model for their own workload. Downloaded from HuggingFace Hub on
+first use and cached under ``MODEL_DIR`` (see ``audio_import._get_whisper_model``),
+exactly like the embedder/reranker's own ONNX models -- the on-disk cache
+format differs (CTranslate2 conversion, not ONNX), but the "download once,
+reuse from MODEL_DIR forever after" behavior is identical."""
+
+# ---------------------------------------------------------------------------
 # Updates
 # ---------------------------------------------------------------------------
 
@@ -1077,6 +1100,7 @@ __all__ = [
     "OCR_DET_MODEL_PATH",
     "OCR_CLS_MODEL_PATH",
     "OCR_REC_MODEL_PATH",
+    "AUDIO_MODEL_SIZE",
     "BACKUP_S3_BUCKET",
     "BACKUP_S3_PREFIX",
     "BACKUP_S3_ENDPOINT_URL",

@@ -1054,7 +1054,7 @@ paths:
                 kind:
                   type: string
                   default: auto
-                  enum: [auto, chat, document, pdf, image, readwise]
+                  enum: [auto, chat, document, pdf, image, readwise, obsidian, audio]
       responses:
         "200":
           description: |

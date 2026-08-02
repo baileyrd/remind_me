@@ -1038,9 +1038,9 @@ async def test_list_connectors_reports_builtins() -> None:
     from remind_me_mcp.tools import remind_me_list_connectors
 
     data = json.loads(await remind_me_list_connectors())
-    assert {"chat", "document", "pdf", "image", "readwise", "obsidian"} <= set(data["connectors"])
+    assert {"chat", "document", "pdf", "image", "readwise", "obsidian", "audio"} <= set(data["connectors"])
     assert set(data["file_import_kinds"]) == {
-        "chat", "document", "pdf", "image", "readwise", "obsidian",
+        "chat", "document", "pdf", "image", "readwise", "obsidian", "audio",
     }
 
 
