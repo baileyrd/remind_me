@@ -27,7 +27,21 @@ HUB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$HUB_DIR/.." && pwd)"
 DATA_DIR="${REMIND_ME_HUB_DATA:-$HOME/remind-me-hub}"
 QUADLET_DIR="$HOME/.config/containers/systemd"
-HEALTH_URL="http://127.0.0.1:8765/health"
+
+# Probe the hub through the address its Quadlet actually publishes, not a
+# hardcoded loopback: ours binds to the host's Tailscale IP (see
+# deploy/remind-me-hub.container), so 127.0.0.1 never answers there even
+# when the hub is perfectly healthy.
+_hub_publish_host() {
+    local quadlet="$QUADLET_DIR/remind-me-hub.container" publish
+    [[ -f "$quadlet" ]] || { echo 127.0.0.1; return; }
+    publish=$(sed -n 's/^PublishPort=//p' "$quadlet" | head -n1)
+    case "$publish" in
+        *:*:*) echo "${publish%%:*}" ;;   # ip:hostPort:containerPort
+        *)     echo 127.0.0.1 ;;          # hostPort:containerPort -- all interfaces
+    esac
+}
+HEALTH_URL="http://$(_hub_publish_host):8765/health"
 PG_CONTAINER=remind-me-postgres
 HUB_SERVICE=remind-me-hub.service
 PG_SERVICE=remind-me-postgres.service
