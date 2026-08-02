@@ -80,6 +80,44 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
 
+  /api/analytics/trend:
+    get:
+      operationId: getAnalyticsTrend
+      summary: Daily analytics-snapshot history for the dashboard's trend chart (issue #186)
+      description: >-
+        One row per calendar day the background scheduler has captured
+        (`remind_me_mcp.analytics.maybe_capture_analytics_snapshot`), oldest
+        first. Returns an empty array (not an error) on a fresh install that
+        hasn't captured a snapshot yet.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  snapshots:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        captured_at:
+                          type: string
+                          format: date-time
+                        total_memories:
+                          type: integer
+                        vitality_buckets:
+                          type: object
+                          additionalProperties:
+                            type: integer
+                        category_counts:
+                          type: object
+                          additionalProperties:
+                            type: integer
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   /api/vitality:
     get:
       operationId: getVitalityReport
@@ -925,7 +963,7 @@ paths:
                 kind:
                   type: string
                   default: auto
-                  enum: [auto, chat, document]
+                  enum: [auto, chat, document, pdf, image]
       responses:
         "200":
           description: |
@@ -993,6 +1031,40 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "500":
           description: Server-side write failed (e.g. disk error).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/reminders/{token}.ics:
+    get:
+      operationId: getRemindersIcs
+      summary: Subscribable ICS calendar feed of reminders (issue #190)
+      description: >-
+        Unauthenticated by the normal Authorization-header bearer scheme --
+        a calendar app's "subscribe by URL" feature polls this URL from the
+        provider's own servers with no way to attach custom headers, so the
+        secret lives in the URL path itself (`REMIND_ME_ICS_TOKEN`, compared
+        with `hmac.compare_digest`). Treat this URL like a password: whoever
+        holds it can read every reminder's content. A wrong token returns a
+        bare 404, never a 401, so a probe can't distinguish "wrong token"
+        from "route doesn't exist".
+      security: []
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: iCalendar (RFC 5545) feed of upcoming and overdue-but-undelivered reminders
+          content:
+            text/calendar:
+              schema:
+                type: string
+        "404":
+          description: Token did not match `REMIND_ME_ICS_TOKEN`
           content:
             application/json:
               schema:
