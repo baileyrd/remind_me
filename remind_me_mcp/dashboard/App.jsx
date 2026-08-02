@@ -57,6 +57,24 @@ async function api(path, opts = {}) {
   return res.json();
 }
 
+// Issue #211: the build serving this page. Read from /health rather than
+// /api/stats deliberately -- /health is unauthenticated, so the version still
+// shows while the API key is wrong or missing, which is one of the situations
+// where you most want to know which build you are talking to. Failure is
+// silent: an absent version renders nothing, never an error in the chrome.
+function useServerVersion() {
+  const [version, setVersion] = useState("");
+  useEffect(() => {
+    let cancelled = false;
+    fetch(window.location.origin + "/health")
+      .then(r => r.json())
+      .then(d => { if (!cancelled && d && d.version) setVersion(d.version); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+  return version;
+}
+
 function useMemoryStore() {
   const [memories, setMemories] = useState([]);
   const [stats, setStats] = useState({ total: 0, categories: {}, sources: {}, tags: {} });
@@ -591,6 +609,7 @@ function ImportForm({onComplete, onCancel}) {
 
 function App() {
   const store = useMemoryStore();
+  const serverVersion = useServerVersion();
   const wikiStore = useWikiStore();
   const entityStore = useEntityStore();
   const [view, setView] = useState("browse");
@@ -691,7 +710,7 @@ function App() {
         React.createElement("div",{style:{width:36,height:36,borderRadius:8,background:"linear-gradient(135deg,"+theme.accent+",#a855f7)",display:"flex",alignItems:"center",justifyContent:"center"}}, React.createElement(Icons.Brain)),
         React.createElement("div",null,
           React.createElement("h1",{style:{margin:0,fontSize:18,fontWeight:700,fontFamily:sans,letterSpacing:"-0.02em"}},"Remind Me"),
-          React.createElement("span",{style:{fontSize:11,color:theme.textMuted,fontFamily:mono}}, (stats.total||0)+" memories \u00b7 "+((stats.db_path||"").replace(/.*\//,"~/"))),
+          React.createElement("span",{style:{fontSize:11,color:theme.textMuted,fontFamily:mono}}, (stats.total||0)+" memories \u00b7 "+((stats.db_path||"").replace(/.*\//,"~/"))+(serverVersion?" \u00b7 v"+serverVersion:"")),
         )
       ),
       React.createElement("div",{style:{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}},
