@@ -69,6 +69,8 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from remind_me_mcp import metrics
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -155,6 +157,12 @@ class RateLimiter:
             if count >= self.limit:
                 self._buckets[key] = (window_start, count)
                 retry_after = max(0.0, self.window_seconds - (now - window_start))
+                # Issue #197: the single choke point both rate-limited routes
+                # (webhook_server.py's POST /ingest, remote.py's Streamable
+                # HTTP endpoint) already flow through -- see metrics.py's
+                # record_rate_limit_rejection docstring. No-op unless
+                # REMIND_ME_METRICS_ENABLED is set.
+                metrics.record_rate_limit_rejection()
                 return RateLimitResult(allowed=False, retry_after=retry_after)
             self._buckets[key] = (window_start, count + 1)
             return RateLimitResult(allowed=True, retry_after=0.0)

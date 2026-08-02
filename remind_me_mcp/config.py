@@ -825,6 +825,20 @@ RATE_LIMIT_WINDOW_SECONDS = _env_int("REMIND_ME_RATE_LIMIT_WINDOW_SECONDS", 60)
 """Window length in seconds for REMIND_ME_RATE_LIMIT_REQUESTS."""
 
 # ---------------------------------------------------------------------------
+# Metrics (issue #197)
+# ---------------------------------------------------------------------------
+
+METRICS_ENABLED: bool = _env_bool("REMIND_ME_METRICS_ENABLED", False)
+"""Whether GET /metrics (remind_me_mcp.metrics) is served. Default off,
+matching the OTel tracing opt-in precedent (see README's "Observability"
+section) -- this is instrumentation surface, not a core feature, and an
+operator who wants it firewalls/gates the port themselves same as any other
+scrape target. REMIND_ME_METRICS_ENABLED="" disables it explicitly, mirroring
+RATE_LIMIT_ENABLED's empty-string opt-out convention. When off, every
+remind_me_mcp.metrics.record_* call is a no-op (mirrors telemetry.maybe_span)
+-- no counter state accumulates, and GET /metrics returns 404."""
+
+# ---------------------------------------------------------------------------
 # OCR (image import, issue #181/#202)
 # ---------------------------------------------------------------------------
 #
@@ -962,6 +976,7 @@ __all__ = [
     "RATE_LIMIT_ENABLED",
     "RATE_LIMIT_REQUESTS",
     "RATE_LIMIT_WINDOW_SECONDS",
+    "METRICS_ENABLED",
     "AUTO_UPDATE_CHECK",
     "UPDATE_EXPECTED_ORIGIN",
     "DB_ENCRYPTION_KEY",

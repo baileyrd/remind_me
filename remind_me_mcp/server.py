@@ -12,12 +12,13 @@ circular imports.
 from __future__ import annotations
 
 import logging
+import time
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
 from mcp.server.fastmcp import FastMCP
 
-from remind_me_mcp import watchdog
+from remind_me_mcp import metrics, watchdog
 from remind_me_mcp.config import DB_PATH, SYNC_ENABLED
 from remind_me_mcp.db import _close_db, _get_db
 from remind_me_mcp.telemetry import maybe_span
@@ -48,6 +49,14 @@ class _TracedFastMCP(FastMCP):
     see ``remind_me_mcp.watchdog``): arming/disarming here means a stuck
     call gets its stack dumped automatically, without needing an operator to
     already have py-spy installed and know to reach for it.
+
+    Issue #197: also the choke point for tool-call metrics
+    (``remind_me_mcp.metrics``) -- call count and wall-clock duration are
+    recorded here per tool name, success or failure alike, same reasoning as
+    the watchdog: one place covers every tool without touching each of the
+    ~40 individually-decorated functions. ``record_tool_call`` is a no-op
+    unless ``REMIND_ME_METRICS_ENABLED`` is set, so this has no effect (and
+    negligible overhead -- one ``time.monotonic()`` call) by default.
     """
 
     async def call_tool(
@@ -55,9 +64,11 @@ class _TracedFastMCP(FastMCP):
     ) -> Sequence[ContentBlock] | dict[str, Any]:
         with maybe_span(f"tool.{name}"):
             watchdog.arm()
+            start = time.monotonic()
             try:
                 return await super().call_tool(name, arguments)
             finally:
+                metrics.record_tool_call(name, time.monotonic() - start)
                 watchdog.disarm()
 
 

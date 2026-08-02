@@ -44,6 +44,40 @@ paths:
                     type: string
                     example: ok
 
+  /metrics:
+    get:
+      operationId: getMetrics
+      summary: Prometheus text-exposition metrics (issue #197)
+      description: >-
+        Gated on `REMIND_ME_METRICS_ENABLED` (default off) -- returns a
+        plain 404 while disabled, not an empty-but-200 body. Unauthenticated
+        by the normal Authorization-header bearer scheme (same posture as
+        `/health` above): this route sits outside `/api/*`'s protected
+        prefix, since Prometheus scrape configs typically send no custom
+        headers and the endpoint is already opt-in at the config level.
+        Reveals usage patterns (tool-call counts/latency, search volume,
+        memory/outbox counts) to anyone who can reach the port while
+        enabled -- firewall the dashboard port or front it with your own
+        auth if that's a concern. Exposes MCP tool-call counts and latency,
+        cumulative search-tier result counts (keyword/semantic/hybrid),
+        rate-limit rejection counts, and two gauges computed fresh on every
+        scrape (total memory count, and sync outbox depth when sync is
+        configured).
+      security: []
+      responses:
+        "200":
+          description: Prometheus text exposition format (version 0.0.4)
+          content:
+            text/plain:
+              schema:
+                type: string
+        "404":
+          description: Metrics are disabled (`REMIND_ME_METRICS_ENABLED` unset)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /api/stats:
     get:
       operationId: getStats
@@ -1096,8 +1130,9 @@ components:
       description: |
         `REMIND_ME_API_KEY`, or an auto-generated key persisted at
         `~/.remind-me/api_key` (0600) on first run. Every `/api/*` route
-        requires it unless `REMIND_ME_API_KEY=disabled` is set. `/` and
-        `/health` are always unauthenticated.
+        requires it unless `REMIND_ME_API_KEY=disabled` is set. `/`,
+        `/health`, and `/metrics` are always unauthenticated (`/metrics` is
+        additionally gated on `REMIND_ME_METRICS_ENABLED`, see above).
 
   parameters:
     Category:

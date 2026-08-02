@@ -14,6 +14,7 @@ import re
 import sqlite3
 from typing import Any
 
+from remind_me_mcp import metrics
 from remind_me_mcp import tools as _pkg
 from remind_me_mcp.db import _normalize_entity_name, _resolve_entity, _row_to_dict
 from remind_me_mcp.formatting import _fmt_memory_md
@@ -914,6 +915,9 @@ async def memory_search(params: MemorySearchInput) -> str:
 
     # --- Compute tier breakdown (always) ---
     tier_breakdown = compute_tier_breakdown(envelope["memories"])
+    # Issue #197: accumulate into the running cumulative counters exposed at
+    # GET /metrics -- no-op unless REMIND_ME_METRICS_ENABLED is set.
+    metrics.record_search_tier(tier_breakdown)
 
     # --- Format response ---
     if params.response_format == ResponseFormat.JSON:

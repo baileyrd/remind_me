@@ -19,7 +19,7 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from remind_me_mcp import ann_index
+from remind_me_mcp import ann_index, metrics
 from remind_me_mcp import config as _config
 from remind_me_mcp.analytics import get_analytics_trend
 from remind_me_mcp.api_keys import ApiKeyStore
@@ -353,6 +353,76 @@ def _build_api_app() -> Starlette:
         guard keep working when API auth is enabled.
         """
         return JSONResponse({"status": "ok"})
+
+    async def metrics_endpoint(request: Request) -> Response:
+        """Prometheus text-exposition metrics (issue #197).
+
+        Gated on ``config.METRICS_ENABLED`` (``REMIND_ME_METRICS_ENABLED``,
+        default off): returns a plain 404 (not a JSON error under ``/api/``,
+        since this route intentionally sits outside that prefix) while
+        disabled -- same "off means genuinely absent" posture the OTel
+        opt-in (``telemetry.py``) already established, rather than a 403 or
+        an empty-but-200 body that would misleadingly imply the feature is
+        active.
+
+        **Auth stance: deliberately unauthenticated, gated on the enable
+        flag instead of a bearer token.** This route lives outside
+        ``BearerAuthMiddleware``'s ``/api/`` ``protect_prefix`` -- the exact
+        same posture as ``/health`` (SE-04) above, not an oversight. Reasons:
+        (1) Prometheus' own scrape configs typically send no custom headers
+        at all by default, so requiring one here would mean most real
+        deployments end up hand-rolling a static-bearer scrape_config just
+        for this one target; (2) it's off by default, so exposure is already
+        opt-in at the config level, unlike ``/api/*``'s always-on surface;
+        (3) it matches the ecosystem-idiomatic default -- most self-hosted
+        Prometheus exporters ship unauthenticated and rely on network
+        placement instead. The tradeoff is real, not hand-waved: this
+        endpoint reveals usage patterns (which tools are called, how often,
+        search volume, memory/outbox counts) to anyone who can reach the
+        port. Operators who consider that sensitive on their network should
+        firewall the dashboard port or put a reverse proxy with its own
+        auth in front of it -- the same mitigation this codebase already
+        documents for the peer sync server's default all-interfaces bind
+        (``REMIND_ME_PEER_BIND``) and the ICS reminders feed's secret-path
+        scheme above.
+        """
+        if not _config.METRICS_ENABLED:
+            return _json_err(
+                "Metrics are disabled. Set REMIND_ME_METRICS_ENABLED=1 to enable GET /metrics.",
+                404,
+            )
+
+        def _work() -> Response:
+            db = _get_db()
+            total = db.execute(
+                "SELECT COUNT(*) as cnt FROM memories WHERE deleted_at IS NULL"
+            ).fetchone()["cnt"]
+            # Issue #197: computed fresh on every scrape (a cheap COUNT(*)),
+            # not tracked as counter state -- see metrics.py's module
+            # docstring for why "already a cheap point-in-time query" is
+            # deliberately NOT duplicated as a shadow counter.
+            gauges = [
+                metrics.GaugeSpec(
+                    "remind_me_memories_total",
+                    "Total non-deleted memories currently in the store.",
+                    float(total),
+                )
+            ]
+            if SYNC_ENABLED:
+                from remind_me_mcp.sync import get_sync_status
+                sync_status = get_sync_status()
+                gauges.append(
+                    metrics.GaugeSpec(
+                        "remind_me_sync_outbox_pending",
+                        "Sync outbox rows not yet acknowledged by the hub "
+                        "(sync.get_sync_status()['outbox']['pending']).",
+                        float(sync_status["outbox"]["pending"]),
+                    )
+                )
+            text = metrics.render_prometheus_text(gauges=gauges)
+            return Response(text, media_type="text/plain; version=0.0.4")
+
+        return await asyncio.to_thread(_work)
 
     async def api_stats(request: Request) -> JSONResponse:
         """Return aggregate statistics about the memory store."""
@@ -1331,6 +1401,7 @@ def _build_api_app() -> Starlette:
     routes = [
         Route("/", index),
         Route("/health", health),
+        Route("/metrics", metrics_endpoint, methods=["GET"]),
         Route("/api/stats", api_stats),
         Route("/api/vitality", api_vitality),
         Route("/api/analytics/trend", api_analytics_trend, methods=["GET"]),

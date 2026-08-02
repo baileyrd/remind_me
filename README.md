@@ -859,6 +859,20 @@ REMIND_ME_OTEL_ENABLED=1 REMIND_ME_OTEL_ENDPOINT=http://localhost:4318/v1/traces
 - **Graceful degradation** — if `REMIND_ME_OTEL_ENABLED=1` is set but the `otel` extra isn't installed (or setup fails for any other reason), tracing silently no-ops after a one-time warning in the log — it can never break the server it's observing.
 - **Status** — `remind_me_server_status` reports whether tracing is enabled and actually active.
 
+## Metrics
+
+Off by default, same posture as OTel tracing above — this is instrumentation surface, not a core feature. Set `REMIND_ME_METRICS_ENABLED=1` and a Prometheus scrape target appears at `GET /metrics` on the dashboard server (`--serve-ui`):
+
+```bash
+REMIND_ME_METRICS_ENABLED=1 remind-me-mcp --serve-ui
+curl http://127.0.0.1:5199/metrics
+```
+
+- **What's exposed** — `remind_me_tool_calls_total{tool="..."}` and `remind_me_tool_call_duration_seconds_sum`/`_count{tool="..."}` (call count and total latency per MCP tool, from the single `_TracedFastMCP.call_tool` dispatch choke point already used for OTel/the watchdog); `remind_me_search_tier_results_total{tier="keyword"|"semantic"|"hybrid"}` (cumulative `remind_me_search` result counts by ranking tier); `remind_me_rate_limit_rejections_total` (requests rejected by the #183 rate limiter, from `RateLimiter.hit()`'s own rejection path); plus two gauges computed fresh on every scrape rather than tracked as counters — `remind_me_memories_total` and, when sync is configured, `remind_me_sync_outbox_pending`.
+- **No new dependency** — the Prometheus text exposition format is hand-rolled in `remind_me_mcp/metrics.py` (a few dozen lines of `# HELP`/`# TYPE`/`name{labels} value` formatting) rather than adding the `prometheus_client` package, consistent with this codebase's general bias toward minimal dependencies. Thread-safe counter increments use the same single-`threading.Lock`-around-a-plain-dict approach `rate_limit.py` already established for an identical concurrency requirement.
+- **Auth stance: unauthenticated, gated on the enable flag instead.** `GET /metrics` sits outside `BearerAuthMiddleware`'s `/api/` prefix — the same posture as `/health` (SE-04) — because Prometheus scrape configs typically send no custom headers, and the endpoint is already opt-in at the config level. **This means anyone who can reach the dashboard port can see tool-call and search-volume patterns while it's enabled** — firewall the port or put a reverse proxy with its own auth in front of it if that's a concern on your network, the same mitigation already documented for the peer sync server's default bind and the reminders ICS feed above.
+- **Disabled behavior** — `GET /metrics` returns a plain `404` while `REMIND_ME_METRICS_ENABLED` is unset, not an empty-but-200 body.
+
 ## Entity Knowledge Graph
 
 Memories can carry a structured **subject/predicate/object triple** plus links to **entities** (people, projects, tools, places, orgs — each with a kind and aliases). The graph builds up through normal use:
