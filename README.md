@@ -967,6 +967,21 @@ Two wiring points, both optional in the sense that they're no-ops with nothing c
 
 Deliberately *not* wired into `remind_me_server_status`'s maintenance-backlog nudges or the feedback hint — those are in-band by design (surfaced only inside a live tool response), not outbound alerts.
 
+### Automation event stream vs. notifications — which one do I want?
+
+`REMIND_ME_NOTIFY_WEBHOOK_URL` (above) and `REMIND_ME_EVENT_WEBHOOK_URL` (issue #198) both POST JSON to a webhook, but they answer different questions and are configured, and fire, independently:
+
+| | `REMIND_ME_NOTIFY_WEBHOOK_URL` | `REMIND_ME_EVENT_WEBHOOK_URL` |
+|---|---|---|
+| **For** | A human, on their phone/Slack/ntfy | An automation consumer — a relay, a second indexer, an audit log |
+| **Fires on** | A fired reminder; a *faulted* sync verdict | Every `remind_me_add` / `remind_me_update` / `remind_me_delete` call (and their REST equivalents) |
+| **Throttling** | Sync faults throttled to one per `REMIND_ME_NOTIFY_SYNC_FAULT_INTERVAL` (default 1800s) | None — every qualifying mutation fires, since a raw event stream needs completeness, not alert-fatigue protection |
+| **Payload** | `{"subject": ..., "body": ..., "source": "remind-me"}` — body is human-readable text, e.g. a reminder's own content | `{"event": "created"\|"updated"\|"deleted", "memory_id": ..., "category": ..., "timestamp": ...}` — metadata only, **never memory content** |
+
+If you want "ping me when something's due," use `REMIND_ME_NOTIFY_WEBHOOK_URL`. If you want "tell my other system every time a memory changes," use `REMIND_ME_EVENT_WEBHOOK_URL`.
+
+`remind_me_mcp.events.emit_event()` fires the POST as a held-reference fire-and-forget background task (same PF-04 discipline as the tools package's own background embedding tasks — see `BACKLOG.md`), bounded by `REMIND_ME_EVENT_WEBHOOK_TIMEOUT` (default 5s, mirroring `REMIND_ME_NOTIFY_WEBHOOK_TIMEOUT`), and never raises into the calling tool/API path on failure. `remind_me_set_reminder` and `remind_me_revert` deliberately do **not** fire an `updated` event even though both funnel through the same internal `_apply_memory_field_update` helper `remind_me_update` uses — a reminder set/clear touches no content field at all, and a revert is its own distinct, separately-documented operation (see [Edit History](#edit-history)); only genuine `remind_me_add`/`remind_me_update`/`remind_me_delete` (and `api_add`/`api_update`/`api_delete`) calls emit an event.
+
 ## Edit History
 
 `remind_me_update` overwrites a memory's content/category/tags/metadata in place — issue #187 gives it the same "don't lose data on a destructive-looking operation" treatment [deletion already gets](#deletion-propagates-too) from `deleted_at` tombstones, applied to edits instead of deletes.

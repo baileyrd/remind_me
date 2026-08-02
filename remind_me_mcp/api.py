@@ -44,6 +44,7 @@ from remind_me_mcp.db import (
     _resolve_entity,
     _row_to_dict,
 )
+from remind_me_mcp.events import emit_event
 from remind_me_mcp.exporter import EXPORT_FORMATS, collect_export_records, export_memories, render_export
 from remind_me_mcp.ics_export import build_ics
 from remind_me_mcp.importer import IMPORT_KINDS, import_chat_file, import_directory
@@ -808,6 +809,15 @@ def _build_api_app() -> Starlette:
         source = body.get("source", "manual")
         metadata = body.get("metadata", {})
 
+        # Issue #198: _work() runs in a worker thread via asyncio.to_thread
+        # below (PF-06) — asyncio.create_task requires a running loop in the
+        # *calling* thread, so emit_event (which spawns one) cannot be called
+        # from inside _work itself. It records the new id here instead and
+        # emit_event is called back on the event-loop thread after the
+        # to_thread call returns, mirroring how remind_me_add (crud.py) fires
+        # it on its own async request thread.
+        created_id: dict[str, str] = {}
+
         def _work() -> JSONResponse:
             db = _get_db()
             mem_id = _make_id(content)
@@ -819,10 +829,14 @@ def _build_api_app() -> Starlette:
             )
             db.commit()
             _embed_and_store(mem_id, content)
+            created_id["memory_id"] = mem_id
             row = db.execute("SELECT * FROM memories WHERE id = ?", (mem_id,)).fetchone()
             return _json_ok(_row_to_dict(row), status=201)
 
-        return await asyncio.to_thread(_work)
+        response = await asyncio.to_thread(_work)
+        if "memory_id" in created_id:
+            emit_event("created", created_id["memory_id"], category)
+        return response
 
     async def api_update(request: Request) -> JSONResponse:
         """Update fields on an existing memory by its ID."""
@@ -852,6 +866,10 @@ def _build_api_app() -> Starlette:
         bindings.append(_now_iso())
         bindings.append(memory_id)
 
+        # Issue #198: see api_add's comment above for why emit_event is
+        # called after the to_thread call returns rather than inside _work.
+        updated_category: dict[str, str] = {}
+
         def _work() -> JSONResponse:
             db = _get_db()
             row = db.execute(
@@ -865,9 +883,13 @@ def _build_api_app() -> Starlette:
             if "content" in body and body["content"] is not None:
                 _embed_and_store(memory_id, body["content"])
             updated = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+            updated_category["category"] = updated["category"]
             return _json_ok(_row_to_dict(updated))
 
-        return await asyncio.to_thread(_work)
+        response = await asyncio.to_thread(_work)
+        if "category" in updated_category:
+            emit_event("updated", memory_id, updated_category["category"])
+        return response
 
     async def api_delete(request: Request) -> JSONResponse:
         """Delete a memory by its ID.
@@ -882,23 +904,31 @@ def _build_api_app() -> Starlette:
 
         memory_id = request.path_params["memory_id"]
 
+        # Issue #198: see api_add's comment above for why emit_event is
+        # called after the to_thread call returns rather than inside _work.
+        deleted_category: dict[str, str] = {}
+
         def _work() -> JSONResponse:
             db = _get_db()
             row = db.execute(
-                "SELECT rowid FROM memories WHERE id = ? AND deleted_at IS NULL",
+                "SELECT rowid, category FROM memories WHERE id = ? AND deleted_at IS NULL",
                 (memory_id,),
             ).fetchone()
             if row is None:
                 return _json_err("Not found", 404)
             removed_vec_rowids = _purge_memory(
-                db, memory_id, row[0], soft=SYNC_ENABLED, now=_now_iso()
+                db, memory_id, row["rowid"], soft=SYNC_ENABLED, now=_now_iso()
             )
             db.commit()
             for vec_rowid in removed_vec_rowids:
                 ann_index.remove_vector(db, vec_rowid)
+            deleted_category["category"] = row["category"]
             return _json_ok({"deleted": memory_id})
 
-        return await asyncio.to_thread(_work)
+        response = await asyncio.to_thread(_work)
+        if "category" in deleted_category:
+            emit_event("deleted", memory_id, deleted_category["category"])
+        return response
 
     async def _bulk_ids_from_body(request: Request) -> tuple[list[str], JSONResponse | None]:
         """Parse and validate a bulk request body's ``ids`` list.

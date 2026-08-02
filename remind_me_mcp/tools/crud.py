@@ -17,6 +17,7 @@ from remind_me_mcp import ann_index
 from remind_me_mcp import tools as _pkg
 from remind_me_mcp.config import CLIENT, NODE_ID, SYNC_ENABLED
 from remind_me_mcp.db import _make_id, _now_iso, _row_to_dict
+from remind_me_mcp.events import emit_event
 from remind_me_mcp.formatting import _fmt_memories, _fmt_memory_md
 from remind_me_mcp.models import (  # noqa: TC001  # FastMCP resolves these annotations at runtime for tool schemas
     MemoryAddInput,
@@ -102,6 +103,9 @@ async def memory_add(params: MemoryAddInput) -> str:
     except sqlite3.OperationalError as e:
         log.error("Database error adding memory: %s", e)
         return f"Error: Database operation failed — {e}"
+    # Issue #198: unthrottled automation event stream, separate from the
+    # human-alert notifications channel — see events.py's module docstring.
+    emit_event("created", mem_id, params.category)
     await asyncio.to_thread(_pkg._embed_and_store, mem_id, params.content)
     msg = f"✓ Memory stored with id `{mem_id}` in category '{params.category}'."
     if superseded:
@@ -386,6 +390,23 @@ async def memory_update(params: MemoryUpdateInput) -> str:
         return "Nothing to update — no fields provided."
 
     _apply_memory_field_update(db, params.memory_id, sets, bindings)
+    # Issue #198: fired here in remind_me_update itself, deliberately NOT
+    # inside the shared _apply_memory_field_update choke point above — that
+    # function is also called by remind_me_set_reminder (tools/reminders.py,
+    # issue #179) with sets=["remind_at = ..."] only, and by remind_me_revert
+    # (tools/history.py, issue #187). Neither of those is a "memory update"
+    # in the sense this issue means: a reminder being set/cleared touches no
+    # content field at all, and a revert is itself framed (and documented,
+    # see history.py) as its own distinct operation. Keeping the emit call
+    # here, specific to this tool, is what keeps both of those from firing a
+    # spurious "updated" automation event. category reports the memory's
+    # post-update category — the new value when this call changed it,
+    # otherwise its unchanged existing value from the row fetched above.
+    emit_event(
+        "updated",
+        params.memory_id,
+        params.category if params.category is not None else row["category"],
+    )
     # Re-embed if content changed
     if params.content is not None:
         await asyncio.to_thread(_pkg._embed_and_store, params.memory_id, params.content)
@@ -428,7 +449,7 @@ async def memory_delete(params: MemoryDeleteInput) -> str:
     """
     db = _pkg._get_db()
     row = db.execute(
-        "SELECT rowid FROM memories WHERE id = ? AND deleted_at IS NULL",
+        "SELECT rowid, category FROM memories WHERE id = ? AND deleted_at IS NULL",
         (params.memory_id,),
     ).fetchone()
     if row is None:
@@ -437,10 +458,14 @@ async def memory_delete(params: MemoryDeleteInput) -> str:
     # db._purge_memory — see its docstring for why they must not be inlined
     # per call site.
     removed_vec_rowids = _pkg._purge_memory(
-        db, params.memory_id, row[0], soft=SYNC_ENABLED, now=_now_iso()
+        db, params.memory_id, row["rowid"], soft=SYNC_ENABLED, now=_now_iso()
     )
     db.commit()
     # ANN mutations only after the commit succeeds — see db._delete_chunks.
     for vec_rowid in removed_vec_rowids:
         ann_index.remove_vector(db, vec_rowid)
+    # Issue #198: fired only after the delete/tombstone commit above
+    # succeeds — an event stream consumer must never see "deleted" for a
+    # delete that didn't actually happen.
+    emit_event("deleted", params.memory_id, row["category"])
     return f"✓ Memory `{params.memory_id}` deleted."

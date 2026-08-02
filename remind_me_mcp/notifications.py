@@ -35,7 +35,7 @@ from __future__ import annotations
 import logging
 import smtplib
 from email.message import EmailMessage
-from typing import Protocol
+from typing import Any, Protocol
 
 import httpx
 
@@ -60,6 +60,55 @@ class Notifier(Protocol):
     def send(self, subject: str, body: str) -> bool:
         """Attempt delivery. Returns whether it succeeded; never raises."""
         ...
+
+
+# ---------------------------------------------------------------------------
+# Shared HTTP-POST-with-timeout helper
+# ---------------------------------------------------------------------------
+
+
+def _post_json(
+    url: str,
+    payload: dict[str, Any],
+    timeout: float,
+    client: httpx.Client | None = None,
+) -> httpx.Response:
+    """POST *payload* as JSON to *url*; return the response, raising on failure.
+
+    The one piece of HTTP-client plumbing genuinely shared between
+    :class:`WebhookNotifier` and :mod:`remind_me_mcp.events` (issue #198): a
+    single POST through an optional injected client (for tests, mirroring
+    ``sync.reconcile_with_hub``) or a fresh one-shot ``httpx.post``, bounded
+    by *timeout*, with a non-2xx status raised via
+    ``Response.raise_for_status``. Deliberately does NOT catch or log --
+    each caller wraps this in its own try/except so the warning it logs on
+    failure keeps its own caller-specific wording, and each caller decides
+    what "delivery succeeded" means for its own return type (a bool for
+    ``Notifier.send``, a fire-and-forget task outcome for
+    ``events.emit_event``). The throttling and subject/body payload shape
+    that ``WebhookNotifier`` also has are deliberately NOT pulled in here --
+    those only apply to the human-alert channel, not the raw event stream.
+
+    Args:
+        url: Destination URL.
+        payload: JSON-serializable request body.
+        timeout: Seconds before giving up.
+        client: Optional httpx.Client to POST through, for tests. A fresh
+            one-shot request via ``httpx.post`` is used when omitted.
+
+    Returns:
+        The successful response.
+
+    Raises:
+        Exception: Any connection error, timeout, or non-2xx status from
+            ``httpx``.
+    """
+    if client is not None:
+        resp = client.post(url, json=payload, timeout=timeout)
+    else:
+        resp = httpx.post(url, json=payload, timeout=timeout)
+    resp.raise_for_status()
+    return resp
 
 
 # ---------------------------------------------------------------------------
@@ -108,11 +157,7 @@ class WebhookNotifier:
         """
         payload = {"subject": subject, "body": body, "source": "remind-me"}
         try:
-            if self._client is not None:
-                resp = self._client.post(self.url, json=payload, timeout=self.timeout)
-            else:
-                resp = httpx.post(self.url, json=payload, timeout=self.timeout)
-            resp.raise_for_status()
+            _post_json(self.url, payload, self.timeout, self._client)
             return True
         except Exception as e:  # noqa: BLE001 — a notifier must never raise
             log.warning("Webhook notification to %s failed: %s", self.url, e)

@@ -731,6 +731,39 @@ BACKLOG Wave 4 documents, so this throttles to one notification per window
 per persisting fault rather than firing on every poll."""
 
 # ---------------------------------------------------------------------------
+# Automation event stream (issue #198)
+# ---------------------------------------------------------------------------
+#
+# Deliberately a separate config/delivery path from NOTIFY_WEBHOOK_URL above,
+# not a second consumer of it: NOTIFY_WEBHOOK_URL is for human-facing,
+# throttled alerts (a fired reminder, a faulted sync verdict) meant to be
+# read by a person on a phone/Slack/ntfy; this is a raw, unthrottled
+# create/update/delete event stream meant to be consumed by automation (a
+# webhook relay, a second indexer, an audit log) that wants to know about
+# every memory mutation, not a curated subset of human-relevant ones. See
+# remind_me_mcp.events' module docstring for the delivery mechanics.
+
+EVENT_WEBHOOK_URL = os.environ.get("REMIND_ME_EVENT_WEBHOOK_URL", "")
+"""Webhook URL that receives one JSON POST per memory create/update/delete —
+``{"event": "created"|"updated"|"deleted", "memory_id": ..., "category": ...,
+"timestamp": ...}``. Metadata only, deliberately: memory content is never
+included in the payload (scope limit, not an oversight — this is an
+automation event stream, not a content-sync mechanism). Empty (default)
+disables it entirely, mirroring how NOTIFY_WEBHOOK_URL/the embedder/reranker
+decide availability from configuration alone rather than a separate on/off
+flag. Unlike NOTIFY_WEBHOOK_URL's sync-fault throttling, there is no
+throttling here — every qualifying event fires, since a consumer of a raw
+event stream needs completeness, not alert-fatigue protection."""
+
+EVENT_WEBHOOK_TIMEOUT = _env_int("REMIND_ME_EVENT_WEBHOOK_TIMEOUT", 5)
+"""Seconds to wait for the event webhook POST before giving up, mirroring
+NOTIFY_WEBHOOK_TIMEOUT's role for the human-alert channel -- a hung endpoint
+must never block the memory_add/update/delete call that triggered the event
+(the POST itself runs as a held-reference fire-and-forget background task,
+see remind_me_mcp.events._spawn_task, so this bounds the task's own runtime,
+not the caller's)."""
+
+# ---------------------------------------------------------------------------
 # Digest (issue #188)
 # ---------------------------------------------------------------------------
 
@@ -919,6 +952,8 @@ __all__ = [
     "NOTIFY_SMTP_TO",
     "NOTIFY_SMTP_USE_TLS",
     "NOTIFY_SYNC_FAULT_INTERVAL",
+    "EVENT_WEBHOOK_URL",
+    "EVENT_WEBHOOK_TIMEOUT",
     "DIGEST_INTERVAL",
     "DIGEST_INTERVAL_SECONDS",
     "WEBHOOK_PORT",
