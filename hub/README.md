@@ -565,6 +565,9 @@ journalctl --user -u remind-me-hub.service -f
 journalctl --user -u remind-me-postgres.service -f
 
 # Update after a code change (pull, rebuild, restart)
+# Fails loudly if the new build isn't the one actually serving afterwards —
+# `/health` answering only proves *something* is up, which is how a failed
+# build or a no-op restart otherwise gets reported as a successful deploy.
 ~/remind_me/hub/setup.sh update
 
 # Backup
@@ -574,6 +577,31 @@ podman exec remind-me-postgres pg_dump -U remindme remindme \
 # Poke at the data
 podman exec -it remind-me-postgres psql -U remindme -d remindme
 ```
+
+### Rolling back a hub build
+
+`setup.sh` tags every build twice — `remind-me-hub:latest` (what the Quadlet
+runs) and `remind-me-hub:$HUB_VERSION` — so previous builds stay on disk
+instead of being overwritten. A rollback is then a retag, not a rebuild from
+an older checkout:
+
+```bash
+podman image ls remind-me-hub                       # what's available
+podman tag localhost/remind-me-hub:1.2.0 localhost/remind-me-hub:latest
+systemctl --user restart remind-me-hub.service
+curl -s http://127.0.0.1:8765/health                # confirm the version
+```
+
+The image also carries `org.opencontainers.image.version`, so a build can be
+identified while stopped or crash-looping — when `/health` can't answer:
+
+```bash
+podman inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' \
+  localhost/remind-me-hub:latest
+```
+
+An image built by hand without `--build-arg HUB_VERSION=...` reports
+`unknown` rather than guessing.
 
 Useful queries:
 
