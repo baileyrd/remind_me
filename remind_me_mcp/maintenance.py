@@ -120,6 +120,53 @@ UNNORMALIZED_WHERE = """
 # remind_me_reclassify_batch.
 UNCLASSIFIED_WHERE = "m.memory_type = 'unclassified'"
 
+# Memories worth an importance recalibration pass (issue #200): nothing
+# today re-evaluates whether a memory's *original* importance classification
+# has gone stale (the issue's own examples: a "decision" later reversed by a
+# different memory, or a "fact" superseded in spirit but not via the formal
+# triple-supersession mechanism). This heuristic is deliberately
+# deterministic -- it only narrows an unbounded set down to a reviewable
+# batch; the actual judgment about whether a given memory's importance is
+# still right happens client-side, in remind_me_recalibrate_candidates'
+# calling Claude session (see tools/recalibrate.py).
+RECALIBRATION_MIN_BASE_WEIGHT = 1.15
+"""base_weight floor for the "importance" half of the heuristic -- matches
+vitality.BASE_WEIGHT_TYPE_PRIORS' fact/insight seed (1.15), i.e. the point at
+which the write-time prior itself already treats a memory as more than
+default-important, not an arbitrarily chosen cutoff."""
+
+RECALIBRATION_DURABLE_TYPES: tuple[str, ...] = ("decision", "fact")
+"""memory_type values whose category implies durability on its own, even
+when base_weight hasn't (yet) been bumped by seeding or feedback -- these are
+the issue's own two examples of a classification that can go stale."""
+
+RECALIBRATION_STALE_DAYS = 90
+"""Days since last access (or creation, if never accessed) before an
+important-looking memory is old enough, relative to its importance, to be
+worth a second look -- a memory that's still being actively used is
+presumably still classified correctly."""
+
+_RECALIBRATION_TYPES_SQL = ", ".join(f"'{t}'" for t in RECALIBRATION_DURABLE_TYPES)
+
+# NOT EXISTS against memory_feedback is a correlated subquery, but (unlike
+# the UNNORMALIZED_WHERE json_extract case issue #120 fixed) memory_id there
+# carries a real index (idx_memory_feedback_memory_id) and the table is tiny
+# relative to memories, so this resolves as a per-row index SEEK rather than
+# a table SCAN -- the same shape UNANNOTATED_WHERE already relies on for its
+# own correlated NOT EXISTS.
+RECALIBRATION_CANDIDATE_WHERE = f"""
+    m.superseded_by IS NULL
+    AND m.deleted_at IS NULL
+    AND (
+        m.base_weight >= {RECALIBRATION_MIN_BASE_WEIGHT}
+        OR m.memory_type IN ({_RECALIBRATION_TYPES_SQL})
+    )
+    AND (julianday('now') - julianday(COALESCE(m.accessed_at, m.created_at))) >= {RECALIBRATION_STALE_DAYS}
+    AND NOT EXISTS (
+        SELECT 1 FROM memory_feedback mf WHERE mf.memory_id = m.id
+    )
+"""
+
 
 # Queue key -> (WHERE clause, the prompt that drains it). The prompt name is
 # what the nudge points at: naming a single prompt is more actionable than
@@ -129,6 +176,7 @@ _QUEUES: dict[str, tuple[str, str]] = {
     "unannotated_memories": (UNANNOTATED_WHERE, "backfill_graph"),
     "unnormalized_imports": (UNNORMALIZED_WHERE, "normalize_imports"),
     "unclassified_memories": (UNCLASSIFIED_WHERE, "classify_memories"),
+    "recalibration_candidates": (RECALIBRATION_CANDIDATE_WHERE, "recalibrate_importance"),
 }
 
 
@@ -239,6 +287,7 @@ _LABELS = {
     "unannotated_memories": "memories with no entity/triple annotation",
     "unnormalized_imports": "raw imports not normalized",
     "unclassified_memories": "memories unclassified",
+    "recalibration_candidates": "memories due for an importance review",
     "pending_wiki_compile": "memories not folded into the wiki",
 }
 
@@ -339,6 +388,10 @@ __all__ = [
     "UNANNOTATED_WHERE",
     "UNNORMALIZED_WHERE",
     "UNCLASSIFIED_WHERE",
+    "RECALIBRATION_MIN_BASE_WEIGHT",
+    "RECALIBRATION_DURABLE_TYPES",
+    "RECALIBRATION_STALE_DAYS",
+    "RECALIBRATION_CANDIDATE_WHERE",
     "pending_counts",
     "capture_health",
     "maybe_maintenance_notice",

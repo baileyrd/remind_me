@@ -225,6 +225,42 @@ Report which clusters you merged and which you declined, with the reason.
 """
 
 
+@mcp.prompt(
+    name="recalibrate_importance",
+    title="Review importance recalibration candidates",
+    description=(
+        "Review old, high-importance memories that have never received a "
+        "feedback signal, and reclassify anything whose importance looks "
+        "stale (remind_me_recalibrate_candidates -> remind_me_reclassify)."
+    ),
+)
+def recalibrate_importance(limit: str = "20") -> str:
+    """Drive the importance recalibration review loop."""
+    return f"""\
+Run the importance recalibration loop over old, high-importance memories that
+have never received a real-world feedback signal.
+
+1. Call `remind_me_recalibrate_candidates` with `limit={limit}` to fetch
+   candidates. If it returns none, say so and stop.
+2. For each candidate, read its content and decide whether its current
+   memory_type/importance still looks right — e.g. a "decision" that was
+   later reversed by a different memory, or a "fact" that's since been
+   superseded in spirit but not via the formal supersession mechanism. Most
+   candidates will look fine as-is; only flag genuine drift.
+3. For anything that needs a different memory_type, call `remind_me_reclassify`
+   (or review a fresh `remind_me_reclassify_batch` if a type genuinely needs
+   reconsidering). For a pure importance correction with no type change, call
+   `remind_me_feedback` with a "helpful"/"unhelpful" signal and no `query` to
+   adjust `base_weight` directly instead.
+
+This is a review pass, not a bulk rewrite — leave a memory alone rather than
+reclassifying it on a weak signal. There is no separate "apply" tool for this
+loop: reclassify/feedback, which already exist, are the write path.
+
+Report how many candidates you reviewed and how many you actually changed.
+"""
+
+
 __all__ = [
     "decompose_facts",
     "normalize_imports",
@@ -232,4 +268,5 @@ __all__ = [
     "classify_memories",
     "compile_wiki",
     "consolidate_duplicates",
+    "recalibrate_importance",
 ]

@@ -1313,6 +1313,36 @@ class ConsolidateInput(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Importance recalibration models (issue #200)
+# ---------------------------------------------------------------------------
+
+
+class RecalibrateCandidatesInput(BaseModel):
+    """Input for remind_me_recalibrate_candidates: surface memories whose
+    importance classification may be stale (issue #200).
+
+    Read-only surfacing half of a two-phase, Claude-driven workflow, the
+    same shape as remind_me_normalize_batch/remind_me_reclassify_batch: this
+    tool only narrows an unbounded set down to a reviewable batch via a
+    deterministic heuristic (see maintenance.RECALIBRATION_CANDIDATE_WHERE).
+    The actual judgment happens in the calling Claude session, which then
+    applies anything that needs to change via the EXISTING
+    remind_me_reclassify/remind_me_reclassify_batch tools (or
+    remind_me_feedback for a pure importance nudge) -- there is no separate
+    "apply" tool here.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    limit: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="Number of importance-review candidates to return",
+    )
+
+
+# ---------------------------------------------------------------------------
 # LLM Wiki models (FT-08)
 # ---------------------------------------------------------------------------
 

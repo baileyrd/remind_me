@@ -13,6 +13,9 @@ Formerly a single ~2000-line module; split into submodules (HY-02):
   - ``capture``   — auto_capture / get_capture / decompose(+batch)
   - ``entity``    — remind_me_entity knowledge-graph lookup (FT-04)
   - ``lifecycle`` — vitality_report / reclassify(+batch) / consolidate
+  - ``recalibrate`` — remind_me_recalibrate_candidates: surfaces stale-looking
+    high-importance memories for review, pairing with the existing
+    reclassify(+batch) tools as its "apply" half (issue #200)
   - ``reminders`` — remind_me_set_reminder / remind_me_list_reminders (issue #179),
     remind_me_reminders_ics_url (issue #190), remind_me_digest (issue #188)
   - ``saved_searches`` — remind_me_save_search / remind_me_list_saved_searches /
@@ -118,6 +121,7 @@ from remind_me_mcp.tools import (
     lifecycle,
     normalize,
     prompts,
+    recalibrate,
     reminders,
     saved_searches,
     search,
@@ -195,7 +199,9 @@ from remind_me_mcp.tools.prompts import (
     consolidate_duplicates,
     decompose_facts,
     normalize_imports,
+    recalibrate_importance,
 )
+from remind_me_mcp.tools.recalibrate import remind_me_recalibrate_candidates
 from remind_me_mcp.tools.reminders import (
     remind_me_digest,
     remind_me_list_reminders,
@@ -312,6 +318,7 @@ __all__ = [
     "remind_me_entity",
     "remind_me_entity_traverse",
     "remind_me_consolidate",
+    "remind_me_recalibrate_candidates",
     "wiki_write",
     "wiki_read",
     "wiki_list",
@@ -329,4 +336,5 @@ __all__ = [
     "classify_memories",
     "compile_wiki",
     "consolidate_duplicates",
+    "recalibrate_importance",
 ]

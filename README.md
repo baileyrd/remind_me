@@ -423,6 +423,7 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_vitality_report` | Generate vault health metrics with decay and vitality scores |
 | `remind_me_reclassify` | Apply a memory type classification to a single memory |
 | `remind_me_reclassify_batch` | Fetch unclassified memories for batch classification |
+| `remind_me_recalibrate_candidates` | Fetch old, high-importance memories that have never received a feedback signal, for review — pairs with `remind_me_reclassify`/`remind_me_reclassify_batch` (the apply half) and `remind_me_feedback` (a pure importance nudge); no separate apply tool |
 | `remind_me_consolidate` | Find semantically similar memories, preview clusters (dry_run=true), and merge duplicates using an LLM-authored `summaries` entry per cluster (dry_run=false) — a cluster with no matching summary is skipped, not merged with a raw concatenation |
 
 ### LLM Wiki
@@ -458,7 +459,7 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_check_update` | Check if a newer version is available on origin/main |
 | `remind_me_self_update` | Pull latest changes from origin and reinstall the package |
 
-49 tools + 6 prompts + 4 resources (`memory://stats`, `memory://categories`, `wiki://schema`, `wiki://index`).
+50 tools + 7 prompts + 4 resources (`memory://stats`, `memory://categories`, `wiki://schema`, `wiki://index`).
 
 ### Prompts: the maintenance loops as one-shot workflows
 
@@ -472,6 +473,7 @@ Every LLM-driven maintenance workflow is a *sequence* — a batch tool surfaces 
 | `classify_memories` | `remind_me_reclassify_batch` → `remind_me_reclassify` |
 | `compile_wiki` | `remind_me_wiki_compile` → `remind_me_wiki_write` ×N → `mark_integrated=true` |
 | `consolidate_duplicates` | `remind_me_consolidate` dry run → merge with LLM-authored summaries |
+| `recalibrate_importance` | `remind_me_recalibrate_candidates` → `remind_me_reclassify`/`remind_me_feedback` |
 
 Every argument is optional (batch size, similarity threshold), so invoking a prompt bare runs the loop with the tool's own defaults. The two loops whose second phase is hard to undo — `compile_wiki`'s watermark advance and `consolidate_duplicates`' merge — put the preview phase first and say why, so the destructive step is never the first thing done.
 
@@ -1469,6 +1471,16 @@ Every new memory used to start at a flat `base_weight=1.0` regardless of kind, s
 - `remind_me_add` doesn't have a `memory_type` yet (that's set later by `remind_me_reclassify`), so it seeds from `source` instead — a deliberate `manual` entry keeps the historical flat default; raw bulk-import sources (`chat_import`, `document_import`, `webhook`) start slightly lower, since they're unreviewed and often noisy.
 - An unrecognized or absent source (and `memory_type="unclassified"`) falls through to the original flat 1.0 default — this is purely additive, not a behavior change for existing content.
 - Other write paths (the chat/document importer's bulk INSERT, `mempalace`/`dbs` imports, `remind_me_normalize_apply`, the dashboard REST API) still use the flat default for now — an explicit, documented scope decision, not an oversight; extend the same `seed_base_weight()` helper (`vitality.py`) there later if it proves valuable.
+
+### Importance Recalibration (issue #200)
+
+The write-time prior above and `remind_me_feedback`'s adjustments are the only two ways `base_weight` moves — nothing periodically re-checks whether a memory's *original* importance classification has gone stale, e.g. a memory classified as a "decision" that was later reversed by a different memory, or a "fact" that's since been superseded in spirit but not via the formal triple-supersession mechanism (see [Contradiction-Based Supersession](#contradiction-based-supersession)).
+
+`remind_me_recalibrate_candidates` (`limit`, default 20) surfaces a bounded batch of candidates using a deterministic heuristic — no LLM call happens inside the server. A memory qualifies when it looks important (`base_weight >= 1.15`, matching the fact/insight write-time prior, **or** a durability-implying `memory_type` like `decision`/`fact`) yet has gone stale (no access/creation activity in the last 90 days) and has never received a `remind_me_feedback` signal — used as a proxy for "never actually reviewed," since nothing else in the schema records that. Each candidate carries its content snippet, category, `memory_type`, `base_weight`, and access history so the calling Claude session can judge whether it's still classified correctly.
+
+This is a **two-phase, Claude-driven workflow**, the same shape as `remind_me_normalize_batch`/`remind_me_normalize_apply` and `remind_me_consolidate`'s dry-run mode: the tool surfaces structured candidates, the calling agent does the actual reasoning, and — deliberately — there is no third "apply" tool. The apply half is the tools that already exist: `remind_me_reclassify`/`remind_me_reclassify_batch` for a genuine `memory_type` change, or `remind_me_feedback` (an "unhelpful"/"helpful" signal with no `query`) for a pure importance nudge with no type change. Building a redundant write path here would just duplicate reclassify's.
+
+Architectural note: the original issue proposed "a periodic (scheduler-loop-hosted) LLM-driven pass," following the pattern of the reminder/digest/analytics-snapshot scheduler loops (#186/#187/#188). This server has no in-server LLM dependency and never calls an LLM API itself — a background thread can only run deterministic code — so the scheduler-hosted framing doesn't fit here the way it does for those purely-mechanical loops. What *is* mechanical and scheduler-appropriate is the count: [Maintenance Nudges](#maintenance-nudges) gained a `recalibration_candidates` queue using this same heuristic, so a growing backlog surfaces on ordinary tool responses (once past the usual threshold) the same way every other maintenance queue already does — only the counting is deterministic background work; the judgment stays client-side, on demand.
 
 ## Environment Variables
 
