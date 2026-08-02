@@ -17,6 +17,7 @@ from remind_me_mcp import ann_index
 from remind_me_mcp import tools as _pkg
 from remind_me_mcp.config import CLIENT, NODE_ID, SYNC_ENABLED
 from remind_me_mcp.db import _make_id, _now_iso, _row_to_dict
+from remind_me_mcp.events import emit_event
 from remind_me_mcp.formatting import _fmt_memories, _fmt_memory_md
 from remind_me_mcp.models import (  # noqa: TC001  # FastMCP resolves these annotations at runtime for tool schemas
     MemoryAddInput,
@@ -63,8 +64,9 @@ async def memory_add(params: MemoryAddInput) -> str:
         db.execute(
             """INSERT INTO memories (id, content, category, tags, source, metadata,
                                      created_at, updated_at, node_id, client,
-                                     subject, predicate, object, base_weight, vitality)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                     subject, predicate, object, base_weight, vitality,
+                                     sensitive)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 mem_id,
                 params.content,
@@ -81,6 +83,7 @@ async def memory_add(params: MemoryAddInput) -> str:
                 params.object,
                 base_weight,
                 base_weight,
+                int(params.sensitive),
             ),
         )
         # FT-04: upsert mentioned entities and record the mention links.
@@ -102,8 +105,17 @@ async def memory_add(params: MemoryAddInput) -> str:
     except sqlite3.OperationalError as e:
         log.error("Database error adding memory: %s", e)
         return f"Error: Database operation failed — {e}"
+    # Issue #198: unthrottled automation event stream, separate from the
+    # human-alert notifications channel — see events.py's module docstring.
+    emit_event("created", mem_id, params.category)
     await asyncio.to_thread(_pkg._embed_and_store, mem_id, params.content)
     msg = f"✓ Memory stored with id `{mem_id}` in category '{params.category}'."
+    if params.sensitive:
+        msg += (
+            " Marked sensitive — excluded from search/list/digest/wiki compile "
+            "by default (issue #195; not access control, see remind_me_add's "
+            "sensitive parameter)."
+        )
     if superseded:
         previews = _pkg._supersession_preview(db, superseded)
         detail = "; ".join(f'`{p["id"]}` was: "{p["content"]}"' for p in previews)
@@ -150,6 +162,12 @@ async def memory_list(params: MemoryListInput) -> str:
     db = _pkg._get_db()
     conditions: list[str] = ["m.deleted_at IS NULL"]
     bindings: list[Any] = []
+    # Issue #195: sensitive memories are excluded from this browsing surface
+    # by default too, same reasoning as remind_me_search — browsing a
+    # category/tag/source slice is still a "surface by default" read path,
+    # not a direct lookup by known id.
+    if not params.include_sensitive:
+        conditions.append("m.sensitive = 0")
 
     if params.category:
         conditions.append("m.category = ?")
@@ -214,7 +232,11 @@ async def memory_get(memory_id: str) -> str:
 # field_update might be asked to touch. See _apply_memory_field_update's
 # docstring for why gating on these specific columns is what keeps a
 # remind_me_set_reminder call from producing a spurious revision.
-_REVISION_TRACKED_COLUMNS = frozenset({"content", "category", "tags", "metadata"})
+#
+# "sensitive" (issue #195) is included: flipping a memory's sensitivity is a
+# meaningful, revertable edit in the same sense as changing its category —
+# not per-device bookkeeping like remind_at/superseded_by, which stay out.
+_REVISION_TRACKED_COLUMNS = frozenset({"content", "category", "tags", "metadata", "sensitive"})
 
 
 def _extract_tracked_field_changes(
@@ -282,11 +304,12 @@ def _apply_memory_field_update(
     empty ``sets``.
 
     Edit history (issue #187): before applying the update, this snapshots
-    the row's *current* ``content``/``category``/``tags``/``metadata`` into
-    ``memory_revisions`` — but only when ``sets`` actually touches one of
-    those tracked columns AND the incoming value genuinely differs from what
-    is already stored (mirroring the v22 migration's "only sync on genuine
-    content change" discipline — a same-value update creates no revision).
+    the row's *current* ``content``/``category``/``tags``/``metadata``/
+    ``sensitive`` (issue #195) into ``memory_revisions`` — but only when
+    ``sets`` actually touches one of those tracked columns AND the incoming
+    value genuinely differs from what is already stored (mirroring the v22
+    migration's "only sync on genuine content change" discipline — a
+    same-value update creates no revision).
     This is a deliberate judgment call: rather than duplicate the snapshot
     logic in ``remind_me_update`` and ``remind_me_revert`` separately, it
     lives once at this shared choke point. A useful side effect falls out of
@@ -312,7 +335,7 @@ def _apply_memory_field_update(
     changes = _extract_tracked_field_changes(sets, bindings)
     if changes:
         old_row = db.execute(
-            "SELECT content, category, tags, metadata FROM memories WHERE id = ?",
+            "SELECT content, category, tags, metadata, sensitive FROM memories WHERE id = ?",
             (memory_id,),
         ).fetchone()
         if old_row is not None and any(
@@ -320,14 +343,16 @@ def _apply_memory_field_update(
         ):
             db.execute(
                 """INSERT INTO memory_revisions
-                       (memory_id, content, category, tags, metadata, edited_at, revision_reason)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                       (memory_id, content, category, tags, metadata, sensitive,
+                        edited_at, revision_reason)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     memory_id,
                     old_row["content"],
                     old_row["category"],
                     old_row["tags"],
                     old_row["metadata"],
+                    old_row["sensitive"],
                     _now_iso(),
                     revision_reason,
                 ),
@@ -379,6 +404,9 @@ async def memory_update(params: MemoryUpdateInput) -> str:
     if params.metadata is not None:
         sets.append("metadata = ?")
         bindings.append(json.dumps(params.metadata))
+    if params.sensitive is not None:
+        sets.append("sensitive = ?")
+        bindings.append(int(params.sensitive))
     if params.clear_superseded:
         sets.append("superseded_by = NULL")
 
@@ -386,10 +414,31 @@ async def memory_update(params: MemoryUpdateInput) -> str:
         return "Nothing to update — no fields provided."
 
     _apply_memory_field_update(db, params.memory_id, sets, bindings)
+    # Issue #198: fired here in remind_me_update itself, deliberately NOT
+    # inside the shared _apply_memory_field_update choke point above — that
+    # function is also called by remind_me_set_reminder (tools/reminders.py,
+    # issue #179) with sets=["remind_at = ..."] only, and by remind_me_revert
+    # (tools/history.py, issue #187). Neither of those is a "memory update"
+    # in the sense this issue means: a reminder being set/cleared touches no
+    # content field at all, and a revert is itself framed (and documented,
+    # see history.py) as its own distinct operation. Keeping the emit call
+    # here, specific to this tool, is what keeps both of those from firing a
+    # spurious "updated" automation event. category reports the memory's
+    # post-update category — the new value when this call changed it,
+    # otherwise its unchanged existing value from the row fetched above.
+    emit_event(
+        "updated",
+        params.memory_id,
+        params.category if params.category is not None else row["category"],
+    )
     # Re-embed if content changed
     if params.content is not None:
         await asyncio.to_thread(_pkg._embed_and_store, params.memory_id, params.content)
     msg = f"✓ Memory `{params.memory_id}` updated."
+    if params.sensitive is True:
+        msg += " Marked sensitive — excluded from search/list/digest/wiki compile by default."
+    elif params.sensitive is False:
+        msg += " Cleared sensitive — visible in search/list/digest/wiki compile again."
     if params.clear_superseded:
         msg += " Cleared superseded_by — visible to search/entity lookups again."
     return msg
@@ -428,7 +477,7 @@ async def memory_delete(params: MemoryDeleteInput) -> str:
     """
     db = _pkg._get_db()
     row = db.execute(
-        "SELECT rowid FROM memories WHERE id = ? AND deleted_at IS NULL",
+        "SELECT rowid, category FROM memories WHERE id = ? AND deleted_at IS NULL",
         (params.memory_id,),
     ).fetchone()
     if row is None:
@@ -437,10 +486,14 @@ async def memory_delete(params: MemoryDeleteInput) -> str:
     # db._purge_memory — see its docstring for why they must not be inlined
     # per call site.
     removed_vec_rowids = _pkg._purge_memory(
-        db, params.memory_id, row[0], soft=SYNC_ENABLED, now=_now_iso()
+        db, params.memory_id, row["rowid"], soft=SYNC_ENABLED, now=_now_iso()
     )
     db.commit()
     # ANN mutations only after the commit succeeds — see db._delete_chunks.
     for vec_rowid in removed_vec_rowids:
         ann_index.remove_vector(db, vec_rowid)
+    # Issue #198: fired only after the delete/tombstone commit above
+    # succeeds — an event stream consumer must never see "deleted" for a
+    # delete that didn't actually happen.
+    emit_event("deleted", params.memory_id, row["category"])
     return f"✓ Memory `{params.memory_id}` deleted."

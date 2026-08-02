@@ -26,6 +26,20 @@ from the importer's 'already_imported' skip response on the first scan.
 Lifecycle: :func:`start_watcher` is called from the server lifespan (gated
 on REMIND_ME_WATCH_DIRS being set) and :func:`stop_watcher` signals the
 thread and joins it before the database connections are closed (SE-07).
+
+FT-31: an Obsidian vault is just a directory of Markdown files, so this same
+polling/debounce/supersession machinery already ingests one correctly — what
+was missing was understanding Obsidian's own Markdown conventions (YAML
+frontmatter, ``[[wikilinks]]``, inline ``#tags``) rather than treating every
+note as generic prose. ``_ingest`` resolves each file's effective kind
+through :func:`remind_me_mcp.config.resolve_import_kind`, which upgrades
+``"auto"`` to ``"obsidian"`` for a .md/.markdown file whose parent directory
+sits inside a detected vault (a ``.obsidian/`` directory at or above the
+watch root) — zero new configuration for an existing Obsidian user. The
+``.obsidian/`` directory itself is never scanned for content: it is already
+excluded by :meth:`FolderWatcher._candidate_files`'s existing hidden-
+directory skip (any path component starting with ``.``), which predates
+FT-31 and needed no changes.
 """
 
 from __future__ import annotations
@@ -39,18 +53,22 @@ from pathlib import Path
 from typing import Any
 
 from remind_me_mcp import config
-from remind_me_mcp.config import is_in_import_roots
+from remind_me_mcp.config import is_in_import_roots, resolve_import_kind
 from remind_me_mcp.db import _get_db, _now_iso
 from remind_me_mcp.importer import import_chat_file
 from remind_me_mcp.telemetry import maybe_span
 
 log = logging.getLogger("remind_me_mcp.watcher")
 
-WATCH_EXTENSIONS = (".md", ".markdown", ".txt", ".json", ".jsonl", ".pdf", ".png", ".jpg", ".jpeg")
+WATCH_EXTENSIONS = (
+    ".md", ".markdown", ".txt", ".json", ".jsonl", ".pdf", ".png", ".jpg", ".jpeg",
+    ".mp3", ".m4a", ".wav", ".ogg",
+)
 """File extensions the watcher ingests — the same set the importer supports
-(FT-19 added the pdf/image extensions; a pdf/image dropped into a watched
-folder without its optional extra installed surfaces as a watcher import
-error like any other per-file failure, not a crash)."""
+(FT-19 added the pdf/image extensions; FT-32 added the four audio ones; a
+pdf/image/audio file dropped into a watched folder without its optional
+extra installed surfaces as a watcher import error like any other per-file
+failure, not a crash)."""
 
 _ERROR_HISTORY = 10
 """How many recent error messages the watcher keeps for the status surface."""
@@ -270,7 +288,16 @@ class FolderWatcher:
         marked superseded. On a dedup skip the existing import_id is adopted
         as the path's current import. On error the signature is still
         recorded so a broken file is not retried until it changes.
+
+        FT-31: the watcher always requests ``kind="auto"`` at the top level,
+        then lets :func:`~remind_me_mcp.config.resolve_import_kind` upgrade
+        that to ``"obsidian"`` for a .md/.markdown file whose parent
+        directory sits inside a detected Obsidian vault (a ``.obsidian/``
+        directory at or above the watch root) — this is the zero-config path
+        an existing Obsidian user gets frontmatter/wikilink/inline-tag-aware
+        import through, with no new env var to set.
         """
+        kind = resolve_import_kind(path, "auto")
         try:
             result = import_chat_file(
                 file_path=str(path),
@@ -278,6 +305,7 @@ class FolderWatcher:
                 tags=list(self.tags),
                 extract_mode=self.extract_mode,
                 max_length=self.max_length,
+                kind=kind,
             )
         except Exception as e:
             self._ingested[path] = sig

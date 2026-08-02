@@ -13,6 +13,16 @@ too, so a backup of an encrypted database is itself encrypted with the same
 key -- ``Connection.backup()`` copies pages as SQLCipher already stores them
 (ciphertext), it never decrypts in transit. See ARCHITECTURE.md's
 "Encryption at rest" section for what this does and doesn't cover.
+
+When ``config.BACKUP_S3_BUCKET`` is set (issue #196), ``create_backup`` also
+calls :func:`remind_me_mcp.cloud_backup.upload_backup` as a strict
+post-success hook -- only once the atomic rename to the final local
+filename below has already completed. This is a best-effort enhancement,
+never a replacement for or a race with the local-first write: a missing
+``boto3``, a refused plaintext upload, or any upload failure is logged and
+never propagates back into this function. See cloud_backup.py's module
+docstring for the full design (provider choice, credential handling, and
+the plaintext-upload consent gate).
 """
 
 from __future__ import annotations
@@ -63,6 +73,7 @@ def create_backup(db: sqlite3.Connection, *, label: str = "manual") -> Path:
             ``list_backups``/``_prune_old_backups`` can never mistake a
             half-written file for a real, restorable backup.
     """
+    from remind_me_mcp import cloud_backup
     from remind_me_mcp.db import _open_db_connection
 
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
@@ -82,6 +93,11 @@ def create_backup(db: sqlite3.Connection, *, label: str = "manual") -> Path:
     else:
         dest_conn.close()
     os.replace(tmp_dest, dest)
+    # Post-success cloud upload hook (issue #196): only reached once the
+    # local backup file already exists under its final name. A best-effort
+    # enhancement that never raises -- see cloud_backup.upload_backup's own
+    # docstring for the full failure discipline.
+    cloud_backup.upload_backup(dest)
     _prune_old_backups()
     return dest
 

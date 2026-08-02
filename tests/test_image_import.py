@@ -146,6 +146,58 @@ def test_get_ocr_engine_missing_dependency_raises_actionable_error(
         _image_mod._get_ocr_engine()
 
 
+def test_get_ocr_engine_passes_configured_model_paths_to_rapidocr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REMIND_ME_OCR_*_MODEL_PATH overrides (issue #202) pass straight
+    through as RapidOCR() kwargs -- an unset override contributes no kwarg
+    at all (see the sibling default test), so this only exercises the
+    opt-in path."""
+    monkeypatch.setattr(_image_mod, "_ocr_engine", None)
+    monkeypatch.setattr(_image_mod, "_ocr_deps_missing", False)
+    monkeypatch.setattr(_image_mod, "OCR_DET_MODEL_PATH", "/models/en_det.onnx")
+    monkeypatch.setattr(_image_mod, "OCR_CLS_MODEL_PATH", None)
+    monkeypatch.setattr(_image_mod, "OCR_REC_MODEL_PATH", "/models/en_rec.onnx")
+
+    captured: dict[str, str] = {}
+
+    class FakeRapidOCR:
+        def __init__(self, **kwargs: str) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(rapidocr, "RapidOCR", FakeRapidOCR)
+
+    engine = _image_mod._get_ocr_engine()
+    assert isinstance(engine, FakeRapidOCR)
+    assert captured == {
+        "det_model_path": "/models/en_det.onnx",
+        "rec_model_path": "/models/en_rec.onnx",
+    }
+
+
+def test_get_ocr_engine_default_config_passes_no_model_path_kwargs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unset overrides (today's default) call plain RapidOCR() -- no kwargs
+    at all, so behavior is byte-for-byte identical to before issue #202."""
+    monkeypatch.setattr(_image_mod, "_ocr_engine", None)
+    monkeypatch.setattr(_image_mod, "_ocr_deps_missing", False)
+    monkeypatch.setattr(_image_mod, "OCR_DET_MODEL_PATH", None)
+    monkeypatch.setattr(_image_mod, "OCR_CLS_MODEL_PATH", None)
+    monkeypatch.setattr(_image_mod, "OCR_REC_MODEL_PATH", None)
+
+    captured: dict[str, str] = {}
+
+    class FakeRapidOCR:
+        def __init__(self, **kwargs: str) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(rapidocr, "RapidOCR", FakeRapidOCR)
+
+    _image_mod._get_ocr_engine()
+    assert captured == {}
+
+
 def test_import_chat_file_missing_image_dependency_raises_actionable_error(
     db_conn: sqlite3.Connection, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

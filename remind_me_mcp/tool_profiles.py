@@ -1,7 +1,7 @@
 """
 remind_me_mcp.tool_profiles — optionally narrow the advertised tool surface.
 
-The full surface is 49 tools costing roughly 21k tokens of context in *every*
+The full surface is 50 tools costing roughly 21k tokens of context in *every*
 session, on every client, whether or not an admin tool is ever touched. For a
 server whose whole job is putting memories into context that is an awkward
 ratio: ``remind_me_wiki_load`` defaults to a 12k-token budget, so the tool
@@ -93,6 +93,8 @@ MAINTENANCE = frozenset({
     "remind_me_annotate",
     "remind_me_reclassify",
     "remind_me_reclassify_batch",
+    "remind_me_recalibrate_candidates",
+    "remind_me_contradiction_candidates",
     "remind_me_consolidate",
     "remind_me_vitality_report",
     "remind_me_wiki_write",
@@ -108,6 +110,8 @@ MAINTENANCE_PROMPTS = frozenset({
     "classify_memories",
     "compile_wiki",
     "consolidate_duplicates",
+    "recalibrate_importance",
+    "review_contradictions",
 })
 
 

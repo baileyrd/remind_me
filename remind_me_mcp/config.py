@@ -627,6 +627,82 @@ WATCH_GRACE = _env_int("REMIND_ME_WATCH_GRACE", 5)
 is deferred until a later scan observes the same (mtime, size) signature, so
 partially-written files are never ingested mid-write."""
 
+
+def is_obsidian_vault(root: Path) -> bool:
+    """Return True when *root* is (or sits inside) an Obsidian vault (FT-31).
+
+    An Obsidian vault is, structurally, just a directory tree of Markdown
+    files with one reliable, zero-configuration signal: the app itself
+    creates a ``.obsidian/`` subdirectory (plugin settings, workspace state)
+    at the vault's root the first time it opens that folder. Checking for it
+    means an existing Obsidian user gets vault-aware import
+    (frontmatter/wikilink/inline-tag parsing — see ``obsidian_import.py``)
+    with zero new configuration, which is preferable to a new
+    ``REMIND_ME_*_IS_VAULT`` env var that every such user would otherwise
+    have to discover and set.
+
+    Checks *root* itself and its ancestors — "at or above a watched path's
+    root" — because a watched/imported directory may be a *subfolder* of a
+    larger vault (e.g. ``REMIND_ME_WATCH_DIRS=~/vault/Projects`` while
+    ``.obsidian/`` sits at ``~/vault``) rather than the vault root itself.
+    The ancestor walk is bounded to stay within :data:`IMPORT_ROOTS`
+    (:func:`is_in_import_roots`) — the same SE-02 containment boundary
+    already enforced on watch/import directories — so this can never walk
+    all the way up to an unrelated ``.obsidian/`` directory that happens to
+    exist somewhere further up an unrelated part of the filesystem.
+
+    Args:
+        root: An already ``expanduser().resolve()``-ed directory.
+
+    Returns:
+        True if ``.obsidian/`` exists at *root* or a bounded ancestor.
+    """
+    for candidate in (root, *root.parents):
+        if not is_in_import_roots(candidate):
+            break
+        try:
+            if (candidate / ".obsidian").is_dir():
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def resolve_import_kind(path: Path, requested_kind: str) -> str:
+    """Upgrade ``kind="auto"`` to ``"obsidian"`` for a vault-resident Markdown file.
+
+    Deliberately placed here rather than in ``importer.py``/``obsidian_import.py``:
+    ``obsidian_import.py`` registers its connector by importing FROM
+    ``importer.py`` (mirroring ``pdf_import.py``/``readwise_import.py``'s
+    existing one-directional dependency), so ``importer.py`` cannot import
+    FROM ``obsidian_import.py`` at module level without creating an import
+    cycle. ``config.py`` sits below both — this function only needs a path
+    and a kind string, no connector-specific logic — so both ``watcher.py``
+    and ``importer.import_directory`` can call it without introducing one.
+
+    Only ever changes ``"auto"`` — an explicitly requested kind (including an
+    explicit ``"obsidian"`` for a note outside any detected vault) always
+    passes through unchanged, matching every other kind's forcing semantics.
+
+    Args:
+        path: The file being imported (its suffix and parent directory are
+            what matter here).
+        requested_kind: The caller's ``kind`` argument.
+
+    Returns:
+        ``"obsidian"`` when *requested_kind* is ``"auto"``, the suffix is
+        ``.md``/``.markdown``, and :func:`is_obsidian_vault` says the file's
+        parent directory is inside a detected vault; *requested_kind*
+        unchanged otherwise.
+    """
+    if (
+        requested_kind == "auto"
+        and path.suffix.lower() in (".md", ".markdown")
+        and is_obsidian_vault(path.parent)
+    ):
+        return "obsidian"
+    return requested_kind
+
 # ---------------------------------------------------------------------------
 # Reminders (issue #179)
 # ---------------------------------------------------------------------------
@@ -731,6 +807,55 @@ BACKLOG Wave 4 documents, so this throttles to one notification per window
 per persisting fault rather than firing on every poll."""
 
 # ---------------------------------------------------------------------------
+# Automation event stream (issue #198)
+# ---------------------------------------------------------------------------
+#
+# Deliberately a separate config/delivery path from NOTIFY_WEBHOOK_URL above,
+# not a second consumer of it: NOTIFY_WEBHOOK_URL is for human-facing,
+# throttled alerts (a fired reminder, a faulted sync verdict) meant to be
+# read by a person on a phone/Slack/ntfy; this is a raw, unthrottled
+# create/update/delete event stream meant to be consumed by automation (a
+# webhook relay, a second indexer, an audit log) that wants to know about
+# every memory mutation, not a curated subset of human-relevant ones. See
+# remind_me_mcp.events' module docstring for the delivery mechanics.
+
+EVENT_WEBHOOK_URL = os.environ.get("REMIND_ME_EVENT_WEBHOOK_URL", "")
+"""Webhook URL that receives one JSON POST per memory create/update/delete —
+``{"event": "created"|"updated"|"deleted", "memory_id": ..., "category": ...,
+"timestamp": ...}``. Metadata only, deliberately: memory content is never
+included in the payload (scope limit, not an oversight — this is an
+automation event stream, not a content-sync mechanism). Empty (default)
+disables it entirely, mirroring how NOTIFY_WEBHOOK_URL/the embedder/reranker
+decide availability from configuration alone rather than a separate on/off
+flag. Unlike NOTIFY_WEBHOOK_URL's sync-fault throttling, there is no
+throttling here — every qualifying event fires, since a consumer of a raw
+event stream needs completeness, not alert-fatigue protection."""
+
+EVENT_WEBHOOK_TIMEOUT = _env_int("REMIND_ME_EVENT_WEBHOOK_TIMEOUT", 5)
+"""Seconds to wait for the event webhook POST before giving up, mirroring
+NOTIFY_WEBHOOK_TIMEOUT's role for the human-alert channel -- a hung endpoint
+must never block the memory_add/update/delete call that triggered the event
+(the POST itself runs as a held-reference fire-and-forget background task,
+see remind_me_mcp.events._spawn_task, so this bounds the task's own runtime,
+not the caller's)."""
+
+# ---------------------------------------------------------------------------
+# Saved searches (issue #194)
+# ---------------------------------------------------------------------------
+
+SAVED_SEARCH_POLL_INTERVAL = _env_int("REMIND_ME_SAVED_SEARCH_POLL_INTERVAL", 300)
+"""Seconds between remind_me_mcp.scheduler poll passes that check watch=true
+saved searches for new matches. Deliberately coarser than
+REMINDER_POLL_INTERVAL's 60s default -- a saved search's underlying content
+changes far less often than a reminder's due time -- but implemented as a
+persisted-watermark due-check inside the *same* poll loop, exactly mirroring
+DIGEST_INTERVAL_SECONDS's shape (a `sync_flags` watermark, not a second
+thread), rather than a separate poll interval mechanism. Unlike the digest
+interval, this is not itself an opt-in switch: whether polling actually does
+anything is gated per-search by `saved_searches.watch`, not by this value
+being set -- this only tunes how often the (usually empty) check runs."""
+
+# ---------------------------------------------------------------------------
 # Digest (issue #188)
 # ---------------------------------------------------------------------------
 
@@ -790,6 +915,78 @@ limits, so SYNC_INTERVAL's cadence never factors into this default."""
 
 RATE_LIMIT_WINDOW_SECONDS = _env_int("REMIND_ME_RATE_LIMIT_WINDOW_SECONDS", 60)
 """Window length in seconds for REMIND_ME_RATE_LIMIT_REQUESTS."""
+
+# ---------------------------------------------------------------------------
+# Metrics (issue #197)
+# ---------------------------------------------------------------------------
+
+METRICS_ENABLED: bool = _env_bool("REMIND_ME_METRICS_ENABLED", False)
+"""Whether GET /metrics (remind_me_mcp.metrics) is served. Default off,
+matching the OTel tracing opt-in precedent (see README's "Observability"
+section) -- this is instrumentation surface, not a core feature, and an
+operator who wants it firewalls/gates the port themselves same as any other
+scrape target. REMIND_ME_METRICS_ENABLED="" disables it explicitly, mirroring
+RATE_LIMIT_ENABLED's empty-string opt-out convention. When off, every
+remind_me_mcp.metrics.record_* call is a no-op (mirrors telemetry.maybe_span)
+-- no counter state accumulates, and GET /metrics returns 404."""
+
+# ---------------------------------------------------------------------------
+# OCR (image import, issue #181/#202)
+# ---------------------------------------------------------------------------
+#
+# image_import.py's default RapidOCR() call uses the models bundled inside
+# the rapidocr-onnxruntime wheel (ch_PP-OCRv4 detection/recognition +
+# ch_ppocr_mobile_v2.0 orientation classification) -- a combined Chinese +
+# English/Latin+digits charset baked into the recognition model's ONNX
+# metadata. It does not recognize other scripts (Japanese, Korean, Arabic,
+# Cyrillic, Devanagari, ...). RapidOCR's own constructor already accepts
+# det_model_path/cls_model_path/rec_model_path kwargs to swap in a
+# different script's model (downloaded separately -- RapidOCR's model zoo
+# publishes per-language recognition models, but only the Chinese+English
+# one ships in the pip package itself). These three env vars are a thin,
+# optional passthrough to that existing RapidOCR capability, unset (None)
+# by default so behavior is byte-for-byte identical to plain RapidOCR()
+# until a user opts in.
+
+OCR_DET_MODEL_PATH = os.environ.get("REMIND_ME_OCR_DET_MODEL_PATH") or None
+"""Optional path to an alternate ONNX text-detection model, passed through
+to RapidOCR(det_model_path=...). Unset by default."""
+
+OCR_CLS_MODEL_PATH = os.environ.get("REMIND_ME_OCR_CLS_MODEL_PATH") or None
+"""Optional path to an alternate ONNX text-orientation-classification model,
+passed through to RapidOCR(cls_model_path=...). Unset by default."""
+
+OCR_REC_MODEL_PATH = os.environ.get("REMIND_ME_OCR_REC_MODEL_PATH") or None
+"""Optional path to an alternate ONNX text-recognition model, passed through
+to RapidOCR(rec_model_path=...). This is the model whose baked-in character
+set actually determines which script(s) OCR can read -- set it (typically
+paired with a matching REMIND_ME_OCR_DET_MODEL_PATH, since detection
+geometry can differ by script) to a recognition model downloaded from
+RapidOCR's model zoo (https://github.com/RapidAI/RapidOCR) for a script the
+bundled ch_PP-OCRv4 model doesn't cover. Unset by default."""
+
+# ---------------------------------------------------------------------------
+# Audio transcription (audio import, issue #192)
+# ---------------------------------------------------------------------------
+
+AUDIO_MODEL_SIZE = os.environ.get("REMIND_ME_AUDIO_MODEL", "base")
+"""faster-whisper model size/name (``audio_import.py``, FT-32). One of
+Whisper's standard sizes (``tiny``/``tiny.en``/``base``/``base.en``/
+``small``/``small.en``/``medium``/``medium.en``/``large-v2``/``large-v3``/
+``large-v3-turbo``/``distil-*``), or a full HuggingFace repo id for a custom
+CTranslate2-converted model.
+
+Default ``base`` (~145MB int8, ~74M params) deliberately trades some
+accuracy for a small download and fast CPU inference -- consistent with this
+being a local-first tool's DEFAULT, not its ceiling: a user who wants
+noticeably better transcription and has the CPU/RAM/disk budget for it can
+set this to ``small`` or larger with no code change, exactly like
+``REMIND_ME_EMBEDDING_MODEL``/``REMIND_ME_RERANK_MODEL`` let a user opt into
+a stronger model for their own workload. Downloaded from HuggingFace Hub on
+first use and cached under ``MODEL_DIR`` (see ``audio_import._get_whisper_model``),
+exactly like the embedder/reranker's own ONNX models -- the on-disk cache
+format differs (CTranslate2 conversion, not ONNX), but the "download once,
+reuse from MODEL_DIR forever after" behavior is identical."""
 
 # ---------------------------------------------------------------------------
 # Updates
@@ -871,6 +1068,8 @@ __all__ = [
     "WATCH_DIRS",
     "WATCH_INTERVAL",
     "WATCH_GRACE",
+    "is_obsidian_vault",
+    "resolve_import_kind",
     "REMINDER_POLL_INTERVAL",
     "REVISION_RETENTION_DAYS",
     "ANALYTICS_RETENTION_DAYS",
@@ -884,6 +1083,8 @@ __all__ = [
     "NOTIFY_SMTP_TO",
     "NOTIFY_SMTP_USE_TLS",
     "NOTIFY_SYNC_FAULT_INTERVAL",
+    "EVENT_WEBHOOK_URL",
+    "EVENT_WEBHOOK_TIMEOUT",
     "DIGEST_INTERVAL",
     "DIGEST_INTERVAL_SECONDS",
     "WEBHOOK_PORT",
@@ -892,9 +1093,19 @@ __all__ = [
     "RATE_LIMIT_ENABLED",
     "RATE_LIMIT_REQUESTS",
     "RATE_LIMIT_WINDOW_SECONDS",
+    "METRICS_ENABLED",
     "AUTO_UPDATE_CHECK",
     "UPDATE_EXPECTED_ORIGIN",
     "DB_ENCRYPTION_KEY",
+    "OCR_DET_MODEL_PATH",
+    "OCR_CLS_MODEL_PATH",
+    "OCR_REC_MODEL_PATH",
+    "AUDIO_MODEL_SIZE",
+    "BACKUP_S3_BUCKET",
+    "BACKUP_S3_PREFIX",
+    "BACKUP_S3_ENDPOINT_URL",
+    "BACKUP_S3_REGION",
+    "BACKUP_S3_ALLOW_PLAINTEXT_UPLOAD",
 ]
 
 # ---------------------------------------------------------------------------
@@ -928,6 +1139,59 @@ secret (so logging it once is the only way the operator ever sees it); this
 key is always user-supplied and never auto-generated or persisted by this
 module, so there is nothing here that needs announcing, only a value to
 read once per connection and pass straight to SQLCipher."""
+
+# ---------------------------------------------------------------------------
+# Cloud backup upload (issue #196)
+# ---------------------------------------------------------------------------
+
+BACKUP_S3_BUCKET = os.environ.get("REMIND_ME_BACKUP_S3_BUCKET", "")
+"""S3 (or S3-compatible) bucket name that receives a copy of every backup
+`create_backup` writes locally. Empty (default) disables cloud upload
+entirely -- gated on config presence, mirroring NOTIFY_WEBHOOK_URL/
+EVENT_WEBHOOK_URL's "a URL/bucket being set *is* the opt-in" convention.
+See remind_me_mcp/cloud_backup.py for the upload itself, which runs as a
+post-backup hook from create_backup -- strictly after the local file is
+already finalized, never a replacement for or a race with it."""
+
+BACKUP_S3_PREFIX = os.environ.get("REMIND_ME_BACKUP_S3_PREFIX", "")
+"""Optional key prefix within BACKUP_S3_BUCKET, e.g. "my-host/backups" --
+joined with the backup's own filename (the same name create_backup already
+generated locally) to form the object key, so a local backup and its cloud
+copy correspond 1:1 by name. Empty (default) uploads at the bucket root."""
+
+BACKUP_S3_ENDPOINT_URL = os.environ.get("REMIND_ME_BACKUP_S3_ENDPOINT_URL") or None
+"""Optional S3-compatible endpoint override, e.g.
+"https://s3.us-west-002.backblazeb2.com" (Backblaze B2) or
+"http://localhost:9000" (a self-hosted MinIO). Passed straight through to
+boto3.client("s3", endpoint_url=...). Unset (default) means real AWS S3 --
+boto3 resolves the endpoint itself from BACKUP_S3_REGION/its own defaults."""
+
+BACKUP_S3_REGION = os.environ.get("REMIND_ME_BACKUP_S3_REGION") or None
+"""Optional AWS region (e.g. "us-west-2"), passed through to
+boto3.client("s3", region_name=...). Unset (default) lets boto3 resolve a
+region from its own standard chain (AWS_DEFAULT_REGION, ~/.aws/config,
+etc.) -- required by some S3-compatible providers even when
+BACKUP_S3_ENDPOINT_URL is also set."""
+
+BACKUP_S3_ALLOW_PLAINTEXT_UPLOAD: bool = _env_bool(
+    "REMIND_ME_BACKUP_S3_ALLOW_PLAINTEXT_UPLOAD", False
+)
+"""Explicit opt-in required to upload a backup to cloud storage while
+DB_ENCRYPTION_KEY is unset. Off by default: with encryption unset, a local
+backup file is plaintext personal data (see ARCHITECTURE.md's "Encryption
+at rest" section), and uploading it as-is to a third-party bucket is a
+distinct, real risk this feature introduces -- it needs explicit consent,
+not silent default behavior. When DB_ENCRYPTION_KEY IS set, the local
+backup file is already ciphertext (confirmed by issue #184's own tests, see
+backup.py's module docstring), so uploading it is safe by default and this
+flag is not required in that case."""
+
+# Deliberately no REMIND_ME_BACKUP_S3_* credential env vars: boto3 already
+# has its own standard credential resolution chain (AWS_ACCESS_KEY_ID/
+# AWS_SECRET_ACCESS_KEY env vars, the shared ~/.aws/credentials file, an
+# EC2/ECS instance role, ...). Reinventing a parallel bespoke credential
+# config here would be worse, not better -- see cloud_backup.py's module
+# docstring and the README's "Backups" section for the same note.
 
 # ---------------------------------------------------------------------------
 # Sync configuration

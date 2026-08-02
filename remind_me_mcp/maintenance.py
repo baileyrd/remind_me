@@ -120,15 +120,133 @@ UNNORMALIZED_WHERE = """
 # remind_me_reclassify_batch.
 UNCLASSIFIED_WHERE = "m.memory_type = 'unclassified'"
 
+# Memories worth an importance recalibration pass (issue #200): nothing
+# today re-evaluates whether a memory's *original* importance classification
+# has gone stale (the issue's own examples: a "decision" later reversed by a
+# different memory, or a "fact" superseded in spirit but not via the formal
+# triple-supersession mechanism). This heuristic is deliberately
+# deterministic -- it only narrows an unbounded set down to a reviewable
+# batch; the actual judgment about whether a given memory's importance is
+# still right happens client-side, in remind_me_recalibrate_candidates'
+# calling Claude session (see tools/recalibrate.py).
+RECALIBRATION_MIN_BASE_WEIGHT = 1.15
+"""base_weight floor for the "importance" half of the heuristic -- matches
+vitality.BASE_WEIGHT_TYPE_PRIORS' fact/insight seed (1.15), i.e. the point at
+which the write-time prior itself already treats a memory as more than
+default-important, not an arbitrarily chosen cutoff."""
 
-# Queue key -> (WHERE clause, the prompt that drains it). The prompt name is
-# what the nudge points at: naming a single prompt is more actionable than
-# naming the two or three tools its loop actually sequences.
-_QUEUES: dict[str, tuple[str, str]] = {
-    "undecomposed_captures": (UNDECOMPOSED_WHERE, "decompose_facts"),
-    "unannotated_memories": (UNANNOTATED_WHERE, "backfill_graph"),
-    "unnormalized_imports": (UNNORMALIZED_WHERE, "normalize_imports"),
-    "unclassified_memories": (UNCLASSIFIED_WHERE, "classify_memories"),
+RECALIBRATION_DURABLE_TYPES: tuple[str, ...] = ("decision", "fact")
+"""memory_type values whose category implies durability on its own, even
+when base_weight hasn't (yet) been bumped by seeding or feedback -- these are
+the issue's own two examples of a classification that can go stale."""
+
+RECALIBRATION_STALE_DAYS = 90
+"""Days since last access (or creation, if never accessed) before an
+important-looking memory is old enough, relative to its importance, to be
+worth a second look -- a memory that's still being actively used is
+presumably still classified correctly."""
+
+_RECALIBRATION_TYPES_SQL = ", ".join(f"'{t}'" for t in RECALIBRATION_DURABLE_TYPES)
+
+# NOT EXISTS against memory_feedback is a correlated subquery, but (unlike
+# the UNNORMALIZED_WHERE json_extract case issue #120 fixed) memory_id there
+# carries a real index (idx_memory_feedback_memory_id) and the table is tiny
+# relative to memories, so this resolves as a per-row index SEEK rather than
+# a table SCAN -- the same shape UNANNOTATED_WHERE already relies on for its
+# own correlated NOT EXISTS.
+RECALIBRATION_CANDIDATE_WHERE = f"""
+    m.superseded_by IS NULL
+    AND m.deleted_at IS NULL
+    AND (
+        m.base_weight >= {RECALIBRATION_MIN_BASE_WEIGHT}
+        OR m.memory_type IN ({_RECALIBRATION_TYPES_SQL})
+    )
+    AND (julianday('now') - julianday(COALESCE(m.accessed_at, m.created_at))) >= {RECALIBRATION_STALE_DAYS}
+    AND NOT EXISTS (
+        SELECT 1 FROM memory_feedback mf WHERE mf.memory_id = m.id
+    )
+"""
+
+# Free-text contradiction candidates (issue #201): db._supersede_contradicting_facts
+# already auto-supersedes a memory whenever a new/updated SPO triple shares an
+# existing one's (subject, predicate) but has a different object -- see that
+# function's docstring and the README's "Contradiction-based supersession"
+# section. That mechanism only fires on exact triple structure. It says
+# nothing about two pieces of free-text prose that conflict without ever
+# sharing a formal subject/predicate ("I moved to Boston" vs. "I live in
+# Seattle" as two unstructured memories, neither carrying SPO columns) -- this
+# queue targets exactly that gap.
+#
+# The comparison space is bounded by the entity graph (FT-04) rather than
+# all-pairs: two memories are only worth comparing if they mention at least
+# one entity in common (a candidate pair that shares no entity is extremely
+# unlikely to be a direct contradiction, and all-pairs over the whole vault
+# would be O(n^2)). This is a JOIN over memory_entities, not a single-table
+# WHERE like the queues above -- see CONTRADICTION_CANDIDATE_PAIRS_SQL and the
+# is_full_query flag in _QUEUES below.
+#
+# Pairs already covered by the exact-triple mechanism are excluded so this
+# queue doesn't re-surface what db.py already resolved automatically. Two
+# points worth being explicit about:
+#   1. A pair where BOTH sides have a matching normalized (subject, predicate)
+#      but a *different* object cannot actually be observed here: the moment
+#      the second one was written, _supersede_contradicting_facts would have
+#      set superseded_by on the first, and this queue (like every other one)
+#      only considers superseded_by IS NULL rows. So excluding "matching
+#      subject+predicate" pairs is filtering out same-object verbatim
+#      restatements (not a contradiction worth flagging) and the ordering-
+#      cheap way to encode both cases in one clause, not a defense against
+#      pairs that could otherwise slip through.
+#   2. The comparison here approximates db._normalize_entity_name (lowercase
+#      + whitespace-collapse) with lower()/trim() in SQL rather than
+#      replicating it exactly -- this queue only narrows a candidate set for
+#      human/Claude review, so an imprecise exclusion is a false negative
+#      (worst case: a genuinely-covered pair also gets surfaced here, which
+#      the calling session will just recognize and skip), not a correctness
+#      bug the way it would be in the write-path supersession check itself.
+CONTRADICTION_CANDIDATE_PAIRS_SQL = """
+    SELECT DISTINCT me1.memory_id AS id_a, me2.memory_id AS id_b
+    FROM memory_entities me1
+    JOIN memory_entities me2
+        ON me2.entity_id = me1.entity_id AND me2.memory_id > me1.memory_id
+    JOIN memories m1 ON m1.id = me1.memory_id
+    JOIN memories m2 ON m2.id = me2.memory_id
+    WHERE m1.superseded_by IS NULL AND m1.deleted_at IS NULL
+      AND m2.superseded_by IS NULL AND m2.deleted_at IS NULL
+      AND m1.category != 'dialog' AND m2.category != 'dialog'
+      AND NOT (
+          m1.subject IS NOT NULL AND m1.predicate IS NOT NULL
+          AND m2.subject IS NOT NULL AND m2.predicate IS NOT NULL
+          AND lower(trim(m1.subject)) = lower(trim(m2.subject))
+          AND lower(trim(m1.predicate)) = lower(trim(m2.predicate))
+      )
+"""
+
+CONTRADICTION_CANDIDATE_COUNT_SQL = (
+    f"SELECT COUNT(*) AS cnt FROM ({CONTRADICTION_CANDIDATE_PAIRS_SQL}) p"  # noqa: S608 — constants only
+)
+
+
+# Queue key -> (WHERE clause or full count query, the prompt that drains it,
+# whether the first element is a full "SELECT COUNT..." query rather than a
+# bare WHERE fragment to splice into "FROM memories m WHERE {...}"). The
+# prompt name is what the nudge points at: naming a single prompt is more
+# actionable than naming the two or three tools its loop actually sequences.
+_QUEUES: dict[str, tuple[str, str, bool]] = {
+    "undecomposed_captures": (UNDECOMPOSED_WHERE, "decompose_facts", False),
+    "unannotated_memories": (UNANNOTATED_WHERE, "backfill_graph", False),
+    "unnormalized_imports": (UNNORMALIZED_WHERE, "normalize_imports", False),
+    "unclassified_memories": (UNCLASSIFIED_WHERE, "classify_memories", False),
+    "recalibration_candidates": (
+        RECALIBRATION_CANDIDATE_WHERE,
+        "recalibrate_importance",
+        False,
+    ),
+    "contradiction_candidates": (
+        CONTRADICTION_CANDIDATE_COUNT_SQL,
+        "review_contradictions",
+        True,
+    ),
 }
 
 
@@ -145,11 +263,14 @@ def pending_counts(db: sqlite3.Connection) -> dict[str, int]:
         thing that breaks a search.
     """
     counts: dict[str, int] = {}
-    for key, (where, _prompt) in _QUEUES.items():
+    for key, (where_or_query, _prompt, is_full_query) in _QUEUES.items():
         try:
-            row = db.execute(
-                f"SELECT COUNT(*) AS cnt FROM memories m WHERE {where}"  # noqa: S608 — constants above, no user input
-            ).fetchone()
+            query = (
+                where_or_query
+                if is_full_query
+                else f"SELECT COUNT(*) AS cnt FROM memories m WHERE {where_or_query}"  # noqa: S608 — constants above, no user input
+            )
+            row = db.execute(query).fetchone()
             counts[key] = int(row["cnt"]) if row is not None else 0
         except Exception:  # noqa: BLE001 — never let a count break the caller
             log.debug("Pending count failed for %s", key, exc_info=True)
@@ -239,10 +360,12 @@ _LABELS = {
     "unannotated_memories": "memories with no entity/triple annotation",
     "unnormalized_imports": "raw imports not normalized",
     "unclassified_memories": "memories unclassified",
+    "recalibration_candidates": "memories due for an importance review",
+    "contradiction_candidates": "possibly-contradictory memory pairs",
     "pending_wiki_compile": "memories not folded into the wiki",
 }
 
-_QUEUE_PROMPTS = {key: prompt for key, (_where, prompt) in _QUEUES.items()}
+_QUEUE_PROMPTS = {key: prompt for key, (_where, prompt, _is_full) in _QUEUES.items()}
 _QUEUE_PROMPTS["pending_wiki_compile"] = "compile_wiki"
 
 
@@ -339,6 +462,12 @@ __all__ = [
     "UNANNOTATED_WHERE",
     "UNNORMALIZED_WHERE",
     "UNCLASSIFIED_WHERE",
+    "RECALIBRATION_MIN_BASE_WEIGHT",
+    "RECALIBRATION_DURABLE_TYPES",
+    "RECALIBRATION_STALE_DAYS",
+    "RECALIBRATION_CANDIDATE_WHERE",
+    "CONTRADICTION_CANDIDATE_PAIRS_SQL",
+    "CONTRADICTION_CANDIDATE_COUNT_SQL",
     "pending_counts",
     "capture_health",
     "maybe_maintenance_notice",

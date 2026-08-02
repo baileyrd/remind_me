@@ -44,6 +44,79 @@ paths:
                     type: string
                     example: ok
 
+  /manifest.json:
+    get:
+      operationId: getManifest
+      summary: Web App Manifest (issue #199)
+      description: >-
+        Minimal PWA manifest referenced by the dashboard's `<link
+        rel="manifest">`, letting a phone browser install/"Add to Home
+        Screen" the dashboard as a standalone app. Unauthenticated like
+        `/health` above -- browsers fetch manifest links with no
+        Authorization header, and it carries no user data. No icons are
+        declared (the repo has none to point at yet); still spec-valid.
+      security: []
+      responses:
+        "200":
+          description: Web App Manifest
+          content:
+            application/manifest+json:
+              schema:
+                type: object
+                properties:
+                  name:
+                    type: string
+                    example: Remind Me — Memory Dashboard
+                  short_name:
+                    type: string
+                    example: Remind Me
+                  start_url:
+                    type: string
+                    example: "/"
+                  display:
+                    type: string
+                    example: standalone
+                  background_color:
+                    type: string
+                    example: "#0a0a0f"
+                  theme_color:
+                    type: string
+                    example: "#0a0a0f"
+
+  /metrics:
+    get:
+      operationId: getMetrics
+      summary: Prometheus text-exposition metrics (issue #197)
+      description: >-
+        Gated on `REMIND_ME_METRICS_ENABLED` (default off) -- returns a
+        plain 404 while disabled, not an empty-but-200 body. Unauthenticated
+        by the normal Authorization-header bearer scheme (same posture as
+        `/health` above): this route sits outside `/api/*`'s protected
+        prefix, since Prometheus scrape configs typically send no custom
+        headers and the endpoint is already opt-in at the config level.
+        Reveals usage patterns (tool-call counts/latency, search volume,
+        memory/outbox counts) to anyone who can reach the port while
+        enabled -- firewall the dashboard port or front it with your own
+        auth if that's a concern. Exposes MCP tool-call counts and latency,
+        cumulative search-tier result counts (keyword/semantic/hybrid),
+        rate-limit rejection counts, and two gauges computed fresh on every
+        scrape (total memory count, and sync outbox depth when sync is
+        configured).
+      security: []
+      responses:
+        "200":
+          description: Prometheus text exposition format (version 0.0.4)
+          content:
+            text/plain:
+              schema:
+                type: string
+        "404":
+          description: Metrics are disabled (`REMIND_ME_METRICS_ENABLED` unset)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /api/stats:
     get:
       operationId: getStats
@@ -164,6 +237,10 @@ paths:
     get:
       operationId: listMemories
       summary: List memories with optional filters and pagination
+      description: |
+        Excludes memories marked `sensitive` by default (issue #195); pass
+        `include_sensitive=true` to include them. A convenience filter, not
+        access control.
       parameters:
         - $ref: "#/components/parameters/Category"
         - name: source
@@ -171,6 +248,7 @@ paths:
           schema:
             type: string
         - $ref: "#/components/parameters/Tags"
+        - $ref: "#/components/parameters/IncludeSensitive"
         - name: limit
           in: query
           schema:
@@ -235,6 +313,15 @@ paths:
                 metadata:
                   type: object
                   default: {}
+                sensitive:
+                  type: boolean
+                  default: false
+                  description: |
+                    Convenience "don't surface by default" flag (issue #195),
+                    NOT access control. Excludes this memory from
+                    GET /api/memories, GET /api/memories/search,
+                    remind_me_digest, and remind_me_wiki_compile unless
+                    explicitly opted back in.
       responses:
         "201":
           description: Created
@@ -259,6 +346,9 @@ paths:
         structured subject/object matches it) in addition to any remaining
         free-text FTS5 query. An `entity:`-only query (no text left) lists
         matching memories newest-first instead of FTS-ranking them.
+
+        Excludes memories marked `sensitive` by default (issue #195); pass
+        `include_sensitive=true` to include them.
       parameters:
         - name: q
           in: query
@@ -279,6 +369,7 @@ paths:
             minimum: 0
         - $ref: "#/components/parameters/Category"
         - $ref: "#/components/parameters/Tags"
+        - $ref: "#/components/parameters/IncludeSensitive"
       responses:
         "200":
           description: OK. If an `entity:` token doesn't resolve, total/count are 0 and `message` explains why.
@@ -963,7 +1054,7 @@ paths:
                 kind:
                   type: string
                   default: auto
-                  enum: [auto, chat, document, pdf, image, readwise]
+                  enum: [auto, chat, document, pdf, image, readwise, obsidian, audio]
       responses:
         "200":
           description: |
@@ -1078,8 +1169,9 @@ components:
       description: |
         `REMIND_ME_API_KEY`, or an auto-generated key persisted at
         `~/.remind-me/api_key` (0600) on first run. Every `/api/*` route
-        requires it unless `REMIND_ME_API_KEY=disabled` is set. `/` and
-        `/health` are always unauthenticated.
+        requires it unless `REMIND_ME_API_KEY=disabled` is set. `/`,
+        `/health`, and `/metrics` are always unauthenticated (`/metrics` is
+        additionally gated on `REMIND_ME_METRICS_ENABLED`, see above).
 
   parameters:
     Category:
@@ -1093,6 +1185,15 @@ components:
       description: Comma-separated; a memory must have ALL listed tags.
       schema:
         type: string
+    IncludeSensitive:
+      name: include_sensitive
+      in: query
+      description: |
+        Include memories marked `sensitive` (issue #195). Off by default;
+        not access control — see the `Memory` schema's `sensitive` field.
+      schema:
+        type: boolean
+        default: false
 
   requestBodies:
     MemoryUpdate:
@@ -1115,6 +1216,9 @@ components:
                   type: string
               metadata:
                 type: object
+              sensitive:
+                type: boolean
+                description: See the `sensitive` field on POST /api/memories.
 
   responses:
     BadRequest:
@@ -1215,6 +1319,15 @@ components:
             by any of these routes — a deleted memory is excluded from every
             read path — documented here only because it's a real column on
             the underlying row, mirroring superseded_by's treatment above.
+        sensitive:
+          type: boolean
+          description: |
+            Convenience "don't surface by default" flag (issue #195), NOT
+            access control — remind_me is single-user, so anyone with DB
+            access already sees everything regardless of this field.
+            GET /api/memories and GET /api/memories/search exclude a
+            sensitive memory unless `include_sensitive=true`; a direct
+            GET /api/memories/{memory_id} lookup is unaffected.
 
     WikiPageSummary:
       type: object

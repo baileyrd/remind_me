@@ -62,6 +62,45 @@ than requiring one extra keyword. Callers must pass ``kind="readwise"``
 explicitly; :func:`_validate_kind_and_suffix` enforces that a forced
 ``readwise`` kind only ever pairs with a ``.json`` file.
 
+FT-31: a sixth built-in kind, ``obsidian`` (registered from
+``obsidian_import.py``, same wiring convention as the connectors above),
+understands Obsidian's Markdown conventions — YAML frontmatter, ``[[wikilink]]``
+references resolved into FT-04 entity mentions, and inline ``#tag`` syntax —
+on top of the same per-section chunker :func:`_parse_document` already
+provides for ``document``. Like ``readwise``, ``kind="auto"`` does not
+content-sniff into ``obsidian`` (frontmatter delimiters and double-bracket
+text both have legitimate non-Obsidian uses, so guessing risks misrouting an
+unrelated Markdown file) — but unlike ``readwise``, it IS reachable
+automatically, just via directory context rather than content:
+:func:`remind_me_mcp.config.resolve_import_kind` upgrades a ``kind="auto"``
+``.md``/``.markdown`` file to ``obsidian`` when it sits inside a directory
+tree with a ``.obsidian/`` folder at or above it (the zero-configuration
+vault-detection signal), and both :mod:`remind_me_mcp.watcher` and
+:func:`import_directory` (below) call it per file. A connector's chunk
+metadata may additionally carry two reserved keys handled centrally in
+:func:`_ingest_parsed` rather than reimplemented per connector: ``extra_tags``
+(merged into the stored memory's tags) and ``mention_entities`` (note/entity
+names to resolve via the existing FT-04 :func:`~remind_me_mcp.db._upsert_entity`
+and link the memory to) — see ``obsidian_import.py``'s module docstring for
+the full design rationale, including why frontmatter parsing is hand-rolled
+rather than a new ``pyyaml`` dependency, and the documented v1 limitation
+that a ``[[Note#Heading]]`` wikilink resolves to the ``Note`` entity as a
+whole (the heading anchor is stripped, not tracked separately).
+
+FT-32: a seventh built-in kind, ``audio`` (registered from
+``audio_import.py``, same wiring convention as the connectors above),
+transcribes a ``.mp3``/``.m4a``/``.wav``/``.ogg`` file via
+`faster-whisper <https://github.com/SYSTRAN/faster-whisper>`_ and chunks the
+result per transcript segment -- Whisper's own sentence/phrase-level output
+unit, each with a start/end timestamp -- recording that range on each
+chunk's metadata as ``{"start": <float seconds>, "end": <float seconds>}``,
+the same "section" role a PDF page number or a document heading plays for
+their own connectors. Like ``pdf``/``image``, ``audio`` is a binary format:
+it reads ``meta["raw_bytes"]`` and ignores the lossily-decoded ``raw`` text
+argument entirely, and ``kind="auto"`` routes its four suffixes to it
+unconditionally (there is nothing to content-sniff -- a suffix on this list
+is always audio).
+
 FT-06: exports may carry entity-graph records tagged with a ``record_type``
 discriminator ('entity' / 'memory_entity'; absent = memory, mirroring the
 FT-04 sync wire format). Message extraction skips them, and JSON/JSONL chat
@@ -87,6 +126,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 if TYPE_CHECKING:
     import sqlite3
 
+from remind_me_mcp.config import resolve_import_kind
 from remind_me_mcp.db import (
     _embed_and_store_rows,
     _get_db,
@@ -101,9 +141,10 @@ log = logging.getLogger("remind_me_mcp.importer")
 
 IMPORT_CONCURRENCY = 8
 
-IMPORT_KINDS = ("auto", "chat", "document", "pdf", "image", "readwise")
+IMPORT_KINDS = ("auto", "chat", "document", "pdf", "image", "readwise", "obsidian", "audio")
 """Valid values for the ``kind`` parameter of :func:`import_chat_file` (FT-02,
-extended for ``pdf``/``image`` by FT-19, and ``readwise`` by FT-20).
+extended for ``pdf``/``image`` by FT-19, ``readwise`` by FT-20, ``obsidian``
+by FT-31, and ``audio`` by FT-32).
 
 Deliberately NOT derived from :data:`_CONNECTORS` (Phase 4): that registry can
 hold connectors -- like ``mempalace`` -- that exist purely for discovery
@@ -143,17 +184,34 @@ READWISE_CATEGORY = "readwise"
 """Default ``memories.category`` for Readwise imports when the caller passed
 the generic chat default ('chat_import') or an empty category."""
 
+AUDIO_SOURCE = "audio_import"
+"""``memories.source`` value for audio transcription imports (FT-32)."""
+
+AUDIO_CATEGORY = "audio"
+"""Default ``memories.category`` for audio imports when the caller passed the
+generic chat default ('chat_import') or an empty category."""
+
+# OBSIDIAN_SOURCE / OBSIDIAN_CATEGORY (FT-31) are defined in obsidian_import.py,
+# not here -- unlike pdf/image/readwise, obsidian_import.py imports FROM this
+# module (register_connector, _parse_document), so this module cannot import
+# its constants back at module level without a cycle. _ingest_parsed below
+# imports them lazily, at the point they're actually needed (see there for
+# why that's always safe).
+
 _IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg")
 """File extensions routed to the ``image`` connector (FT-19)."""
 
 _PDF_SUFFIX = ".pdf"
 """File extension routed to the ``pdf`` connector (FT-19)."""
 
+_AUDIO_SUFFIXES = (".mp3", ".m4a", ".wav", ".ogg")
+"""File extensions routed to the ``audio`` connector (FT-32)."""
+
 _TEXT_SUFFIXES = (".json", ".jsonl", ".md", ".markdown", ".txt")
 """File extensions handled as decoded text by ``chat``/``document`` (the
 original, pre-FT-19 supported set)."""
 
-_ALL_SUPPORTED_SUFFIXES = _TEXT_SUFFIXES + (_PDF_SUFFIX,) + _IMAGE_SUFFIXES
+_ALL_SUPPORTED_SUFFIXES = _TEXT_SUFFIXES + (_PDF_SUFFIX,) + _IMAGE_SUFFIXES + _AUDIO_SUFFIXES
 """Every file extension :func:`_validate_kind_and_suffix` accepts."""
 
 
@@ -191,6 +249,15 @@ class Connector(Protocol):
             logical source units found *before* chunking (e.g. extracted
             chat messages); for connectors where chunking IS the extraction
             unit (document sections), it equals ``len(chunks)``.
+
+            Two chunk-metadata keys are reserved and popped by
+            :func:`_ingest_parsed` before the rest of the dict is stored
+            (introduced for the ``obsidian`` connector, FT-31, but usable by
+            any connector): ``"extra_tags"`` (a list of tags merged into that
+            one memory's stored tags, deduplicated against the caller's own
+            ``tags``) and ``"mention_entities"`` (a list of names resolved
+            into entities via the existing FT-04 upsert machinery, with the
+            memory linked to each as a mention).
         """
         ...
 
@@ -823,7 +890,8 @@ def _validate_kind_and_suffix(kind: str, suffix: str, filename: str) -> dict[str
     """Shared kind/suffix validation for both import entry points.
 
     Args:
-        kind: 'chat', 'document', 'pdf', 'image', 'readwise', or 'auto'.
+        kind: 'chat', 'document', 'pdf', 'image', 'readwise', 'obsidian',
+            'audio', or 'auto'.
         suffix: Lowercased file extension (from the path or the pushed
             filename).
         filename: Display name for the error's 'file' field.
@@ -836,7 +904,7 @@ def _validate_kind_and_suffix(kind: str, suffix: str, filename: str) -> dict[str
             "status": "error",
             "reason": (
                 f"invalid kind: {kind!r} (use 'auto', 'chat', 'document', "
-                "'pdf', 'image', or 'readwise')"
+                "'pdf', 'image', 'readwise', 'obsidian', or 'audio')"
             ),
             "file": filename,
         }
@@ -866,6 +934,14 @@ def _validate_kind_and_suffix(kind: str, suffix: str, filename: str) -> dict[str
             "reason": f"image import requires one of {_IMAGE_SUFFIXES}, got {suffix}",
             "file": filename,
         }
+    # FT-32: audio is likewise a binary format with its own dedicated
+    # connector -- same forced-kind-must-agree-with-suffix rule as pdf/image.
+    if kind == "audio" and suffix not in _AUDIO_SUFFIXES:
+        return {
+            "status": "error",
+            "reason": f"audio import requires one of {_AUDIO_SUFFIXES}, got {suffix}",
+            "file": filename,
+        }
     # FT-20: readwise shares the .json suffix with chat (kind="auto" never
     # routes here -- see the module docstring), but a forced kind="readwise"
     # must still name an actual .json file, not a Markdown/text/jsonl one
@@ -874,6 +950,15 @@ def _validate_kind_and_suffix(kind: str, suffix: str, filename: str) -> dict[str
         return {
             "status": "error",
             "reason": f"readwise import requires a .json file, got {suffix}",
+            "file": filename,
+        }
+    # FT-31: obsidian is Markdown-only, like document -- forcing it onto a
+    # plain-text .txt file (or json/jsonl) would try to parse frontmatter and
+    # wikilink syntax that plain text was never going to contain correctly.
+    if kind == "obsidian" and suffix not in (".md", ".markdown"):
+        return {
+            "status": "error",
+            "reason": f"obsidian import requires .md or .markdown, got {suffix}",
             "file": filename,
         }
     if suffix == _PDF_SUFFIX and kind not in ("auto", "pdf"):
@@ -886,6 +971,12 @@ def _validate_kind_and_suffix(kind: str, suffix: str, filename: str) -> dict[str
         return {
             "status": "error",
             "reason": f"{suffix} files must use kind='image' or 'auto', not {kind!r}",
+            "file": filename,
+        }
+    if suffix in _AUDIO_SUFFIXES and kind not in ("auto", "audio"):
+        return {
+            "status": "error",
+            "reason": f"{suffix} files must use kind='audio' or 'auto', not {kind!r}",
             "file": filename,
         }
     return None
@@ -916,9 +1007,9 @@ def _ingest_parsed(
     Args:
         raw: The full content decoded as UTF-8 text (errors="replace"). Used
             by the chat/document connectors and the chat-markdown sniffer;
-            for a binary kind (pdf/image, FT-19) this decoding is lossy and
-            the connector ignores it in favor of ``raw_bytes``.
-        raw_bytes: The original, undecoded bytes — what the pdf/image
+            for a binary kind (pdf/image/audio, FT-19/FT-32) this decoding is
+            lossy and the connector ignores it in favor of ``raw_bytes``.
+        raw_bytes: The original, undecoded bytes — what the pdf/image/audio
             connectors actually parse (see meta["raw_bytes"] below).
         suffix: Lowercased file extension, used for connector dispatch and
             chat/document auto-sniffing.
@@ -929,32 +1020,41 @@ def _ingest_parsed(
         tags: Tags to apply to all imported memories.
         extract_mode: Message extraction strategy (chat imports only).
         max_length: Maximum characters per memory chunk.
-        kind: 'chat', 'document', 'pdf', 'image', 'readwise', or 'auto'.
-            'readwise' must be requested explicitly for a .json file — it is
-            never chosen by 'auto' (FT-20; see the module docstring).
+        kind: 'chat', 'document', 'pdf', 'image', 'readwise', 'obsidian',
+            'audio', or 'auto'. 'readwise' must be requested explicitly for a
+            .json file — it is never chosen by 'auto' (FT-20; see the module
+            docstring). 'obsidian' is likewise never chosen by 'auto'
+            *content*-sniffing, but IS applied automatically by *directory*
+            context — see :func:`remind_me_mcp.config.resolve_import_kind`
+            and the module docstring's FT-31 paragraph. 'audio' (FT-32) IS
+            reachable through 'auto', unconditionally, like pdf/image — its
+            four suffixes need no content-sniffing.
 
     Returns:
         Same result shape as :func:`import_chat_file`.
     """
     db = _get_db()
 
-    # Resolve the effective kind (FT-02, extended by FT-19/FT-20). JSON/JSONL
-    # are chat exports UNLESS the caller explicitly forced kind="readwise"
-    # (validation above already confirmed that only pairs with .json, never
-    # .jsonl) -- kind="auto" never resolves to readwise here, by design (see
-    # the module's FT-20 docstring note: no reliable, false-positive-free way
-    # to content-sniff a Readwise export apart from an arbitrary chat-shaped
-    # JSON file). .pdf/image suffixes always route to their dedicated binary
-    # connector regardless of kind (validation above already confirmed kind
-    # is 'auto' or the matching kind for these suffixes); markdown/text files
-    # are content-sniffed in auto mode so chat-style markdown keeps importing
-    # as chat (existing behavior preserved).
+    # Resolve the effective kind (FT-02, extended by FT-19/FT-20/FT-32).
+    # JSON/JSONL are chat exports UNLESS the caller explicitly forced
+    # kind="readwise" (validation above already confirmed that only pairs
+    # with .json, never .jsonl) -- kind="auto" never resolves to readwise
+    # here, by design (see the module's FT-20 docstring note: no reliable,
+    # false-positive-free way to content-sniff a Readwise export apart from
+    # an arbitrary chat-shaped JSON file). .pdf/image/audio suffixes always
+    # route to their dedicated binary connector regardless of kind
+    # (validation above already confirmed kind is 'auto' or the matching
+    # kind for these suffixes); markdown/text files are content-sniffed in
+    # auto mode so chat-style markdown keeps importing as chat (existing
+    # behavior preserved).
     if suffix in (".json", ".jsonl"):
         effective_kind = "readwise" if kind == "readwise" else "chat"
     elif suffix == _PDF_SUFFIX:
         effective_kind = "pdf"
     elif suffix in _IMAGE_SUFFIXES:
         effective_kind = "image"
+    elif suffix in _AUDIO_SUFFIXES:
+        effective_kind = "audio"
     elif kind == "auto":
         effective_kind = "chat" if _looks_like_chat_markdown(raw) else "document"
     else:
@@ -962,17 +1062,17 @@ def _ingest_parsed(
 
     # Entity-graph records found in JSON/JSONL exports (FT-06) — restored
     # below, never parsed as chat messages. Extracted independently of the
-    # connector dispatch (Phase 4); pdf/image never carry these (JSON/JSONL
-    # only), so this is a no-op cost for those kinds. See
+    # connector dispatch (Phase 4); pdf/image/audio never carry these
+    # (JSON/JSONL only), so this is a no-op cost for those kinds. See
     # _extract_graph_records.
     graph_records = _extract_graph_records(raw, suffix)
 
     # (chunk_content, chunk_metadata) pairs, via the kind's registered
     # connector (Phase 4) — effective_kind is always one of "chat",
-    # "document", "pdf", "image" (resolved just above), and all four are
+    # "document", "pdf", "image", "audio" (resolved just above), and all are
     # always registered, so this lookup cannot miss. raw_bytes rides along
-    # in meta (FT-19) for the binary pdf/image connectors, which ignore the
-    # lossily-decoded `raw` text argument entirely.
+    # in meta (FT-19/FT-32) for the binary pdf/image/audio connectors, which
+    # ignore the lossily-decoded `raw` text argument entirely.
     connector = _CONNECTORS[effective_kind]
     parsed, raw_entries = connector(
         raw,
@@ -996,10 +1096,29 @@ def _ingest_parsed(
         source = IMAGE_SOURCE
         if category in ("", "chat_import"):
             category = IMAGE_CATEGORY
+    elif effective_kind == "audio":
+        source = AUDIO_SOURCE
+        if category in ("", "chat_import"):
+            category = AUDIO_CATEGORY
     elif effective_kind == "readwise":
         source = READWISE_SOURCE
         if category in ("", "chat_import"):
             category = READWISE_CATEGORY
+    elif effective_kind == "obsidian":
+        # Deferred import (FT-31): obsidian_import.py imports FROM this
+        # module at load time (register_connector, _parse_document), so this
+        # module cannot import its constants back at module level without a
+        # cycle. Safe here specifically because effective_kind can only be
+        # "obsidian" if _CONNECTORS["obsidian"] was already looked up
+        # successfully just above -- which means obsidian_import.py has
+        # already fully executed (that's how it got registered), so this
+        # import always hits an already-loaded module, never triggers a
+        # fresh circular load.
+        from remind_me_mcp.obsidian_import import OBSIDIAN_CATEGORY, OBSIDIAN_SOURCE
+
+        source = OBSIDIAN_SOURCE
+        if category in ("", "chat_import"):
+            category = OBSIDIAN_CATEGORY
     else:
         source = "chat_import"
 
@@ -1028,6 +1147,23 @@ def _ingest_parsed(
         # (neighbor-aware chunk retrieval) instead of re-parsing metadata.
         stored = 0
         for chunk_index, (mem_id, chunk, chunk_meta) in enumerate(embed_entries):
+            # Two reserved chunk_meta keys, popped before the rest is merged
+            # into stored metadata, give a connector a generic hook into
+            # tag/entity handling without duplicating that logic per
+            # connector (introduced for FT-31's obsidian connector, but not
+            # obsidian-specific -- any connector can use them):
+            #   - "extra_tags": additional tags for just this memory, merged
+            #     with the caller's own `tags` (deduped, caller's tags first).
+            #   - "mention_entities": names to resolve into entities via the
+            #     existing FT-04 upsert machinery, with this memory linked to
+            #     each as a mention (mirrors _restore_graph_records' own
+            #     entity-upsert-then-link shape, just per-chunk instead of
+            #     from an export's graph records).
+            chunk_meta = dict(chunk_meta)
+            extra_tags = chunk_meta.pop("extra_tags", None)
+            mention_entities = chunk_meta.pop("mention_entities", None)
+            row_tags = list(dict.fromkeys([*tags, *extra_tags])) if extra_tags else tags
+
             metadata: dict[str, Any] = {
                 "import_id": import_id, "filename": filename, **chunk_meta,
             }
@@ -1039,7 +1175,7 @@ def _ingest_parsed(
                     mem_id,
                     chunk,
                     category,
-                    json.dumps(tags),
+                    json.dumps(row_tags),
                     source,
                     json.dumps(metadata),
                     now,
@@ -1049,6 +1185,10 @@ def _ingest_parsed(
                 ),
             )
             stored += 1
+            if mention_entities:
+                for title in mention_entities:
+                    entity_id = _upsert_entity(db, title, kind="note", now=now)
+                    _link_memory_entity(db, mem_id, entity_id, now=now)
 
         stats: dict[str, Any] = {
             "kind": effective_kind,
@@ -1100,37 +1240,49 @@ def import_chat_file(
     max_length: int,
     kind: str = "auto",
 ) -> dict[str, Any]:
-    """Import a single chat export, document, PDF, or image file into the memory store.
+    """Import a single chat export, document, PDF, image, or audio file into the memory store.
 
     Parses the file based on its extension (.json, .jsonl, .md/.markdown/.txt,
-    .pdf, .png/.jpg/.jpeg) and the resolved import ``kind``. Chat exports
-    extract messages according to extract_mode and chunk per-message;
-    documents (FT-02) chunk per-section (Markdown headings) or per-paragraph
-    (plain text), recording the section heading in each memory's metadata.
-    PDFs (FT-19) chunk per-page via the ``pdf`` connector (requires the
-    optional ``pdf`` extra), recording the page number in each memory's
-    metadata; images (FT-19) are OCR'd via the ``image`` connector (requires
-    the optional ``image`` extra) into a single memory. Deduplicates by file
-    hash — if the same file content has already been imported, returns a
-    'skipped' result immediately, without reading the file's text (only its
-    bytes are hashed).
+    .pdf, .png/.jpg/.jpeg, .mp3/.m4a/.wav/.ogg) and the resolved import
+    ``kind``. Chat exports extract messages according to extract_mode and
+    chunk per-message; documents (FT-02) chunk per-section (Markdown
+    headings) or per-paragraph (plain text), recording the section heading
+    in each memory's metadata. PDFs (FT-19) chunk per-page via the ``pdf``
+    connector (requires the optional ``pdf`` extra), recording the page
+    number in each memory's metadata; images (FT-19) are OCR'd via the
+    ``image`` connector (requires the optional ``image`` extra) into a
+    single memory. Audio (FT-32) is transcribed via the ``audio`` connector
+    (requires the optional ``audio`` extra) and chunked per transcript
+    segment, recording each chunk's ``start``/``end`` timestamp (seconds).
+    Deduplicates by file hash — if the same file content has already been
+    imported, returns a 'skipped' result immediately, without reading the
+    file's text (only its bytes are hashed).
 
     Args:
         file_path: Path to the file to import.
         category: Category to assign to all imported memories. For document/
-            pdf/image imports, the generic chat default ('chat_import') or an
-            empty string is replaced with 'document'/'pdf'/'image' respectively.
+            pdf/image/audio imports, the generic chat default ('chat_import')
+            or an empty string is replaced with 'document'/'pdf'/'image'/
+            'audio' respectively.
         tags: Tags to apply to all imported memories.
         extract_mode: Message extraction strategy (e.g., 'assistant_messages');
             chat imports only.
         max_length: Maximum characters per memory chunk.
-        kind: 'chat', 'document', 'pdf', 'image', 'readwise', or 'auto'
-            (default). Auto routes .json/.jsonl to the chat parser, .pdf to
-            the pdf parser, .png/.jpg/.jpeg to the image (OCR) parser, and
-            sniffs .md/.markdown/.txt content: chat role markers import as
-            chat, everything else as a document. 'readwise' (a Readwise
-            "Export" JSON file, one memory per highlight — FT-20) is never
-            chosen by auto and must be requested explicitly.
+        kind: 'chat', 'document', 'pdf', 'image', 'readwise', 'obsidian',
+            'audio', or 'auto' (default). Auto routes .json/.jsonl to the
+            chat parser, .pdf to the pdf parser, .png/.jpg/.jpeg to the image
+            (OCR) parser, .mp3/.m4a/.wav/.ogg to the audio (transcription)
+            parser, and sniffs .md/.markdown/.txt content: chat role markers
+            import as chat, everything else as a document. 'readwise' (a
+            Readwise "Export" JSON file, one memory per highlight — FT-20)
+            is never chosen by auto and must be requested explicitly.
+            'obsidian' (frontmatter/wikilink/inline-tag-aware Markdown
+            import — FT-31) is likewise never chosen by auto's *content*
+            sniffing, but a caller that resolves the effective kind via
+            :func:`remind_me_mcp.config.resolve_import_kind` first (as
+            :mod:`remind_me_mcp.watcher` and :func:`import_directory` both
+            do) gets it automatically for a .md/.markdown file inside a
+            detected Obsidian vault.
 
     Returns:
         A status dict. On success: {'status': 'ok', 'import_id': str,
@@ -1140,10 +1292,11 @@ def import_chat_file(
         'relations_restored', and 'relations_skipped_dangling'.
         On skip: {'status': 'skipped', 'reason': str, 'file': str,
         'import_id': str}. On unsupported format/kind: {'status': 'error',
-        'reason': str, 'file': str}. A pdf/image file imported without its
-        required optional extra installed raises RuntimeError with an
-        actionable install message (see pdf_import.py/image_import.py) —
-        callers (tools/admin.py) catch this and return a clean error.
+        'reason': str, 'file': str}. A pdf/image/audio file imported without
+        its required optional extra installed raises RuntimeError with an
+        actionable install message (see pdf_import.py/image_import.py/
+        audio_import.py) — callers (tools/admin.py) catch this and return a
+        clean error.
     """
     path = Path(file_path)
     suffix = path.suffix.lower()
@@ -1205,18 +1358,20 @@ def import_content(
 
     Args:
         content: Raw file bytes. Decoded as UTF-8 (replacing invalid bytes)
-            for the text-based chat/document connectors; the pdf/image
-            connectors (FT-19) instead receive these bytes undecoded.
+            for the text-based chat/document connectors; the pdf/image/audio
+            connectors (FT-19/FT-32) instead receive these bytes undecoded.
         filename: Display name; its extension selects the parser
-            (.json, .jsonl, .md, .markdown, .txt, .pdf, .png, .jpg, .jpeg).
+            (.json, .jsonl, .md, .markdown, .txt, .pdf, .png, .jpg, .jpeg,
+            .mp3, .m4a, .wav, .ogg).
         category: Category to assign to all imported memories. For document/
-            pdf/image imports, the generic chat default ('chat_import') or an
-            empty string is replaced with 'document'/'pdf'/'image' respectively.
+            pdf/image/audio imports, the generic chat default ('chat_import')
+            or an empty string is replaced with 'document'/'pdf'/'image'/
+            'audio' respectively.
         tags: Tags to apply to all imported memories.
         extract_mode: Message extraction strategy (chat imports only).
         max_length: Maximum characters per memory chunk.
-        kind: 'chat', 'document', 'pdf', 'image', 'readwise', or 'auto'
-            (default) — see :func:`import_chat_file`.
+        kind: 'chat', 'document', 'pdf', 'image', 'readwise', 'obsidian',
+            'audio', or 'auto' (default) — see :func:`import_chat_file`.
 
     Returns:
         Same result shape as :func:`import_chat_file`.
@@ -1302,32 +1457,39 @@ async def import_directory(
     recursive: bool = True,
     kind: str = "auto",
 ) -> dict[str, Any]:
-    """Import all chat export, document, PDF, and image files from a directory concurrently.
+    """Import all chat export, document, PDF, image, and audio files from a directory concurrently.
 
-    Scans for .json, .jsonl, .md, .markdown, .txt, .pdf, .png, .jpg, and
-    .jpeg files (FT-19 added the last four). Skips already-imported files
+    Scans for .json, .jsonl, .md, .markdown, .txt, .pdf, .png, .jpg, .jpeg,
+    .mp3, .m4a, .wav, and .ogg files (FT-19 added the pdf/image extensions;
+    FT-32 added the four audio ones). Skips already-imported files
     (hash-based deduplication). Files are processed concurrently using
     asyncio.gather with a semaphore bounded by IMPORT_CONCURRENCY (default 8)
-    to prevent resource exhaustion. A pdf/image file failing because its
-    optional extra isn't installed is caught per-file by _import_one (below)
-    and reported as an 'error' entry, same as any other single-file failure —
-    it never aborts the rest of the batch.
+    to prevent resource exhaustion. A pdf/image/audio file failing because
+    its optional extra isn't installed is caught per-file by _import_one
+    (below) and reported as an 'error' entry, same as any other single-file
+    failure — it never aborts the rest of the batch.
 
     Args:
         directory: Path to the directory containing files to import.
         category: Category to assign to all imported memories (the chat
-            default 'chat_import' becomes 'document'/'pdf'/'image' for
-            document/pdf/image files respectively).
+            default 'chat_import' becomes 'document'/'pdf'/'image'/'audio'
+            for document/pdf/image/audio files respectively).
         tags: Optional tags to apply to all imported memories.
         extract_mode: Message extraction strategy (chat files only).
         max_length: Max characters per memory chunk.
         recursive: Whether to search subdirectories.
-        kind: 'chat', 'document', 'pdf', 'image', 'readwise', or 'auto'
-            (default) — per-file routing, see :func:`import_chat_file`
-            (FT-02, FT-19, FT-20). 'readwise' is applied to every .json file
-            in the directory when forced (auto never picks it), so mixing
-            genuine Readwise exports with other .json files in one directory
-            import isn't supported — import them separately.
+        kind: 'chat', 'document', 'pdf', 'image', 'readwise', 'obsidian',
+            'audio', or 'auto' (default) — per-file routing, see
+            :func:`import_chat_file` (FT-02, FT-19, FT-20, FT-31, FT-32).
+            'readwise' is applied to every .json file in the directory when
+            forced (auto never picks it), so mixing genuine Readwise exports
+            with other .json files in one directory import isn't supported —
+            import them separately. When 'auto', a .md/.markdown file inside
+            a detected Obsidian vault (see
+            :func:`remind_me_mcp.config.is_obsidian_vault`) is imported as
+            'obsidian' automatically, per file — this is how bulk-importing
+            an existing vault once (rather than watching it live) still gets
+            frontmatter/wikilink/tag parsing with no extra argument needed.
 
     Returns:
         Summary dict with keys: files_processed, imported, skipped,
@@ -1336,7 +1498,10 @@ async def import_directory(
     root = Path(directory)
     if tags is None:
         tags = []
-    extensions = {".json", ".jsonl", ".md", ".markdown", ".txt", ".pdf", ".png", ".jpg", ".jpeg"}
+    extensions = {
+        ".json", ".jsonl", ".md", ".markdown", ".txt", ".pdf", ".png", ".jpg", ".jpeg",
+        ".mp3", ".m4a", ".wav", ".ogg",
+    }
     files = _collect_importable_files(root, extensions, recursive)
 
     sem = asyncio.Semaphore(IMPORT_CONCURRENCY)
@@ -1351,7 +1516,7 @@ async def import_directory(
                     tags=tags,
                     extract_mode=extract_mode,
                     max_length=max_length,
-                    kind=kind,
+                    kind=resolve_import_kind(f, kind),
                 )
             except Exception as e:
                 # Was narrowed to (JSONDecodeError, UnicodeDecodeError,
@@ -1396,6 +1561,8 @@ __all__ = [
     "IMAGE_CATEGORY",
     "READWISE_SOURCE",
     "READWISE_CATEGORY",
+    "AUDIO_SOURCE",
+    "AUDIO_CATEGORY",
     "Connector",
     "register_connector",
     "_CONNECTORS",

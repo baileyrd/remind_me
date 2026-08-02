@@ -14,6 +14,7 @@ import re
 import sqlite3
 from typing import Any
 
+from remind_me_mcp import metrics
 from remind_me_mcp import tools as _pkg
 from remind_me_mcp.db import _normalize_entity_name, _resolve_entity, _row_to_dict
 from remind_me_mcp.formatting import _fmt_memory_md
@@ -83,16 +84,20 @@ def _structured_lookup(
     predicate: str | None,
     limit: int,
     entity: dict[str, Any] | None = None,
+    include_sensitive: bool = False,
 ) -> list[dict]:
     """Perform indexed SQL lookup for structured fact triples.
 
     Builds a WHERE clause dynamically based on which fields are provided.
     Always excludes superseded facts (superseded_by IS NOT NULL) and
-    soft-deleted memories (deleted_at IS NOT NULL, gap #11). The optional
-    resolved *entity* (FT-04) AND-composes with subject/predicate:
-    a memory matches when it is linked to the entity via memory_entities OR
-    its SPO subject/object equals the entity's canonical name
-    (case-insensitive; the canonical name is already whitespace-collapsed).
+    soft-deleted memories (deleted_at IS NOT NULL, gap #11). Also excludes
+    memories marked sensitive (issue #195) unless *include_sensitive* is
+    set — same default-off convenience filter as the FTS/semantic tiers.
+    The optional resolved *entity* (FT-04) AND-composes with
+    subject/predicate: a memory matches when it is linked to the entity via
+    memory_entities OR its SPO subject/object equals the entity's canonical
+    name (case-insensitive; the canonical name is already
+    whitespace-collapsed).
 
     Args:
         db: An open SQLite connection.
@@ -100,12 +105,16 @@ def _structured_lookup(
         predicate: Predicate value to match, or None to skip.
         limit: Maximum number of results to return.
         entity: A resolved entity row (from ``_resolve_entity``), or None.
+        include_sensitive: If False (default), exclude memories marked
+            sensitive.
 
     Returns:
         List of memory dicts from matching rows.
     """
     conditions: list[str] = ["m.superseded_by IS NULL", "m.deleted_at IS NULL"]
     bindings: list[Any] = []
+    if not include_sensitive:
+        conditions.append("m.sensitive = 0")
 
     if subject is not None:
         conditions.append("m.subject = ?")
@@ -270,12 +279,14 @@ def _expand_via_entities(
     db: sqlite3.Connection,
     memories: list[dict],
     cap: int = _ENTITY_EXPANSION_CAP,
+    include_sensitive: bool = False,
 ) -> list[dict[str, Any]]:
     """Collect up to *cap* 1-hop entity-graph neighbors of the given results.
 
     Finds entities mentioned by the seed memories, then other non-superseded
     memories sharing those entities (newest first), excluding the seeds
-    themselves. Each item carries the linking entity name(s) in
+    themselves and, unless *include_sensitive* (issue #195), sensitive
+    memories. Each item carries the linking entity name(s) in
     ``via_entities``. INNER joins on entities and memories keep dangling
     links (sync may deliver a link before its endpoints) invisible.
 
@@ -288,6 +299,8 @@ def _expand_via_entities(
         db: An open SQLite connection.
         memories: The main ranked results (the seeds).
         cap: Maximum number of expansion items to return.
+        include_sensitive: If False (default), exclude memories marked
+            sensitive.
 
     Returns:
         List of {id, content_snippet, category, created_at, via_entities}
@@ -297,6 +310,7 @@ def _expand_via_entities(
     if not seed_ids:
         return []
     ph = ",".join("?" * len(seed_ids))
+    sensitive_clause = "" if include_sensitive else " AND m.sensitive = 0"
     rows = db.execute(
         f"""SELECT m.id, substr(m.content, 1, 300) AS content_snippet,
                    m.category, m.created_at, e.name AS entity_name
@@ -307,7 +321,7 @@ def _expand_via_entities(
             WHERE seed.memory_id IN ({ph})
               AND nbr.memory_id NOT IN ({ph})
               AND m.superseded_by IS NULL
-              AND m.deleted_at IS NULL
+              AND m.deleted_at IS NULL{sensitive_clause}
             ORDER BY m.created_at DESC, m.id, e.name""",
         [*seed_ids, *seed_ids],
     ).fetchall()
@@ -365,6 +379,7 @@ def _expand_via_neighbors(
     memories: list[dict],
     window: int = _NEIGHBOR_WINDOW,
     cap: int = _NEIGHBOR_EXPANSION_CAP,
+    include_sensitive: bool = False,
 ) -> list[dict[str, Any]]:
     """Collect up to *cap* sibling chunks (same doc_id, adjacent chunk_index).
 
@@ -372,7 +387,8 @@ def _expand_via_neighbors(
     (manually added memories and other single-row sources have neither, so
     they are skipped). For each such seed, fetches sibling rows from the
     same source document within +/- *window* chunk positions, excluding the
-    seeds themselves and superseded rows.
+    seeds themselves, superseded rows, and (unless *include_sensitive*,
+    issue #195) sensitive rows.
 
     Access recording (PF-02): like _expand_via_entities, expanded hits are
     deliberately NOT recorded -- they are a discovery aid surfaced by
@@ -383,6 +399,8 @@ def _expand_via_neighbors(
         memories: The main ranked results (the seeds).
         window: How many chunk positions on either side to include.
         cap: Maximum number of expansion items to return.
+        include_sensitive: If False (default), exclude memories marked
+            sensitive.
 
     Returns:
         List of {id, content_snippet, category, created_at, doc_id,
@@ -390,6 +408,7 @@ def _expand_via_neighbors(
     """
     seed_ids = {m["id"] for m in memories}
     expanded: dict[str, dict[str, Any]] = {}
+    sensitive_clause = "" if include_sensitive else " AND sensitive = 0"
 
     for m in memories:
         if len(expanded) >= cap:
@@ -400,12 +419,12 @@ def _expand_via_neighbors(
             continue
 
         rows = db.execute(
-            """SELECT id, substr(content, 1, 300) AS content_snippet,
+            f"""SELECT id, substr(content, 1, 300) AS content_snippet,
                       category, created_at, doc_id, chunk_index
                FROM memories
                WHERE doc_id = ?
                  AND chunk_index BETWEEN ? AND ?
-                 AND superseded_by IS NULL
+                 AND superseded_by IS NULL{sensitive_clause}
                  AND deleted_at IS NULL
                ORDER BY chunk_index""",
             (doc_id, chunk_index - window, chunk_index + window),
@@ -458,6 +477,7 @@ def _expand_via_co_retrieval(
     db: sqlite3.Connection,
     memories: list[dict],
     cap: int = _CO_RETRIEVAL_EXPANSION_CAP,
+    include_sensitive: bool = False,
 ) -> list[dict[str, Any]]:
     """Collect up to *cap* memories most strongly co-retrieved with the given results.
 
@@ -465,7 +485,8 @@ def _expand_via_co_retrieval(
     ``vitality.record_co_retrieval`` -- memories that have appeared together
     with the seeds in past search result sets, strongest association first.
     Purely informational: never affects the main ranking (see
-    ``record_co_retrieval``'s docstring for why that matters).
+    ``record_co_retrieval``'s docstring for why that matters). Excludes
+    sensitive memories (issue #195) unless *include_sensitive* is set.
 
     Access recording (PF-02): like ``_expand_via_entities``, expanded hits
     are deliberately NOT recorded -- they are a discovery aid, not direct
@@ -475,6 +496,8 @@ def _expand_via_co_retrieval(
         db: An open SQLite connection.
         memories: The main ranked results (the seeds).
         cap: Maximum number of expansion items to return.
+        include_sensitive: If False (default), exclude memories marked
+            sensitive.
 
     Returns:
         List of {id, content_snippet, category, created_at,
@@ -486,6 +509,7 @@ def _expand_via_co_retrieval(
         return []
     seed_id_set = set(seed_ids)
     ph = ",".join("?" * len(seed_ids))
+    sensitive_clause = "" if include_sensitive else " AND m.sensitive = 0"
     rows = db.execute(
         f"""SELECT other_id, weight, substr(m.content, 1, 300) AS content_snippet,
                    m.category, m.created_at
@@ -497,7 +521,7 @@ def _expand_via_co_retrieval(
                 WHERE memory_id_b IN ({ph})
             ) assoc
             JOIN memories m ON m.id = assoc.other_id
-            WHERE m.superseded_by IS NULL AND m.deleted_at IS NULL
+            WHERE m.superseded_by IS NULL AND m.deleted_at IS NULL{sensitive_clause}
             ORDER BY assoc.weight DESC, m.created_at DESC""",
         [*seed_ids, *seed_ids],
     ).fetchall()
@@ -611,6 +635,7 @@ async def memory_search(params: MemorySearchInput) -> str:
             predicate=structured_fields.get("predicate"),
             limit=params.limit,
             entity=entity_row,
+            include_sensitive=params.include_sensitive,
         )
         if structured_results:
             # Read-time vitality decay (DI-04): the stored column is an
@@ -637,19 +662,25 @@ async def memory_search(params: MemorySearchInput) -> str:
             # not access-recorded — see _expand_via_entities).
             related: list[dict[str, Any]] = []
             if params.expand_entities:
-                related = _expand_via_entities(db, envelope["memories"])
+                related = _expand_via_entities(
+                    db, envelope["memories"], include_sensitive=params.include_sensitive
+                )
 
             # Opt-in neighbor-aware chunk expansion (expanded hits are not
             # access-recorded — see _expand_via_neighbors).
             related_neighbors: list[dict[str, Any]] = []
             if params.include_neighbors:
-                related_neighbors = _expand_via_neighbors(db, envelope["memories"])
+                related_neighbors = _expand_via_neighbors(
+                    db, envelope["memories"], include_sensitive=params.include_sensitive
+                )
 
             # Opt-in co-retrieval expansion (issue #9; expanded hits are not
             # access-recorded — see _expand_via_co_retrieval).
             related_co_retrieval: list[dict[str, Any]] = []
             if params.expand_co_retrieval:
-                related_co_retrieval = _expand_via_co_retrieval(db, envelope["memories"])
+                related_co_retrieval = _expand_via_co_retrieval(
+                    db, envelope["memories"], include_sensitive=params.include_sensitive
+                )
 
             if params.response_format == ResponseFormat.JSON:
                 extra: dict[str, Any] = {}
@@ -702,6 +733,8 @@ async def memory_search(params: MemorySearchInput) -> str:
     def _run_fts(match_query: str) -> list[dict]:
         conditions = ""
         bindings: list[Any] = [match_query]
+        if not params.include_sensitive:
+            conditions += " AND m.sensitive = 0"
         if params.category:
             conditions += " AND m.category = ?"
             bindings.append(params.category)
@@ -768,6 +801,7 @@ async def memory_search(params: MemorySearchInput) -> str:
         extra_texts=extra_texts,
         category=params.category,
         tags=params.tags,
+        include_sensitive=params.include_sensitive,
     )
 
     # --- Tag search method on raw results before RRF ---
@@ -851,19 +885,25 @@ async def memory_search(params: MemorySearchInput) -> str:
     # access-recorded — see _expand_via_entities) ---
     related = []  # also annotated in the structured-path branch above
     if params.expand_entities:
-        related = _expand_via_entities(db, envelope["memories"])
+        related = _expand_via_entities(
+            db, envelope["memories"], include_sensitive=params.include_sensitive
+        )
 
     # --- Opt-in neighbor-aware chunk expansion (expanded hits are not
     # access-recorded — see _expand_via_neighbors) ---
     related_neighbors = []  # also annotated in the structured-path branch above
     if params.include_neighbors:
-        related_neighbors = _expand_via_neighbors(db, envelope["memories"])
+        related_neighbors = _expand_via_neighbors(
+            db, envelope["memories"], include_sensitive=params.include_sensitive
+        )
 
     # --- Opt-in co-retrieval expansion (issue #9; expanded hits are not
     # access-recorded — see _expand_via_co_retrieval) ---
     related_co_retrieval = []  # also annotated in the structured-path branch above
     if params.expand_co_retrieval:
-        related_co_retrieval = _expand_via_co_retrieval(db, envelope["memories"])
+        related_co_retrieval = _expand_via_co_retrieval(
+            db, envelope["memories"], include_sensitive=params.include_sensitive
+        )
 
     # --- Attach debug signals if verbose (Phase 6: includes the resolved
     # strategy/weight profile actually used for this search) ---
@@ -875,6 +915,9 @@ async def memory_search(params: MemorySearchInput) -> str:
 
     # --- Compute tier breakdown (always) ---
     tier_breakdown = compute_tier_breakdown(envelope["memories"])
+    # Issue #197: accumulate into the running cumulative counters exposed at
+    # GET /metrics -- no-op unless REMIND_ME_METRICS_ENABLED is set.
+    metrics.record_search_tier(tier_breakdown)
 
     # --- Format response ---
     if params.response_format == ResponseFormat.JSON:

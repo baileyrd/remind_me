@@ -19,7 +19,7 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from remind_me_mcp import ann_index
+from remind_me_mcp import ann_index, metrics
 from remind_me_mcp import config as _config
 from remind_me_mcp.analytics import get_analytics_trend
 from remind_me_mcp.api_keys import ApiKeyStore
@@ -44,6 +44,7 @@ from remind_me_mcp.db import (
     _resolve_entity,
     _row_to_dict,
 )
+from remind_me_mcp.events import emit_event
 from remind_me_mcp.exporter import EXPORT_FORMATS, collect_export_records, export_memories, render_export
 from remind_me_mcp.ics_export import build_ics
 from remind_me_mcp.importer import IMPORT_KINDS, import_chat_file, import_directory
@@ -252,6 +253,8 @@ def _build_dashboard_html() -> str:
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#0a0a0f">
 <title>Remind Me — Memory Dashboard</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -279,6 +282,27 @@ def _build_dashboard_html() -> str:
 </script>
 </body>
 </html>"""
+
+
+def _build_manifest_json() -> dict[str, Any]:
+    """Return a minimal Web App Manifest so the dashboard can be "Added to
+    Home Screen" / installed as a standalone PWA on a phone (issue #199
+    mobile audit).
+
+    Deliberately minimal (spike scope, not a full PWA build): no service
+    worker, no offline support, no icons -- the repo has no icon/logo asset
+    to point at, and a manifest without ``icons`` is still valid per the Web
+    App Manifest spec (the OS falls back to a generic/text glyph). Add real
+    icon assets and reference them here if/when one is designed.
+    """
+    return {
+        "name": "Remind Me — Memory Dashboard",
+        "short_name": "Remind Me",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#0a0a0f",
+        "theme_color": "#0a0a0f",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +350,17 @@ def _build_api_app() -> Starlette:
                 f"Invalid integer for query parameter {name!r}: {raw!r}"
             ) from None
 
+    def _bool_param(params: Any, name: str, default: bool = False) -> bool:
+        """Parse a boolean query parameter (issue #195's include_sensitive and
+        alike). Absent/empty falls back to *default*; "1"/"true"/"yes"
+        (case-insensitive) are truthy, anything else falsy — never raises, a
+        malformed value just isn't treated as opted-in.
+        """
+        raw = params.get(name)
+        if raw is None or raw == "":
+            return default
+        return raw.strip().lower() in ("1", "true", "yes")
+
     # -- routes --
     #
     # PF-06: every handler runs its (blocking) SQLite work in a worker thread
@@ -341,6 +376,76 @@ def _build_api_app() -> Starlette:
         guard keep working when API auth is enabled.
         """
         return JSONResponse({"status": "ok"})
+
+    async def metrics_endpoint(request: Request) -> Response:
+        """Prometheus text-exposition metrics (issue #197).
+
+        Gated on ``config.METRICS_ENABLED`` (``REMIND_ME_METRICS_ENABLED``,
+        default off): returns a plain 404 (not a JSON error under ``/api/``,
+        since this route intentionally sits outside that prefix) while
+        disabled -- same "off means genuinely absent" posture the OTel
+        opt-in (``telemetry.py``) already established, rather than a 403 or
+        an empty-but-200 body that would misleadingly imply the feature is
+        active.
+
+        **Auth stance: deliberately unauthenticated, gated on the enable
+        flag instead of a bearer token.** This route lives outside
+        ``BearerAuthMiddleware``'s ``/api/`` ``protect_prefix`` -- the exact
+        same posture as ``/health`` (SE-04) above, not an oversight. Reasons:
+        (1) Prometheus' own scrape configs typically send no custom headers
+        at all by default, so requiring one here would mean most real
+        deployments end up hand-rolling a static-bearer scrape_config just
+        for this one target; (2) it's off by default, so exposure is already
+        opt-in at the config level, unlike ``/api/*``'s always-on surface;
+        (3) it matches the ecosystem-idiomatic default -- most self-hosted
+        Prometheus exporters ship unauthenticated and rely on network
+        placement instead. The tradeoff is real, not hand-waved: this
+        endpoint reveals usage patterns (which tools are called, how often,
+        search volume, memory/outbox counts) to anyone who can reach the
+        port. Operators who consider that sensitive on their network should
+        firewall the dashboard port or put a reverse proxy with its own
+        auth in front of it -- the same mitigation this codebase already
+        documents for the peer sync server's default all-interfaces bind
+        (``REMIND_ME_PEER_BIND``) and the ICS reminders feed's secret-path
+        scheme above.
+        """
+        if not _config.METRICS_ENABLED:
+            return _json_err(
+                "Metrics are disabled. Set REMIND_ME_METRICS_ENABLED=1 to enable GET /metrics.",
+                404,
+            )
+
+        def _work() -> Response:
+            db = _get_db()
+            total = db.execute(
+                "SELECT COUNT(*) as cnt FROM memories WHERE deleted_at IS NULL"
+            ).fetchone()["cnt"]
+            # Issue #197: computed fresh on every scrape (a cheap COUNT(*)),
+            # not tracked as counter state -- see metrics.py's module
+            # docstring for why "already a cheap point-in-time query" is
+            # deliberately NOT duplicated as a shadow counter.
+            gauges = [
+                metrics.GaugeSpec(
+                    "remind_me_memories_total",
+                    "Total non-deleted memories currently in the store.",
+                    float(total),
+                )
+            ]
+            if SYNC_ENABLED:
+                from remind_me_mcp.sync import get_sync_status
+                sync_status = get_sync_status()
+                gauges.append(
+                    metrics.GaugeSpec(
+                        "remind_me_sync_outbox_pending",
+                        "Sync outbox rows not yet acknowledged by the hub "
+                        "(sync.get_sync_status()['outbox']['pending']).",
+                        float(sync_status["outbox"]["pending"]),
+                    )
+                )
+            text = metrics.render_prometheus_text(gauges=gauges)
+            return Response(text, media_type="text/plain; version=0.0.4")
+
+        return await asyncio.to_thread(_work)
 
     async def api_stats(request: Request) -> JSONResponse:
         """Return aggregate statistics about the memory store."""
@@ -409,10 +514,19 @@ def _build_api_app() -> Starlette:
         return await asyncio.to_thread(_work)
 
     async def api_list(request: Request) -> JSONResponse:
-        """List memories with optional category, source, and tag filters."""
+        """List memories with optional category, source, and tag filters.
+
+        Issue #195: excludes memories marked sensitive by default, same as
+        ``GET /api/memories/search`` — pass ``include_sensitive=true`` to
+        include them. Not access control (remind_me is single-user); a
+        convenience filter to keep sensitive content out of an ordinary
+        listing.
+        """
         params = request.query_params
         conditions: list[str] = ["m.deleted_at IS NULL"]
         bindings: list[Any] = []
+        if not _bool_param(params, "include_sensitive"):
+            conditions.append("m.sensitive = 0")
 
         if cat := params.get("category"):
             conditions.append("m.category = ?")
@@ -475,6 +589,9 @@ def _build_api_app() -> Starlette:
         carries ``total``/``has_more`` alongside ``count``/``memories`` --
         parity with ``api_list``, so a client can page through results
         beyond the ``limit`` cap instead of only ever seeing the head.
+
+        Issue #195: excludes memories marked sensitive by default; pass
+        ``include_sensitive=true`` to include them.
         """
         import sqlite3 as _sqlite3
 
@@ -501,7 +618,12 @@ def _build_api_app() -> Starlette:
         # (DI-03; same pattern as api_list's DATA-02 fix). deleted_at IS NULL
         # is unconditional -- a soft-deleted memory must never resurface here,
         # unlike superseded_by (only excluded on the entity-scoped path below).
+        # sensitive = 0 is likewise unconditional unless include_sensitive
+        # opts in (issue #195) -- same default-off convenience filter as the
+        # MCP remind_me_search surface.
         conditions = " AND m.deleted_at IS NULL"
+        if not _bool_param(params, "include_sensitive"):
+            conditions += " AND m.sensitive = 0"
         bindings: list[Any] = []
         if cat := params.get("category"):
             conditions += " AND m.category = ?"
@@ -807,22 +929,39 @@ def _build_api_app() -> Starlette:
         tags = body.get("tags", [])
         source = body.get("source", "manual")
         metadata = body.get("metadata", {})
+        # Issue #195: convenience "don't surface by default" flag, not access
+        # control -- see MemoryAddInput.sensitive's docstring.
+        sensitive = int(bool(body.get("sensitive", False)))
+
+        # Issue #198: _work() runs in a worker thread via asyncio.to_thread
+        # below (PF-06) — asyncio.create_task requires a running loop in the
+        # *calling* thread, so emit_event (which spawns one) cannot be called
+        # from inside _work itself. It records the new id here instead and
+        # emit_event is called back on the event-loop thread after the
+        # to_thread call returns, mirroring how remind_me_add (crud.py) fires
+        # it on its own async request thread.
+        created_id: dict[str, str] = {}
 
         def _work() -> JSONResponse:
             db = _get_db()
             mem_id = _make_id(content)
             now = _now_iso()
             db.execute(
-                """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (mem_id, content, category, json.dumps(tags), source, json.dumps(metadata), now, now),
+                """INSERT INTO memories (id, content, category, tags, source, metadata,
+                                         created_at, updated_at, sensitive)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (mem_id, content, category, json.dumps(tags), source, json.dumps(metadata), now, now, sensitive),
             )
             db.commit()
             _embed_and_store(mem_id, content)
+            created_id["memory_id"] = mem_id
             row = db.execute("SELECT * FROM memories WHERE id = ?", (mem_id,)).fetchone()
             return _json_ok(_row_to_dict(row), status=201)
 
-        return await asyncio.to_thread(_work)
+        response = await asyncio.to_thread(_work)
+        if "memory_id" in created_id:
+            emit_event("created", created_id["memory_id"], category)
+        return response
 
     async def api_update(request: Request) -> JSONResponse:
         """Update fields on an existing memory by its ID."""
@@ -844,6 +983,10 @@ def _build_api_app() -> Starlette:
         if "metadata" in body and body["metadata"] is not None:
             sets.append("metadata = ?")
             bindings.append(json.dumps(body["metadata"]))
+        if "sensitive" in body and body["sensitive"] is not None:
+            # Issue #195: see MemoryUpdateInput.sensitive's docstring.
+            sets.append("sensitive = ?")
+            bindings.append(int(bool(body["sensitive"])))
 
         if not sets:
             return _json_err("No fields to update")
@@ -851,6 +994,10 @@ def _build_api_app() -> Starlette:
         sets.append("updated_at = ?")
         bindings.append(_now_iso())
         bindings.append(memory_id)
+
+        # Issue #198: see api_add's comment above for why emit_event is
+        # called after the to_thread call returns rather than inside _work.
+        updated_category: dict[str, str] = {}
 
         def _work() -> JSONResponse:
             db = _get_db()
@@ -865,9 +1012,13 @@ def _build_api_app() -> Starlette:
             if "content" in body and body["content"] is not None:
                 _embed_and_store(memory_id, body["content"])
             updated = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+            updated_category["category"] = updated["category"]
             return _json_ok(_row_to_dict(updated))
 
-        return await asyncio.to_thread(_work)
+        response = await asyncio.to_thread(_work)
+        if "category" in updated_category:
+            emit_event("updated", memory_id, updated_category["category"])
+        return response
 
     async def api_delete(request: Request) -> JSONResponse:
         """Delete a memory by its ID.
@@ -882,23 +1033,31 @@ def _build_api_app() -> Starlette:
 
         memory_id = request.path_params["memory_id"]
 
+        # Issue #198: see api_add's comment above for why emit_event is
+        # called after the to_thread call returns rather than inside _work.
+        deleted_category: dict[str, str] = {}
+
         def _work() -> JSONResponse:
             db = _get_db()
             row = db.execute(
-                "SELECT rowid FROM memories WHERE id = ? AND deleted_at IS NULL",
+                "SELECT rowid, category FROM memories WHERE id = ? AND deleted_at IS NULL",
                 (memory_id,),
             ).fetchone()
             if row is None:
                 return _json_err("Not found", 404)
             removed_vec_rowids = _purge_memory(
-                db, memory_id, row[0], soft=SYNC_ENABLED, now=_now_iso()
+                db, memory_id, row["rowid"], soft=SYNC_ENABLED, now=_now_iso()
             )
             db.commit()
             for vec_rowid in removed_vec_rowids:
                 ann_index.remove_vector(db, vec_rowid)
+            deleted_category["category"] = row["category"]
             return _json_ok({"deleted": memory_id})
 
-        return await asyncio.to_thread(_work)
+        response = await asyncio.to_thread(_work)
+        if "category" in deleted_category:
+            emit_event("deleted", memory_id, deleted_category["category"])
+        return response
 
     async def _bulk_ids_from_body(request: Request) -> tuple[list[str], JSONResponse | None]:
         """Parse and validate a bulk request body's ``ids`` list.
@@ -1262,9 +1421,21 @@ def _build_api_app() -> Starlette:
         """Serve the dashboard UI as a single-page app."""
         return HTMLResponse(_build_dashboard_html())
 
+    async def manifest(request: Request) -> JSONResponse:
+        """Serve the PWA manifest (issue #199) referenced by the dashboard's
+        <link rel="manifest">. Unauthenticated like "/" and "/health" above --
+        browsers fetch a manifest link with no Authorization header, and it
+        carries no user data (see _build_manifest_json's docstring).
+        """
+        return JSONResponse(
+            _build_manifest_json(), media_type="application/manifest+json"
+        )
+
     routes = [
         Route("/", index),
+        Route("/manifest.json", manifest, methods=["GET"]),
         Route("/health", health),
+        Route("/metrics", metrics_endpoint, methods=["GET"]),
         Route("/api/stats", api_stats),
         Route("/api/vitality", api_vitality),
         Route("/api/analytics/trend", api_analytics_trend, methods=["GET"]),
@@ -1336,4 +1507,5 @@ __all__ = [
     "JSONContentTypeMiddleware",
     "_build_api_app",
     "_build_dashboard_html",
+    "_build_manifest_json",
 ]

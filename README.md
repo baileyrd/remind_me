@@ -10,8 +10,10 @@ Persistent, searchable memory that works across **Claude.ai**, **Claude Code**, 
 - **Chat export import** — ingest JSON, JSONL, or Markdown exports from Claude, ChatGPT, or custom formats
 - **Document ingestion** — import Markdown notes and plain-text files, chunked per-section (heading context preserved) or per-paragraph; `kind=auto` detects chat vs document per file
 - **PDF and image (OCR) ingestion** — import `.pdf` files (chunked per-page, page number kept as metadata) and `.png`/`.jpg`/`.jpeg` images (OCR'd into a single memory); `kind=auto` routes both automatically. Requires the optional `pdf`/`image` extras — see [PDF and Image Import](#pdf-and-image-import)
+- **Audio transcription ingestion** — import `.mp3`/`.m4a`/`.wav`/`.ogg` files, transcribed via a local Whisper model and chunked per transcript segment (start/end timestamp kept as metadata); `kind=auto` routes all four extensions automatically. Requires the optional `audio` extra — see [Audio Import](#audio-import)
 - **Readwise highlights import** — import a Readwise "Export" JSON file as one memory per highlight (book/article title, author, category, and the highlight's own note all kept as metadata/content); requires explicit `kind=readwise` — see [Importing from Readwise](#importing-from-readwise)
-- **Bulk directory import** — point at a folder of exports/notes/PDFs/images and import them all
+- **Obsidian vault import** — frontmatter `tags:`, inline `#tags`, and `[[wikilinks]]` (resolved into knowledge-graph entities) are understood, not flattened into prose; a `.obsidian/` directory at or above a watched/imported path auto-detects the vault with zero configuration — see [Importing from Obsidian](#importing-from-obsidian)
+- **Bulk directory import** — point at a folder of exports/notes/PDFs/images/audio and import them all
 - **Watched folders** — set `REMIND_ME_WATCH_DIRS` and new or changed files auto-ingest in the background; changed files supersede their previous import
 - **Push/webhook ingestion** — set `REMIND_ME_WEBHOOK_SECRET` and `POST /ingest` accepts content directly over the network, no filesystem staging required
 - **Ingest-time normalization** — `remind_me_normalize_batch`/`remind_me_normalize_apply` distill noisy raw imports into clean `{question, summary, resolution?}` memories, non-destructively linked back to the source
@@ -248,6 +250,35 @@ This is not multi-tenancy (see [ARCHITECTURE.md](ARCHITECTURE.md)): every key
 - **Browse the Wiki** — read-only view of the LLM Wiki (FT-08): searchable page catalogue in the sidebar, rendered page body with clickable `[[Wikilinks]]`, and a backlinks/links panel for cross-page navigation; a pending-compile badge flags raw memories not yet folded in
 - **Live data** — the dashboard reads and writes your real SQLite database; changes appear immediately
 
+### Mobile / PWA Support
+
+The dashboard is usable at phone widths and installable as a standalone app
+(issue #199 mobile audit — a spike, not a full native-mobile build):
+
+- A `<meta name="viewport">` tag has been present in the HTML shell since
+  the dashboard's original build, so pinch-zoom/text-size already scaled
+  correctly on phones before this audit.
+- The header, sidebar/main split, and the Stats view's two-up chart grid
+  now reflow at narrow widths (~≤680px): the sidebar stacks above the main
+  content instead of squeezing it, and the "By Category"/"By Source" bar
+  charts drop to one column instead of getting crushed unreadably narrow.
+  Verified with a real headless-Chromium render at 390×844 (iPhone-width):
+  zero horizontal overflow across Browse/Stats/Wiki/Entities, versus real,
+  reproducible overflow (`document.documentElement.scrollWidth` 610px vs.
+  a 390px viewport) before the fix.
+- Icon-only buttons (copy/edit/delete on memory cards, modal close) and the
+  view-tab/Import/Add buttons now have a ~40-44px minimum tap target,
+  mobile-accessibility guidance, without changing their visible icon size.
+- A minimal `manifest.json` (`GET /manifest.json`, linked via `<link
+  rel="manifest">`) lets a phone browser "Add to Home Screen" the dashboard
+  as a standalone-display PWA. **Known gaps, left alone deliberately**: no
+  service worker or offline support, and no app icon yet (the repo has no
+  icon/logo asset — the manifest is still spec-valid without one; the OS
+  falls back to a generic glyph). Smaller interactive controls — inline
+  tag pills, form category chips — were left at their current size rather
+  than widened, since doing so for every one would start to reshape the
+  visual density of the UI rather than being a targeted fix.
+
 ### REST API
 
 The dashboard is powered by a REST API you can also use directly:
@@ -255,6 +286,7 @@ The dashboard is powered by a REST API you can also use directly:
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/health` | Liveness probe (no auth) |
+| `GET` | `/manifest.json` | PWA manifest for "Add to Home Screen" (no auth) |
 | `GET` | `/api/stats` | Memory statistics, categories, tags, DB info |
 | `GET` | `/api/vitality` | Vault vitality report: active/dormant counts, health score, vitality-bucket distribution |
 | `GET` | `/api/analytics/trend` | Daily analytics-snapshot history for the dashboard's Vault Trend panel: `{snapshots: [{captured_at, total_memories, vitality_buckets, category_counts}, ...]}`, oldest first (empty array on a fresh install) |
@@ -329,7 +361,7 @@ The stats view replaces the main content area with summary cards, horizontal bar
 
 | Tool | Description |
 |------|-------------|
-| `remind_me_search` | Hybrid search with RRF rank fusion, auto-routed or pinned ranking `strategy`, token budget, dormant exclusion, structured `subject:`/`predicate:`/`entity:` queries, opt-in `expand_entities` graph expansion, opt-in `include_neighbors` sibling-chunk expansion, and opt-in `expand_co_retrieval` co-retrieval expansion |
+| `remind_me_search` | Hybrid search with RRF rank fusion, auto-routed or pinned ranking `strategy`, token budget, dormant exclusion, structured `subject:`/`predicate:`/`entity:` queries, opt-in `expand_entities` graph expansion, opt-in `include_neighbors` sibling-chunk expansion, opt-in `expand_co_retrieval` co-retrieval expansion, and opt-in `include_sensitive` to include memories marked sensitive — see [Sensitive Memories](#sensitive-memories) |
 | `remind_me_entity` | Look up a knowledge-graph entity by name or alias: canonical record, facts, and linked memories |
 | `remind_me_entity_traverse` | Multi-hop traversal of the typed entity-relation graph (1-3 hops, both directions, optional relation filter) — for questions that require chaining relations, not just co-mention |
 | `remind_me_feedback` | Mark a memory helpful/unhelpful for a search result — a signed signal, distinct from the always-positive reinforcement of a plain access. Without `query`: global `base_weight`/vitality adjustment. With `query`: query-contextual instead — only applies to future searches with a similar query |
@@ -338,10 +370,10 @@ The stats view replaces the main content area with summary cards, horizontal bar
 
 | Tool | Description |
 |------|-------------|
-| `remind_me_add` | Store a new memory with content, category, tags, metadata, optional SPO triple, and entity mentions |
-| `remind_me_list` | List memories with filters (category, tags, source) and pagination |
-| `remind_me_get` | Retrieve a single memory by ID |
-| `remind_me_update` | Update a memory's content, category, tags, or metadata |
+| `remind_me_add` | Store a new memory with content, category, tags, metadata, optional SPO triple, entity mentions, and optional `sensitive` flag — see [Sensitive Memories](#sensitive-memories) |
+| `remind_me_list` | List memories with filters (category, tags, source), pagination, and opt-in `include_sensitive` |
+| `remind_me_get` | Retrieve a single memory by ID — always returns it, even if marked sensitive (a direct id lookup isn't "surfacing by default") |
+| `remind_me_update` | Update a memory's content, category, tags, metadata, or `sensitive` flag |
 | `remind_me_delete` | Permanently delete a memory |
 | `remind_me_history` | List a memory's prior content revisions, newest first — see [Edit History](#edit-history) |
 | `remind_me_revert` | Restore a memory to a prior revision — see [Edit History](#edit-history) |
@@ -353,6 +385,15 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_set_reminder` | Set a future `remind_at` timestamp on an existing memory, or clear one already set (omit/null `remind_at`) — must be a valid ISO-8601 timestamp in the future |
 | `remind_me_list_reminders` | List memories with a set reminder: `upcoming` (still in the future), `overdue` (due but not yet delivered — e.g. the server was offline), or `all` |
 | `remind_me_digest` | Summarize recent additions, vault vitality, reminders, and sync health in one read — see [Digest](#digest) |
+
+### Saved Searches
+
+| Tool | Description |
+|------|-------------|
+| `remind_me_save_search` | Save a named, replayable `remind_me_search` query (`query`, `category`, `tags`, `include_sensitive`, `watch`). Saving again with an existing name updates it in place — see [Saved Searches](#saved-searches) |
+| `remind_me_list_saved_searches` | List every saved search with its query, filters, and watch status |
+| `remind_me_run_saved_search` | Re-run a saved search's stored query/filters — identical output to calling `remind_me_search` with those params |
+| `remind_me_delete_saved_search` | Delete a saved search by name |
 
 ### Capture & decomposition
 
@@ -384,6 +425,8 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_vitality_report` | Generate vault health metrics with decay and vitality scores |
 | `remind_me_reclassify` | Apply a memory type classification to a single memory |
 | `remind_me_reclassify_batch` | Fetch unclassified memories for batch classification |
+| `remind_me_recalibrate_candidates` | Fetch old, high-importance memories that have never received a feedback signal, for review — pairs with `remind_me_reclassify`/`remind_me_reclassify_batch` (the apply half) and `remind_me_feedback` (a pure importance nudge); no separate apply tool |
+| `remind_me_contradiction_candidates` | Fetch bounded pairs of memories sharing an entity that might conflict but weren't caught by structured-triple supersession, for review — pairs with `remind_me_update`/`remind_me_delete`/`remind_me_add` (the apply half); no separate apply tool |
 | `remind_me_consolidate` | Find semantically similar memories, preview clusters (dry_run=true), and merge duplicates using an LLM-authored `summaries` entry per cluster (dry_run=false) — a cluster with no matching summary is skipped, not merged with a raw concatenation |
 
 ### LLM Wiki
@@ -402,8 +445,8 @@ The stats view replaces the main content area with summary cards, horizontal bar
 
 | Tool | Description |
 |------|-------------|
-| `remind_me_import_chat` | Import a single chat export, document, PDF, or image file (`kind`: auto/chat/document/pdf/image) |
-| `remind_me_import_directory` | Bulk import all exports/documents/PDFs/images from a directory |
+| `remind_me_import_chat` | Import a single chat export, document, PDF, image, or audio file (`kind`: auto/chat/document/pdf/image/audio/readwise/obsidian) |
+| `remind_me_import_directory` | Bulk import all exports/documents/PDFs/images/audio from a directory |
 | `remind_me_import_mempalace` | Bulk-import memories from a MemPalace ChromaDB store, one page at a time (requires the optional `mempalace` extra) |
 | `remind_me_import_dbs` | Bulk-import memories from a [dbs](https://github.com/baileyrd/daily-backup-system) SQLite store, one page at a time — source and tags land as knowledge-graph entities, not flattened prose |
 | `remind_me_list_connectors` | List every registered import connector (built-in and third-party) and which are valid `remind_me_import_chat` kinds |
@@ -419,7 +462,7 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_check_update` | Check if a newer version is available on origin/main |
 | `remind_me_self_update` | Pull latest changes from origin and reinstall the package |
 
-49 tools + 6 prompts + 4 resources (`memory://stats`, `memory://categories`, `wiki://schema`, `wiki://index`).
+51 tools + 8 prompts + 4 resources (`memory://stats`, `memory://categories`, `wiki://schema`, `wiki://index`).
 
 ### Prompts: the maintenance loops as one-shot workflows
 
@@ -433,6 +476,8 @@ Every LLM-driven maintenance workflow is a *sequence* — a batch tool surfaces 
 | `classify_memories` | `remind_me_reclassify_batch` → `remind_me_reclassify` |
 | `compile_wiki` | `remind_me_wiki_compile` → `remind_me_wiki_write` ×N → `mark_integrated=true` |
 | `consolidate_duplicates` | `remind_me_consolidate` dry run → merge with LLM-authored summaries |
+| `recalibrate_importance` | `remind_me_recalibrate_candidates` → `remind_me_reclassify`/`remind_me_feedback` |
+| `review_contradictions` | `remind_me_contradiction_candidates` → `remind_me_update`/`remind_me_delete`/`remind_me_add` |
 
 Every argument is optional (batch size, similarity threshold), so invoking a prompt bare runs the loop with the tool's own defaults. The two loops whose second phase is hard to undo — `compile_wiki`'s watermark advance and `consolidate_duplicates`' merge — put the preview phase first and say why, so the destructive step is never the first thing done.
 
@@ -550,6 +595,14 @@ The embedding model (`all-MiniLM-L6-v2`, ~80MB) downloads automatically on first
 - **Graceful fallback**: if the embedding dependencies aren't installed, everything still works — you just get FTS5 keyword search only
 - **Results are labeled** with their search method: ⚡ hybrid (matched both), 🔮 semantic only, 🔤 keyword only
 
+### Language Coverage
+
+Both the default embedding model and the default reranker (see [Changing the Embedding Model](#changing-the-embedding-model) and the [`REMIND_ME_RERANK_MODEL` reference below](#environment-variables)) are optimized for specific languages, not general-purpose multilingual retrieval — worth knowing before relying on semantic search over non-English content:
+
+- **Embedding model** — the default [`sentence-transformers/all-MiniLM-L6-v2`](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) is trained and evaluated on English sentence pairs. It has no documented multilingual training data or evaluation, so semantic similarity for non-English content (or cross-lingual queries) is unreliable — expect it to behave close to random for languages it wasn't trained on. FTS5 keyword search is unaffected (it matches literal terms regardless of language), so hybrid search degrades to keyword-only quality for non-English content rather than failing outright.
+- **Reranker** — the default [`BAAI/bge-reranker-base`](https://huggingface.co/BAAI/bge-reranker-base) is a **bilingual Chinese/English** cross-encoder (it pairs with BGE's `bge-large-en-v1.5`/`bge-large-zh-v1.5` embedding models), not a general multilingual model. It reorders candidates well for English or Chinese queries; for any other language it's providing little more signal than chance. That said, reranking only ever *reorders* the existing RRF-ranked candidate list — it never filters — so a bad rerank on unsupported-language content degrades at worst to the plain RRF order, never to dropped results.
+- If your vault is primarily non-English (or mixed-language), see the multilingual embedding model recommendation below; there is currently no non-English/multilingual alternative wired up for the reranker (`REMIND_ME_RERANK=""` disables reranking entirely if it's doing more harm than good for your content).
+
 ### Scaling Semantic Search (ANN Index)
 
 By default, semantic search does an exact brute-force scan over every stored chunk vector via `sqlite-vec` — fast enough for a typical personal store, but it gets slower as the number of chunks grows (linearly with the store size). Once a store passes a size threshold, an optional HNSW approximate-nearest-neighbor index (via [`usearch`](https://github.com/unum-cloud/usearch)) takes over automatically:
@@ -585,6 +638,16 @@ This only generates embeddings for memories that don't have them yet — existin
 
 Switching `REMIND_ME_EMBEDDING_MODEL`, `REMIND_ME_EMBEDDING_DIM`, or `REMIND_ME_EMBEDDING_BACKEND` no longer requires remembering to manually reindex. The server records which model/dimension/backend produced the vectors currently stored, and detects a mismatch automatically at startup: stale vectors (and the on-disk ANN index, if built) are cleared so search never silently serves results from the wrong embedding space, and every memory falls through to the normal "missing embeddings" path — run `remind_me_reindex` to rebuild them under the new model.
 
+**Recommended override for multilingual vaults**: [`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`](https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2) — trained on parallel data for 50+ languages, widely adopted for multilingual semantic search, and a genuine drop-in: it outputs the same 384-dimensional vectors as the default model, so only `REMIND_ME_EMBEDDING_MODEL` needs to change, not `REMIND_ME_EMBEDDING_DIM`:
+
+```bash
+REMIND_ME_EMBEDDING_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+```
+
+Then run `remind_me_reindex` (the model-mismatch detection above clears stale vectors automatically). **Tradeoff, not a strict upgrade**: a multilingual model spreads its capacity across 50+ languages instead of specializing in one, so on an English-only vault it typically scores somewhat below the English-specialized `all-MiniLM-L6-v2` default — only switch if your content actually spans languages.
+
+For heavier multilingual needs (100+ languages, much longer documents, or combined dense/sparse/multi-vector retrieval), [`BAAI/bge-m3`](https://huggingface.co/BAAI/bge-m3) is a stronger option in principle, but it is **not** a same-effort drop-in with this server's ONNX loader today: the official `BAAI/bge-m3` repo doesn't publish an `onnx/model.onnx` at the path `embeddings.py`'s loader expects (only community-converted mirrors do, e.g. `aapot/bge-m3-onnx`, unverified here for correctness/currency), and it outputs 1024-dimensional vectors, so it would also need `REMIND_ME_EMBEDDING_DIM=1024`. Treat it as a "possible future option requiring more verification," not a documented recommendation like the multilingual MiniLM model above.
+
 ### Checking Status
 
 Use `remind_me_server_status` to see how many memories have embeddings and whether the model is loaded.
@@ -613,9 +676,50 @@ uv pip install "remind-me-mcp[image]"
 
 A `.png`/`.jpg`/`.jpeg` file is OCR'd via [RapidOCR](https://github.com/RapidAI/RapidOCR) into a single memory (whole image as one chunk). **Why RapidOCR over `pytesseract`:** this server already depends on `onnxruntime` for the embedder/reranker, so an ONNX-based OCR engine reuses infrastructure already present rather than adding a new runtime family — and RapidOCR's detection/recognition models ship *inside* the pip package itself, so OCR works fully offline with no HuggingFace download (unlike the embedder/reranker). `pytesseract` was considered and rejected: it additionally requires the system `tesseract` binary, which pip can't install and which isn't present in this project's CI/dev images.
 
+**Language coverage**: the connector constructs `RapidOCR()` with no arguments, so it loads the models bundled inside the `rapidocr-onnxruntime` package — the `ch_PP-OCRv4` detection and recognition models plus a `ch_ppocr_mobile_v2.0` orientation classifier. That recognition model's character set (baked into the model itself) covers **Chinese and English/Latin script + digits only**; other scripts — Japanese, Korean, Arabic, Cyrillic, Devanagari, and others — are not recognized (detection may still find text regions, but recognized characters will be garbage). If you need OCR for one of those, three optional env vars pass straight through to RapidOCR's own model-path constructor arguments, so you can point the connector at an alternate-language model downloaded separately from [RapidOCR's model zoo](https://github.com/RapidAI/RapidOCR) — unset by default, so behavior is unchanged unless you opt in:
+
+| Variable | Default | Description |
+|---|---|---|
+| `REMIND_ME_OCR_DET_MODEL_PATH` | *(unset)* | Path to an alternate ONNX text-detection model (`RapidOCR(det_model_path=...)`) |
+| `REMIND_ME_OCR_CLS_MODEL_PATH` | *(unset)* | Path to an alternate ONNX text-orientation-classification model (`RapidOCR(cls_model_path=...)`) |
+| `REMIND_ME_OCR_REC_MODEL_PATH` | *(unset)* | Path to an alternate ONNX text-recognition model (`RapidOCR(rec_model_path=...)`) — this is the one whose character set actually determines what script(s) get recognized; pair it with a matching `_DET_MODEL_PATH` if the target script needs different detection geometry |
+
 ### Without These Extras
 
 Importing a `.pdf`/image file without its extra installed returns a clear, actionable error (e.g. *"PDF import requires the 'pdf' extra: pip install remind-me-mcp[pdf]"*) — not a bare `ModuleNotFoundError` traceback. Every other import kind, and the rest of the server, is completely unaffected either way.
+
+## Audio Import
+
+A third import kind, `audio`, sits alongside `chat`/`document`/`pdf`/`image` — same `remind_me_import_chat`/`remind_me_import_directory` tools, same hash-dedup and `kind=auto` routing, one more optional extra so a base install doesn't pull in a Whisper runtime.
+
+### Enabling Audio Import
+
+```bash
+pip install faster-whisper
+# Or with uv:
+uv pip install "remind-me-mcp[audio]"
+```
+
+An `.mp3`/`.m4a`/`.wav`/`.ogg` file is transcribed via [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (a CTranslate2 re-implementation of OpenAI's Whisper) and chunked **per transcript segment** — Whisper's own sentence/phrase-level output unit — with each chunk's metadata carrying a `start`/`end` timestamp (seconds), the same role a PDF's `page` number plays. A segment too long for one memory is split further, with every resulting sub-chunk still tagged with that segment's full timestamp range.
+
+**Library choice.** This was researched and verified against real audio in a sandbox before committing to it, in order of preference:
+
+1. An ONNX-based option ([`onnx-asr`](https://github.com/istupakov/onnx-asr), which does support a Whisper model over `onnxruntime` — the same runtime this server already depends on for the embedder/reranker/OCR) was tried first, but rejected: it only accepts raw PCM WAV, with no built-in decoder for compressed containers at all — three of this feature's four required extensions (`.mp3`/`.m4a`/`.ogg`) would need a *second* new dependency just for decoding.
+2. [`pywhispercpp`](https://github.com/absadiki/pywhispercpp) (Python bindings for whisper.cpp — lighter-weight than a full CTranslate2/PyTorch runtime) was tried next. It worked fine on a plain 16kHz WAV, but failed reproducibly on `.mp3`: it shells out to a **system** `ffmpeg` binary for anything other than 16kHz mono WAV, and a sandbox with no `ffmpeg` installed hit `Exception: FFMPEG is not installed or not in PATH.` — reintroducing the exact class of dependency this project's own precedent already rejected once (`pdf_import.py` chose pure-Python `pypdf` over poppler-utils; `image_import.py` chose RapidOCR over pytesseract's system `tesseract` binary).
+3. **`faster-whisper` (chosen).** Verified end-to-end with a real synthesized speech clip, including a re-encoded `.mp3` of the same clip — the exact case that eliminated pywhispercpp. It decodes every common audio container out of the box via its own bundled [PyAV](https://github.com/PyAV-Org/PyAV) (`av`) dependency, which ships a statically-linked ffmpeg build inside its own wheel — no system `ffmpeg` binary required. It also already shares three of its four dependencies (`onnxruntime`, `huggingface-hub`, `tokenizers`) with this project's own `semantic` extra.
+4. `openai-whisper` (the heavier, plain-PyTorch reference implementation) was the documented last-resort fallback; not needed since faster-whisper worked cleanly.
+
+**Model size.** Defaults to `base` (~145MB int8-quantized, ~74M parameters) — deliberately smaller than Whisper's largest (`large-v3`, ~3GB), trading some transcription accuracy for a small download and fast CPU-only inference. Consistent with this being a local-first tool's DEFAULT, not its ceiling:
+
+| Variable | Default | Description |
+|---|---|---|
+| `REMIND_ME_AUDIO_MODEL` | `base` | Whisper model size/name (`tiny`/`base`/`small`/`medium`/`large-v2`/`large-v3`/`large-v3-turbo`/`distil-*`/etc., or a full HuggingFace repo id for a custom CTranslate2-converted model) — set to `small` or larger for noticeably better accuracy if you have the CPU/RAM/disk budget, no code change needed |
+
+The model downloads from HuggingFace Hub on first use and caches under `MODEL_DIR` (the same directory the embedder/reranker cache their own models in), and runs on CPU only, matching this server's other in-process models.
+
+### Without This Extra
+
+Importing an audio file without `faster-whisper` installed returns a clear, actionable error (*"Audio import requires the 'audio' extra: pip install remind-me-mcp[audio]"*) — not a bare `ModuleNotFoundError` traceback. Every other import kind, and the rest of the server, is completely unaffected either way.
 
 ## CLI
 
@@ -648,6 +752,22 @@ For a single-user app where one SQLite file holds someone's entire memory store,
   ```
   Validates the backup (`PRAGMA integrity_check` plus a sanity check that it's actually a remind-me database) before touching anything, and snapshots the *current* database first so a bad restore is itself recoverable. Refuses to run while an MCP server is holding the lock on this database. `--restore` accepts either a bare filename (resolved against the backups directory) or a full path to any valid backup file.
 
+### Cloud Backup Upload
+
+Optional, opt-in, off by default. Setting `REMIND_ME_BACKUP_S3_BUCKET` (requires `pip install remind-me-mcp[cloud-backup]`) makes every backup `remind_me_backup` or the pre-migration snapshot writes also get uploaded to S3 or an S3-compatible bucket, as a strict post-success hook — it runs only after the local backup file is already fully written under its final name, and a failed or unconfigured cloud upload never affects the local backup, which remains the primary guarantee.
+
+- `REMIND_ME_BACKUP_S3_BUCKET` — target bucket name. Empty (default) disables cloud upload entirely.
+- `REMIND_ME_BACKUP_S3_PREFIX` — optional key prefix within the bucket (e.g. `my-host/backups`). Empty (default) uploads at the bucket root. The object key is `<prefix>/<filename>`, reusing the exact filename the local backup already has, so local and cloud backups correspond 1:1.
+- `REMIND_ME_BACKUP_S3_ENDPOINT_URL` — optional S3-compatible endpoint override, e.g. `https://s3.us-west-002.backblazeb2.com` (Backblaze B2) or `http://localhost:9000` (a self-hosted MinIO). Unset (default) means real AWS S3. `boto3`'s S3 client works against essentially any S3-compatible provider through this one setting — no per-provider integration needed.
+- `REMIND_ME_BACKUP_S3_REGION` — optional AWS region, passed through to the S3 client.
+- **Credentials are never a new env var here.** `boto3` already has its own standard credential resolution chain — `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` env vars, the shared `~/.aws/credentials` file, an EC2/ECS/Lambda instance role, and so on — and this feature relies on that chain as-is rather than inventing a parallel, bespoke `REMIND_ME_BACKUP_S3_*` secret to configure and keep safe.
+
+**The plaintext-upload gate.** Whether cloud upload is safe by default depends on [Encryption at Rest](#encryption-at-rest), below:
+- If `REMIND_ME_DB_ENCRYPTION_KEY` **is** set, the local backup file is already SQLCipher ciphertext — uploading it as-is to cloud storage is safe by default, no extra flag needed.
+- If it is **not** set, the local backup file is plaintext personal data, and uploading plaintext personal data to a third-party bucket is a real, distinct risk on top of everything else this tool already does locally. Cloud upload is refused with a clear error explaining why, unless `REMIND_ME_BACKUP_S3_ALLOW_PLAINTEXT_UPLOAD=1` is explicitly set — this needs deliberate consent, not silent default behavior.
+
+A missing `boto3` (bucket configured but the `cloud-backup` extra not installed) or any upload failure (network, credentials, wrong bucket, ...) is logged clearly and never fails the local backup that already succeeded.
+
 ## Encryption at Rest
 
 Optional, opt-in, off by default. Setting `REMIND_ME_DB_ENCRYPTION_KEY` (requires `pip install remind-me-mcp[encryption]`) encrypts `memory.db` and its backups at rest via [SQLCipher](https://www.zetetic.net/sqlcipher/). Not for every user or install — see [ARCHITECTURE.md's "Encryption at rest" design note](ARCHITECTURE.md#encryption-at-rest-is-opt-in-not-default-issue-184) for the full rationale, what is and isn't covered, and the v1 adoption story (encryption must be enabled before an install's first run; there's no in-place re-encryption of an existing plaintext database yet).
@@ -660,12 +780,14 @@ The import tools (`remind_me_import_chat`, `remind_me_import_directory`, `POST /
 
 | Kind | Behavior |
 |------|----------|
-| `auto` *(default)* | `.json`/`.jsonl` always parse as chat. `.pdf` always parses as pdf; `.png`/`.jpg`/`.jpeg` always parses as image. `.md`/`.markdown`/`.txt` are content-sniffed: files with chat role markers (`**User:**`, `## Assistant`, …) import as chat, everything else as a document. **Never** resolves to `readwise` — see below |
+| `auto` *(default)* | `.json`/`.jsonl` always parse as chat. `.pdf` always parses as pdf; `.png`/`.jpg`/`.jpeg` always parses as image; `.mp3`/`.m4a`/`.wav`/`.ogg` always parses as audio. `.md`/`.markdown`/`.txt` are content-sniffed: files with chat role markers (`**User:**`, `## Assistant`, …) import as chat, everything else as a document. **Never** resolves to `readwise` by content sniffing — see below. **Does** resolve to `obsidian` for a `.md`/`.markdown` file inside a detected Obsidian vault (directory context, not content sniffing) — see [Importing from Obsidian](#importing-from-obsidian) |
 | `chat` | Force the chat-export parser (chunked per-message) |
 | `document` | Force document chunking (`.md`/`.markdown`/`.txt` only) |
 | `pdf` | Force per-page PDF chunking (`.pdf` only; requires the optional `pdf` extra) — see [PDF and Image Import](#pdf-and-image-import) |
 | `image` | Force OCR of an image into a single memory (`.png`/`.jpg`/`.jpeg` only; requires the optional `image` extra) — see [PDF and Image Import](#pdf-and-image-import) |
+| `audio` | Force per-segment transcription of an audio file (`.mp3`/`.m4a`/`.wav`/`.ogg` only; requires the optional `audio` extra) — see [Audio Import](#audio-import) |
 | `readwise` | Force a Readwise "Export" JSON file into one memory per highlight (`.json` only, must be requested explicitly — never chosen by `auto`) — see [Importing from Readwise](#importing-from-readwise) |
+| `obsidian` | Force frontmatter/wikilink/inline-`#tag`-aware Markdown import (`.md`/`.markdown` only) — see [Importing from Obsidian](#importing-from-obsidian) |
 
 Document imports chunk Markdown per-section (the heading context is kept with each chunk and stored in metadata) and plain text per-paragraph. They get `source: document_import` and default to category `document`.
 
@@ -673,7 +795,7 @@ Imports are restricted to paths inside `REMIND_ME_IMPORT_ROOTS` (default: your h
 
 ### Pluggable Connectors
 
-Every import kind — including the built-in `chat`, `document`, `pdf`, `image`, and `readwise` — is a plain parser function registered by kind string in `remind_me_mcp/importer.py`, not a hardcoded dispatch. `remind_me_import_chat`/`remind_me_import_directory`/`POST /api/import` resolve the effective kind (by extension, or by content-sniffing for `auto`, or by whatever the caller forced) and then look it up in one registry. A third-party module can register more kinds **without touching `importer.py` at all** — this is the whole point of the registry, and it's meant to be actually used by someone outside this codebase, not just an internal implementation detail. What follows is the contract, not just a pointer to source.
+Every import kind — including the built-in `chat`, `document`, `pdf`, `image`, `readwise`, and `obsidian` — is a plain parser function registered by kind string in `remind_me_mcp/importer.py`, not a hardcoded dispatch. `remind_me_import_chat`/`remind_me_import_directory`/`POST /api/import` resolve the effective kind (by extension, or by content-sniffing for `auto`, or by whatever the caller forced) and then look it up in one registry. A third-party module can register more kinds **without touching `importer.py` at all** — this is the whole point of the registry, and it's meant to be actually used by someone outside this codebase, not just an internal implementation detail. What follows is the contract, not just a pointer to source.
 
 **Registering a connector.** Call `register_connector(kind, parser)` at import time (module-level, right after defining `parser` — see every built-in below):
 
@@ -696,6 +818,7 @@ register_connector("my_kind", my_connector)
 **Reference implementations**, roughly in order of how much of the shared pipeline they use:
 
 - `remind_me_mcp/readwise_import.py` — the fullest example of "just implement the parser": turns a Readwise export into one `(highlight_text[+note], {book/author/... metadata})` pair per highlight, and nothing else — dedup, chunking, and embedding are entirely `_ingest_parsed`'s job. Also the best example of *deliberately not* joining `kind="auto"`'s content-sniffing (documented in its own module docstring) when a format shares a suffix with an existing kind and can't be told apart reliably.
+- `remind_me_mcp/obsidian_import.py` — the best example of a connector *wrapping* another connector's chunker (`_parse_document`) instead of reimplementing chunking, and of the two reserved chunk-metadata keys, `extra_tags`/`mention_entities`, that let a connector hook into tag/entity handling generically rather than duplicating it. Also the reference for reaching `kind="auto"` through *directory* context (`config.resolve_import_kind`) instead of content-sniffing when content-sniffing alone would be unreliable.
 - `remind_me_mcp/dbs_import.py` — a connector registered purely for discovery (`remind_me_list_connectors`), with its own dedicated tool (`remind_me_import_dbs`) and bespoke per-item dedup/supersession loop, because dbs items arrive individually from a live SQLite read rather than as one file. Read this one if your source is a live store you'd page through, not a static export file.
 - `remind_me_mcp/mempalace_import.py` — the same discovery-only pattern as `dbs_import.py`, for a ChromaDB-backed store.
 
@@ -730,6 +853,24 @@ Use remind_me_import_chat with:
 - **A highlight's own note is appended to its content**, not discarded — `"{highlight text}\n\nNote: {your note}"` — since the note is often the actual reason you highlighted the passage, and only memory content participates in full-text search.
 - Same hash-based dedup, chunking, and embedding as every other import kind (it flows through the same shared pipeline) — re-importing the same export file is a no-op.
 
+### Importing from Obsidian
+
+An [Obsidian](https://obsidian.md) vault is just a directory of Markdown files, so it works with the same watched-folder/bulk-directory-import machinery every other document import uses — the `obsidian` kind adds understanding of Obsidian's own conventions on top:
+
+```
+Use remind_me_import_directory with:
+  directory: ~/Documents/MyVault
+```
+
+That's it — **no `kind` argument needed**. `remind_me_import_directory` (and the folder watcher, if you point `REMIND_ME_WATCH_DIRS` at the vault instead) auto-detects the vault by the `.obsidian/` directory Obsidian itself already creates at the vault's root, and imports every `.md`/`.markdown` file with the `obsidian` kind automatically. You can also force it explicitly on a single file (`kind: obsidian`) for a note outside any detected vault.
+
+- **YAML frontmatter.** A leading ```---\n...\n---``` block's `tags:` field (list or a single comma-separated string) becomes memory tags; every other field lands under `metadata.obsidian_frontmatter`. Frontmatter this codebase's parser can't represent (nested/flow mappings, anchors, block scalars — real Obsidian frontmatter is almost always flatter than this) degrades to "skip frontmatter, ingest the body" rather than crashing; the delimited block is still stripped from the stored content either way.
+- **`[[Wikilinks]]`.** `[[Note]]`, `[[Note|Display Text]]`, and `[[Note#Heading]]` are all recognized. Each resolves to a knowledge-graph entity for the linked note's *title* — created or matched via the same entity-upsert machinery `remind_me_entity`/FT-04 already use — and the memory is linked to it as a mention, so `remind_me_entity`/`remind_me_search`'s `entity:"..."` syntax can find it. A link to a note title that hasn't been imported yet (or never will be) still resolves — order doesn't matter. **v1 limitation**: the `#Heading`/`^block-id` anchor is stripped, not tracked — `[[Note#Overview]]` resolves to the same entity a plain `[[Note]]` would, not to a specific section.
+- **Inline `#tags`.** Distinct from a Markdown heading (`# Heading` has a space after the `#`; a tag doesn't) and from a wikilink's own heading anchor. Extracted from the body and merged into the memory's tags, deduplicated (case-insensitively) against frontmatter tags. A `#tag` inside a fenced code block or an inline code span is never mistaken for a real tag.
+- **Why frontmatter parsing is hand-rolled, not `pyyaml`.** `pyyaml` isn't a direct, always-installed dependency of this project's base install (it only shows up transitively through optional extras like `semantic`/`image`), and this codebase consistently prefers hand-rolling small, bounded formats over adding a dependency for them (`rate_limit.py`, `telemetry.py`, `metrics.py`'s Prometheus exposition format). Real Obsidian frontmatter is overwhelmingly flat `key: value`/`key: [list]`/block-list shapes, which the built-in parser covers directly.
+- **Why a separate `obsidian` kind, not a `document` enhancement.** Keeping it a distinct kind (mirroring `pdf`/`image`/`readwise`) means an ordinary, non-Obsidian Markdown `document` import is completely unaffected. Chunking itself isn't reimplemented — the connector strips frontmatter and hands the body to the same per-section chunker `document` uses.
+- **`.obsidian/` is never scanned for content.** It's Obsidian's own internal config folder (plugin settings, workspace state) — the folder watcher's existing hidden-directory skip already excludes it, same as any other dot-directory.
+
 ### Claude Export Format
 
 Export your Claude conversations from claude.ai (Settings → Export Data), then:
@@ -758,6 +899,7 @@ Use remind_me_import_directory with:
 - **Markdown**: Chat exports (headings or bold markers for roles: `## Human`, `**Assistant:**`, …) or plain notes (imported as documents)
 - **Plain text** (`.txt`): imported as documents, chunked per-paragraph
 - **Readwise export** (`.json`, `kind=readwise` required — see [Importing from Readwise](#importing-from-readwise)): one memory per highlight
+- **Obsidian vault notes** (`.md`/`.markdown`, `kind=obsidian` — auto-detected for a `.obsidian/`-marked directory, see [Importing from Obsidian](#importing-from-obsidian)): frontmatter tags, `[[wikilinks]]` resolved to entities, and inline `#tags`, chunked per-section like `document`
 
 ## Exporting & Backup
 
@@ -793,6 +935,7 @@ $env:REMIND_ME_WATCH_DIRS = "C:\notes;C:\Downloads\exports"
 - **Changed files supersede** — a changed file has a new hash, so it imports fresh; the watcher then marks every memory from the file's previous import as superseded (`superseded_by` = the new import id). Stale chunks drop out of search results (which filter `superseded_by IS NULL`) but remain in the database for audit.
 - **Status** — the `remind_me_watch_status` tool reports watched dirs, scan counters, ingest/skip/supersede counts, and recent errors; `remind_me_server_status` includes a watcher summary too.
 - **Wiki is downstream, not automatic** — the watcher feeds the **memory store**, not the wiki. Synthesis into wiki pages is a separate LLM-driven step (`remind_me_wiki_compile`). So both status tools also report `pending_wiki_compile` — the count of non-superseded memories created since the last compile watermark — as a nudge that newly ingested files are waiting to be folded into the wiki.
+- **Obsidian vaults auto-detect, no extra config** — if a watched directory (or any of its ancestors, bounded by `REMIND_ME_IMPORT_ROOTS`) contains a `.obsidian/` directory, the watcher treats it as an Obsidian vault: every `.md`/`.markdown` file is imported with the frontmatter/wikilink/inline-`#tag`-aware `obsidian` kind instead of plain `document` — see [Importing from Obsidian](#importing-from-obsidian). `.obsidian/` itself (Obsidian's internal plugin-settings/workspace-state folder, never real notes) is never scanned — it's excluded by the same dot-directory skip that already keeps any hidden folder out of the watcher's scans.
 - **Example upstream feed** — [dbs](https://github.com/baileyrd/daily-backup-system) (a personal-data archiver for Reddit/YouTube/Raindrop/etc.) can write one Markdown note per backed-up item straight into a watched directory via `dbs export-notes --out-dir DIR`, incrementally, after each `dbs backup`. See [docs/dbs-integration-review-2026-07-21.md](docs/dbs-integration-review-2026-07-21.md) for the full setup and rationale.
 
 ## Push/Webhook Ingestion
@@ -833,6 +976,20 @@ REMIND_ME_OTEL_ENABLED=1 REMIND_ME_OTEL_ENDPOINT=http://localhost:4318/v1/traces
 - **Graceful degradation** — if `REMIND_ME_OTEL_ENABLED=1` is set but the `otel` extra isn't installed (or setup fails for any other reason), tracing silently no-ops after a one-time warning in the log — it can never break the server it's observing.
 - **Status** — `remind_me_server_status` reports whether tracing is enabled and actually active.
 
+## Metrics
+
+Off by default, same posture as OTel tracing above — this is instrumentation surface, not a core feature. Set `REMIND_ME_METRICS_ENABLED=1` and a Prometheus scrape target appears at `GET /metrics` on the dashboard server (`--serve-ui`):
+
+```bash
+REMIND_ME_METRICS_ENABLED=1 remind-me-mcp --serve-ui
+curl http://127.0.0.1:5199/metrics
+```
+
+- **What's exposed** — `remind_me_tool_calls_total{tool="..."}` and `remind_me_tool_call_duration_seconds_sum`/`_count{tool="..."}` (call count and total latency per MCP tool, from the single `_TracedFastMCP.call_tool` dispatch choke point already used for OTel/the watchdog); `remind_me_search_tier_results_total{tier="keyword"|"semantic"|"hybrid"}` (cumulative `remind_me_search` result counts by ranking tier); `remind_me_rate_limit_rejections_total` (requests rejected by the #183 rate limiter, from `RateLimiter.hit()`'s own rejection path); plus two gauges computed fresh on every scrape rather than tracked as counters — `remind_me_memories_total` and, when sync is configured, `remind_me_sync_outbox_pending`.
+- **No new dependency** — the Prometheus text exposition format is hand-rolled in `remind_me_mcp/metrics.py` (a few dozen lines of `# HELP`/`# TYPE`/`name{labels} value` formatting) rather than adding the `prometheus_client` package, consistent with this codebase's general bias toward minimal dependencies. Thread-safe counter increments use the same single-`threading.Lock`-around-a-plain-dict approach `rate_limit.py` already established for an identical concurrency requirement.
+- **Auth stance: unauthenticated, gated on the enable flag instead.** `GET /metrics` sits outside `BearerAuthMiddleware`'s `/api/` prefix — the same posture as `/health` (SE-04) — because Prometheus scrape configs typically send no custom headers, and the endpoint is already opt-in at the config level. **This means anyone who can reach the dashboard port can see tool-call and search-volume patterns while it's enabled** — firewall the port or put a reverse proxy with its own auth in front of it if that's a concern on your network, the same mitigation already documented for the peer sync server's default bind and the reminders ICS feed above.
+- **Disabled behavior** — `GET /metrics` returns a plain `404` while `REMIND_ME_METRICS_ENABLED` is unset, not an empty-but-200 body.
+
 ## Entity Knowledge Graph
 
 Memories can carry a structured **subject/predicate/object triple** plus links to **entities** (people, projects, tools, places, orgs — each with a kind and aliases). The graph builds up through normal use:
@@ -867,7 +1024,18 @@ The dashboard's **Entities** view is a human-facing browser for the graph: a cli
 
 Supersession previously only happened via similarity-merge (`remind_me_consolidate`) — near-duplicate memories get merged. That misses a genuine contradiction: "I moved to Boston" doesn't textually resemble "I live in Seattle," even though they're in direct conflict. Whenever an SPO triple is written (`remind_me_add`, `remind_me_decompose`, `remind_me_annotate`), any other non-superseded, non-deleted memory sharing the same **subject + predicate** but a **different object** is automatically superseded — the same `superseded_by` mechanism, so every existing superseded-exclusion read path (search, list, entity lookups) picks it up for free.
 
-This is deliberately narrow: a differently-worded predicate never contradicts, e.g. "I *live in* Seattle" and "I *visited* Boston" don't collide, since they don't share a predicate — the caller (an LLM choosing predicate names) controls specificity, not this check. It's a cheap, deterministic first pass over the existing SPO columns; an LLM-based contradiction check is a possible later enhancement if this proves too narrow in practice.
+This is deliberately narrow: a differently-worded predicate never contradicts, e.g. "I *live in* Seattle" and "I *visited* Boston" don't collide, since they don't share a predicate — the caller (an LLM choosing predicate names) controls specificity, not this check. It's a cheap, deterministic first pass over the existing SPO columns.
+
+**The free-text gap (issue #201).** The mechanism above only fires on exact structured-triple matches — it says nothing about two pieces of free-text prose that conflict without ever being decomposed into a shared subject/predicate ("I moved to Boston last month" vs. "My apartment in Seattle has great light" as two unstructured memories). `remind_me_contradiction_candidates` (`limit`, default 20) closes that gap the same read-only, Claude-judged way [Importance Recalibration](#importance-recalibration-issue-200) closes its own gap: it surfaces bounded PAIRS of memories using a deterministic heuristic, and the calling Claude session judges whether a given pair actually conflicts — no LLM call happens inside the server, and nothing is auto-superseded by this tool.
+
+The comparison space is bounded two ways, so this never becomes an all-pairs O(n²) scan of the vault:
+
+1. **Shared entity.** Both memories in a pair must mention at least one common entity in the entity graph (FT-04, the same graph `remind_me_entity` traverses) — two memories that share no entity are extremely unlikely to be a direct contradiction.
+2. **Not already covered.** Pairs that would already auto-supersede via the exact subject+predicate mechanism above are excluded — a genuinely covered pair can't actually coexist as two live (non-superseded) memories by the time both would be visible, since the write path already resolved it.
+
+Each candidate pair carries both memories' content snippets, category, `memory_type`, any SPO triple, and the shared entity name(s), so the calling session has enough context to judge. This surfaces pairs that MIGHT conflict, not pairs that ARE confirmed contradictions — prose comparison is inherently less certain than exact triple matching. There is deliberately no third "apply"/"resolve" tool: once a genuine contradiction is confirmed, use the EXISTING `remind_me_update` (correct the stale memory in place), `remind_me_delete` (remove it), or `remind_me_add` with an explicit SPO triple (which also lets the exact-triple mechanism catch any future conflict on the same claim automatically). A matching `review_contradictions` prompt drives the loop end to end.
+
+Architectural note, same correction as #200's: the issue's literal text proposed a scheduler-hosted LLM pass; this server has no in-server LLM dependency and never calls an LLM API itself, so this is built as the two-phase, on-demand pattern instead. A `contradiction_candidates` queue joins [Maintenance Nudges](#maintenance-nudges) using the same deterministic pairing query, so a growing backlog surfaces the same way every other maintenance queue does.
 
 ### Sync & export
 
@@ -941,6 +1109,21 @@ Two wiring points, both optional in the sense that they're no-ops with nothing c
 
 Deliberately *not* wired into `remind_me_server_status`'s maintenance-backlog nudges or the feedback hint — those are in-band by design (surfaced only inside a live tool response), not outbound alerts.
 
+### Automation event stream vs. notifications — which one do I want?
+
+`REMIND_ME_NOTIFY_WEBHOOK_URL` (above) and `REMIND_ME_EVENT_WEBHOOK_URL` (issue #198) both POST JSON to a webhook, but they answer different questions and are configured, and fire, independently:
+
+| | `REMIND_ME_NOTIFY_WEBHOOK_URL` | `REMIND_ME_EVENT_WEBHOOK_URL` |
+|---|---|---|
+| **For** | A human, on their phone/Slack/ntfy | An automation consumer — a relay, a second indexer, an audit log |
+| **Fires on** | A fired reminder; a *faulted* sync verdict | Every `remind_me_add` / `remind_me_update` / `remind_me_delete` call (and their REST equivalents) |
+| **Throttling** | Sync faults throttled to one per `REMIND_ME_NOTIFY_SYNC_FAULT_INTERVAL` (default 1800s) | None — every qualifying mutation fires, since a raw event stream needs completeness, not alert-fatigue protection |
+| **Payload** | `{"subject": ..., "body": ..., "source": "remind-me"}` — body is human-readable text, e.g. a reminder's own content | `{"event": "created"\|"updated"\|"deleted", "memory_id": ..., "category": ..., "timestamp": ...}` — metadata only, **never memory content** |
+
+If you want "ping me when something's due," use `REMIND_ME_NOTIFY_WEBHOOK_URL`. If you want "tell my other system every time a memory changes," use `REMIND_ME_EVENT_WEBHOOK_URL`.
+
+`remind_me_mcp.events.emit_event()` fires the POST as a held-reference fire-and-forget background task (same PF-04 discipline as the tools package's own background embedding tasks — see `BACKLOG.md`), bounded by `REMIND_ME_EVENT_WEBHOOK_TIMEOUT` (default 5s, mirroring `REMIND_ME_NOTIFY_WEBHOOK_TIMEOUT`), and never raises into the calling tool/API path on failure. `remind_me_set_reminder` and `remind_me_revert` deliberately do **not** fire an `updated` event even though both funnel through the same internal `_apply_memory_field_update` helper `remind_me_update` uses — a reminder set/clear touches no content field at all, and a revert is its own distinct, separately-documented operation (see [Edit History](#edit-history)); only genuine `remind_me_add`/`remind_me_update`/`remind_me_delete` (and `api_add`/`api_update`/`api_delete`) calls emit an event.
+
 ## Edit History
 
 `remind_me_update` overwrites a memory's content/category/tags/metadata in place — issue #187 gives it the same "don't lose data on a destructive-looking operation" treatment [deletion already gets](#deletion-propagates-too) from `deleted_at` tombstones, applied to edits instead of deletes.
@@ -952,6 +1135,17 @@ Deliberately *not* wired into `remind_me_server_status`'s maintenance-backlog nu
 - **Scope: content fields only.** What's tracked is exactly what `remind_me_update` can change (`content`, `category`, `tags`, `metadata`) — not `remind_at` or the vitality/classification columns. `remind_me_set_reminder` happens to funnel through the same shared internal update helper, but since it only ever touches `remind_at`, it never produces a revision.
 - **Local only, never synced** — like `reminder_deliveries` and the wiki index tables, `memory_revisions` carries no sync outbox trigger. Edit history is per-device audit trail, not a replicated entity; a revert on one device does not (yet) merge with another device's edit history for the same memory.
 - **Retention** — `REMIND_ME_REVISION_RETENTION_DAYS` (default 90) bounds how far back `remind_me_revert` can reach. Old revisions are pruned by the always-on reminder-scheduler loop (not the sync loop — revisions accumulate regardless of whether sync is configured at all).
+
+## Sensitive Memories
+
+`sensitive: bool = False` on `remind_me_add`/`remind_me_update` (and their REST equivalents) marks a memory as one that shouldn't surface in ambient/passive reads by default (issue #195).
+
+- **This is NOT access control.** remind_me is local-first and single-user (see [Design Scope](#design-scope)) — anyone with access to the SQLite database file already sees every row in it regardless of this flag. `sensitive` only reduces *accidental* exposure — a memory about something you'd rather not have pop up in an ordinary search or a scheduled digest, not a memory you need cryptographically hidden from other people. Real secrecy from other people requires filesystem/OS-level access control on the database file (or [encryption at rest](#encryption-at-rest)), not this flag.
+- **Excluded by default from:** `remind_me_search`, `remind_me_list`, `GET /api/memories`, `GET /api/memories/search` — each gained a matching `include_sensitive: bool = False` opt-in for the (rarer) case where you actually want to see sensitive results, e.g. because the question is specifically about that content.
+- **Always excluded, no opt-in, from:** `remind_me_digest` and `remind_me_wiki_compile`'s pending-sources query. Both are ambient/passive surfaces by nature — a digest can be scheduled and pushed to a notification channel without you asking a specific question, and a wiki page is meant to be read by anyone who opens the wiki — so neither offers an escape hatch. Want to write about a sensitive topic in the wiki anyway? Call `remind_me_wiki_write` directly; nothing stops that, only *automatic* inclusion during compile.
+- **Never filtered:** `remind_me_get` (fetch by an id you already hold), `remind_me_history`, `remind_me_revert`. A direct lookup by a known id isn't "surfacing by default" — the caller already knows exactly what they're asking for.
+- **A tracked, revertable field** — like content/category/tags/metadata (see [Edit History](#edit-history) above), toggling `sensitive` via `remind_me_update` snapshots the prior value and shows up in `remind_me_history`; `remind_me_revert` restores it along with everything else a revision captures.
+- **Not yet synced across devices** — the column rides the normal write path and enters the sync outbox payload, but (mirroring `remind_at`'s own existing scope limit) the receiving side of sync does not yet apply it, so marking a memory sensitive on one device does not currently propagate to another. A reasonable follow-up, not implemented in this pass.
 
 ## Digest
 
@@ -966,6 +1160,24 @@ Deliberately *not* wired into `remind_me_server_status`'s maintenance-backlog nu
 
 - **Piggybacks on the existing reminder-poll thread** rather than a second background thread: the check is a single disabled-by-default attribute read when unset, so a zero-config server pays nothing extra per poll tick. See `remind_me_mcp/scheduler.py`'s module docstring for the full reasoning.
 - **Throttled by a persisted watermark**, not an in-memory timer — the last-sent timestamp lives in the same `sync_flags` key/value table `remind_me_mcp.sync` already uses for its own cross-restart bookkeeping (under the key `digest_last_sent_at`), so a server restart mid-interval does not immediately re-fire a digest that was already sent.
+
+## Saved Searches
+
+A saved search (issue #194) is a named, replayable `remind_me_search` call — save a query once, then either re-run it on demand or turn on background `watch` polling that notifies (see [Notifications](#notifications)) when a genuinely new memory starts matching.
+
+- **`remind_me_save_search`** — creates or updates (by name) a saved search: `name`, `query`, optional `category`/`tags` filters, `include_sensitive` (default `false`, same as `remind_me_search` — issue #195), and `watch` (default `false`). Saving again under an existing name overwrites it in place — there's no separate "toggle watch" tool; re-save with a different `watch` value to change it, the same "same name is the same thing" convention `remind_me_wiki_write` already uses for pages.
+- **`remind_me_list_saved_searches`** — lists every saved search with its query, filters, and watch status, as JSON.
+- **`remind_me_run_saved_search`** — re-runs the stored query/filters through the exact same search code `remind_me_search` itself calls, so the output is identical to calling `remind_me_search` directly with those params — it *is* that call, not a re-implementation of it.
+- **`remind_me_delete_saved_search`** — deletes a saved search by name, along with its watch-polling "already seen" state (below) so no orphaned rows are left behind.
+
+### Watch polling
+
+Setting `watch=true` has the background scheduler (the same loop [Reminders](#reminders)/[Digest](#digest) piggyback on) re-run the search every `REMIND_ME_SAVED_SEARCH_POLL_INTERVAL` seconds (default 300 — deliberately coarser than the 60s reminder poll, since a search's matching set changes far less often than a reminder's due time) and diff its results against what it matched last time.
+
+- **⚠ The first poll after turning `watch` on seeds silently — it never notifies.** Every memory the search currently matches at that moment is recorded as "already seen" without calling `notify()`. This is deliberate: if it notified on every existing match the instant you turned watch on, that would read as a flood of "new" results for memories that were never actually new — they were just never looked at through this saved search before. Only a match that shows up on a **later** poll, absent from what was seeded, is treated as genuinely new and triggers one notification (memory id + a content preview, identifying which saved search fired).
+- **No re-notification** — once a match has been notified (or seeded), it's recorded in a per-saved-search "seen" table and never fires again for that same memory, even across further polls.
+- **`watch=false` searches are never polled** — the scheduler's per-tick check is a plain `WHERE watch = 1` query, so an unwatched saved search costs nothing beyond its own row.
+- **Storage**: a dedicated `saved_search_seen_memories` table (`saved_search_id`, `memory_id`, `first_seen_at`), not a single watermark like the digest check uses — watch-polling needs a per-(search, memory) fact ("have I already notified about *this* match"), which one timestamp per search can't represent. Local-only, no sync outbox trigger, matching the precedent `reminder_deliveries`/`memory_revisions`/`analytics_snapshots` already set for per-device bookkeeping tables — see `remind_me_mcp/db.py`'s v26→v27 migration.
 
 ## Multi-Machine Sync
 
@@ -1331,6 +1543,18 @@ Every new memory used to start at a flat `base_weight=1.0` regardless of kind, s
 - An unrecognized or absent source (and `memory_type="unclassified"`) falls through to the original flat 1.0 default — this is purely additive, not a behavior change for existing content.
 - Other write paths (the chat/document importer's bulk INSERT, `mempalace`/`dbs` imports, `remind_me_normalize_apply`, the dashboard REST API) still use the flat default for now — an explicit, documented scope decision, not an oversight; extend the same `seed_base_weight()` helper (`vitality.py`) there later if it proves valuable.
 
+### Importance Recalibration (issue #200)
+
+The write-time prior above and `remind_me_feedback`'s adjustments are the only two ways `base_weight` moves — nothing periodically re-checks whether a memory's *original* importance classification has gone stale, e.g. a memory classified as a "decision" that was later reversed by a different memory, or a "fact" that's since been superseded in spirit but not via the formal triple-supersession mechanism (see [Contradiction-Based Supersession](#contradiction-based-supersession)).
+
+`remind_me_recalibrate_candidates` (`limit`, default 20) surfaces a bounded batch of candidates using a deterministic heuristic — no LLM call happens inside the server. A memory qualifies when it looks important (`base_weight >= 1.15`, matching the fact/insight write-time prior, **or** a durability-implying `memory_type` like `decision`/`fact`) yet has gone stale (no access/creation activity in the last 90 days) and has never received a `remind_me_feedback` signal — used as a proxy for "never actually reviewed," since nothing else in the schema records that. Each candidate carries its content snippet, category, `memory_type`, `base_weight`, and access history so the calling Claude session can judge whether it's still classified correctly.
+
+This is a **two-phase, Claude-driven workflow**, the same shape as `remind_me_normalize_batch`/`remind_me_normalize_apply` and `remind_me_consolidate`'s dry-run mode: the tool surfaces structured candidates, the calling agent does the actual reasoning, and — deliberately — there is no third "apply" tool. The apply half is the tools that already exist: `remind_me_reclassify`/`remind_me_reclassify_batch` for a genuine `memory_type` change, or `remind_me_feedback` (an "unhelpful"/"helpful" signal with no `query`) for a pure importance nudge with no type change. Building a redundant write path here would just duplicate reclassify's.
+
+Architectural note: the original issue proposed "a periodic (scheduler-loop-hosted) LLM-driven pass," following the pattern of the reminder/digest/analytics-snapshot scheduler loops (#186/#187/#188). This server has no in-server LLM dependency and never calls an LLM API itself — a background thread can only run deterministic code — so the scheduler-hosted framing doesn't fit here the way it does for those purely-mechanical loops. What *is* mechanical and scheduler-appropriate is the count: [Maintenance Nudges](#maintenance-nudges) gained a `recalibration_candidates` queue using this same heuristic, so a growing backlog surfaces on ordinary tool responses (once past the usual threshold) the same way every other maintenance queue already does — only the counting is deterministic background work; the judgment stays client-side, on demand.
+
+This importance-staleness gap has a free-text-prose analog: `remind_me_contradiction_candidates` surfaces entity-linked memory pairs that might conflict without ever sharing a formal SPO triple — see [Contradiction-Based Supersession](#contradiction-based-supersession) for the full writeup. Same two-phase, no-in-server-LLM shape as this section, just surfacing PAIRS instead of single memories.
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -1349,7 +1573,7 @@ Every new memory used to start at a flat `base_weight=1.0` regardless of kind, s
 | `REMIND_ME_REMOTE_HOST` | `127.0.0.1` | Host to bind the remote MCP connector (keep localhost; let the tunnel do the exposing) |
 | `REMIND_ME_REMOTE_TOKEN` | *(auto-generated)* | Connector token (doubles as the secret URL path and the OAuth owner credential). When unset, generated on first run and stored at `~/.remind-me/connector_token` (0600). Delete the file to rotate |
 | `REMIND_ME_REMOTE_ISSUER` | *(unset)* | Public HTTPS origin of the remote connector (e.g. the tunnel hostname). Setting it activates the single-user OAuth 2.1 authorization server; unset falls back to the secret-path mode with a warning |
-| `REMIND_ME_EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | HuggingFace model for semantic embeddings (ONNX backend) |
+| `REMIND_ME_EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | HuggingFace model for semantic embeddings (ONNX backend). The default is English-trained/English-optimized — see [Language Coverage](#language-coverage) for a recommended multilingual override |
 | `REMIND_ME_EMBEDDING_BACKEND` | `onnx` | Embedding backend: `onnx` (in-process) or `ollama` (local daemon) |
 | `REMIND_ME_EMBEDDING_DIM` | `384` | Embedding dimension — must match the model (nomic-embed-text=768, bge-m3=1024). Changing it requires recreating the vector table + `remind_me_reindex` |
 | `REMIND_ME_BACKUP_RETENTION_COUNT` | `10` | Number of backup files (manual + pre-migration) kept under `MEMORY_DIR/backups/`; oldest pruned after each new backup |
@@ -1384,6 +1608,7 @@ Every new memory used to start at a flat `base_weight=1.0` regardless of kind, s
 | `REMIND_ME_NOTIFY_SMTP_USE_TLS` | `true` | STARTTLS a plaintext SMTP connection before authenticating. No effect on port 465 (always implicit TLS) |
 | `REMIND_ME_NOTIFY_SYNC_FAULT_INTERVAL` | `1800` | Minimum seconds between sync-fault notifications, so a persisting `fault` verdict from `remind_me_sync_reconcile` doesn't re-alert on every call |
 | `REMIND_ME_DIGEST_INTERVAL` | *(unset)* | `daily`, `weekly`, or unset/empty to disable scheduled digest delivery via `notify()`. The on-demand `remind_me_digest` tool call always works regardless of this setting |
+| `REMIND_ME_SAVED_SEARCH_POLL_INTERVAL` | `300` | Seconds between the scheduler's poll passes checking `watch=true` saved searches for new matches — see [Saved Searches](#saved-searches). Not itself an enable switch; whether a pass does anything is gated per-search by `watch` |
 | `REMIND_ME_TOOL_PROFILE` | `full` | Advertised tool surface: `full` (48 tools, ~21k context), `standard` (30, ~14.8k — drops imports/sync/ops), or `core` (17, ~7.8k — conversational only, also hides the maintenance prompts). An unrecognised value logs a warning and falls back to `full` |
 | `REMIND_ME_MAINTENANCE_NUDGES` | `true` | Whether search/add responses may carry a maintenance-backlog nudge. Set `false` to silence them entirely |
 | `REMIND_ME_MAINTENANCE_NUDGE_INTERVAL` | `3600` | Minimum seconds between nudge *checks*. Bounds cost as well as noise — the backlog COUNTs only run when this has elapsed |
@@ -1408,8 +1633,12 @@ Every new memory used to start at a flat `base_weight=1.0` regardless of kind, s
 | `REMIND_ME_RRF_W_IDF` | `0.0` | RRF weight for the IDF signal (derived from FTS5's `bm25()` score). Off by default — set a positive value to opt in |
 | `REMIND_ME_RRF_FUSION` | `rank` | Fusion mode: `rank` (classic ordinal Reciprocal Rank Fusion) or `score` (normalized-magnitude fusion over `bm25`/semantic-distance/recency/vitality — preserves match-strength information that rank-only RRF discards). Off by default; opt in with `score` |
 | `REMIND_ME_RERANK` | `onnx` | Reranks the top search candidates with a cross-encoder (on by default — bounded to `REMIND_ME_RERANK_TOP_K` candidates, so latency is small and constant). Set to `""` to disable for latency-sensitive deployments |
-| `REMIND_ME_RERANK_MODEL` | `BAAI/bge-reranker-base` | HuggingFace cross-encoder repo (must ship `onnx/model.onnx`) |
+| `REMIND_ME_RERANK_MODEL` | `BAAI/bge-reranker-base` | HuggingFace cross-encoder repo (must ship `onnx/model.onnx`). The default is a bilingual Chinese/English model — see [Language Coverage](#language-coverage) |
 | `REMIND_ME_RERANK_TOP_K` | `20` | How many top RRF candidates the reranker rescores |
+| `REMIND_ME_OCR_DET_MODEL_PATH` | *(unset)* | Path to an alternate ONNX text-detection model for image OCR (`RapidOCR(det_model_path=...)`) — see [Enabling Image (OCR) Import](#enabling-image-ocr-import) |
+| `REMIND_ME_OCR_CLS_MODEL_PATH` | *(unset)* | Path to an alternate ONNX text-orientation-classification model for image OCR (`RapidOCR(cls_model_path=...)`) |
+| `REMIND_ME_OCR_REC_MODEL_PATH` | *(unset)* | Path to an alternate ONNX text-recognition model for image OCR (`RapidOCR(rec_model_path=...)`) — determines which script(s) OCR can actually read; the bundled default only covers Chinese + English/Latin+digits |
+| `REMIND_ME_AUDIO_MODEL` | `base` | Whisper model size/name for audio transcription (`faster-whisper`) — see [Audio Import](#audio-import) |
 | `REMIND_ME_QUERY_EXPANSION` | *(unset)* | Set to `hyde` to expand queries with a hypothetical answer passage before vector search |
 | `REMIND_ME_HYDE_MODEL` | `llama3.2` | Ollama model that writes the HyDE passage |
 | `REMIND_ME_HYDE_TIMEOUT` | `15` | Seconds to wait for HyDE generation before falling back to the plain query |
@@ -1564,7 +1793,7 @@ The server uses:
 remind_me is local-first, single-user, and MCP-native by design — some capabilities other memory/knowledge systems offer are deliberately out of scope rather than missing, because building them would work against that center. Documented here so the reasoning doesn't have to be reconstructed from a GitHub issue thread:
 
 - **Pluggable vector/graph storage backends (Neo4j, Qdrant, etc.)** — not planned. remind_me stores everything in one SQLite file (+ `sqlite-vec` for vectors) so it stays zero-ops: no second service to run, back up, or lose sync with. `storage_interfaces.py` documents the storage operations as `Protocol`s (mypy-verified against the real SQLite implementation) purely so the seam is legible if this ever changes — it ships no second backend and implies no near-term plan to build one.
-- **Multimodal ingestion (images, audio)** — deferred entirely. Ingestion, chunking, embedding, FTS5, and the wiki are all text-native end to end; images would need a second embedding pipeline, binary storage, and a UI story, none of which serve the text-first "personal memory for Claude clients" center. Revisit only if a concrete use case emerges.
+- **Multimodal *retrieval* (visual/audio search over binary content itself)** — deferred; images and audio are extracted to plain text at import time instead (OCR for images since #181, Whisper transcription for audio since #192) and flow through the exact same text-native pipeline as every other memory: chunking, FTS5, embedding, the wiki. What's deliberately still out of scope is a *second* embedding pipeline over the binary content itself (e.g. CLIP-style image embeddings, audio fingerprinting) — extract-to-text has served every concrete use case so far, so a genuinely multimodal retrieval index hasn't been justified yet. Revisit only if a concrete use case emerges that extraction-to-text can't serve.
 - **Multi-tenant / cross-agent isolation** — deferred. remind_me is explicitly single-owner by design: one OAuth owner token, one SQLite file per node. Multi-tenancy is an architecture change orthogonal to "personal memory," not a gap in the current design — worth revisiting only if the project's scope deliberately shifts toward shared/team memory infrastructure.
 - **Client SDKs beyond MCP** — no hand-written TS/Rust/etc. SDKs (maintenance surface disproportionate to a single-user local tool whose real client is Claude via MCP). Instead, the existing `GET /api/*` REST surface is published as an [OpenAPI 3.0 spec](docs/openapi.yaml) so any language can generate a thin client for free.
 - **Cloud/managed & serverless hosting** — no managed hosting product. The per-user SQLite node is designed to stay local; the one component that's natural to host centrally (the sync hub) already had a Podman quadlet deploy path, and now also has [Docker Compose, Fly.io, and Railway templates](hub/deploy/) — deliberately still self-hosted, not a one-click managed service.

@@ -43,11 +43,11 @@ from remind_me_mcp.server import mcp
 async def remind_me_history(params: RevisionHistoryInput) -> str:
     """List a memory's prior content revisions, newest first.
 
-    Each revision captures the memory's content/category/tags/metadata as
-    they were immediately *before* an edit that changed one of them —
-    plain access (search hits) and reminder-only changes never appear here,
-    only genuine content/category/tag/metadata edits (including reverts,
-    which create their own revision of the pre-revert state).
+    Each revision captures the memory's content/category/tags/metadata/
+    sensitive (issue #195) as they were immediately *before* an edit that
+    changed one of them — plain access (search hits) and reminder-only
+    changes never appear here, only genuine tracked-field edits (including
+    reverts, which create their own revision of the pre-revert state).
 
     Args:
         params (RevisionHistoryInput): The memory ID and how many revisions
@@ -87,7 +87,7 @@ async def remind_me_history(params: RevisionHistoryInput) -> str:
     },
 )
 async def remind_me_revert(params: RevertInput) -> str:
-    """Restore a memory's content/category/tags/metadata to a prior revision.
+    """Restore a memory's content/category/tags/metadata/sensitive to a prior revision.
 
     The revision id must have come from ``remind_me_history`` for this exact
     memory — reverting to a nonexistent id, or one that belongs to a
@@ -114,8 +114,8 @@ async def remind_me_revert(params: RevertInput) -> str:
         return f"Memory `{params.memory_id}` not found."
 
     rev_row = db.execute(
-        "SELECT content, category, tags, metadata, edited_at FROM memory_revisions "
-        "WHERE id = ? AND memory_id = ?",
+        "SELECT content, category, tags, metadata, sensitive, edited_at "
+        "FROM memory_revisions WHERE id = ? AND memory_id = ?",
         (params.revision_id, params.memory_id),
     ).fetchone()
     if rev_row is None:
@@ -126,11 +126,21 @@ async def remind_me_revert(params: RevertInput) -> str:
 
     content_changed = mem_row["content"] != rev_row["content"]
     reason = params.reason or f"revert to revision {params.revision_id}"
+    # A revision captured before issue #195 shipped has no sensitive value
+    # (column added nullable) -- fall back to "not sensitive" rather than
+    # write NULL into the NOT NULL memories.sensitive column.
+    rev_sensitive = rev_row["sensitive"] if rev_row["sensitive"] is not None else 0
     _pkg._apply_memory_field_update(
         db,
         params.memory_id,
-        ["content = ?", "category = ?", "tags = ?", "metadata = ?"],
-        [rev_row["content"], rev_row["category"], rev_row["tags"], rev_row["metadata"]],
+        ["content = ?", "category = ?", "tags = ?", "metadata = ?", "sensitive = ?"],
+        [
+            rev_row["content"],
+            rev_row["category"],
+            rev_row["tags"],
+            rev_row["metadata"],
+            rev_sensitive,
+        ],
         revision_reason=reason,
     )
     if content_changed:

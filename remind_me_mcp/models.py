@@ -159,6 +159,19 @@ class MemoryAddInput(BaseModel):
         description="Entities this memory mentions (FT-04 knowledge graph)",
         max_length=20,
     )
+    sensitive: bool = Field(
+        default=False,
+        description=(
+            "Mark this memory sensitive (issue #195) — a convenience flag, "
+            "NOT access control (remind_me is single-user; anyone with DB "
+            "access already sees everything). A sensitive memory is simply "
+            "kept out of remind_me_search/remind_me_list/remind_me_digest/"
+            "remind_me_wiki_compile by default, to reduce accidental "
+            "exposure in ambient surfaces. It stays fully readable via "
+            "remind_me_get and remind_me_search/remind_me_list with "
+            "include_sensitive=true."
+        ),
+    )
 
 
 class MemorySearchInput(BaseModel):
@@ -187,6 +200,15 @@ class MemorySearchInput(BaseModel):
     include_dormant: bool = Field(
         default=False,
         description="Include decayed-out memories (vitality < 0.05).",
+    )
+    include_sensitive: bool = Field(
+        default=False,
+        description=(
+            "Include memories marked sensitive (issue #195). Off by default "
+            "so a sensitive memory never surfaces in an ordinary search — "
+            "opt in explicitly when you actually need it, e.g. because the "
+            "question is specifically about that content."
+        ),
     )
     min_vitality: float = Field(
         default=0.0,
@@ -329,6 +351,15 @@ class MemoryListInput(BaseModel):
     source: str | None = Field(
         default=None, description="Filter by source (e.g., 'chat_import', 'manual')"
     )
+    include_sensitive: bool = Field(
+        default=False,
+        description=(
+            "Include memories marked sensitive (issue #195). Off by default, "
+            "same reasoning and opt-in as remind_me_search's flag of the "
+            "same name — browsing a category/tag/source slice should not "
+            "surface sensitive content any more than searching it should."
+        ),
+    )
     limit: int = Field(default=20, ge=1, le=100)
     offset: int = Field(default=0, ge=0)
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
@@ -348,6 +379,15 @@ class MemoryUpdateInput(BaseModel):
     category: str | None = Field(default=None, max_length=100)
     tags: list[str] | None = Field(default=None, max_length=20)
     metadata: dict[str, Any] | None = Field(default=None)
+    sensitive: bool | None = Field(
+        default=None,
+        description=(
+            "Set or clear this memory's sensitive flag (issue #195) — "
+            "true marks it sensitive (excluded from search/list/digest/wiki "
+            "compile by default, see remind_me_add), false clears it. Omit "
+            "to leave the current value unchanged."
+        ),
+    )
     clear_superseded: bool = Field(
         default=False,
         description=(
@@ -518,17 +558,87 @@ class DigestInput(BaseModel):
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
 
 
+# ---------------------------------------------------------------------------
+# Saved searches (issue #194)
+# ---------------------------------------------------------------------------
+
+
+class SaveSearchInput(BaseModel):
+    """Input for remind_me_save_search: create or update (by name) a saved search.
+
+    A second call with the same `name` updates the existing saved search
+    in place (query/filters/watch all overwritten with the new call's
+    values) rather than creating a duplicate -- the same "same name is the
+    same logical thing" convention `remind_me_wiki_write` already uses for
+    pages. `include_sensitive` defaults to False for consistency with
+    `remind_me_search`'s own default (issue #195) -- a saved search is just
+    a stored, replayable `remind_me_search` call, so it should not
+    surface sensitive memories by default either.
+    """
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    name: str = Field(
+        ...,
+        description="Unique name for this saved search. Saving again with the same name updates it.",
+        min_length=1,
+        max_length=200,
+    )
+    query: str = Field(
+        ...,
+        description="The search query to store and re-run, same syntax as remind_me_search's query.",
+        min_length=1,
+        max_length=500,
+    )
+    category: str | None = Field(default=None, description="Filter by category")
+    tags: list[str] | None = Field(
+        default=None, description="Filter: memory must have ALL of these tags"
+    )
+    include_sensitive: bool = Field(
+        default=False,
+        description=(
+            "Include memories marked sensitive (issue #195) when this saved "
+            "search runs or is polled. Off by default, same as remind_me_search."
+        ),
+    )
+    watch: bool = Field(
+        default=False,
+        description=(
+            "Actively poll this saved search in the background "
+            "(REMIND_ME_SAVED_SEARCH_POLL_INTERVAL seconds, default 300) and "
+            "notify (see Notifications) on genuinely new matches. The first "
+            "poll after watch is turned on seeds its 'already seen' state "
+            "from the current results WITHOUT notifying -- only a match that "
+            "appears on a LATER poll triggers a notification."
+        ),
+    )
+
+
 class ImportKind(StrEnum):
-    """How to parse an imported file (FT-02, extended by FT-19 and FT-20).
+    """How to parse an imported file (FT-02, extended by FT-19, FT-20, FT-31, FT-32).
 
     AUTO routes by extension and content sniffing: .json/.jsonl always import
     as chat; .pdf always imports as pdf; .png/.jpg/.jpeg always import as
-    image; .md/.markdown/.txt import as chat when they contain chat role
-    markers (e.g. '**User:**', '## Assistant'), otherwise as a document.
+    image; .mp3/.m4a/.wav/.ogg always import as audio; .md/.markdown/.txt
+    import as chat when they contain chat role markers (e.g. '**User:**',
+    '## Assistant'), otherwise as a document.
     READWISE (a Readwise "Export" JSON file, one memory per highlight) is
     deliberately NOT reachable through AUTO — a Readwise export and a chat
     export are both plain .json with no reliable content-sniff to tell them
     apart, so it must be requested explicitly (see readwise_import.py).
+    OBSIDIAN (frontmatter/wikilink/inline-tag-aware Markdown, one note's
+    sections chunked like a document — see obsidian_import.py) is likewise
+    never chosen by AUTO's *content* sniffing (frontmatter delimiters and
+    double-bracket text both have legitimate non-Obsidian uses), but a
+    caller that resolves the kind through
+    remind_me_mcp.config.resolve_import_kind first — as the folder watcher
+    and remind_me_import_directory both do — gets it automatically for a
+    .md/.markdown file inside a detected Obsidian vault (a `.obsidian/`
+    directory at or above the watched/imported root).
+    AUDIO (a transcribed .mp3/.m4a/.wav/.ogg file, chunked per transcript
+    segment with a start/end timestamp — see audio_import.py) IS reachable
+    through AUTO, unconditionally, like PDF/IMAGE: there is nothing to
+    content-sniff, a suffix on its list is always audio.
     """
 
     AUTO = "auto"
@@ -537,6 +647,8 @@ class ImportKind(StrEnum):
     PDF = "pdf"
     IMAGE = "image"
     READWISE = "readwise"
+    OBSIDIAN = "obsidian"
+    AUDIO = "audio"
 
 
 class ChatImportInput(BaseModel):
@@ -582,10 +694,14 @@ class ChatImportInput(BaseModel):
     kind: ImportKind = Field(
         default=ImportKind.AUTO,
         description=(
-            "How to parse the file (FT-02, extended by FT-19 and FT-20): "
+            "How to parse the file (FT-02, extended by FT-19, FT-20, FT-31, FT-32): "
             "'auto' — detect by extension/content (chat-style markdown imports "
             "as chat, notes markdown/text as a document, .pdf as pdf, "
-            "image extensions as image; never resolves to 'readwise' — see below), "
+            "image extensions as image, audio extensions as audio; never "
+            "resolves to 'readwise' by content — see below — but DOES resolve "
+            "to 'obsidian' for a .md/.markdown file inside a detected Obsidian "
+            "vault, i.e. a `.obsidian/` directory at or above an ancestor "
+            "import root), "
             "'chat' — force the chat-export parser, "
             "'document' — force per-section/paragraph document chunking "
             "(.md/.markdown/.txt only), "
@@ -596,7 +712,14 @@ class ChatImportInput(BaseModel):
             "'readwise' — force a Readwise 'Export' JSON file into one memory "
             "per highlight (.json only; must be requested explicitly — 'auto' "
             "never picks it, since a Readwise export and a chat export are both "
-            "indistinguishable-by-extension .json files)"
+            "indistinguishable-by-extension .json files), "
+            "'obsidian' — force frontmatter/wikilink/inline-#tag-aware Markdown "
+            "import (.md/.markdown only): frontmatter 'tags' and inline '#tag' "
+            "syntax become memory tags, and '[[wikilinks]]' resolve to entities "
+            "linked to the memory via the existing knowledge-graph machinery, "
+            "'audio' — force transcription of an audio file, chunked per "
+            "transcript segment with a start/end timestamp "
+            "(.mp3/.m4a/.wav/.ogg only; requires the optional 'audio' extra)"
         ),
     )
 
@@ -616,9 +739,10 @@ class ChatImportInput(BaseModel):
             raise ValueError(f"File not found: {p}")
         if p.suffix.lower() not in (
             ".json", ".jsonl", ".md", ".markdown", ".txt", ".pdf", ".png", ".jpg", ".jpeg",
+            ".mp3", ".m4a", ".wav", ".ogg",
         ):
             raise ValueError(
-                f"Unsupported file type: {p.suffix}. Use .json, .jsonl, .md, .pdf, or an image"
+                f"Unsupported file type: {p.suffix}. Use .json, .jsonl, .md, .pdf, an image, or audio"
             )
         return str(p)
 
@@ -722,10 +846,12 @@ class BulkImportDirInput(BaseModel):
     kind: ImportKind = Field(
         default=ImportKind.AUTO,
         description=(
-            "Per-file parsing mode (FT-02, extended by FT-19 and FT-20): 'auto' "
-            "(detect chat/document/pdf/image per file — never 'readwise', which "
+            "Per-file parsing mode (FT-02, extended by FT-19, FT-20, FT-31, FT-32): 'auto' "
+            "(detect chat/document/pdf/image/audio per file — never 'readwise', which "
             "must be forced explicitly and then applies to every .json file in "
-            "the directory), 'chat', 'document', 'pdf', 'image', or 'readwise'"
+            "the directory; DOES resolve to 'obsidian' per .md/.markdown file "
+            "inside a detected Obsidian vault), "
+            "'chat', 'document', 'pdf', 'image', 'readwise', 'obsidian', or 'audio'"
         ),
     )
 
@@ -1217,6 +1343,69 @@ class ConsolidateInput(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Importance recalibration models (issue #200)
+# ---------------------------------------------------------------------------
+
+
+class RecalibrateCandidatesInput(BaseModel):
+    """Input for remind_me_recalibrate_candidates: surface memories whose
+    importance classification may be stale (issue #200).
+
+    Read-only surfacing half of a two-phase, Claude-driven workflow, the
+    same shape as remind_me_normalize_batch/remind_me_reclassify_batch: this
+    tool only narrows an unbounded set down to a reviewable batch via a
+    deterministic heuristic (see maintenance.RECALIBRATION_CANDIDATE_WHERE).
+    The actual judgment happens in the calling Claude session, which then
+    applies anything that needs to change via the EXISTING
+    remind_me_reclassify/remind_me_reclassify_batch tools (or
+    remind_me_feedback for a pure importance nudge) -- there is no separate
+    "apply" tool here.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    limit: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="Number of importance-review candidates to return",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Free-text contradiction candidates (issue #201)
+# ---------------------------------------------------------------------------
+
+
+class ContradictionCandidatesInput(BaseModel):
+    """Input for remind_me_contradiction_candidates: surface pairs of memories
+    that might conflict but were never caught by structured-triple
+    supersession (issue #201).
+
+    Read-only surfacing half of the same two-phase, Claude-driven shape as
+    remind_me_recalibrate_candidates: this tool only narrows an unbounded
+    all-pairs comparison down to a reviewable batch, bounded by the entity
+    graph (pairs must share at least one linked entity) and excluding pairs
+    already resolvable by the exact subject+predicate supersession mechanism
+    (see maintenance.CONTRADICTION_CANDIDATE_PAIRS_SQL). The actual judgment
+    -- whether a given pair genuinely conflicts -- happens in the calling
+    Claude session, which then acts on a real finding with the EXISTING
+    remind_me_update/remind_me_delete tools, or by writing a superseding
+    remind_me_add with an explicit SPO triple -- there is no separate
+    "apply"/"resolve" tool here.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    limit: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="Number of candidate pairs to return",
+    )
+
+
+# ---------------------------------------------------------------------------
 # LLM Wiki models (FT-08)
 # ---------------------------------------------------------------------------
 
@@ -1423,6 +1612,7 @@ __all__ = [
     "ReminderWindow",
     "ListRemindersInput",
     "DigestInput",
+    "SaveSearchInput",
     "ImportKind",
     "ChatImportInput",
     "MemoryStatsInput",

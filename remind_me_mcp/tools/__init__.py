@@ -13,8 +13,18 @@ Formerly a single ~2000-line module; split into submodules (HY-02):
   - ``capture``   — auto_capture / get_capture / decompose(+batch)
   - ``entity``    — remind_me_entity knowledge-graph lookup (FT-04)
   - ``lifecycle`` — vitality_report / reclassify(+batch) / consolidate
+  - ``recalibrate`` — remind_me_recalibrate_candidates: surfaces stale-looking
+    high-importance memories for review, pairing with the existing
+    reclassify(+batch) tools as its "apply" half (issue #200)
+  - ``contradictions`` — remind_me_contradiction_candidates: surfaces
+    entity-linked memory pairs that might conflict but were never caught by
+    structured-triple supersession, pairing with the existing update/delete/
+    add tools as its "apply" half (issue #201)
   - ``reminders`` — remind_me_set_reminder / remind_me_list_reminders (issue #179),
     remind_me_reminders_ics_url (issue #190), remind_me_digest (issue #188)
+  - ``saved_searches`` — remind_me_save_search / remind_me_list_saved_searches /
+    remind_me_run_saved_search / remind_me_delete_saved_search, with
+    background watch-polling for new matches (issue #194)
   - ``wiki``      — LLM Wiki: page read/write/list/search/load/delete + compile (FT-08)
   - ``admin``     — stats / reindex / server_status / updates / imports / resources
   - ``prompts``   — MCP prompts driving the multi-step maintenance loops
@@ -109,13 +119,16 @@ from remind_me_mcp.tool_profiles import apply_profile as _apply_profile
 from remind_me_mcp.tools import (
     admin,
     capture,
+    contradictions,
     crud,
     entity,
     history,
     lifecycle,
     normalize,
     prompts,
+    recalibrate,
     reminders,
+    saved_searches,
     search,
     wiki,
 )
@@ -157,6 +170,7 @@ from remind_me_mcp.tools.capture import (
     remind_me_extract_batch,
     remind_me_get_capture,
 )
+from remind_me_mcp.tools.contradictions import remind_me_contradiction_candidates
 from remind_me_mcp.tools.crud import (
     _apply_memory_field_update,
     memory_add,
@@ -191,12 +205,21 @@ from remind_me_mcp.tools.prompts import (
     consolidate_duplicates,
     decompose_facts,
     normalize_imports,
+    recalibrate_importance,
+    review_contradictions,
 )
+from remind_me_mcp.tools.recalibrate import remind_me_recalibrate_candidates
 from remind_me_mcp.tools.reminders import (
     remind_me_digest,
     remind_me_list_reminders,
     remind_me_reminders_ics_url,
     remind_me_set_reminder,
+)
+from remind_me_mcp.tools.saved_searches import (
+    remind_me_delete_saved_search,
+    remind_me_list_saved_searches,
+    remind_me_run_saved_search,
+    remind_me_save_search,
 )
 from remind_me_mcp.tools.search import (
     _STRUCTURED_PATTERN,
@@ -267,6 +290,10 @@ __all__ = [
     "remind_me_list_reminders",
     "remind_me_reminders_ics_url",
     "remind_me_digest",
+    "remind_me_save_search",
+    "remind_me_list_saved_searches",
+    "remind_me_run_saved_search",
+    "remind_me_delete_saved_search",
     "memory_export",
     "memory_import_chat",
     "memory_import_directory",
@@ -298,6 +325,8 @@ __all__ = [
     "remind_me_entity",
     "remind_me_entity_traverse",
     "remind_me_consolidate",
+    "remind_me_recalibrate_candidates",
+    "remind_me_contradiction_candidates",
     "wiki_write",
     "wiki_read",
     "wiki_list",
@@ -315,4 +344,6 @@ __all__ = [
     "classify_memories",
     "compile_wiki",
     "consolidate_duplicates",
+    "recalibrate_importance",
+    "review_contradictions",
 ]

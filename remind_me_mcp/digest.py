@@ -8,7 +8,9 @@ independently:
   - **Recent additions**: a plain query over ``memories`` (created since
     ``since_days`` days ago), rendered with ``formatting._fmt_memories`` --
     the same renderer ``remind_me_list_reminders``/``remind_me_get`` use, so
-    memory blocks look identical everywhere.
+    memory blocks look identical everywhere. Sensitive memories (issue #195)
+    are always excluded here, with no override -- see
+    :func:`build_digest_data`.
   - **Vault vitality**: :func:`remind_me_mcp.vitality.build_vitality_report`,
     the exact function ``remind_me_vitality_report`` calls -- this can never
     disagree with that tool's bucket counts.
@@ -83,6 +85,12 @@ def build_digest_data(
 ) -> dict[str, Any]:
     """Assemble the digest's underlying data (JSON-serializable).
 
+    ``recent_memories``/``recent_total`` always exclude memories marked
+    sensitive (issue #195) -- unlike remind_me_search/remind_me_list, this
+    has no ``include_sensitive`` override; a digest is precisely the
+    ambient/passive surface the flag exists to keep sensitive content off
+    of by default.
+
     Args:
         db: An open SQLite connection.
         since_days: How many days back counts as "recent" for the first
@@ -99,9 +107,16 @@ def build_digest_data(
     """
     cutoff = (datetime.now(UTC) - timedelta(days=since_days)).isoformat()
 
+    # Issue #195: sensitive memories never appear in the digest, with no
+    # opt-in override (unlike remind_me_search/remind_me_list's
+    # include_sensitive) -- a digest is exactly the ambient/passive surface
+    # this "don't surface by default" convenience feature exists to protect,
+    # and it has no per-call caller intent to opt back in against (it's
+    # often delivered on a schedule to a notification channel, not read in
+    # response to a specific question).
     recent_rows = db.execute(
         """SELECT * FROM memories
-            WHERE deleted_at IS NULL AND created_at >= ?
+            WHERE deleted_at IS NULL AND sensitive = 0 AND created_at >= ?
             ORDER BY created_at DESC
             LIMIT ?""",
         (cutoff, MAX_RECENT_MEMORIES),
@@ -109,7 +124,7 @@ def build_digest_data(
     recent_memories = [_row_to_dict(r) for r in recent_rows]
 
     (recent_total,) = db.execute(
-        "SELECT COUNT(*) FROM memories WHERE deleted_at IS NULL AND created_at >= ?",
+        "SELECT COUNT(*) FROM memories WHERE deleted_at IS NULL AND sensitive = 0 AND created_at >= ?",
         (cutoff,),
     ).fetchone()
 
