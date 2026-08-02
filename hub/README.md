@@ -199,6 +199,13 @@ compare version strings — this is a diagnostic, not feature negotiation.
 
 ### Hardening
 
+- **FastAPI's interactive docs are disabled.** `/docs`, `/redoc` and
+  `/openapi.json` are ON and unauthenticated by default, and publish every
+  route — including `POST /admin/compact_tombstones`, which hard-deletes
+  rows — with full schemas to anyone who can reach the port. The app passes
+  `docs_url=None, redoc_url=None, openapi_url=None`; the wire protocol is
+  documented above instead. FastAPI's own `version=` is wired to
+  `HUB_VERSION` so nothing reports the framework's `0.1.0` placeholder.
 - **Auth comparison is byte-safe.** `_require_auth` compares UTF-8-encoded
   bytes, not `str` — `hmac.compare_digest` raises `TypeError` on a non-ASCII
   `str`, which a crafted `Authorization` header could trigger to get an

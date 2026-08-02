@@ -48,6 +48,18 @@ def _hub_version() -> str:
     raise AssertionError("hub/main.py does not define HUB_VERSION")
 
 
+def _app_call() -> str:
+    """Source of the ``FastAPI(...)`` construction."""
+    for node in ast.walk(ast.parse(_source())):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "FastAPI"
+        ):
+            return ast.unparse(node)
+    raise AssertionError("hub/main.py does not construct a FastAPI app")
+
+
 def _route_decorators(path: str) -> list[str]:
     """Source of every decorator on the handler for ``GET path``."""
     tree = ast.parse(_source())
@@ -123,6 +135,36 @@ def test_health_reports_version_without_auth() -> None:
     """
     assert "HUB_VERSION" in _route_body("/health")
     assert not any("_require_auth" in d for d in _route_decorators("/health"))
+
+
+def test_fastapi_metadata_uses_the_hub_version() -> None:
+    """FastAPI's own ``version=`` must not be left at its "0.1.0" placeholder.
+
+    Anything that reads the app's OpenAPI metadata would otherwise report a
+    version contradicting HUB_VERSION — a stale version that looks
+    authoritative, which is worse than none.
+    """
+    call = _app_call()
+    assert "version=HUB_VERSION" in call, (
+        "FastAPI(version=...) must be HUB_VERSION, not the framework default"
+    )
+
+
+def test_interactive_docs_routes_are_disabled() -> None:
+    """/docs, /redoc and /openapi.json default to ON and UNAUTHENTICATED.
+
+    Left at the default they publish every route — including
+    POST /admin/compact_tombstones, which hard-deletes rows — with full
+    schemas, to anyone who can reach the port. The hub is documented as
+    commonly fronted by a tunnel reachable from the open internet, so this
+    silently undoes the auth posture the rest of this file argues for.
+    """
+    call = _app_call()
+    for kwarg in ("docs_url=None", "redoc_url=None", "openapi_url=None"):
+        assert kwarg in call, (
+            f"FastAPI(...) must pass {kwarg}; the framework default exposes an "
+            "unauthenticated documentation surface listing every route"
+        )
 
 
 def test_public_version_carries_no_build_detail() -> None:

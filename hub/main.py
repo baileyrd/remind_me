@@ -334,7 +334,32 @@ async def _lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(lifespan=_lifespan)
+app = FastAPI(
+    title="remind-me sync hub",
+    # FastAPI's own metadata, not a second version to keep in step: the
+    # interactive docs are off below, but this is what any future OpenAPI
+    # export reports, and a placeholder "0.1.0" contradicting HUB_VERSION is
+    # exactly the sort of stale-version-that-looks-authoritative the constant
+    # exists to prevent.
+    version=HUB_VERSION,
+    lifespan=_lifespan,
+    # All three of FastAPI's documentation routes are disabled deliberately.
+    # They default to ON and UNAUTHENTICATED, which quietly undoes this file's
+    # otherwise careful auth posture: /openapi.json publishes every route --
+    # including POST /admin/compact_tombstones, which hard-deletes rows --
+    # with full request/response schemas, to anyone who can reach the port.
+    # The hub is documented as commonly fronted by a tunnel reachable from
+    # the open internet, so that is a real exposure, not a theoretical one.
+    #
+    # Disabled rather than auth-gated because nothing consumes them: the hub
+    # has exactly one client (remind_me_mcp/sync.py) against a wire protocol
+    # documented in hub/README.md. Should an interactive explorer ever be
+    # wanted, add a custom /openapi.json behind Depends(_require_auth) rather
+    # than re-enabling these.
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 
 
 # ---------------------------------------------------------------------------
