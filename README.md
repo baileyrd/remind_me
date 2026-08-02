@@ -683,6 +683,22 @@ For a single-user app where one SQLite file holds someone's entire memory store,
   ```
   Validates the backup (`PRAGMA integrity_check` plus a sanity check that it's actually a remind-me database) before touching anything, and snapshots the *current* database first so a bad restore is itself recoverable. Refuses to run while an MCP server is holding the lock on this database. `--restore` accepts either a bare filename (resolved against the backups directory) or a full path to any valid backup file.
 
+### Cloud Backup Upload
+
+Optional, opt-in, off by default. Setting `REMIND_ME_BACKUP_S3_BUCKET` (requires `pip install remind-me-mcp[cloud-backup]`) makes every backup `remind_me_backup` or the pre-migration snapshot writes also get uploaded to S3 or an S3-compatible bucket, as a strict post-success hook — it runs only after the local backup file is already fully written under its final name, and a failed or unconfigured cloud upload never affects the local backup, which remains the primary guarantee.
+
+- `REMIND_ME_BACKUP_S3_BUCKET` — target bucket name. Empty (default) disables cloud upload entirely.
+- `REMIND_ME_BACKUP_S3_PREFIX` — optional key prefix within the bucket (e.g. `my-host/backups`). Empty (default) uploads at the bucket root. The object key is `<prefix>/<filename>`, reusing the exact filename the local backup already has, so local and cloud backups correspond 1:1.
+- `REMIND_ME_BACKUP_S3_ENDPOINT_URL` — optional S3-compatible endpoint override, e.g. `https://s3.us-west-002.backblazeb2.com` (Backblaze B2) or `http://localhost:9000` (a self-hosted MinIO). Unset (default) means real AWS S3. `boto3`'s S3 client works against essentially any S3-compatible provider through this one setting — no per-provider integration needed.
+- `REMIND_ME_BACKUP_S3_REGION` — optional AWS region, passed through to the S3 client.
+- **Credentials are never a new env var here.** `boto3` already has its own standard credential resolution chain — `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` env vars, the shared `~/.aws/credentials` file, an EC2/ECS/Lambda instance role, and so on — and this feature relies on that chain as-is rather than inventing a parallel, bespoke `REMIND_ME_BACKUP_S3_*` secret to configure and keep safe.
+
+**The plaintext-upload gate.** Whether cloud upload is safe by default depends on [Encryption at Rest](#encryption-at-rest), below:
+- If `REMIND_ME_DB_ENCRYPTION_KEY` **is** set, the local backup file is already SQLCipher ciphertext — uploading it as-is to cloud storage is safe by default, no extra flag needed.
+- If it is **not** set, the local backup file is plaintext personal data, and uploading plaintext personal data to a third-party bucket is a real, distinct risk on top of everything else this tool already does locally. Cloud upload is refused with a clear error explaining why, unless `REMIND_ME_BACKUP_S3_ALLOW_PLAINTEXT_UPLOAD=1` is explicitly set — this needs deliberate consent, not silent default behavior.
+
+A missing `boto3` (bucket configured but the `cloud-backup` extra not installed) or any upload failure (network, credentials, wrong bucket, ...) is logged clearly and never fails the local backup that already succeeded.
+
 ## Encryption at Rest
 
 Optional, opt-in, off by default. Setting `REMIND_ME_DB_ENCRYPTION_KEY` (requires `pip install remind-me-mcp[encryption]`) encrypts `memory.db` and its backups at rest via [SQLCipher](https://www.zetetic.net/sqlcipher/). Not for every user or install — see [ARCHITECTURE.md's "Encryption at rest" design note](ARCHITECTURE.md#encryption-at-rest-is-opt-in-not-default-issue-184) for the full rationale, what is and isn't covered, and the v1 adoption story (encryption must be enabled before an install's first run; there's no in-place re-encryption of an existing plaintext database yet).

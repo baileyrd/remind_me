@@ -999,6 +999,11 @@ __all__ = [
     "OCR_DET_MODEL_PATH",
     "OCR_CLS_MODEL_PATH",
     "OCR_REC_MODEL_PATH",
+    "BACKUP_S3_BUCKET",
+    "BACKUP_S3_PREFIX",
+    "BACKUP_S3_ENDPOINT_URL",
+    "BACKUP_S3_REGION",
+    "BACKUP_S3_ALLOW_PLAINTEXT_UPLOAD",
 ]
 
 # ---------------------------------------------------------------------------
@@ -1032,6 +1037,59 @@ secret (so logging it once is the only way the operator ever sees it); this
 key is always user-supplied and never auto-generated or persisted by this
 module, so there is nothing here that needs announcing, only a value to
 read once per connection and pass straight to SQLCipher."""
+
+# ---------------------------------------------------------------------------
+# Cloud backup upload (issue #196)
+# ---------------------------------------------------------------------------
+
+BACKUP_S3_BUCKET = os.environ.get("REMIND_ME_BACKUP_S3_BUCKET", "")
+"""S3 (or S3-compatible) bucket name that receives a copy of every backup
+`create_backup` writes locally. Empty (default) disables cloud upload
+entirely -- gated on config presence, mirroring NOTIFY_WEBHOOK_URL/
+EVENT_WEBHOOK_URL's "a URL/bucket being set *is* the opt-in" convention.
+See remind_me_mcp/cloud_backup.py for the upload itself, which runs as a
+post-backup hook from create_backup -- strictly after the local file is
+already finalized, never a replacement for or a race with it."""
+
+BACKUP_S3_PREFIX = os.environ.get("REMIND_ME_BACKUP_S3_PREFIX", "")
+"""Optional key prefix within BACKUP_S3_BUCKET, e.g. "my-host/backups" --
+joined with the backup's own filename (the same name create_backup already
+generated locally) to form the object key, so a local backup and its cloud
+copy correspond 1:1 by name. Empty (default) uploads at the bucket root."""
+
+BACKUP_S3_ENDPOINT_URL = os.environ.get("REMIND_ME_BACKUP_S3_ENDPOINT_URL") or None
+"""Optional S3-compatible endpoint override, e.g.
+"https://s3.us-west-002.backblazeb2.com" (Backblaze B2) or
+"http://localhost:9000" (a self-hosted MinIO). Passed straight through to
+boto3.client("s3", endpoint_url=...). Unset (default) means real AWS S3 --
+boto3 resolves the endpoint itself from BACKUP_S3_REGION/its own defaults."""
+
+BACKUP_S3_REGION = os.environ.get("REMIND_ME_BACKUP_S3_REGION") or None
+"""Optional AWS region (e.g. "us-west-2"), passed through to
+boto3.client("s3", region_name=...). Unset (default) lets boto3 resolve a
+region from its own standard chain (AWS_DEFAULT_REGION, ~/.aws/config,
+etc.) -- required by some S3-compatible providers even when
+BACKUP_S3_ENDPOINT_URL is also set."""
+
+BACKUP_S3_ALLOW_PLAINTEXT_UPLOAD: bool = _env_bool(
+    "REMIND_ME_BACKUP_S3_ALLOW_PLAINTEXT_UPLOAD", False
+)
+"""Explicit opt-in required to upload a backup to cloud storage while
+DB_ENCRYPTION_KEY is unset. Off by default: with encryption unset, a local
+backup file is plaintext personal data (see ARCHITECTURE.md's "Encryption
+at rest" section), and uploading it as-is to a third-party bucket is a
+distinct, real risk this feature introduces -- it needs explicit consent,
+not silent default behavior. When DB_ENCRYPTION_KEY IS set, the local
+backup file is already ciphertext (confirmed by issue #184's own tests, see
+backup.py's module docstring), so uploading it is safe by default and this
+flag is not required in that case."""
+
+# Deliberately no REMIND_ME_BACKUP_S3_* credential env vars: boto3 already
+# has its own standard credential resolution chain (AWS_ACCESS_KEY_ID/
+# AWS_SECRET_ACCESS_KEY env vars, the shared ~/.aws/credentials file, an
+# EC2/ECS instance role, ...). Reinventing a parallel bespoke credential
+# config here would be worse, not better -- see cloud_backup.py's module
+# docstring and the README's "Backups" section for the same note.
 
 # ---------------------------------------------------------------------------
 # Sync configuration
