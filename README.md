@@ -288,6 +288,7 @@ The dashboard is powered by a REST API you can also use directly:
 |--------|----------|-------------|
 | `GET` | `/health` | Liveness probe + node role and installed version (no auth) |
 | `GET` | `/manifest.json` | PWA manifest for "Add to Home Screen" (no auth) |
+| `GET` | `/api/versions` | This node's build and, when sync is configured, the hub's — probed live, `null` when the hub can't be reached |
 | `GET` | `/api/stats` | Memory statistics, categories, tags, DB info |
 | `GET` | `/api/vitality` | Vault vitality report: active/dormant counts, health score, vitality-bucket distribution |
 | `GET` | `/api/analytics/trend` | Daily analytics-snapshot history for the dashboard's Vault Trend panel: `{snapshots: [{captured_at, total_memories, vitality_buckets, category_counts}, ...]}`, oldest first (empty array on a fresh install) |

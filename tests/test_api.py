@@ -2269,3 +2269,100 @@ def test_api_update_excludes_soft_deleted_memories(
 
     r = client.patch(f"/api/memories/{mem['id']}", json={"content": "resurrected"})
     assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# GET /api/versions (issue #211)
+# ---------------------------------------------------------------------------
+
+
+def test_versions_reports_the_node_build(client: TestClient) -> None:
+    r = client.get("/api/versions")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["version"] == __version__
+    assert body["sync_enabled"] is False
+    # Present-but-null rather than absent, so the caller indexes it
+    # unconditionally instead of branching on which fields exist.
+    assert body["hub"] is None
+
+
+def test_versions_requires_auth(client_with_auth: TestClient) -> None:
+    """The node's build is its own to publish; the hub's is another machine's.
+
+    /health stays open for the node version — this route is gated because it
+    reaches out to, and reports on, a different host.
+    """
+    assert client_with_auth.get("/api/versions").status_code == 401
+
+
+def test_versions_survives_an_unreachable_hub(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A down hub must not break the page that asks about it.
+
+    This is the failure the route is most likely to meet in practice, and the
+    dashboard renders its own chrome from the answer — so it degrades to
+    hub: null rather than a 500 or a hang.
+    """
+    import remind_me_mcp.api as api_mod
+    import remind_me_mcp.config as cfg_mod
+
+    monkeypatch.setattr(api_mod, "SYNC_ENABLED", True)
+    monkeypatch.setattr(cfg_mod, "HUB_URL", "http://127.0.0.1:1")  # nothing listens
+    monkeypatch.setattr(cfg_mod, "SYNC_SECRET", "s")
+    api_mod._hub_version_cache["at"] = 0.0  # bypass any cached probe
+
+    r = client.get("/api/versions")
+
+    assert r.status_code == 200
+    assert r.json()["hub"] is None
+    assert r.json()["sync_enabled"] is True
+
+
+def test_versions_caches_the_hub_probe(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Several open tabs refreshing shouldn't turn page loads into hub traffic."""
+    import remind_me_mcp.api as api_mod
+    import remind_me_mcp.config as cfg_mod
+
+    probes = 0
+
+    class _CountingClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, *a, **k):
+            nonlocal probes
+            probes += 1
+
+            class _R:
+                status_code = 200
+
+                @staticmethod
+                def json():
+                    return {"version": "9.9.9"}
+
+            return _R()
+
+    import httpx
+
+    monkeypatch.setattr(api_mod, "SYNC_ENABLED", True)
+    monkeypatch.setattr(cfg_mod, "HUB_URL", "http://hub.example")
+    monkeypatch.setattr(cfg_mod, "SYNC_SECRET", "s")
+    monkeypatch.setattr(httpx, "AsyncClient", _CountingClient)
+    api_mod._hub_version_cache["at"] = 0.0
+
+    first = client.get("/api/versions").json()
+    second = client.get("/api/versions").json()
+
+    assert first["hub"] == "9.9.9" == second["hub"]
+    assert probes == 1, f"expected one probe across two requests, got {probes}"
+    api_mod._hub_version_cache["at"] = 0.0  # don't leak into other tests

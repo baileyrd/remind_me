@@ -16,6 +16,7 @@ import hmac
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -234,6 +235,14 @@ class JSONContentTypeMiddleware:
 # ---------------------------------------------------------------------------
 
 
+# Hub-version probe cache for GET /api/versions (issue #211). Module-level so
+# it survives across requests; a plain dict rather than a class because the
+# GIL makes the read-check-write here effectively atomic for a value this
+# small, and a stale-by-one-request version is not worth a lock.
+_HUB_VERSION_TTL_SECONDS = 60
+_hub_version_cache: dict[str, Any] = {"at": 0.0, "value": None}
+
+
 def _build_dashboard_html() -> str:
     """Return a self-contained HTML page with the React dashboard embedded.
 
@@ -389,6 +398,65 @@ def _build_api_app() -> Starlette:
         ``tests/test_api.py``'s exact-body assertions hold this route to.
         """
         return JSONResponse({"status": "ok", "role": "node", "version": __version__})
+
+    async def api_versions(request: Request) -> JSONResponse:
+        """Which builds are on each side of sync (issue #211).
+
+        The node's own version is also on ``/health``; this route exists for
+        the hub's, which the dashboard has no other way to see.
+
+        **The hub version is probed live rather than read from
+        ``sync._remote_versions``**, which is where the X-Hub-Version response
+        hook records it. That map is populated by the sync cycle, and the sync
+        thread only starts in the MCP server's lifespan (``server.py``) -- a
+        dashboard started standalone with ``--serve-ui`` never runs one, so
+        reading it there would report ``null`` forever while looking like a
+        working feature. Asking the hub is correct regardless of which process
+        is serving this page.
+
+        Best-effort by design: a short timeout, and any failure yields
+        ``hub: null`` so the dashboard omits the line instead of rendering an
+        error into its own chrome. Cached briefly, since several open tabs
+        refreshing shouldn't turn a page load into hub traffic.
+
+        Auth-gated by the ``/api/`` prefix, unlike ``/health``: the node's
+        build is its own to publish, the hub's is another machine's.
+        """
+        payload: dict[str, Any] = {
+            "version": __version__,
+            "node_id": _config.NODE_ID or None,
+            "sync_enabled": SYNC_ENABLED,
+            "hub": None,
+        }
+        if not SYNC_ENABLED:
+            return _json_ok(payload)
+
+        now = time.monotonic()
+        if now - _hub_version_cache["at"] < _HUB_VERSION_TTL_SECONDS:
+            payload["hub"] = _hub_version_cache["value"]
+            return _json_ok(payload)
+
+        version = None
+        try:
+            import httpx
+
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    f"{_config.HUB_URL}/health",
+                    headers={"Authorization": f"Bearer {_config.SYNC_SECRET}"},
+                    timeout=3,
+                )
+                if resp.status_code == 200:
+                    body = resp.json()
+                    if isinstance(body, dict):
+                        version = body.get("version")
+        except Exception as e:  # noqa: BLE001 — a version line must never 500
+            log.debug("Hub version probe failed: %s", e)
+
+        _hub_version_cache["at"] = now
+        _hub_version_cache["value"] = version
+        payload["hub"] = version
+        return _json_ok(payload)
 
     async def metrics_endpoint(request: Request) -> Response:
         """Prometheus text-exposition metrics (issue #197).
@@ -1449,6 +1517,7 @@ def _build_api_app() -> Starlette:
         Route("/manifest.json", manifest, methods=["GET"]),
         Route("/health", health),
         Route("/metrics", metrics_endpoint, methods=["GET"]),
+        Route("/api/versions", api_versions, methods=["GET"]),
         Route("/api/stats", api_stats),
         Route("/api/vitality", api_vitality),
         Route("/api/analytics/trend", api_analytics_trend, methods=["GET"]),
