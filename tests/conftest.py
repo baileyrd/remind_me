@@ -76,6 +76,7 @@ def tmp_memory_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     mp.setattr(_pid_mod, "PID_FILE", tmp_pid)
     mp.setattr(_srv_mod, "DB_PATH", tmp_db)
     mp.setattr(_backup_mod, "BACKUP_DIR", tmp_dir / "backups")
+    mp.setattr(_backup_mod, "DB_PATH", tmp_db)
 
     yield tmp_dir
 

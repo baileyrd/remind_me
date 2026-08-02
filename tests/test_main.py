@@ -11,12 +11,15 @@ from __future__ import annotations
 
 import argparse
 import signal
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
 import remind_me_mcp.__main__ as main_mod
 import remind_me_mcp.updater as updater_mod
+
+if TYPE_CHECKING:
+    from pathlib import Path
 from remind_me_mcp.updater import UpdateResult, UpdateStatus
 
 
@@ -201,6 +204,137 @@ def test_status_stopped(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureF
     assert code == 0
     assert "Dashboard not running" in out
     assert "Database: /tmp/memory.db (missing)" in out
+
+
+# ---------------------------------------------------------------------------
+# --list-backups / --restore (issue #152)
+# ---------------------------------------------------------------------------
+
+
+def test_list_backups_prints_each_entry(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    from remind_me_mcp import backup as backup_mod
+
+    monkeypatch.setattr(
+        backup_mod,
+        "list_backups",
+        lambda: [
+            {
+                "filename": "manual-20260101T000000Z.db",
+                "path": "/backups/manual-20260101T000000Z.db",
+                "size_bytes": 2_500_000,
+                "created_at": "2026-01-01T00:00:00+00:00",
+            }
+        ],
+    )
+
+    code = _run_main_expect_exit(monkeypatch, "--list-backups")
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "manual-20260101T000000Z.db" in out
+    assert "2.5 MB" in out
+
+
+def test_list_backups_reports_none_found(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    from remind_me_mcp import backup as backup_mod
+
+    monkeypatch.setattr(backup_mod, "list_backups", lambda: [])
+
+    code = _run_main_expect_exit(monkeypatch, "--list-backups")
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "No backups found" in out
+
+
+def test_restore_without_yes_refuses_and_explains(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """--restore without --yes must not touch anything -- just explain."""
+
+
+    monkeypatch.setattr(main_mod, "_read_pid_file", lambda *a, **kw: None)
+    calls = []
+    monkeypatch.setattr(
+        "remind_me_mcp.backup.restore_backup",
+        lambda *a, **kw: calls.append((a, kw)),
+    )
+
+    code = _run_main_expect_exit(monkeypatch, "--restore", "manual-20260101.db")
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "--yes" in out
+    assert calls == []
+
+
+def test_restore_refuses_while_server_is_running(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+
+
+    monkeypatch.setattr(
+        main_mod, "_read_pid_file", lambda *a, **kw: {"pid": 4242, "started_at": "now"}
+    )
+    calls = []
+    monkeypatch.setattr(
+        "remind_me_mcp.backup.restore_backup",
+        lambda *a, **kw: calls.append((a, kw)),
+    )
+
+    code = _run_main_expect_exit(monkeypatch, "--restore", "manual-20260101.db", "--yes")
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "currently running" in out
+    assert calls == []
+
+
+def test_restore_with_yes_calls_restore_backup_and_reports_success(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, tmp_path: Path
+) -> None:
+    from remind_me_mcp import backup as backup_mod
+
+
+    monkeypatch.setattr(main_mod, "_read_pid_file", lambda *a, **kw: None)
+    monkeypatch.setattr(backup_mod, "BACKUP_DIR", tmp_path)
+    existing_backup = tmp_path / "manual-20260101.db"
+    existing_backup.touch()
+    calls = []
+
+    def fake_restore(source, **kw):
+        calls.append(source)
+        return tmp_path / "pre-restore-snapshot.db"
+
+    monkeypatch.setattr(backup_mod, "restore_backup", fake_restore)
+
+    code = _run_main_expect_exit(monkeypatch, "--restore", "manual-20260101.db", "--yes")
+    out = capsys.readouterr().out
+    assert code == 0
+    assert calls == [existing_backup]
+    assert "Restored" in out
+    assert "pre-restore-snapshot.db" in out
+
+
+def test_restore_reports_a_validation_failure_cleanly(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, tmp_path: Path
+) -> None:
+    from remind_me_mcp import backup as backup_mod
+
+
+    monkeypatch.setattr(main_mod, "_read_pid_file", lambda *a, **kw: None)
+
+    def fake_restore(source, **kw):
+        raise backup_mod.RestoreError("integrity check failed")
+
+    monkeypatch.setattr(backup_mod, "restore_backup", fake_restore)
+
+    code = _run_main_expect_exit(
+        monkeypatch, "--restore", str(tmp_path / "bad.db"), "--yes"
+    )
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "integrity check failed" in out
 
 
 # ---------------------------------------------------------------------------

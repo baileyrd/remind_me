@@ -11,6 +11,7 @@ are not installed.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Any, Literal
 
@@ -164,6 +165,15 @@ class _Embedder:
         # retried only after AVAILABILITY_FAILURE_TTL instead of on every call.
         self._deps_missing = False
         self._failed_until = 0.0
+        # issue #153: without this, two threads racing a cold _ensure_loaded()
+        # (the webhook server, folder watcher, sync thread, and every
+        # asyncio.to_thread API worker can all reach here concurrently on
+        # first use) could both pass the "not ready yet" check and both
+        # proceed to download/write the same model files under MODEL_DIR at
+        # once -- a torn/partially-written file then poisons every later
+        # load in the process, and worst case both fully load a duplicate
+        # model, doubling peak RSS for nothing.
+        self._load_lock = threading.Lock()
 
     def _ensure_loaded(self) -> None:
         """Lazily load the ONNX model and tokenizer from HuggingFace Hub.
@@ -173,9 +183,20 @@ class _Embedder:
         (network, corrupt model, ...) is only retried after
         AVAILABILITY_FAILURE_TTL seconds, so an offline machine doesn't
         re-attempt a HuggingFace download on every search.
+
+        Thread-safe (issue #153): serialized on ``_load_lock`` with a
+        double-checked ``_ready`` flag, so concurrent first-callers block on
+        one real load instead of racing separate downloads/loads.
         """
         if self._ready:
             return
+        with self._load_lock:
+            if self._ready:  # a concurrent caller may have just finished
+                return
+            self._load_locked()
+
+    def _load_locked(self) -> None:
+        """The actual load body -- always called with ``_load_lock`` held."""
         if self._deps_missing:
             raise RuntimeError("Embedding dependencies are not installed (cached failure)")
         if time.monotonic() < self._failed_until:
@@ -430,6 +451,7 @@ class OllamaEmbedder:
 # ---------------------------------------------------------------------------
 
 _embedder: _Embedder | OllamaEmbedder | None = None
+_embedder_construct_lock = threading.Lock()
 
 
 def _get_embedder() -> _Embedder | OllamaEmbedder | None:
@@ -437,10 +459,17 @@ def _get_embedder() -> _Embedder | OllamaEmbedder | None:
 
     Returns None when the backend is unavailable (missing ONNX deps, or an
     unreachable Ollama daemon), so callers degrade to FTS5 keyword search.
+
+    Constructing the singleton is locked (issue #153) so concurrent
+    first-callers share one embedder instance instead of racing separate
+    constructions -- the actual load race this matters for is inside
+    ``_Embedder._ensure_loaded()``, which has its own lock; this one just
+    keeps the module-level singleton itself from being assigned twice.
     """
     global _embedder
-    if _embedder is None:
-        _embedder = OllamaEmbedder() if EMBEDDING_BACKEND == "ollama" else _Embedder()
+    with _embedder_construct_lock:
+        if _embedder is None:
+            _embedder = OllamaEmbedder() if EMBEDDING_BACKEND == "ollama" else _Embedder()
 
     if isinstance(_embedder, OllamaEmbedder):
         return _embedder if _embedder.available else None

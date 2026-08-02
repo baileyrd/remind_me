@@ -897,6 +897,31 @@ def test_snapshot_failure_is_non_fatal(
     _maybe_snapshot_before_migration(db_conn, 5)  # must not raise
 
 
+def test_snapshot_sqlite_error_is_also_non_fatal(
+    db_conn: sqlite3.Connection, memory_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression guard for issue #151.
+
+    create_backup's db.backup() call can fail with sqlite3.OperationalError
+    ("database is locked", "disk I/O error") -- not an OSError subclass --
+    which the except clause used to miss entirely, letting a locked/read-only
+    backups dir crash server startup and contradicting this function's own
+    documented "must never block startup" guarantee.
+    """
+    import sqlite3 as sqlite3_module
+
+    from remind_me_mcp import backup as backup_mod
+
+    memory_factory(content="Has data worth protecting")
+
+    def _boom(*_a, **_kw):
+        raise sqlite3_module.OperationalError("database is locked")
+
+    monkeypatch.setattr(backup_mod, "create_backup", _boom)
+
+    _maybe_snapshot_before_migration(db_conn, 5)  # must not raise
+
+
 def test_migration_rerun_does_not_resnapshot(
     db_conn: sqlite3.Connection, memory_factory
 ) -> None:

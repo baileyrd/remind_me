@@ -367,6 +367,25 @@ def main() -> None:
         action="store_true",
         help="Pull latest changes from origin and reinstall",
     )
+    parser.add_argument(
+        "--list-backups",
+        action="store_true",
+        help="List available database backups and exit",
+    )
+    parser.add_argument(
+        "--restore",
+        metavar="BACKUP",
+        help=(
+            "Restore the database from BACKUP (a filename from --list-backups, "
+            "or a full path to any valid remind-me .db file). The server must "
+            "not be running. Requires --yes."
+        ),
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the confirmation prompt for --restore",
+    )
     args = parser.parse_args()
 
     # -- Version mode --
@@ -420,6 +439,57 @@ def main() -> None:
         print(f"Commits: {result.previous_commit} -> {result.new_commit}")
         if result.restart_required:
             print("\nRestart the MCP server for changes to take effect.")
+        sys.exit(0)
+
+    # -- List backups mode --
+    if args.list_backups:
+        from remind_me_mcp.backup import list_backups
+
+        backups = list_backups()
+        if not backups:
+            print("No backups found.")
+        else:
+            for b in backups:
+                size_mb = b["size_bytes"] / 1_000_000
+                print(f"{b['filename']}\t{size_mb:.1f} MB\t{b['created_at']}")
+        sys.exit(0)
+
+    # -- Restore mode (issue #152) --
+    if args.restore:
+        from pathlib import Path
+
+        from remind_me_mcp.backup import BACKUP_DIR, RestoreError, restore_backup
+        from remind_me_mcp.config import DB_PATH
+
+        if _read_pid_file(MCP_PID_FILE) is not None:
+            print(
+                "Error: an MCP server is currently running against this database. "
+                "Stop it first -- restoring while it's running would corrupt state "
+                "the running process still has open."
+            )
+            sys.exit(1)
+
+        # Accept either a bare filename (resolved against BACKUP_DIR, as
+        # printed by --list-backups) or a full path to any valid backup.
+        source = Path(args.restore)
+        if not source.is_absolute() and not source.exists():
+            source = BACKUP_DIR / args.restore
+
+        if not args.yes:
+            print(f"This will replace {DB_PATH} with the contents of {source}.")
+            print("The current database will be snapshotted first.")
+            print("Re-run with --yes to proceed.")
+            sys.exit(1)
+
+        try:
+            snapshot = restore_backup(source)
+        except RestoreError as e:
+            print(f"Restore failed: {e}")
+            sys.exit(1)
+
+        print(f"Restored {DB_PATH} from {source}.")
+        if snapshot is not None:
+            print(f"Pre-restore snapshot saved to {snapshot}.")
         sys.exit(0)
 
     # -- Status check mode --

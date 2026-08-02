@@ -310,7 +310,13 @@ def _maybe_snapshot_before_migration(db: sqlite3.Connection, current_version: in
 
         path = create_backup(db, label=f"pre-migration-v{current_version}")
         log.info("Pre-migration snapshot created: %s", path)
-    except OSError as e:
+    except (OSError, sqlite3.Error) as e:
+        # sqlite3.Error too, not just OSError (issue #151): create_backup's
+        # db.backup() call can fail with sqlite3.OperationalError ("database
+        # is locked", "disk I/O error") -- not an OSError subclass -- and
+        # this function's own docstring promises a snapshot failure must
+        # never block startup. Narrowly catching OSError let a locked/
+        # read-only backups dir crash the whole server on the next restart.
         log.warning("Pre-migration snapshot failed (continuing without one): %s", e)
 
 
@@ -2029,6 +2035,15 @@ def _purge_memory(
     # Query-contextual feedback (gap #6) is meaningless once its memory is
     # gone; a tombstoned memory is excluded from every read path anyway.
     db.execute("DELETE FROM memory_feedback WHERE memory_id = ?", (memory_id,))
+    # Co-retrieval associations (issue #9) have no FK either, same reasoning
+    # as memory_entities above -- and this function's own docstring already
+    # calls out a prior incident where a table got missed here (issue #156:
+    # memory_associations recurred as exactly that same missed-table failure
+    # mode, leaking one row per remaining pairing forever).
+    db.execute(
+        "DELETE FROM memory_associations WHERE memory_id_a = ? OR memory_id_b = ?",
+        (memory_id, memory_id),
+    )
     if soft:
         db.execute(
             "UPDATE memories SET deleted_at = ?, updated_at = ? WHERE id = ?",

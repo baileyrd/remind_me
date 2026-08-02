@@ -81,6 +81,83 @@ def test_collect_records_category_filter(db_conn: sqlite3.Connection, memory_fac
     assert records[0]["content"] == "Work note"
 
 
+def test_collect_records_excludes_soft_deleted_by_default(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """Regression guard for issue #157.
+
+    The generic importer has no concept of a tombstone -- it treats every
+    exported record as a fresh live message. Including soft-deleted
+    memories in an export by default meant re-importing that export (e.g.
+    moving memories to another machine) silently resurrected every memory
+    the user had deliberately deleted.
+    """
+    live = memory_factory(content="still alive")
+    deleted = memory_factory(content="deleted memory")
+    db_conn.execute(
+        "UPDATE memories SET deleted_at = updated_at WHERE id = ?", (deleted["id"],)
+    )
+    db_conn.commit()
+
+    records = collect_export_records()
+
+    assert [r["content"] for r in records] == ["still alive"]
+    assert live["id"] in {r["id"] for r in records}
+
+
+def test_collect_records_excludes_superseded_by_default(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """A superseded (stale, replaced) memory is excluded the same way a
+    soft-deleted one is -- re-importing it would bring back a stale
+    duplicate that search is supposed to have hidden."""
+    current = memory_factory(content="current version")
+    old = memory_factory(content="stale superseded version")
+    db_conn.execute(
+        "UPDATE memories SET superseded_by = ? WHERE id = ?", (current["id"], old["id"])
+    )
+    db_conn.commit()
+
+    records = collect_export_records()
+
+    assert [r["content"] for r in records] == ["current version"]
+
+
+def test_collect_records_include_deleted_true_restores_full_backup_behavior(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """include_deleted=True is the escape hatch for a genuine full-backup/
+    audit export that needs tombstone history preserved."""
+    memory_factory(content="still alive")
+    deleted = memory_factory(content="deleted memory")
+    db_conn.execute(
+        "UPDATE memories SET deleted_at = updated_at WHERE id = ?", (deleted["id"],)
+    )
+    db_conn.commit()
+
+    records = collect_export_records(include_deleted=True)
+
+    assert {r["content"] for r in records} == {"still alive", "deleted memory"}
+
+
+async def test_tool_export_include_deleted_flag(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """The MCP tool exposes include_deleted: default off, opt-in honored."""
+    memory_factory(content="still alive")
+    deleted = memory_factory(content="deleted memory")
+    db_conn.execute(
+        "UPDATE memories SET deleted_at = updated_at WHERE id = ?", (deleted["id"],)
+    )
+    db_conn.commit()
+
+    default_result = json.loads(await memory_export(ExportInput()))
+    assert default_result["exported"] == 1
+
+    full_result = json.loads(await memory_export(ExportInput(include_deleted=True)))
+    assert full_result["exported"] == 2
+
+
 def test_collect_records_tag_filter_requires_all_tags(db_conn: sqlite3.Connection, memory_factory) -> None:
     """Tag filtering uses ALL-of semantics, matching list/search behavior."""
     memory_factory(content="Both tags", tags=["python", "work"])

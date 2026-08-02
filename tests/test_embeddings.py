@@ -11,10 +11,13 @@ caller (e.g. the initial hub sync) can never build one giant tensor.
 
 from __future__ import annotations
 
+import threading
+import time
+
 import numpy as np
 
 import remind_me_mcp.embeddings as emb_mod
-from remind_me_mcp.embeddings import _Embedder, _prefix_for
+from remind_me_mcp.embeddings import _Embedder, _get_embedder, _prefix_for
 
 
 def _stub_embedder(monkeypatch, forward_batch: int, dim: int = 4) -> tuple[_Embedder, list[int]]:
@@ -137,3 +140,80 @@ def test_embed_no_prefix_for_default_onnx_model(monkeypatch):
     e.embed(["hello"], role="query")
     e.embed(["hello"], role="passage")
     assert seen == ["hello", "hello"]
+
+
+# ---------------------------------------------------------------------------
+# Concurrent-load safety (issue #153)
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_loaded_serializes_concurrent_first_callers(monkeypatch):
+    """Regression guard for issue #153.
+
+    Two threads racing a cold _ensure_loaded() (the webhook server, folder
+    watcher, sync thread, and every asyncio.to_thread API worker can all
+    reach here concurrently on first use) used to both pass the "not ready
+    yet" check and both proceed into the load body -- e.g. both downloading
+    the same model file into the same cache path at once. The fix serializes
+    on an instance lock with a double-checked _ready flag, so only one
+    thread ever actually executes the load body; the other blocks and then
+    observes _ready=True instead of loading again.
+    """
+    e = _Embedder(dim=4)
+    load_call_count = 0
+    load_call_lock = threading.Lock()
+
+    def slow_load(self=e):
+        nonlocal load_call_count
+        with load_call_lock:
+            load_call_count += 1
+        time.sleep(0.1)  # wide enough for a second thread to reach the check
+        self._ready = True
+
+    monkeypatch.setattr(e, "_load_locked", slow_load)
+
+    threads = [threading.Thread(target=e._ensure_loaded) for _ in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert load_call_count == 1
+    assert e._ready is True
+
+
+def test_get_embedder_constructs_the_singleton_only_once_under_concurrency(
+    monkeypatch,
+):
+    """Regression guard for issue #153's other half: _get_embedder's
+    singleton construction is also locked, so concurrent first-callers
+    share one embedder instance instead of racing separate constructions."""
+    monkeypatch.setattr(emb_mod, "_embedder", None)
+    monkeypatch.setattr(emb_mod, "EMBEDDING_BACKEND", "onnx")
+
+    constructed = []
+    real_embedder_cls = emb_mod._Embedder
+
+    class _CountingEmbedder(real_embedder_cls):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            constructed.append(self)
+            time.sleep(0.05)  # widen the race window
+
+        def _ensure_loaded(self):
+            pass  # skip the real load entirely for this test
+
+    monkeypatch.setattr(emb_mod, "_Embedder", _CountingEmbedder)
+
+    results = []
+    threads = [
+        threading.Thread(target=lambda: results.append(_get_embedder()))
+        for _ in range(5)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert len(constructed) == 1
+    assert len({id(r) for r in results}) == 1

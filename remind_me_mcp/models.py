@@ -506,6 +506,17 @@ class ExportInput(BaseModel):
             "memories-only export."
         ),
     )
+    include_deleted: bool = Field(
+        default=False,
+        description=(
+            "Include soft-deleted and superseded memories. Off by default: "
+            "the importer treats every record as a fresh live message, so "
+            "re-importing an export that included them would resurrect "
+            "deleted/stale content as new live memories. Only set true for "
+            "a genuine full-backup/audit export, not for moving memories "
+            "between machines."
+        ),
+    )
 
     @field_validator("file_path")
     @classmethod

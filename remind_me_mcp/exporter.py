@@ -119,6 +119,7 @@ def collect_export_records(
     category: str | None = None,
     tags: list[str] | None = None,
     include_graph: bool = True,
+    include_deleted: bool = False,
 ) -> list[dict[str, Any]]:
     """Collect memory (and entity-graph) rows as export records.
 
@@ -135,10 +136,22 @@ def collect_export_records(
     graph records in its chat-message parsing. Filtered exports scope the
     graph to the exported memories' links and the entities they reference.
 
+    Soft-deleted (``deleted_at``) and superseded (``superseded_by``) memories
+    are excluded by default (issue #157): the generic importer has no
+    concept of a tombstone or a superseded record -- it treats every
+    exported record as a fresh live message, so re-importing an export that
+    included them silently resurrected every memory the user had
+    deliberately deleted, and every stale chunk the watcher had superseded,
+    as brand-new live memories on the receiving side. Pass
+    ``include_deleted=True`` for the genuine full-backup/audit case, where
+    tombstones and history are exactly what you want preserved.
+
     Args:
         category: If set, only export memories with this category.
         tags: If set, only export memories that have ALL of these tags.
         include_graph: Append entities/memory_entities records (default True).
+        include_deleted: Include soft-deleted and superseded memories
+            (default False -- see above).
 
     Returns:
         List of record dicts — memories ordered by (created_at, id), with the
@@ -148,6 +161,9 @@ def collect_export_records(
     db = _get_db()
     conditions: list[str] = []
     bindings: list[Any] = []
+    if not include_deleted:
+        conditions.append("m.deleted_at IS NULL")
+        conditions.append("m.superseded_by IS NULL")
     if category:
         conditions.append("m.category = ?")
         bindings.append(category)
@@ -170,8 +186,14 @@ def collect_export_records(
     # verbatim, so a re-import preserves memory content losslessly.
     records = [{"role": "assistant", **_row_to_dict(r)} for r in rows]
     if include_graph:
-        # Full backups export the whole graph; filtered exports scope it to
-        # the exported memories (links by memory id, entities by reference).
+        # Full backups export the whole graph -- including entities/links
+        # not connected to any exported memory (e.g. a manually-created
+        # entity with no mentions yet) -- so category/tag filtering is what
+        # narrows the graph, not the deleted/superseded exclusion above.
+        # A link that ends up pointing at an excluded memory_id degrades
+        # the same way an already-supported case does: the importer skips
+        # (and counts) dangling links on restore, so this isn't a new
+        # failure mode, just the existing one reached a different way.
         filtered = bool(category or tags)
         memory_ids = {str(r["id"]) for r in records} if filtered else None
         records.extend(collect_graph_records(memory_ids))
@@ -212,6 +234,7 @@ def export_memories(
     file_path: str | None = None,
     inline_max: int | None = None,
     include_graph: bool = True,
+    include_deleted: bool = False,
 ) -> dict[str, Any]:
     """Export memories (and the entity graph) to JSON or JSONL, inline or to a file.
 
@@ -228,6 +251,12 @@ def export_memories(
             file_path instead).
         include_graph: Append entities/memory_entities/entity_relations
             records (FT-06/Phase 3, default True).
+        include_deleted: Include soft-deleted and superseded memories
+            (issue #157, default False). Re-importing an export that
+            includes them resurrects them as fresh live memories, since the
+            generic importer has no concept of a tombstone -- only set this
+            for a genuine full-backup/audit export, not for portable
+            migration between machines.
 
     Returns:
         A status dict. File write: {'status': 'ok', 'exported': int,
@@ -242,7 +271,10 @@ def export_memories(
         OSError: If writing *file_path* fails.
     """
     records = collect_export_records(
-        category=category, tags=tags, include_graph=include_graph
+        category=category,
+        tags=tags,
+        include_graph=include_graph,
+        include_deleted=include_deleted,
     )
     payload = render_export(records, format)
     n_entities = sum(1 for r in records if r.get("record_type") == "entity")

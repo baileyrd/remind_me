@@ -23,6 +23,7 @@ def _reset_telemetry_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(tel, "OTEL_ENABLED", False)
     monkeypatch.setattr(tel, "_init_attempted", False)
     monkeypatch.setattr(tel, "_tracer", None)
+    monkeypatch.setattr(tel, "_provider", None)
 
 
 # ---------------------------------------------------------------------------
@@ -173,3 +174,60 @@ def test_get_tracer_real_init_succeeds_when_enabled(monkeypatch: pytest.MonkeyPa
 
     assert tracer is not None
     assert tel.is_enabled() is True
+
+
+# ---------------------------------------------------------------------------
+# shutdown() -- issue #159
+# ---------------------------------------------------------------------------
+
+
+def test_shutdown_is_a_noop_when_never_initialized() -> None:
+    """No tracer was ever built (the default) -- shutdown() must not raise."""
+    tel.shutdown()
+
+
+def test_shutdown_flushes_and_clears_the_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """shutdown() calls provider.shutdown() (which flushes buffered spans)
+    and clears the cached provider so a second call is a no-op."""
+    pytest.importorskip("opentelemetry")
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(tel, "_provider", provider)
+
+    calls: list[bool] = []
+    original_shutdown = provider.shutdown
+
+    def _tracking_shutdown(*args, **kwargs):
+        calls.append(True)
+        return original_shutdown(*args, **kwargs)
+
+    monkeypatch.setattr(provider, "shutdown", _tracking_shutdown)
+
+    tel.shutdown()
+
+    assert calls == [True]
+    assert tel._provider is None
+
+    # A second call is a no-op -- doesn't try to shut the provider down again.
+    tel.shutdown()
+    assert calls == [True]
+
+
+def test_shutdown_degrades_gracefully_on_provider_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A misbehaving exporter (e.g. an unreachable collector) must not make
+    server shutdown fail -- same best-effort contract as the rest of the module."""
+
+    class _BoomProvider:
+        def shutdown(self) -> None:
+            raise RuntimeError("collector unreachable")
+
+    monkeypatch.setattr(tel, "_provider", _BoomProvider())
+
+    tel.shutdown()  # must not raise
+
+    assert tel._provider is None

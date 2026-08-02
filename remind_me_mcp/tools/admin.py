@@ -301,12 +301,18 @@ async def memory_export(params: ExportInput) -> str:
 
     Every column of the memories table is included (id, content, category, tags,
     source, metadata, timestamps, and lifecycle fields like vitality and
-    superseded_by), so an export is a complete logical backup. By default the
-    entity graph is included too (FT-06): entities and memory-entity links
-    follow the memories as record_type-tagged records ('entity' /
-    'memory_entity'); set include_graph=false for a memories-only export.
-    Embedding vectors are NOT exported — they are derived data; run
-    remind_me_reindex after importing on the target machine to rebuild them.
+    superseded_by). By default the entity graph is included too (FT-06):
+    entities and memory-entity links follow the memories as
+    record_type-tagged records ('entity' / 'memory_entity'); set
+    include_graph=false for a memories-only export. Embedding vectors are
+    NOT exported — they are derived data; run remind_me_reindex after
+    importing on the target machine to rebuild them.
+
+    Soft-deleted and superseded memories are excluded by default: the
+    importer has no concept of a tombstone, so re-importing them would
+    resurrect deleted/stale content as fresh live memories. Set
+    include_deleted=true for a genuine full-backup/audit export that needs
+    to preserve tombstone history — not for moving memories between machines.
 
     Each memory record also carries a 'role' key, making the file directly
     consumable by remind_me_import_chat / remind_me_import_directory (the
@@ -324,8 +330,8 @@ async def memory_export(params: ExportInput) -> str:
 
     Args:
         params (ExportInput): Format (json|jsonl), optional category/tag
-            filters, optional destination file path, and the include_graph
-            flag.
+            filters, optional destination file path, and the include_graph/
+            include_deleted flags.
 
     Returns:
         str: JSON result — inline export content, or a file-write summary.
@@ -341,6 +347,7 @@ async def memory_export(params: ExportInput) -> str:
             file_path=params.file_path,
             inline_max=EXPORT_INLINE_MAX,
             include_graph=params.include_graph,
+            include_deleted=params.include_deleted,
         )
     except OSError as e:
         log.error("Export failed for %s: %s", params.file_path, e)
