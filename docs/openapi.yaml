@@ -117,6 +117,37 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /api/versions:
+    get:
+      operationId: getVersions
+      summary: Build versions for this node and, when sync is configured, the hub
+      description: >
+        The node's own version is also on /health; this route exists for the
+        hub's, which is probed live with a short timeout and cached briefly.
+        Best-effort: hub is null when sync is disabled or the hub cannot be
+        reached, so a caller renders nothing rather than an error.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version:
+                    type: string
+                    description: This node's installed remind-me-mcp version.
+                  node_id:
+                    type: string
+                    nullable: true
+                  sync_enabled:
+                    type: boolean
+                  hub:
+                    type: string
+                    nullable: true
+                    description: >
+                      The hub's HUB_VERSION as just reported by its /health,
+                      or null when sync is off or the hub is unreachable.
   /api/stats:
     get:
       operationId: getStats

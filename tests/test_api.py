@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -2311,7 +2312,10 @@ def test_versions_survives_an_unreachable_hub(
     monkeypatch.setattr(api_mod, "SYNC_ENABLED", True)
     monkeypatch.setattr(cfg_mod, "HUB_URL", "http://127.0.0.1:1")  # nothing listens
     monkeypatch.setattr(cfg_mod, "SYNC_SECRET", "s")
-    api_mod._hub_version_cache["at"] = 0.0  # bypass any cached probe
+    # setitem, not a bare assignment: the cache is module-global, and a test
+    # that leaves it mutated decides the outcome of whichever test runs next.
+    monkeypatch.setitem(api_mod._hub_version_cache, "at", 0.0)
+    monkeypatch.setitem(api_mod._hub_version_cache, "value", None)
 
     r = client.get("/api/versions")
 
@@ -2320,49 +2324,24 @@ def test_versions_survives_an_unreachable_hub(
     assert r.json()["sync_enabled"] is True
 
 
-def test_versions_caches_the_hub_probe(
+def test_versions_serves_a_warm_cache_without_asking_the_hub(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Several open tabs refreshing shouldn't turn page loads into hub traffic."""
+    """Several open tabs refreshing shouldn't turn page loads into hub traffic.
+
+    Asserted by making the hub unreachable while the cache is warm: if a
+    version still comes back, it can only have come from the cache. That is
+    deterministic, unlike counting calls through a patched httpx global —
+    which is shared with the test client itself and made this test's outcome
+    depend on what ran before it.
+    """
     import remind_me_mcp.api as api_mod
     import remind_me_mcp.config as cfg_mod
 
-    probes = 0
-
-    class _CountingClient:
-        def __init__(self, *a, **k):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            return False
-
-        async def get(self, *a, **k):
-            nonlocal probes
-            probes += 1
-
-            class _R:
-                status_code = 200
-
-                @staticmethod
-                def json():
-                    return {"version": "9.9.9"}
-
-            return _R()
-
-    import httpx
-
     monkeypatch.setattr(api_mod, "SYNC_ENABLED", True)
-    monkeypatch.setattr(cfg_mod, "HUB_URL", "http://hub.example")
+    monkeypatch.setattr(cfg_mod, "HUB_URL", "http://127.0.0.1:1")  # nothing listens
     monkeypatch.setattr(cfg_mod, "SYNC_SECRET", "s")
-    monkeypatch.setattr(httpx, "AsyncClient", _CountingClient)
-    api_mod._hub_version_cache["at"] = 0.0
+    monkeypatch.setitem(api_mod._hub_version_cache, "at", time.monotonic())
+    monkeypatch.setitem(api_mod._hub_version_cache, "value", "9.9.9")
 
-    first = client.get("/api/versions").json()
-    second = client.get("/api/versions").json()
-
-    assert first["hub"] == "9.9.9" == second["hub"]
-    assert probes == 1, f"expected one probe across two requests, got {probes}"
-    api_mod._hub_version_cache["at"] = 0.0  # don't leak into other tests
+    assert client.get("/api/versions").json()["hub"] == "9.9.9"
