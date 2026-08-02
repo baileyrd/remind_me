@@ -764,6 +764,22 @@ see remind_me_mcp.events._spawn_task, so this bounds the task's own runtime,
 not the caller's)."""
 
 # ---------------------------------------------------------------------------
+# Saved searches (issue #194)
+# ---------------------------------------------------------------------------
+
+SAVED_SEARCH_POLL_INTERVAL = _env_int("REMIND_ME_SAVED_SEARCH_POLL_INTERVAL", 300)
+"""Seconds between remind_me_mcp.scheduler poll passes that check watch=true
+saved searches for new matches. Deliberately coarser than
+REMINDER_POLL_INTERVAL's 60s default -- a saved search's underlying content
+changes far less often than a reminder's due time -- but implemented as a
+persisted-watermark due-check inside the *same* poll loop, exactly mirroring
+DIGEST_INTERVAL_SECONDS's shape (a `sync_flags` watermark, not a second
+thread), rather than a separate poll interval mechanism. Unlike the digest
+interval, this is not itself an opt-in switch: whether polling actually does
+anything is gated per-search by `saved_searches.watch`, not by this value
+being set -- this only tunes how often the (usually empty) check runs."""
+
+# ---------------------------------------------------------------------------
 # Digest (issue #188)
 # ---------------------------------------------------------------------------
 

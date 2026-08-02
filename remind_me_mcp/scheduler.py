@@ -52,6 +52,18 @@ a persisted watermark (mirroring the digest check's own throttle exactly),
 and -- like revision compaction -- retention runs unconditionally rather
 than being gated on ``config.SYNC_ENABLED``, since snapshots accumulate
 regardless of whether sync is configured.
+
+Watched-saved-search polling (issue #194,
+``saved_searches.maybe_poll_watched_searches``) piggybacks on this same loop
+for the same reason the digest check does: a saved search's underlying
+content changes far less often than a reminder's due time, so a
+persisted-watermark due-check (its own, coarser
+``REMIND_ME_SAVED_SEARCH_POLL_INTERVAL``, default 300s) inside this loop is
+cheap even when nothing is watched, while a second thread would add its own
+lifecycle purely to poll something on a much longer timescale this thread
+already wakes up for. Unlike the digest check, it is not itself opt-in --
+whether a poll pass actually does anything is gated per-search by
+``saved_searches.watch``, not by a separate global enable switch.
 """
 
 from __future__ import annotations
@@ -201,6 +213,12 @@ def start_scheduler() -> threading.Thread:
                     maybe_send_scheduled_digest()
                 except Exception as e:
                     log.error("Scheduled digest check failed: %s", e, exc_info=True)
+                try:
+                    from remind_me_mcp.saved_searches import maybe_poll_watched_searches
+
+                    maybe_poll_watched_searches()
+                except Exception as e:
+                    log.error("Saved search watch-poll check failed: %s", e, exc_info=True)
                 try:
                     _compact_revisions(_get_db())
                 except Exception as e:

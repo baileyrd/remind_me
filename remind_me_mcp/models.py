@@ -558,6 +558,62 @@ class DigestInput(BaseModel):
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
 
 
+# ---------------------------------------------------------------------------
+# Saved searches (issue #194)
+# ---------------------------------------------------------------------------
+
+
+class SaveSearchInput(BaseModel):
+    """Input for remind_me_save_search: create or update (by name) a saved search.
+
+    A second call with the same `name` updates the existing saved search
+    in place (query/filters/watch all overwritten with the new call's
+    values) rather than creating a duplicate -- the same "same name is the
+    same logical thing" convention `remind_me_wiki_write` already uses for
+    pages. `include_sensitive` defaults to False for consistency with
+    `remind_me_search`'s own default (issue #195) -- a saved search is just
+    a stored, replayable `remind_me_search` call, so it should not
+    surface sensitive memories by default either.
+    """
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    name: str = Field(
+        ...,
+        description="Unique name for this saved search. Saving again with the same name updates it.",
+        min_length=1,
+        max_length=200,
+    )
+    query: str = Field(
+        ...,
+        description="The search query to store and re-run, same syntax as remind_me_search's query.",
+        min_length=1,
+        max_length=500,
+    )
+    category: str | None = Field(default=None, description="Filter by category")
+    tags: list[str] | None = Field(
+        default=None, description="Filter: memory must have ALL of these tags"
+    )
+    include_sensitive: bool = Field(
+        default=False,
+        description=(
+            "Include memories marked sensitive (issue #195) when this saved "
+            "search runs or is polled. Off by default, same as remind_me_search."
+        ),
+    )
+    watch: bool = Field(
+        default=False,
+        description=(
+            "Actively poll this saved search in the background "
+            "(REMIND_ME_SAVED_SEARCH_POLL_INTERVAL seconds, default 300) and "
+            "notify (see Notifications) on genuinely new matches. The first "
+            "poll after watch is turned on seeds its 'already seen' state "
+            "from the current results WITHOUT notifying -- only a match that "
+            "appears on a LATER poll triggers a notification."
+        ),
+    )
+
+
 class ImportKind(StrEnum):
     """How to parse an imported file (FT-02, extended by FT-19 and FT-20).
 
@@ -1463,6 +1519,7 @@ __all__ = [
     "ReminderWindow",
     "ListRemindersInput",
     "DigestInput",
+    "SaveSearchInput",
     "ImportKind",
     "ChatImportInput",
     "MemoryStatsInput",

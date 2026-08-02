@@ -354,6 +354,15 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_list_reminders` | List memories with a set reminder: `upcoming` (still in the future), `overdue` (due but not yet delivered — e.g. the server was offline), or `all` |
 | `remind_me_digest` | Summarize recent additions, vault vitality, reminders, and sync health in one read — see [Digest](#digest) |
 
+### Saved Searches
+
+| Tool | Description |
+|------|-------------|
+| `remind_me_save_search` | Save a named, replayable `remind_me_search` query (`query`, `category`, `tags`, `include_sensitive`, `watch`). Saving again with an existing name updates it in place — see [Saved Searches](#saved-searches) |
+| `remind_me_list_saved_searches` | List every saved search with its query, filters, and watch status |
+| `remind_me_run_saved_search` | Re-run a saved search's stored query/filters — identical output to calling `remind_me_search` with those params |
+| `remind_me_delete_saved_search` | Delete a saved search by name |
+
 ### Capture & decomposition
 
 | Tool | Description |
@@ -1033,6 +1042,24 @@ If you want "ping me when something's due," use `REMIND_ME_NOTIFY_WEBHOOK_URL`. 
 - **Piggybacks on the existing reminder-poll thread** rather than a second background thread: the check is a single disabled-by-default attribute read when unset, so a zero-config server pays nothing extra per poll tick. See `remind_me_mcp/scheduler.py`'s module docstring for the full reasoning.
 - **Throttled by a persisted watermark**, not an in-memory timer — the last-sent timestamp lives in the same `sync_flags` key/value table `remind_me_mcp.sync` already uses for its own cross-restart bookkeeping (under the key `digest_last_sent_at`), so a server restart mid-interval does not immediately re-fire a digest that was already sent.
 
+## Saved Searches
+
+A saved search (issue #194) is a named, replayable `remind_me_search` call — save a query once, then either re-run it on demand or turn on background `watch` polling that notifies (see [Notifications](#notifications)) when a genuinely new memory starts matching.
+
+- **`remind_me_save_search`** — creates or updates (by name) a saved search: `name`, `query`, optional `category`/`tags` filters, `include_sensitive` (default `false`, same as `remind_me_search` — issue #195), and `watch` (default `false`). Saving again under an existing name overwrites it in place — there's no separate "toggle watch" tool; re-save with a different `watch` value to change it, the same "same name is the same thing" convention `remind_me_wiki_write` already uses for pages.
+- **`remind_me_list_saved_searches`** — lists every saved search with its query, filters, and watch status, as JSON.
+- **`remind_me_run_saved_search`** — re-runs the stored query/filters through the exact same search code `remind_me_search` itself calls, so the output is identical to calling `remind_me_search` directly with those params — it *is* that call, not a re-implementation of it.
+- **`remind_me_delete_saved_search`** — deletes a saved search by name, along with its watch-polling "already seen" state (below) so no orphaned rows are left behind.
+
+### Watch polling
+
+Setting `watch=true` has the background scheduler (the same loop [Reminders](#reminders)/[Digest](#digest) piggyback on) re-run the search every `REMIND_ME_SAVED_SEARCH_POLL_INTERVAL` seconds (default 300 — deliberately coarser than the 60s reminder poll, since a search's matching set changes far less often than a reminder's due time) and diff its results against what it matched last time.
+
+- **⚠ The first poll after turning `watch` on seeds silently — it never notifies.** Every memory the search currently matches at that moment is recorded as "already seen" without calling `notify()`. This is deliberate: if it notified on every existing match the instant you turned watch on, that would read as a flood of "new" results for memories that were never actually new — they were just never looked at through this saved search before. Only a match that shows up on a **later** poll, absent from what was seeded, is treated as genuinely new and triggers one notification (memory id + a content preview, identifying which saved search fired).
+- **No re-notification** — once a match has been notified (or seeded), it's recorded in a per-saved-search "seen" table and never fires again for that same memory, even across further polls.
+- **`watch=false` searches are never polled** — the scheduler's per-tick check is a plain `WHERE watch = 1` query, so an unwatched saved search costs nothing beyond its own row.
+- **Storage**: a dedicated `saved_search_seen_memories` table (`saved_search_id`, `memory_id`, `first_seen_at`), not a single watermark like the digest check uses — watch-polling needs a per-(search, memory) fact ("have I already notified about *this* match"), which one timestamp per search can't represent. Local-only, no sync outbox trigger, matching the precedent `reminder_deliveries`/`memory_revisions`/`analytics_snapshots` already set for per-device bookkeeping tables — see `remind_me_mcp/db.py`'s v26→v27 migration.
+
 ## Multi-Machine Sync
 
 ### Distributed Sync (recommended)
@@ -1450,6 +1477,7 @@ Every new memory used to start at a flat `base_weight=1.0` regardless of kind, s
 | `REMIND_ME_NOTIFY_SMTP_USE_TLS` | `true` | STARTTLS a plaintext SMTP connection before authenticating. No effect on port 465 (always implicit TLS) |
 | `REMIND_ME_NOTIFY_SYNC_FAULT_INTERVAL` | `1800` | Minimum seconds between sync-fault notifications, so a persisting `fault` verdict from `remind_me_sync_reconcile` doesn't re-alert on every call |
 | `REMIND_ME_DIGEST_INTERVAL` | *(unset)* | `daily`, `weekly`, or unset/empty to disable scheduled digest delivery via `notify()`. The on-demand `remind_me_digest` tool call always works regardless of this setting |
+| `REMIND_ME_SAVED_SEARCH_POLL_INTERVAL` | `300` | Seconds between the scheduler's poll passes checking `watch=true` saved searches for new matches — see [Saved Searches](#saved-searches). Not itself an enable switch; whether a pass does anything is gated per-search by `watch` |
 | `REMIND_ME_TOOL_PROFILE` | `full` | Advertised tool surface: `full` (48 tools, ~21k context), `standard` (30, ~14.8k — drops imports/sync/ops), or `core` (17, ~7.8k — conversational only, also hides the maintenance prompts). An unrecognised value logs a warning and falls back to `full` |
 | `REMIND_ME_MAINTENANCE_NUDGES` | `true` | Whether search/add responses may carry a maintenance-backlog nudge. Set `false` to silence them entirely |
 | `REMIND_ME_MAINTENANCE_NUDGE_INTERVAL` | `3600` | Minimum seconds between nudge *checks*. Bounds cost as well as noise — the backlog COUNTs only run when this has elapsed |

@@ -459,7 +459,7 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 # Current target schema version.  Increment when adding a new migration step.
-_SCHEMA_VERSION = 26
+_SCHEMA_VERSION = 27
 
 
 
@@ -652,6 +652,11 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         _migrate_v25_to_v26(db)
         db.execute("PRAGMA user_version = 26")
         current_version = 26
+
+    if current_version < 27:
+        _migrate_v26_to_v27(db)
+        db.execute("PRAGMA user_version = 27")
+        current_version = 27
 
     db.commit()
 
@@ -2210,6 +2215,81 @@ def _migrate_v25_to_v26(db: sqlite3.Connection) -> None:
             INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
             VALUES (NEW.id, 'update', {payload}, {_SQL_NOW_ISO});
         END;
+    """)
+
+
+def _migrate_v26_to_v27(db: sqlite3.Connection) -> None:
+    """v26 -> v27: saved/watched searches (issue #194).
+
+    Two new tables:
+
+    - ``saved_searches`` -- one row per named query, storing the raw
+      ``query`` string plus a ``filters`` JSON blob (``category``/``tags``/
+      ``include_sensitive``, the subset of ``MemorySearchInput``'s param
+      surface a saved search re-plays -- see ``remind_me_mcp.saved_searches``)
+      and a ``watch`` boolean gating background polling. JSON-as-TEXT for
+      ``filters`` follows the same convention ``memories.tags``/
+      ``memories.metadata`` and v24->v25's ``analytics_snapshots`` columns
+      already use -- SQLite has no native JSON column type. ``name`` is
+      UNIQUE so ``remind_me_save_search`` can upsert by name (create-or-
+      update, matching how ``remind_me_update`` already treats "same name"
+      as "the same logical thing", not a duplicate).
+    - ``saved_search_seen_memories`` -- one row per (saved search, memory)
+      pair the watch-poller has already notified about (or seeded on first
+      poll without notifying -- see ``saved_searches.poll_saved_search``'s
+      docstring for why the *first* poll of a newly-watched search must not
+      notify on every currently-matching memory). A dedicated table, not a
+      ``sync_flags``-style single watermark like the digest check uses:
+      digest has exactly one global "have I sent since X" fact to track,
+      but watch-polling needs a per-(search, memory) "have I already
+      notified about this specific match" fact, which a single key/value
+      row per search cannot represent. The unique index on
+      ``(saved_search_id, memory_id)`` is both the dedup constraint (a
+      re-poll's ``INSERT OR IGNORE`` no-ops for an already-seen match) and
+      the index the poll's per-search membership check needs.
+
+    Deliberately **no sync outbox trigger** on either table, the same scope
+    decision v22->v23 (``reminder_deliveries``), v23->v24
+    (``memory_revisions``), and v24->v25 (``analytics_snapshots``) already
+    made for their own local-only tables: a saved search's watch state and
+    what it has already notified about are per-device concerns (which
+    background poller has already fired an alert for a given match on
+    *this* node) with no sensible cross-device merge -- syncing "have I
+    already notified" would either double-notify on every device or
+    silently suppress a genuinely new match on a device that never polled
+    it. A synced saved-*search definition* (so the same named search exists
+    on every device) is a reasonable follow-up, not bundled speculatively
+    into this pass.
+
+    No index on ``saved_searches`` beyond the implicit one from its UNIQUE
+    ``name`` constraint -- the table is expected to stay small (a handful to
+    a few dozen named searches per user, not thousands), and the watch-poll
+    loop's ``WHERE watch = 1`` scan is a full-table scan over that small
+    table, not a hot path needing its own index (same low-cardinality-filter
+    reasoning v25->v26 used to skip an index on ``memories.sensitive``).
+
+    Args:
+        db: An open SQLite connection.
+    """
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS saved_searches (
+            id         TEXT PRIMARY KEY,
+            name       TEXT NOT NULL UNIQUE,
+            query      TEXT NOT NULL,
+            filters    TEXT NOT NULL,
+            watch      INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS saved_search_seen_memories (
+            saved_search_id TEXT NOT NULL,
+            memory_id       TEXT NOT NULL,
+            first_seen_at   TEXT NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_search_seen_memories_search_memory
+            ON saved_search_seen_memories(saved_search_id, memory_id);
     """)
 
 
