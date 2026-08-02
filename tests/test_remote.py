@@ -560,6 +560,7 @@ async def test_server_status_reports_remote_connector(
             "ui_url": None,
             "ui_pid": None,
             "ui_started": None,
+            "version": "9.9.9",
             "db_path": "/tmp/test/memory.db",
             "db_exists": True,
         },

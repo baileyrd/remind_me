@@ -616,7 +616,10 @@ async def remind_me_server_status() -> str:
     # First line, deliberately: a stale install after a failed self-update
     # explains more odd behaviour than anything else in this report, and it
     # is the one fact a session otherwise has no way to observe.
-    lines.append(f"**Version:** {status['version']}")
+    # .get, not [], on purpose: this is the tool you call when something is
+    # already wrong, so it must not be the thing that raises. Coverage of the
+    # real value lives in tests/test_tools.py.
+    lines.append(f"**Version:** {status.get('version', 'unknown')}")
 
     if status["ui_server"] == "running":
         lines.append(f"**Dashboard UI:** ✓ Running at {status['ui_url']}")
