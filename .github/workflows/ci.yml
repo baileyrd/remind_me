@@ -39,6 +39,82 @@ jobs:
             --base "${{ github.event.pull_request.base.sha }}" \
             --head "${{ github.event.pull_request.head.sha }}"
 
+  # The hub ships as its own container with its own dependencies (fastapi,
+  # psycopg), neither of which is in this package's requirements — so no
+  # matrix leg can even import hub/main.py, and every hub test in tests/ is a
+  # static AST check. This job is the only place the hub's actual behaviour
+  # runs: real Postgres, real uvicorn, real client (hub/e2e_test.py drives two
+  # simulated nodes through push/pull convergence, LWW, tombstones and auth).
+  # Kept separate from the matrix so the package's own legs stay
+  # dependency-clean and fast.
+  hub-e2e:
+    name: Hub e2e (live Postgres)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: remindme
+          POSTGRES_PASSWORD: testpw
+          POSTGRES_DB: remindme
+        ports:
+          - 5444:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      HUB_TEST_URL: http://127.0.0.1:8765
+      HUB_TEST_SECRET: test-secret
+      HUB_TEST_DSN: postgresql://remindme:testpw@127.0.0.1:5444/remindme
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install the client package
+        run: uv sync --locked
+
+      - name: Start the hub
+        env:
+          DATABASE_URL: postgresql://remindme:testpw@127.0.0.1:5444/remindme
+          SYNC_SECRET: test-secret
+          # On, so the e2e exercises /metrics rather than skipping it.
+          REMIND_ME_HUB_METRICS_ENABLED: "1"
+        working-directory: hub
+        run: |
+          # --with, not a lockfile entry: these are the hub image's
+          # dependencies, deliberately absent from this package's own.
+          nohup uv run \
+            --with "fastapi>=0.115,<1" \
+            --with "uvicorn[standard]>=0.30,<1" \
+            --with "psycopg[binary]>=3.2,<4" \
+            uvicorn main:app --host 127.0.0.1 --port 8765 > /tmp/hub.log 2>&1 &
+          for _ in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:8765/health >/dev/null 2>&1 && exit 0
+            sleep 1
+          done
+          echo "hub did not become healthy"; cat /tmp/hub.log; exit 1
+
+      - name: Run the hub end-to-end suite
+        env:
+          # A fresh runner has no /tmp/node-*; wiping keeps a re-run on a
+          # warm/self-hosted runner honest instead of silently reusing state.
+          E2E_WIPE: "1"
+        working-directory: hub
+        run: uv run --with "psycopg[binary]>=3.2,<4" python e2e_test.py
+
+      - name: Hub log
+        if: failure()
+        run: cat /tmp/hub.log
+
   ci:
     name: Python ${{ matrix.python-version }} (${{ matrix.extras }})
     runs-on: ubuntu-latest

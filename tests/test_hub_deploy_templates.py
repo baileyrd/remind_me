@@ -133,3 +133,24 @@ def test_update_verifies_the_new_version_is_actually_serving() -> None:
     # unchanged, and failing on that would be its own false alarm.
     assert "expected=$(hub_version_from_source)" in text
     assert "the new image is not serving" in text
+
+
+def test_ci_runs_the_hub_end_to_end_suite() -> None:
+    """The hub's only runtime coverage must stay wired up (issue #218).
+
+    Every hub test in tests/ is a static AST check, because no CI leg can
+    import hub/main.py — fastapi and psycopg aren't this package's
+    dependencies. If this job goes away, the hub is back to having zero
+    behaviour verified anywhere automatic, and the static checks quietly
+    become the only thing between a broken hub and a green build.
+    """
+    yaml = pytest.importorskip("yaml")
+    workflow = _HUB_DIR.parent / ".github" / "workflows" / "ci.yml"
+    with workflow.open() as f:
+        data = yaml.safe_load(f)
+
+    job = data["jobs"]["hub-e2e"]
+    assert "postgres" in job["services"], "the e2e needs a live Postgres"
+    steps = " ".join(str(s.get("run", "")) for s in job["steps"])
+    assert "e2e_test.py" in steps
+    assert "uvicorn main:app" in steps, "the e2e needs a real hub process"
