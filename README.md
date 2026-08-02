@@ -248,6 +248,35 @@ This is not multi-tenancy (see [ARCHITECTURE.md](ARCHITECTURE.md)): every key
 - **Browse the Wiki** — read-only view of the LLM Wiki (FT-08): searchable page catalogue in the sidebar, rendered page body with clickable `[[Wikilinks]]`, and a backlinks/links panel for cross-page navigation; a pending-compile badge flags raw memories not yet folded in
 - **Live data** — the dashboard reads and writes your real SQLite database; changes appear immediately
 
+### Mobile / PWA Support
+
+The dashboard is usable at phone widths and installable as a standalone app
+(issue #199 mobile audit — a spike, not a full native-mobile build):
+
+- A `<meta name="viewport">` tag has been present in the HTML shell since
+  the dashboard's original build, so pinch-zoom/text-size already scaled
+  correctly on phones before this audit.
+- The header, sidebar/main split, and the Stats view's two-up chart grid
+  now reflow at narrow widths (~≤680px): the sidebar stacks above the main
+  content instead of squeezing it, and the "By Category"/"By Source" bar
+  charts drop to one column instead of getting crushed unreadably narrow.
+  Verified with a real headless-Chromium render at 390×844 (iPhone-width):
+  zero horizontal overflow across Browse/Stats/Wiki/Entities, versus real,
+  reproducible overflow (`document.documentElement.scrollWidth` 610px vs.
+  a 390px viewport) before the fix.
+- Icon-only buttons (copy/edit/delete on memory cards, modal close) and the
+  view-tab/Import/Add buttons now have a ~40-44px minimum tap target,
+  mobile-accessibility guidance, without changing their visible icon size.
+- A minimal `manifest.json` (`GET /manifest.json`, linked via `<link
+  rel="manifest">`) lets a phone browser "Add to Home Screen" the dashboard
+  as a standalone-display PWA. **Known gaps, left alone deliberately**: no
+  service worker or offline support, and no app icon yet (the repo has no
+  icon/logo asset — the manifest is still spec-valid without one; the OS
+  falls back to a generic glyph). Smaller interactive controls — inline
+  tag pills, form category chips — were left at their current size rather
+  than widened, since doing so for every one would start to reshape the
+  visual density of the UI rather than being a targeted fix.
+
 ### REST API
 
 The dashboard is powered by a REST API you can also use directly:
@@ -255,6 +284,7 @@ The dashboard is powered by a REST API you can also use directly:
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/health` | Liveness probe (no auth) |
+| `GET` | `/manifest.json` | PWA manifest for "Add to Home Screen" (no auth) |
 | `GET` | `/api/stats` | Memory statistics, categories, tags, DB info |
 | `GET` | `/api/vitality` | Vault vitality report: active/dormant counts, health score, vitality-bucket distribution |
 | `GET` | `/api/analytics/trend` | Daily analytics-snapshot history for the dashboard's Vault Trend panel: `{snapshots: [{captured_at, total_memories, vitality_buckets, category_counts}, ...]}`, oldest first (empty array on a fresh install) |

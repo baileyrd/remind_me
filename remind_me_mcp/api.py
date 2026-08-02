@@ -253,6 +253,8 @@ def _build_dashboard_html() -> str:
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#0a0a0f">
 <title>Remind Me — Memory Dashboard</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -280,6 +282,27 @@ def _build_dashboard_html() -> str:
 </script>
 </body>
 </html>"""
+
+
+def _build_manifest_json() -> dict[str, Any]:
+    """Return a minimal Web App Manifest so the dashboard can be "Added to
+    Home Screen" / installed as a standalone PWA on a phone (issue #199
+    mobile audit).
+
+    Deliberately minimal (spike scope, not a full PWA build): no service
+    worker, no offline support, no icons -- the repo has no icon/logo asset
+    to point at, and a manifest without ``icons`` is still valid per the Web
+    App Manifest spec (the OS falls back to a generic/text glyph). Add real
+    icon assets and reference them here if/when one is designed.
+    """
+    return {
+        "name": "Remind Me — Memory Dashboard",
+        "short_name": "Remind Me",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#0a0a0f",
+        "theme_color": "#0a0a0f",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1398,8 +1421,19 @@ def _build_api_app() -> Starlette:
         """Serve the dashboard UI as a single-page app."""
         return HTMLResponse(_build_dashboard_html())
 
+    async def manifest(request: Request) -> JSONResponse:
+        """Serve the PWA manifest (issue #199) referenced by the dashboard's
+        <link rel="manifest">. Unauthenticated like "/" and "/health" above --
+        browsers fetch a manifest link with no Authorization header, and it
+        carries no user data (see _build_manifest_json's docstring).
+        """
+        return JSONResponse(
+            _build_manifest_json(), media_type="application/manifest+json"
+        )
+
     routes = [
         Route("/", index),
+        Route("/manifest.json", manifest, methods=["GET"]),
         Route("/health", health),
         Route("/metrics", metrics_endpoint, methods=["GET"]),
         Route("/api/stats", api_stats),
@@ -1473,4 +1507,5 @@ __all__ = [
     "JSONContentTypeMiddleware",
     "_build_api_app",
     "_build_dashboard_html",
+    "_build_manifest_json",
 ]

@@ -1,5 +1,17 @@
 # Release Notes
 
+## v1.47.0 — 2026-08-02
+
+### Improvements
+
+- **Dashboard mobile/PWA audit and fixes (FT-28, #199)** — this issue was explicitly scoped as a spike/audit first: rendered the dashboard in real headless Chromium at a 390×844 (iPhone-width) viewport rather than just reading the CSS. Confirmed real, reproducible horizontal overflow on every view (`document.documentElement.scrollWidth` 610px vs. a 390px viewport, traced to the header's unwrapped flex row), a Browse-view sidebar squeezing `<main>` to 170px wide, and the Stats view's fixed `1fr 1fr` chart grid crushing bar-chart labels/bars down to near-illegible widths.
+- **What was actually wrong, and what wasn't.** A `<meta name="viewport">` tag turned out to already be present in `_build_dashboard_html()` — the issue's premise on that point was only half right, and no change was needed there. `TrendChart` (the issue #186 line chart) was already responsive (`viewBox` + `width:100%`) and needed no fix either.
+- **Targeted CSS fixes, not a redesign**: `header{flex-wrap:wrap}` so the logo/nav/action buttons wrap instead of forcing page-wide scroll; a `@media (max-width:680px)` block that stacks the sidebar above the main content on narrow viewports; and the Stats "By Category"/"By Source" grid switched from a fixed `1fr 1fr` to `repeat(auto-fit,minmax(260px,1fr))`, which collapses to one column on its own with no media query needed.
+- **Touch targets**: icon-only buttons (copy/edit/delete on memory cards, modal close) and the view-tab/Import/Add buttons now have a ~40-44px minimum tap target per common mobile-accessibility guidance, without changing their visible icon size.
+- **A minimal `manifest.json`** (new unauthenticated `GET /manifest.json` route, linked via `<link rel="manifest">`) lets a phone browser "Add to Home Screen" the dashboard as a standalone PWA. No icons declared — the repo has no icon/logo asset yet; the manifest is still spec-valid without one.
+- **Deliberately left alone**: small, dense controls (inline tag pills, memory-form category chips) are also below the ~44px touch-target guideline, but widening every one would reshape the UI's visual density well past a targeted fix — noted as a known limitation rather than silently left unaddressed. No service worker / offline support either — out of scope for a spike.
+- Verified with a real render: zero horizontal overflow across all four views (Browse/Stats/Wiki/Entities) at 390px post-fix, versus real overflow before; desktop (1280px) layout confirmed visually unchanged.
+
 ## v1.46.0 — 2026-08-02
 
 ### New Features

@@ -44,6 +44,45 @@ paths:
                     type: string
                     example: ok
 
+  /manifest.json:
+    get:
+      operationId: getManifest
+      summary: Web App Manifest (issue #199)
+      description: >-
+        Minimal PWA manifest referenced by the dashboard's `<link
+        rel="manifest">`, letting a phone browser install/"Add to Home
+        Screen" the dashboard as a standalone app. Unauthenticated like
+        `/health` above -- browsers fetch manifest links with no
+        Authorization header, and it carries no user data. No icons are
+        declared (the repo has none to point at yet); still spec-valid.
+      security: []
+      responses:
+        "200":
+          description: Web App Manifest
+          content:
+            application/manifest+json:
+              schema:
+                type: object
+                properties:
+                  name:
+                    type: string
+                    example: Remind Me — Memory Dashboard
+                  short_name:
+                    type: string
+                    example: Remind Me
+                  start_url:
+                    type: string
+                    example: "/"
+                  display:
+                    type: string
+                    example: standalone
+                  background_color:
+                    type: string
+                    example: "#0a0a0f"
+                  theme_color:
+                    type: string
+                    example: "#0a0a0f"
+
   /metrics:
     get:
       operationId: getMetrics
