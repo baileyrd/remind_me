@@ -204,7 +204,8 @@ curl -H "Authorization: Bearer $(cat ~/.remind-me/api_key)" http://localhost:519
 Set `REMIND_ME_API_KEY` to use your own token, or `REMIND_ME_API_KEY=disabled`
 to run an open localhost API (not recommended). Mutating requests must send
 `Content-Type: application/json` (cross-origin form posts are rejected with 415).
-`GET /health` is an unauthenticated liveness probe.
+`GET /health` is an unauthenticated liveness probe, and reports the installed
+version so you can tell which build a node is running without a token.
 
 #### Scoped API keys
 
@@ -285,7 +286,7 @@ The dashboard is powered by a REST API you can also use directly:
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/health` | Liveness probe (no auth) |
+| `GET` | `/health` | Liveness probe + node role and installed version (no auth) |
 | `GET` | `/manifest.json` | PWA manifest for "Add to Home Screen" (no auth) |
 | `GET` | `/api/stats` | Memory statistics, categories, tags, DB info |
 | `GET` | `/api/vitality` | Vault vitality report: active/dormant counts, health score, vitality-bucket distribution |
@@ -1208,6 +1209,26 @@ git clone https://github.com/baileyrd/remind_me.git ~/remind_me
 
 See [`hub/README.md`](hub/README.md) for the protocol details, manual setup reference, restore procedure, and operations guide.
 
+#### Versions and Record Counts
+
+Both sides report their version, because sync problems across a fleet are
+often version-skew problems and the two halves release independently:
+
+| Where | Field | Notes |
+|-------|-------|-------|
+| `GET /health` on the hub | `version` | `HUB_VERSION`, hand-bumped in `hub/main.py`; no auth needed, so a deploy can be verified without the sync secret |
+| `GET /health` on a node's dashboard | `version` | the installed `remind-me-mcp` package version, same string `remind-me-mcp --version` prints |
+| `GET /health` on a node's peer server | `version` | same, but behind the sync secret — the peer port binds all interfaces by default |
+| `remind_me_sync_status` | `version` | this node's build, next to its `node_id` |
+| `remind_me_sync_reconcile` | `version`, `hub_version` | both sides in one report; `hub_version` is `null` against a hub older than this feature |
+
+The hub also serves **`GET /count`** (bearer auth), the cheap counterpart to
+`/stats`: scalar `COUNT(*)`s with no `GROUP BY`, optionally narrowed with
+`?table=memories|entities|memory_entities|entity_relations`. Poll it from a
+dashboard tile or a drift alarm; reach for `/stats` only when you need the
+per-node/per-category breakdown that reconciliation uses. `memories.live`
+excludes tombstones and is the figure that should match a node's own count.
+
 #### Configuring a Node
 
 Add the sync environment variables to your MCP config:
@@ -1256,7 +1277,7 @@ Each node runs a small HTTP server (default port 8766, bind via `REMIND_ME_PEER_
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/health` | Node liveness + node_id |
+| `GET` | `/health` | Node liveness + node_id + installed version |
 | `GET` | `/sync/pull?since=&since_id=&exclude_node=&limit=` | Pull memory records (keyset cursor on `(updated_at, id)` when `since_id` is sent) |
 | `POST` | `/sync/push` | Push records (responds with `processed_ids`) |
 | `GET` | `/sync/pull_entities?since=&since_id=&limit=` | Pull entity records (404 on pre-entity-graph peers is treated as "no entity support") |

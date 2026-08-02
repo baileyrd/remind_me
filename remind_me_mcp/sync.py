@@ -81,6 +81,7 @@ from remind_me_mcp.config import (
 from remind_me_mcp.db import _delete_chunks, _embed_and_store_rows, _get_db, _now_iso
 from remind_me_mcp.maintenance import _due
 from remind_me_mcp.telemetry import maybe_span
+from remind_me_mcp.version import __version__
 
 log = logging.getLogger("remind_me_mcp.sync")
 
@@ -1237,6 +1238,7 @@ def get_sync_status() -> dict[str, Any]:
         return {
             "enabled": False,
             "node_id": NODE_ID or None,
+            "version": __version__,
             "hub_url": HUB_URL or None,
             "hint": (
                 "set " + ", ".join(missing) + " to enable sync; the outbox "
@@ -1305,6 +1307,9 @@ def get_sync_status() -> dict[str, Any]:
     return {
         "enabled": True,
         "node_id": NODE_ID,
+        # This node's build. Sync bugs are usually version-skew bugs across a
+        # fleet, and this is the report an operator already runs per node.
+        "version": __version__,
         "hub_url": HUB_URL,
         "sync_interval_seconds": SYNC_INTERVAL,
         # The triggers are gated on this flag (SY-07); if it ever disagrees
@@ -1683,6 +1688,11 @@ async def reconcile_with_hub(client: httpx.AsyncClient | None = None) -> dict[st
         "verdict": verdict,
         "hints": hints,
         "node_id": NODE_ID,
+        "version": __version__,
+        # Absent on a hub older than the release that added it — reported as
+        # None rather than omitted, so "old hub" is visible in the output
+        # instead of looking like a field this node forgot to fill in.
+        "hub_version": hub.get("version"),
         "hub_url": HUB_URL,
         "last_pull_at": last_pull_at,
         "last_pull_age_seconds": (

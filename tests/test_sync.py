@@ -20,6 +20,7 @@ import pytest
 import remind_me_mcp.db as _db_mod
 import remind_me_mcp.sync as sync
 from remind_me_mcp.db import _ensure_schema, _now_iso
+from remind_me_mcp.version import __version__
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -2198,6 +2199,9 @@ def test_sync_status_disabled_names_the_missing_env_vars(
     status = sync.get_sync_status()
 
     assert status["enabled"] is False
+    # Present even when sync is off: "which build is this?" is asked while
+    # diagnosing why sync never came up, not only once it is running.
+    assert status["version"] == __version__
     assert "REMIND_ME_NODE_ID" in status["hint"]
     assert "REMIND_ME_HUB_URL" in status["hint"]
     assert "REMIND_ME_SYNC_SECRET" in status["hint"]
@@ -2233,6 +2237,9 @@ def test_sync_status_reports_outbox_depth_and_trigger_gate(
 
     assert status["enabled"] is True
     assert status["node_id"] == "test-node"
+    # Reported alongside node_id: identifying a node in a fleet report is
+    # only half the answer without knowing which build it is running.
+    assert status["version"] == __version__
     assert status["outbox"]["pending"] == 2
     # The triggers are gated on this flag; a mismatch means writes silently
     # aren't queued, so it's reported rather than assumed.
@@ -2449,11 +2456,17 @@ def hub_stats(
     memory_entities: int = 0,
     entity_relations: int = 0,
     by_origin_node: dict[str, int] | None = None,
+    version: str | None = "1.0.0",
 ) -> dict[str, Any]:
-    """Build a hub GET /stats payload in the shape hub/main.py returns."""
+    """Build a hub GET /stats payload in the shape hub/main.py returns.
+
+    ``version=None`` drops the key entirely, standing in for a hub deployed
+    before /stats started reporting one.
+    """
     cats = by_category if by_category is not None else {}
     return {
         "role": "hub",
+        **({"version": version} if version is not None else {}),
         "memories": {
             "total": sum(cats.values()),
             "tombstones": tombstones,
@@ -2703,6 +2716,46 @@ async def test_reconcile_flags_node_ahead_as_the_serious_case(
     assert "not landing" in result["hints"][0]
     # The outbox depth is included because it usually explains the cause.
     assert result["outbox_pending"] == 5
+
+
+@pytest.mark.asyncio
+async def test_reconcile_reports_both_sides_versions(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """Version skew is a standing suspect whenever two sides disagree.
+
+    Reconcile is where the two sides are already being compared, so it is the
+    one place both builds can be read off together instead of curl'd from the
+    hub and matched against a node by hand.
+    """
+    insert_memory(sync_db, "m1")
+    recorder = stats_recorder(hub_stats(by_category={"general": 1}, version="1.2.3"))
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_hub(client)
+
+    assert result["version"] == __version__
+    assert result["hub_version"] == "1.2.3"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_reports_hub_version_as_none_on_an_older_hub(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """A hub that predates version reporting is still reconcilable.
+
+    The field is present-but-None rather than absent so 'old hub' reads as a
+    fact about the hub, not as a field this node failed to populate — and so
+    a caller can index it unconditionally.
+    """
+    insert_memory(sync_db, "m1")
+    recorder = stats_recorder(hub_stats(by_category={"general": 1}, version=None))
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_hub(client)
+
+    assert result["status"] == "ok"
+    assert result["hub_version"] is None
 
 
 @pytest.mark.asyncio

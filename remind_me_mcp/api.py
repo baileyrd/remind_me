@@ -48,6 +48,7 @@ from remind_me_mcp.events import emit_event
 from remind_me_mcp.exporter import EXPORT_FORMATS, collect_export_records, export_memories, render_export
 from remind_me_mcp.ics_export import build_ics
 from remind_me_mcp.importer import IMPORT_KINDS, import_chat_file, import_directory
+from remind_me_mcp.version import __version__
 from remind_me_mcp.vitality import DECAY_RATES, build_vitality_report
 
 if TYPE_CHECKING:
@@ -374,8 +375,20 @@ def _build_api_app() -> Starlette:
 
         Used by the pid.py health check so `--status` and the already-running
         guard keep working when API auth is enabled.
+
+        ``version`` is the installed package version, matching what the hub's
+        own ``/health`` reports for itself. It's here rather than behind auth
+        because the question it answers — "which build is actually running on
+        this node?" — is asked during upgrades and incident triage, precisely
+        when the token may not be at hand, and ``/health`` is the one route
+        guaranteed reachable. The tradeoff is fingerprinting: a caller who can
+        reach the port learns the build. That's a real but small delta here —
+        this server binds loopback by default (``--ui-host 127.0.0.1``), and
+        the same caller can already distinguish builds from behavior — and it
+        stays strictly a build identifier, never data, which is what
+        ``tests/test_api.py``'s exact-body assertions hold this route to.
         """
-        return JSONResponse({"status": "ok"})
+        return JSONResponse({"status": "ok", "role": "node", "version": __version__})
 
     async def metrics_endpoint(request: Request) -> Response:
         """Prometheus text-exposition metrics (issue #197).

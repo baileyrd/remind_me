@@ -146,6 +146,57 @@ the hub, permanently excluded by its own `exclude_node`. Point a client with
 an empty local `memories` table at `full=1` to recover its full history back
 from the hub.
 
+### Observability: `/health`, `/count`, `/stats`
+
+Three read-only routes, in increasing cost. Pick the cheapest one that
+answers your question — they are not interchangeable.
+
+| Route | Auth | Cost | Answers |
+|-------|------|------|---------|
+| `GET /health` | none | no query beyond `SELECT 1` | is the hub up, can it reach Postgres, **which version is deployed** |
+| `GET /count` | bearer | one `COUNT(*)` per table | how many records are there |
+| `GET /stats` | bearer | two `GROUP BY` passes + `MIN`/`MAX` | how do the counts break down by node and category |
+
+```bash
+curl -s http://127.0.0.1:8765/health
+# {"status":"ok","role":"hub","version":"1.0.0","db":"ok","time":"..."}
+
+curl -s -H "Authorization: Bearer $SYNC_SECRET" http://127.0.0.1:8765/count
+# {"role":"hub","version":"1.0.0",
+#  "memories":{"total":812,"live":790,"tombstones":22},
+#  "entities":143,"memory_entities":901,"entity_relations":37,"time":"..."}
+
+# Narrow to one table when a poller only watches one:
+curl -s -H "Authorization: Bearer $SYNC_SECRET" \
+     'http://127.0.0.1:8765/count?table=memories'
+```
+
+`/count` is the one to poll — a dashboard tile, a cron drift alarm, a check
+right after a bulk import. `/stats` exists for reconciliation (it is what
+`remind_me_sync_reconcile` reads) and pays for its breakdowns with full
+table scans, which is the right cost once per reconcile and the wrong cost
+once per minute. `table=` accepts `memories`, `entities`, `memory_entities`
+or `entity_relations`; anything else is a `400`.
+
+`memories.live` is `total - tombstones`, and it is the number that should
+agree with a node — a node's user-visible count excludes tombstones while
+the hub retains them until `/admin/compact_tombstones` runs, so comparing
+raw totals across the two looks like permanent drift.
+
+Both counting routes are bearer-authenticated: totals and category names
+leak how much is stored and how fast it grows. `/health` stays public
+because deploy healthchecks need it, and it stays free of counts.
+
+**Versioning.** `HUB_VERSION` in `main.py` is a literal string, bumped by
+hand — the container image contains `main.py` and nothing else (no
+`pyproject.toml`, no git checkout), so there is nothing to derive it from at
+runtime. It is versioned independently of the `remind-me-mcp` package, whose
+version tracks client releases the hub never participates in. Bump MAJOR for
+a wire-protocol break, MINOR for a new endpoint or response field, PATCH for
+a fix nothing can key off. Clients should still probe for a `404` to detect
+a capability (as `sync.reconcile_with_hub` does for `/stats`) rather than
+compare version strings — this is a diagnostic, not feature negotiation.
+
 ### Hardening
 
 - **Auth comparison is byte-safe.** `_require_auth` compares UTF-8-encoded
@@ -237,7 +288,7 @@ systemctl --user daemon-reload
 systemctl --user start remind-me-postgres.service
 systemctl --user start remind-me-hub.service
 curl -s http://127.0.0.1:8765/health
-# {"status":"ok","role":"hub","db":"ok","time":"..."}
+# {"status":"ok","role":"hub","version":"1.0.0","db":"ok","time":"..."}
 ```
 
 The hub creates (or migrates) the database schema itself at startup, and

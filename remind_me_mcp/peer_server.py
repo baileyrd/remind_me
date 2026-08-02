@@ -31,6 +31,7 @@ from urllib.parse import parse_qs, urlparse
 from remind_me_mcp.config import NODE_ID, PEER_BIND, PEER_PORT, SYNC_SECRET
 from remind_me_mcp.db import _get_db
 from remind_me_mcp.sync import _upsert_records
+from remind_me_mcp.version import __version__
 
 log = logging.getLogger("remind_me_mcp.peer_server")
 
@@ -99,8 +100,17 @@ class PeerHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
 
         if parsed.path == "/health":
+            # `version` lets a peer see which build it is talking to, which is
+            # what makes the 404-tolerant capability probing above (a new peer
+            # pulling entity tables from an old server) diagnosable instead of
+            # silently degraded. Auth-gated like every other route here --
+            # unlike the hub's and dashboard's /health, this one already sits
+            # behind _auth(), and the peer port defaults to binding all
+            # interfaces, so there is no reason to widen it.
             self._send_json(200, {
                 "status": "ok",
+                "role": "peer",
+                "version": __version__,
                 "node_id": NODE_ID,
                 "time": datetime.now(UTC).isoformat(),
             })

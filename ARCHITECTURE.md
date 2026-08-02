@@ -221,6 +221,18 @@ drain-rate verdict, per-remote watermarks, last error); the hub's auth-gated
 and classifies the drift. Prefer these over reading logs or querying the
 databases by hand.
 
+Two additions worth knowing about before reaching for `/stats`. The hub's
+auth-gated `GET /count` returns the same totals without `/stats`' `GROUP BY`
+passes, so a dashboard tile or drift alarm can poll it; `/stats` stays the
+reconciliation route. And both halves report a version — the hub's
+`HUB_VERSION` (hand-bumped, independent of the package version, since the
+container holds `main.py` and nothing to derive one from) and each node's
+installed package version — through their `/health` routes and both sync
+tools, so version skew is visible without inspecting images or shelling into
+hosts. The hub's version is unauthenticated so a deploy can be verified
+without the sync secret; its counts are not, because totals leak content
+information.
+
 ## Key decisions
 See [docs/adr/](./docs/adr/) for the record of individual decisions and their tradeoffs.
 

@@ -55,6 +55,29 @@ from psycopg.types.json import Jsonb
 log = logging.getLogger("remind_me_hub")
 logging.basicConfig(level=logging.INFO)
 
+HUB_VERSION = "1.0.0"
+"""Version of the hub server, reported by /health, /count and /stats.
+
+Versioned independently of the ``remind-me-mcp`` package rather than tracking
+its version. The two are separate deployables on separate release cadences:
+the package ships to nodes via ``pip install -e .`` and bumps on every client
+change, while the hub is a container built from this one file and changes
+maybe a handful of times a year. Tying them together would mean the deployed
+hub's reported version churned on releases that never touched hub code --
+worse than useless for the question this answers, which is "does the hub I'm
+talking to have the endpoint I need?".
+
+There is no build metadata to derive it from either: the Containerfile copies
+``main.py`` alone, with no ``pyproject.toml`` or git checkout in the image, so
+a literal constant is the only thing that survives into the running container.
+
+Bump it (semver) whenever the hub's observable behaviour changes: MAJOR for a
+wire-protocol break, MINOR for a new endpoint or response field, PATCH for a
+fix that changes nothing a client can key off. Clients that need to know
+whether a capability exists should still probe for the 404 (as
+``sync.reconcile_with_hub`` does for /stats) rather than compare versions --
+this is a diagnostic, not a feature-negotiation channel."""
+
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 SYNC_SECRET = os.environ.get("SYNC_SECRET", "")
 
@@ -361,6 +384,15 @@ def health() -> JSONResponse:
     README, commonly fronted by a tunnel reachable from the open
     internet). The full exception is still logged server-side for
     debugging.
+
+    ``version`` is public for the same reason ``role`` already is: verifying
+    that a deploy actually rolled over is a job for whoever is holding the
+    curl, and requiring the sync secret for it would push operators toward
+    keeping that secret in their shell history. It is a static build
+    identifier -- unlike ``db``, no request-time state can leak through it,
+    and unlike ``/count``/``/stats`` below it says nothing about content.
+    The cost is fingerprinting, which is why it is a bare version string
+    with no dependency, commit, or platform detail attached.
     """
     db_status = "ok"
     try:
@@ -375,6 +407,7 @@ def health() -> JSONResponse:
         content={
             "status": "ok" if healthy else "degraded",
             "role": "hub",
+            "version": HUB_VERSION,
             "db": db_status,
             "time": datetime.now(UTC).isoformat(),
         },
@@ -443,6 +476,7 @@ def stats() -> JSONResponse:
     return JSONResponse(
         content={
             "role": "hub",
+            "version": HUB_VERSION,
             "memories": {
                 "total": totals["total"],
                 "tombstones": totals["tombstones"],
@@ -456,6 +490,84 @@ def stats() -> JSONResponse:
             "entities": entities["count"],
             "memory_entities": links["count"],
             "entity_relations": relations["count"],
+            "time": datetime.now(UTC).isoformat(),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Count
+# ---------------------------------------------------------------------------
+
+_COUNTABLE = ("memories", "entities", "memory_entities", "entity_relations")
+"""Tables /count will report, and the only values its ``table`` filter
+accepts. An allowlist rather than a validated identifier because the name is
+interpolated straight into the SQL text -- ``COUNT(*) FROM %s`` is not a
+parameterizable position in Postgres, so the value must never come from the
+request itself."""
+
+
+@app.get("/count", dependencies=[Depends(_require_auth)])
+def count(table: str | None = None) -> JSONResponse:
+    """Scalar record counts — the cheap subset of /stats, safe to poll.
+
+    /stats answers "how does my node differ from the hub, and where?", and
+    pays for it with two GROUP BY passes over the whole memories table plus
+    MIN/MAX. That is the right cost once per reconcile, and the wrong cost
+    for the thing operators actually reach for most often: "is the number
+    going up?" -- a dashboard tile, a cron drift alarm, a check right after
+    an import. Those want one number, every minute, and before this endpoint
+    the only way to get it was the full /stats aggregate.
+
+    So this route is deliberately query-shaped, not response-shaped: it never
+    groups, and ``?table=memories`` narrows it to a single COUNT so a poller
+    doesn't scan the graph tables it isn't watching. The memories entry keeps
+    the live/tombstone split (a plain total silently drifts against a node,
+    whose user-visible count excludes tombstones) but that split rides along
+    on the same scan, costing nothing extra.
+
+    Auth-gated, matching /stats: a bare total is less revealing than a
+    category breakdown but still leaks how much the operator has stored and
+    how fast it grows, which is exactly the kind of thing an unauthenticated
+    poller should not be able to graph. /health stays the public route, and
+    stays count-free.
+    """
+    if table is not None and table not in _COUNTABLE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown table {table!r}; expected one of {', '.join(_COUNTABLE)}",
+        )
+    wanted = (table,) if table else _COUNTABLE
+
+    counts: dict[str, Any] = {}
+    with _connect() as conn:
+        for name in wanted:
+            if name == "memories":
+                (row,) = conn.execute(
+                    """
+                    SELECT COUNT(*)                                       AS total,
+                           COUNT(*) FILTER (WHERE deleted_at IS NOT NULL) AS tombstones
+                      FROM memories
+                    """
+                ).fetchall()
+                counts["memories"] = {
+                    "total": row["total"],
+                    # Named to match what a node reports for itself: its
+                    # user-visible count filters deleted_at IS NULL, so
+                    # `live` is the figure that should agree across sides,
+                    # and `total` the one that agrees with /stats.
+                    "live": row["total"] - row["tombstones"],
+                    "tombstones": row["tombstones"],
+                }
+            else:
+                (row,) = conn.execute(f"SELECT COUNT(*) AS count FROM {name}").fetchall()
+                counts[name] = row["count"]
+
+    return JSONResponse(
+        content={
+            "role": "hub",
+            "version": HUB_VERSION,
+            **counts,
             "time": datetime.now(UTC).isoformat(),
         },
     )

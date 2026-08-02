@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 import remind_me_mcp.peer_server as peer_server
 from remind_me_mcp.db import _ensure_schema, _entity_id, _now_iso
+from remind_me_mcp.version import __version__
 
 SECRET = "test-secret"
 AUTH = {"Authorization": f"Bearer {SECRET}"}
@@ -112,6 +113,20 @@ def test_health_with_valid_secret(peer_url: str) -> None:
     body = resp.json()
     assert body["status"] == "ok"
     assert body["node_id"] == "test-node"
+    # A peer's build, so a new peer that gets a 404 probing this server's
+    # entity endpoints can say which version it was talking to rather than
+    # just "unsupported".
+    assert body["role"] == "peer"
+    assert body["version"] == __version__
+
+
+def test_health_version_stays_behind_auth(peer_url: str) -> None:
+    """Unlike the hub's and dashboard's, this /health is auth-gated.
+
+    The peer port binds all interfaces by default (REMIND_ME_PEER_BIND), so
+    the build identifier must not become readable without the secret.
+    """
+    assert httpx.get(f"{peer_url}/health").status_code == 401
 
 
 def test_missing_secret_rejected(peer_url: str) -> None:

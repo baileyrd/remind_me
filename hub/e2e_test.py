@@ -213,4 +213,40 @@ check("malformed record isolated, good record applied",
       body["failed"] == 1 and body["accepted"] == 1
       and body["processed_ids"] == ["good-1"], str(body))
 
+# ---------------- Version + /count ----------------
+# The pytest suite can only check these statically (it can't import hub/main.py
+# at all — no fastapi/psycopg), so this is where the responses are read for
+# real. The interesting part is agreement: /count must not disagree with
+# /stats about the same records, which is the failure a separate cheap query
+# path invites.
+AUTH = {"Authorization": f"Bearer {SECRET}"}
+
+health = httpx.get(f"{HUB_URL}/health").json()
+check("health reports the hub version without auth",
+      bool(health.get("version")), str(health))
+
+counts = httpx.get(f"{HUB_URL}/count", headers=AUTH)
+check("count requires auth", httpx.get(f"{HUB_URL}/count").status_code == 401)
+check("count reports the hub version",
+      counts.json().get("version") == health["version"], str(counts.json()))
+
+stats = httpx.get(f"{HUB_URL}/stats", headers=AUTH).json()
+c = counts.json()
+check("count agrees with stats on totals",
+      c["memories"]["total"] == stats["memories"]["total"]
+      and c["memories"]["tombstones"] == stats["memories"]["tombstones"]
+      and c["entities"] == stats["entities"]
+      and c["memory_entities"] == stats["memory_entities"]
+      and c["entity_relations"] == stats["entity_relations"],
+      f"count={c} stats={stats}")
+check("count splits live from tombstoned",
+      c["memories"]["live"] == c["memories"]["total"] - c["memories"]["tombstones"],
+      str(c["memories"]))
+
+one = httpx.get(f"{HUB_URL}/count?table=memories", headers=AUTH).json()
+check("count?table= narrows to one table",
+      "memories" in one and "entities" not in one, str(one))
+bad = httpx.get(f"{HUB_URL}/count?table=nope", headers=AUTH)
+check("count rejects an unknown table", bad.status_code == 400, str(bad.text))
+
 print("\nALL CHECKS PASSED")
