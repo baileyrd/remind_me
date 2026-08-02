@@ -43,6 +43,15 @@ sync is configured at all, so gating their pruning on sync being enabled
 would leave a single, never-synced device's ``memory_revisions`` table
 growing forever. This loop runs unconditionally (unlike ``sync.py``'s),
 which is exactly the property revision compaction needs.
+
+Analytics trend snapshot capture and retention (issue #186,
+``analytics.maybe_capture_analytics_snapshot`` /
+``db._compact_analytics_snapshots``) piggyback on this same loop too, for
+the combined reasons above: capture is throttled to roughly once a day via
+a persisted watermark (mirroring the digest check's own throttle exactly),
+and -- like revision compaction -- retention runs unconditionally rather
+than being gated on ``config.SYNC_ENABLED``, since snapshots accumulate
+regardless of whether sync is configured.
 """
 
 from __future__ import annotations
@@ -53,7 +62,13 @@ from typing import TYPE_CHECKING, Any
 
 from remind_me_mcp import notifications
 from remind_me_mcp.config import REMINDER_POLL_INTERVAL
-from remind_me_mcp.db import _compact_revisions, _get_db, _now_iso, _row_to_dict
+from remind_me_mcp.db import (
+    _compact_analytics_snapshots,
+    _compact_revisions,
+    _get_db,
+    _now_iso,
+    _row_to_dict,
+)
 
 if TYPE_CHECKING:
     import sqlite3
@@ -190,6 +205,16 @@ def start_scheduler() -> threading.Thread:
                     _compact_revisions(_get_db())
                 except Exception as e:
                     log.error("Revision compaction failed: %s", e, exc_info=True)
+                try:
+                    from remind_me_mcp.analytics import maybe_capture_analytics_snapshot
+
+                    maybe_capture_analytics_snapshot(_get_db())
+                except Exception as e:
+                    log.error("Analytics snapshot capture failed: %s", e, exc_info=True)
+                try:
+                    _compact_analytics_snapshots(_get_db())
+                except Exception as e:
+                    log.error("Analytics snapshot compaction failed: %s", e, exc_info=True)
                 _stop.wait(REMINDER_POLL_INTERVAL)
             log.info("Reminder scheduler thread stopped")
 

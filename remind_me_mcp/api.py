@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 from remind_me_mcp import ann_index
 from remind_me_mcp import config as _config
+from remind_me_mcp.analytics import get_analytics_trend
 from remind_me_mcp.api_keys import ApiKeyStore
 from remind_me_mcp.config import (
     DB_PATH,
@@ -388,6 +389,22 @@ def _build_api_app() -> Starlette:
         def _work() -> JSONResponse:
             db = _get_db()
             return _json_ok(build_vitality_report(db))
+
+        return await asyncio.to_thread(_work)
+
+    async def api_analytics_trend(request: Request) -> JSONResponse:
+        """Return the vault's daily analytics-snapshot history (issue #186).
+
+        One row per calendar day the background scheduler has captured
+        (:func:`remind_me_mcp.analytics.maybe_capture_analytics_snapshot`),
+        oldest first -- the dashboard's trend panel plots this directly.
+        Returns an empty array (not an error) on a fresh install that hasn't
+        captured a snapshot yet.
+        """
+
+        def _work() -> JSONResponse:
+            db = _get_db()
+            return _json_ok({"snapshots": get_analytics_trend(db)})
 
         return await asyncio.to_thread(_work)
 
@@ -1250,6 +1267,7 @@ def _build_api_app() -> Starlette:
         Route("/health", health),
         Route("/api/stats", api_stats),
         Route("/api/vitality", api_vitality),
+        Route("/api/analytics/trend", api_analytics_trend, methods=["GET"]),
         Route("/api/memories", api_list, methods=["GET"]),
         Route("/api/memories", api_add, methods=["POST"]),
         Route("/api/memories/search", api_search),

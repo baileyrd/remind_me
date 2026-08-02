@@ -239,7 +239,7 @@ This is not multi-tenancy (see [ARCHITECTURE.md](ARCHITECTURE.md)): every key
 ### What It Does
 
 - **Browse & search** — full-text search with `⌘K` shortcut, category sidebar with counts, clickable tag filters
-- **View stats** — bar charts for categories, sources, and top tags; database size and server info
+- **View stats** — bar charts for categories, sources, vitality distribution, and top tags; a **Vault Trend** line chart plotting total-memory-count drift over the daily analytics snapshots the background scheduler captures automatically (empty state on a fresh install with no history yet); database size and server info
 - **Add memories** — modal form with content editor, color-coded category picker, and tag input
 - **Edit & delete** — inline controls on every memory card with confirmation dialogs
 - **Expand/collapse** — long memories truncate at 200 characters with a click to expand
@@ -255,6 +255,7 @@ The dashboard is powered by a REST API you can also use directly:
 | `GET` | `/health` | Liveness probe (no auth) |
 | `GET` | `/api/stats` | Memory statistics, categories, tags, DB info |
 | `GET` | `/api/vitality` | Vault vitality report: active/dormant counts, health score, vitality-bucket distribution |
+| `GET` | `/api/analytics/trend` | Daily analytics-snapshot history for the dashboard's Vault Trend panel: `{snapshots: [{captured_at, total_memories, vitality_buckets, category_counts}, ...]}`, oldest first (empty array on a fresh install) |
 | `GET` | `/api/memories?category=&tags=&limit=&offset=` | List memories with filters, paginated (`total`/`count`/`offset`/`limit`/`has_more`) |
 | `GET` | `/api/memories/search?q=&category=&tags=&limit=&offset=` | Full-text search, paginated the same way |
 | `GET` | `/api/memories/{id}` | Get a single memory |
@@ -1275,6 +1276,7 @@ Every new memory used to start at a flat `base_weight=1.0` regardless of kind, s
 | `REMIND_ME_WATCH_GRACE` | `5` | Debounce grace period in seconds — files modified more recently than this are deferred until a scan sees a stable (mtime, size) |
 | `REMIND_ME_REMINDER_POLL_INTERVAL` | `60` | Seconds between the reminder scheduler's poll passes for due `remind_at` timestamps. The scheduler itself always runs — no separate enable switch |
 | `REMIND_ME_REVISION_RETENTION_DAYS` | `90` | An edit-history snapshot (see [Edit History](#edit-history)) older than this is hard-deleted by the reminder-scheduler loop — purely time-based, no per-peer acknowledgment tracking (`memory_revisions` is never synced). Bounds how far back `remind_me_revert` can reach |
+| `REMIND_ME_ANALYTICS_RETENTION_DAYS` | `730` | A daily analytics-trend snapshot (`analytics_snapshots`, `GET /api/analytics/trend`) older than this is hard-deleted by the reminder-scheduler loop — purely time-based, never synced. Deliberately an order of magnitude past `REMIND_ME_REVISION_RETENTION_DAYS`'s 90-day default: each row is one tiny daily rollup meant for long-range trend viewing, not audit |
 | `REMIND_ME_NOTIFY_WEBHOOK_URL` | *(unset)* | Webhook URL that receives a generic `{"subject", "body", "source": "remind-me"}` JSON POST per notification. Empty disables the webhook notifier — gated on config presence, no separate enable flag |
 | `REMIND_ME_NOTIFY_WEBHOOK_TIMEOUT` | `5` | Seconds to wait for the webhook POST before giving up, so a hung endpoint can't block the reminder scheduler or sync thread |
 | `REMIND_ME_NOTIFY_SMTP_HOST` | *(unset)* | SMTP server host. Empty (with no recipients) disables the email notifier |

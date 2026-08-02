@@ -653,6 +653,25 @@ risk as resurrecting a deleted memory that TOMBSTONE_RETENTION_DAYS's longer
 window guards against."""
 
 # ---------------------------------------------------------------------------
+# Analytics trend snapshots (issue #186)
+# ---------------------------------------------------------------------------
+
+ANALYTICS_RETENTION_DAYS = _env_int("REMIND_ME_ANALYTICS_RETENTION_DAYS", 730)
+"""How many days a daily analytics_snapshots row (issue #186) is kept before
+db._compact_analytics_snapshots hard-deletes it. Purely time-based, mirroring
+REVISION_RETENTION_DAYS/TOMBSTONE_RETENTION_DAYS -- no cross-device
+acknowledgment tracking, since analytics_snapshots is a local-only
+observability table that is never synced (see the v24->v25 migration
+docstring). Deliberately an order of magnitude more generous than
+REVISION_RETENTION_DAYS's 90-day default (and well beyond
+TOMBSTONE_RETENTION_DAYS's 180): each row is one tiny daily rollup (a couple
+of small JSON blobs, not full content), and the whole point of the trend
+panel is long-range "is my vault healthy over time" viewing, not short-range
+audit -- 730 days keeps two full years of daily points, which is cheap
+(roughly 730 rows regardless of vault size) and still leaves a bounded
+retention window rather than growing forever."""
+
+# ---------------------------------------------------------------------------
 # Notifications (issue #180)
 # ---------------------------------------------------------------------------
 
@@ -854,6 +873,7 @@ __all__ = [
     "WATCH_GRACE",
     "REMINDER_POLL_INTERVAL",
     "REVISION_RETENTION_DAYS",
+    "ANALYTICS_RETENTION_DAYS",
     "NOTIFY_WEBHOOK_URL",
     "NOTIFY_WEBHOOK_TIMEOUT",
     "NOTIFY_SMTP_HOST",

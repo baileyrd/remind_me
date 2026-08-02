@@ -1,5 +1,15 @@
 # Release Notes
 
+## v1.36.0 — 2026-08-02
+
+### New Features
+
+- **Analytics trend snapshots (#186)** — the dashboard's Stats view (categories, sources, vitality buckets, top tags) was point-in-time only: nothing recorded what those numbers were a week or a month ago, only what they are right now. A new `analytics_snapshots` table (v24->v25 migration) captures one row per calendar day with the vault's total memory count, vitality-bucket distribution, and category counts, so the dashboard can plot drift over time. A new `GET /api/analytics/trend` route returns the full snapshot history (`{snapshots: [...]}`, oldest first — an empty array on a fresh install rather than an error), and a new "Vault Trend" panel in the Stats view renders it with a `TrendChart` component that follows `BarChart`'s exact "no charting library, inline SVG via `React.createElement`" convention.
+- **Capture reuses the exact same report-building function every other vitality-facing tool already calls** (`vitality.build_vitality_report`) so a snapshot can never disagree with the live `remind_me_vitality_report`/`GET /api/vitality` numbers; category counts mirror `GET /api/stats`'s own `{category: count}` query and shape. Capture is idempotent per calendar day — checked by date, not exact timestamp equality, so a server restart mid-day never produces a duplicate row for the same day.
+- **Scheduled capture piggybacks on the existing reminder-scheduler poll loop** (`remind_me_mcp/scheduler.py`), the same "one background loop, multiple periodic concerns gated by their own due-check" pattern issues #187/#188 already established there — no second background thread. Throttling mirrors `digest.is_digest_due`'s exact shape: a persisted watermark in the `sync_flags` table (`analytics_last_snapshot_at`) so a restart mid-interval doesn't immediately re-fire. Unlike the digest, capture is not opt-in — there's no `REMIND_ME_DIGEST_INTERVAL`-style env var, since a trend chart with no history is a worse default than one small daily row.
+- **`analytics_snapshots` is local-only, never synced** — like `memory_revisions` (#187) and `reminder_deliveries` (#179) before it, it carries no sync outbox trigger: a per-node observability rollup of *this* device's vault state, not a replicated entity. Pruned by a new `REMIND_ME_ANALYTICS_RETENTION_DAYS` config (default 730 days — deliberately an order of magnitude more generous than `REMIND_ME_REVISION_RETENTION_DAYS`'s 90, since each row is one tiny daily rollup meant for long-range trend viewing rather than short-range audit) via `db._compact_analytics_snapshots`, called from the same always-on scheduler loop.
+- **Composes with #185's scoped API keys with no new logic** — `GET /api/analytics/trend` is a plain GET route under the existing `BearerAuthMiddleware`, so a `read`-scoped key already authenticates it exactly like `GET /api/stats`/`GET /api/vitality`; only mutating methods are scope-restricted, and this route has none.
+
 ## v1.35.0 — 2026-08-02
 
 ### Security

@@ -60,6 +60,13 @@ Current schema versions:
             (remind_me_revert). Purely additive and, like reminder_deliveries
             and wiki_pages, deliberately NOT synced -- see that migration's
             docstring for why.
+  24 -> 25: analytics trend snapshots (issue #186) -- analytics_snapshots
+            table capturing one row per day of the vault's aggregate
+            vitality-bucket distribution and category counts, so the
+            dashboard can show drift over time instead of only the current
+            instant. Purely additive and, like memory_revisions and
+            reminder_deliveries, deliberately NOT synced -- see that
+            migration's docstring for why.
 """
 
 from __future__ import annotations
@@ -77,6 +84,7 @@ import httpx
 
 from remind_me_mcp import ann_index
 from remind_me_mcp.config import (
+    ANALYTICS_RETENTION_DAYS,
     ANN_MIN_CHUNKS,
     DB_PATH,
     EMBED_BATCH_SIZE,
@@ -291,7 +299,7 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 # Current target schema version.  Increment when adding a new migration step.
-_SCHEMA_VERSION = 24
+_SCHEMA_VERSION = 25
 
 
 
@@ -474,6 +482,11 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         _migrate_v23_to_v24(db)
         db.execute("PRAGMA user_version = 24")
         current_version = 24
+
+    if current_version < 25:
+        _migrate_v24_to_v25(db)
+        db.execute("PRAGMA user_version = 25")
+        current_version = 25
 
     db.commit()
 
@@ -1905,6 +1918,58 @@ def _migrate_v23_to_v24(db: sqlite3.Connection) -> None:
     """)
 
 
+def _migrate_v24_to_v25(db: sqlite3.Connection) -> None:
+    """v24 -> v25: analytics trend snapshots (issue #186).
+
+    ``vitality.build_vitality_report`` (the same computation
+    ``remind_me_vitality_report`` and ``GET /api/vitality`` already expose)
+    and ``GET /api/stats``'s category counts are both point-in-time-only --
+    there was previously nowhere to see how the vault's health or category
+    mix has drifted over weeks or months, only its current instant. This
+    table gives the background scheduler somewhere to park one small daily
+    rollup so a dashboard trend chart has history to plot.
+
+    Columns deliberately mirror exactly what the read-time report already
+    produces rather than inventing a new shape: ``vitality_buckets`` reuses
+    ``build_vitality_report``'s bucket-label scheme (e.g. ``"0.00-0.05"``)
+    and ``category_counts`` reuses ``GET /api/stats``'s
+    ``{category: count}`` shape, both stored as JSON text (SQLite has no
+    native JSON column type) -- the same convention ``memories.tags``/
+    ``memories.metadata`` already use.
+
+    One row per calendar day (enforced by ``analytics.capture_analytics_snapshot``
+    checking for an existing same-day row before inserting, not by a SQL
+    UNIQUE constraint on a truncated date -- ``captured_at`` stores the full
+    capture timestamp, which is useful context to keep, not just a date).
+
+    Deliberately NO sync outbox trigger, the same scope decision v22->v23
+    (``reminder_deliveries``) and v23->v24 (``memory_revisions``) already
+    made for their own local-only tables: this is a per-node observability
+    rollup of *this* device's vault state at capture time, not a synced
+    entity -- a snapshot captured here says nothing about another device's
+    vault and has no sensible cross-device merge.
+
+    An index on ``captured_at`` supports both the "list snapshot history,
+    oldest first" query the trend endpoint runs and the retention
+    compaction's range delete (:func:`_compact_analytics_snapshots`).
+
+    Args:
+        db: An open SQLite connection.
+    """
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS analytics_snapshots (
+            id               INTEGER PRIMARY KEY,
+            captured_at      TEXT NOT NULL,
+            total_memories   INTEGER NOT NULL,
+            vitality_buckets TEXT NOT NULL,
+            category_counts  TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_analytics_snapshots_captured_at
+            ON analytics_snapshots(captured_at);
+    """)
+
+
 def embedding_mismatch_info(db: sqlite3.Connection) -> dict[str, str] | None:
     """Read-only check: do the stored vectors' model/dim/backend differ from
     the currently configured ``EMBEDDING_MODEL``/``EMBEDDING_DIM``/
@@ -2249,6 +2314,39 @@ def _compact_revisions(db: sqlite3.Connection) -> int:
     removed = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
     if removed:
         log.debug("Compacted %d memory revision(s)", removed)
+    return removed
+
+
+# ---------------------------------------------------------------------------
+# Analytics snapshot retention (issue #186)
+# ---------------------------------------------------------------------------
+
+
+def _compact_analytics_snapshots(db: sqlite3.Connection) -> int:
+    """Hard-delete analytics_snapshots rows older than ANALYTICS_RETENTION_DAYS.
+
+    Purely time-based, mirroring :func:`_compact_revisions`'s shape exactly
+    -- no per-peer acknowledgment tracking, because analytics_snapshots is a
+    local-only observability table with no sync counterpart to stay
+    consistent with (see the v24->v25 migration docstring). Called from
+    :mod:`remind_me_mcp.scheduler`'s always-on reminder-poll loop for the
+    same reason revision compaction is: snapshots accumulate regardless of
+    whether sync is configured at all, so gating pruning on sync being
+    enabled would mean a single, never-synced device's snapshot table grows
+    forever (bounded here, but still unbounded is still wrong in principle).
+
+    Args:
+        db: An open SQLite connection.
+
+    Returns:
+        The number of pruned snapshot rows.
+    """
+    cutoff = (datetime.now(UTC) - timedelta(days=ANALYTICS_RETENTION_DAYS)).isoformat()
+    cur = db.execute("DELETE FROM analytics_snapshots WHERE captured_at < ?", (cutoff,))
+    db.commit()
+    removed = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+    if removed:
+        log.debug("Compacted %d analytics snapshot(s)", removed)
     return removed
 
 
@@ -3219,6 +3317,7 @@ __all__ = [
     "_prune_orphan_chunks",
     "_purge_memory",
     "_compact_revisions",
+    "_compact_analytics_snapshots",
     "_fuse_query_embedding",
     "_semantic_search",
     "_hydrate_ann_hits",
