@@ -254,6 +254,10 @@ async def wiki_compile(params: WikiCompileInput) -> str:
     Calling phase 1 repeatedly is safe and idempotent — it never advances the
     watermark on its own.
 
+    Memories marked sensitive (issue #195) are never surfaced as pending
+    sources here, with no override — write about a sensitive topic directly
+    via `remind_me_wiki_write` instead.
+
     Args:
         params (WikiCompileInput): Batch size and the mark_integrated flag.
 
@@ -268,9 +272,20 @@ def _compile_sync(params: WikiCompileInput) -> str:
     wiki.reconcile()
     db = _pkg._get_db()
     watermark = wiki.get_meta(wiki.COMPILE_WATERMARK_KEY, "")
+    # Issue #195: sensitive memories are never surfaced as pending compile
+    # sources, with no override — same reasoning as remind_me_digest (see
+    # digest.py's build_digest_data docstring): a sensitive memory
+    # shouldn't get folded into a wiki page without explicit intent. If a
+    # user wants to write about a sensitive topic in the wiki, they can
+    # call remind_me_wiki_write directly. Because these rows never enter
+    # this query at all, marking a batch integrated advances the watermark
+    # past any sensitive memory in between without ever surfacing it — it
+    # stays permanently excluded from compile unless its sensitive flag is
+    # later cleared via remind_me_update.
     rows = db.execute(
         """SELECT id, category, content, created_at FROM memories
-            WHERE superseded_by IS NULL AND deleted_at IS NULL AND created_at > ?
+            WHERE superseded_by IS NULL AND deleted_at IS NULL AND sensitive = 0
+              AND created_at > ?
             ORDER BY created_at ASC LIMIT ?""",
         (watermark or wiki._EPOCH, params.limit),
     ).fetchall()

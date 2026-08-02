@@ -459,7 +459,7 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 # Current target schema version.  Increment when adding a new migration step.
-_SCHEMA_VERSION = 25
+_SCHEMA_VERSION = 26
 
 
 
@@ -647,6 +647,11 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         _migrate_v24_to_v25(db)
         db.execute("PRAGMA user_version = 25")
         current_version = 25
+
+    if current_version < 26:
+        _migrate_v25_to_v26(db)
+        db.execute("PRAGMA user_version = 26")
+        current_version = 26
 
     db.commit()
 
@@ -1248,7 +1253,7 @@ _OUTBOX_PAYLOAD_COLUMNS = (
     "accessed_at", "access_count", "decay_rate", "vitality", "base_weight",
     "status", "memory_type", "source_capture_id",
     "subject", "predicate", "object", "superseded_by",
-    "doc_id", "chunk_index", "deleted_at", "remind_at",
+    "doc_id", "chunk_index", "deleted_at", "remind_at", "sensitive",
 )
 
 # Entity columns mirrored into sync_outbox payloads (FT-04). Memory records
@@ -2130,6 +2135,84 @@ def _migrate_v24_to_v25(db: sqlite3.Connection) -> None:
     """)
 
 
+def _migrate_v25_to_v26(db: sqlite3.Connection) -> None:
+    """v25 -> v26: sensitive-memory flag (issue #195).
+
+    A "don't surface by default" convenience flag, explicitly NOT access
+    control -- see ARCHITECTURE.md's Non-goals and README's Design Scope:
+    remind_me is single-user, not multi-tenant, so anyone with DB access
+    already sees everything regardless of this column. Setting
+    ``sensitive=true`` on a memory (``remind_me_add``/``remind_me_update``)
+    just keeps it out of the passive/ambient read surfaces (search, list,
+    digest, wiki compile) unless the caller explicitly opts back in
+    (``include_sensitive=true``, where that opt-in exists) or already holds
+    its exact id (``remind_me_get``/``remind_me_history``/``remind_me_revert``
+    are deliberately unaffected -- a direct lookup by a known id is not
+    "surfacing by default").
+
+    ``INTEGER NOT NULL DEFAULT 0`` (boolean-as-integer): this schema has no
+    existing genuine boolean column to match against -- ``deleted_at``
+    encodes its yes/no via NULL-as-false on a timestamp column (a tombstone
+    needs the *when*, not just the fact), and nothing else stores a bare
+    flag -- so this establishes the convention fresh, using the same
+    ``INTEGER NOT NULL DEFAULT 0`` shape already used for "always has a
+    value, no null state" numeric columns like ``access_count`` (v6->v7)
+    and ``memory_associations.weight`` (v18->v19).
+
+    A genuine content field, like v22->v23's ``remind_at``, not
+    access-tracking metadata -- it rides the normal ``updated_at``-bumping
+    write path and is added to ``_OUTBOX_PAYLOAD_COLUMNS``, with the
+    ``memories_outbox_ai``/``_au`` triggers dropped and recreated to pick it
+    up (same HY-03 pattern v12->v13/v15->v16/v22->v23 used). As with
+    ``remind_at`` itself, this wires only the *send* side of sync — the
+    receive-side upsert in ``sync.py`` is intentionally left unmodified in
+    this pass, matching that existing column's own scope limit rather than
+    introducing a new one; cross-device propagation of the sensitive flag
+    is a reasonable follow-up, not bundled speculatively here.
+
+    ``memory_revisions`` (issue #187) grows a matching nullable
+    ``sensitive`` column so toggling a memory's sensitivity via
+    ``remind_me_update`` is itself a tracked, revertable edit like
+    content/category/tags/metadata -- see ``tools/crud.py``'s
+    ``_REVISION_TRACKED_COLUMNS``/``_extract_tracked_field_changes``.
+
+    No index: a low-cardinality boolean filter added alongside the existing
+    ``deleted_at``/``superseded_by IS NULL`` filters on every read path that
+    gained this check, which already carry adequate indexes for their own
+    filters -- add one later only with query-plan evidence it helps.
+
+    Args:
+        db: An open SQLite connection.
+    """
+    with contextlib.suppress(sqlite3.OperationalError):
+        db.execute("ALTER TABLE memories ADD COLUMN sensitive INTEGER NOT NULL DEFAULT 0")
+    with contextlib.suppress(sqlite3.OperationalError):
+        db.execute("ALTER TABLE memory_revisions ADD COLUMN sensitive INTEGER DEFAULT NULL")
+
+    payload = _outbox_payload_sql("NEW.")
+    db.executescript(f"""
+        DROP TRIGGER IF EXISTS memories_outbox_ai;
+        DROP TRIGGER IF EXISTS memories_outbox_au;
+
+        CREATE TRIGGER IF NOT EXISTS memories_outbox_ai
+        AFTER INSERT ON memories
+        WHEN COALESCE((SELECT value FROM sync_flags WHERE key = 'sync_enabled'), '0') = '1'
+        BEGIN
+            INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+            VALUES (NEW.id, 'insert', {payload}, {_SQL_NOW_ISO});
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS memories_outbox_au
+        AFTER UPDATE ON memories
+        WHEN COALESCE((SELECT value FROM sync_flags WHERE key = 'sync_enabled'), '0') = '1'
+             AND NEW.updated_at IS NOT OLD.updated_at
+        BEGIN
+            INSERT INTO sync_outbox (memory_id, operation, payload, created_at)
+            VALUES (NEW.id, 'update', {payload}, {_SQL_NOW_ISO});
+        END;
+    """)
+
+
 def embedding_mismatch_info(db: sqlite3.Connection) -> dict[str, str] | None:
     """Read-only check: do the stored vectors' model/dim/backend differ from
     the currently configured ``EMBEDDING_MODEL``/``EMBEDDING_DIM``/
@@ -2700,12 +2783,14 @@ def _hydrate_ann_hits(
     limit: int,
     category: str | None,
     tags: list[str] | None,
+    include_sensitive: bool = False,
 ) -> list[dict]:
     """Turn ANN ``(vec_rowid, distance)`` pairs into full memory dicts.
 
     Mirrors the brute-force SQL path's semantics exactly: dedupe to each
-    memory's best (smallest-distance) chunk, exclude superseded memories,
-    apply category/tag filters, sort by distance, and truncate to *limit*.
+    memory's best (smallest-distance) chunk, exclude superseded memories
+    and (unless *include_sensitive*, issue #195) sensitive memories, apply
+    category/tag filters, sort by distance, and truncate to *limit*.
     A ``vec_rowid`` with no matching ``vec_chunks`` row (a stale ANN entry —
     e.g. a chunk removed between an in-flight search and an unrelated
     delete) is silently skipped rather than treated as an error.
@@ -2733,6 +2818,8 @@ def _hydrate_ann_hits(
 
     conditions = ""
     bindings: list = []
+    if not include_sensitive:
+        conditions += " AND m.sensitive = 0"
     if category:
         conditions += " AND m.category = ?"
         bindings.append(category)
@@ -2769,6 +2856,7 @@ def _semantic_search(
     extra_texts: list[str] | None = None,
     category: str | None = None,
     tags: list[str] | None = None,
+    include_sensitive: bool = False,
 ) -> list[dict]:
     """Search memories by semantic similarity using the chunked vector index.
 
@@ -2794,6 +2882,8 @@ def _semantic_search(
             embeddings are averaged with the query's before the KNN.
         category: If set, only return memories with this category.
         tags: If set, only return memories that have ALL of these tags.
+        include_sensitive: If False (default), exclude memories marked
+            sensitive (issue #195).
 
     Returns:
         List of memory dicts (from _row_to_dict) with an added
@@ -2820,10 +2910,14 @@ def _semantic_search(
         if chunk_count >= ANN_MIN_CHUNKS:
             ann_hits = ann_index.search(db, query_bytes, knn_k)
             if ann_hits is not None:
-                return _hydrate_ann_hits(db, ann_hits, limit, category, tags)
+                return _hydrate_ann_hits(
+                    db, ann_hits, limit, category, tags, include_sensitive=include_sensitive
+                )
 
         conditions = ""
         bindings: list = [query_bytes, knn_k]
+        if not include_sensitive:
+            conditions += " AND m.sensitive = 0"
         if category:
             conditions += " AND m.category = ?"
             bindings.append(category)

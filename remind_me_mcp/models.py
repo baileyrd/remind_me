@@ -159,6 +159,19 @@ class MemoryAddInput(BaseModel):
         description="Entities this memory mentions (FT-04 knowledge graph)",
         max_length=20,
     )
+    sensitive: bool = Field(
+        default=False,
+        description=(
+            "Mark this memory sensitive (issue #195) — a convenience flag, "
+            "NOT access control (remind_me is single-user; anyone with DB "
+            "access already sees everything). A sensitive memory is simply "
+            "kept out of remind_me_search/remind_me_list/remind_me_digest/"
+            "remind_me_wiki_compile by default, to reduce accidental "
+            "exposure in ambient surfaces. It stays fully readable via "
+            "remind_me_get and remind_me_search/remind_me_list with "
+            "include_sensitive=true."
+        ),
+    )
 
 
 class MemorySearchInput(BaseModel):
@@ -187,6 +200,15 @@ class MemorySearchInput(BaseModel):
     include_dormant: bool = Field(
         default=False,
         description="Include decayed-out memories (vitality < 0.05).",
+    )
+    include_sensitive: bool = Field(
+        default=False,
+        description=(
+            "Include memories marked sensitive (issue #195). Off by default "
+            "so a sensitive memory never surfaces in an ordinary search — "
+            "opt in explicitly when you actually need it, e.g. because the "
+            "question is specifically about that content."
+        ),
     )
     min_vitality: float = Field(
         default=0.0,
@@ -329,6 +351,15 @@ class MemoryListInput(BaseModel):
     source: str | None = Field(
         default=None, description="Filter by source (e.g., 'chat_import', 'manual')"
     )
+    include_sensitive: bool = Field(
+        default=False,
+        description=(
+            "Include memories marked sensitive (issue #195). Off by default, "
+            "same reasoning and opt-in as remind_me_search's flag of the "
+            "same name — browsing a category/tag/source slice should not "
+            "surface sensitive content any more than searching it should."
+        ),
+    )
     limit: int = Field(default=20, ge=1, le=100)
     offset: int = Field(default=0, ge=0)
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
@@ -348,6 +379,15 @@ class MemoryUpdateInput(BaseModel):
     category: str | None = Field(default=None, max_length=100)
     tags: list[str] | None = Field(default=None, max_length=20)
     metadata: dict[str, Any] | None = Field(default=None)
+    sensitive: bool | None = Field(
+        default=None,
+        description=(
+            "Set or clear this memory's sensitive flag (issue #195) — "
+            "true marks it sensitive (excluded from search/list/digest/wiki "
+            "compile by default, see remind_me_add), false clears it. Omit "
+            "to leave the current value unchanged."
+        ),
+    )
     clear_superseded: bool = Field(
         default=False,
         description=(

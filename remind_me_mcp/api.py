@@ -327,6 +327,17 @@ def _build_api_app() -> Starlette:
                 f"Invalid integer for query parameter {name!r}: {raw!r}"
             ) from None
 
+    def _bool_param(params: Any, name: str, default: bool = False) -> bool:
+        """Parse a boolean query parameter (issue #195's include_sensitive and
+        alike). Absent/empty falls back to *default*; "1"/"true"/"yes"
+        (case-insensitive) are truthy, anything else falsy — never raises, a
+        malformed value just isn't treated as opted-in.
+        """
+        raw = params.get(name)
+        if raw is None or raw == "":
+            return default
+        return raw.strip().lower() in ("1", "true", "yes")
+
     # -- routes --
     #
     # PF-06: every handler runs its (blocking) SQLite work in a worker thread
@@ -410,10 +421,19 @@ def _build_api_app() -> Starlette:
         return await asyncio.to_thread(_work)
 
     async def api_list(request: Request) -> JSONResponse:
-        """List memories with optional category, source, and tag filters."""
+        """List memories with optional category, source, and tag filters.
+
+        Issue #195: excludes memories marked sensitive by default, same as
+        ``GET /api/memories/search`` — pass ``include_sensitive=true`` to
+        include them. Not access control (remind_me is single-user); a
+        convenience filter to keep sensitive content out of an ordinary
+        listing.
+        """
         params = request.query_params
         conditions: list[str] = ["m.deleted_at IS NULL"]
         bindings: list[Any] = []
+        if not _bool_param(params, "include_sensitive"):
+            conditions.append("m.sensitive = 0")
 
         if cat := params.get("category"):
             conditions.append("m.category = ?")
@@ -476,6 +496,9 @@ def _build_api_app() -> Starlette:
         carries ``total``/``has_more`` alongside ``count``/``memories`` --
         parity with ``api_list``, so a client can page through results
         beyond the ``limit`` cap instead of only ever seeing the head.
+
+        Issue #195: excludes memories marked sensitive by default; pass
+        ``include_sensitive=true`` to include them.
         """
         import sqlite3 as _sqlite3
 
@@ -502,7 +525,12 @@ def _build_api_app() -> Starlette:
         # (DI-03; same pattern as api_list's DATA-02 fix). deleted_at IS NULL
         # is unconditional -- a soft-deleted memory must never resurface here,
         # unlike superseded_by (only excluded on the entity-scoped path below).
+        # sensitive = 0 is likewise unconditional unless include_sensitive
+        # opts in (issue #195) -- same default-off convenience filter as the
+        # MCP remind_me_search surface.
         conditions = " AND m.deleted_at IS NULL"
+        if not _bool_param(params, "include_sensitive"):
+            conditions += " AND m.sensitive = 0"
         bindings: list[Any] = []
         if cat := params.get("category"):
             conditions += " AND m.category = ?"
@@ -808,6 +836,9 @@ def _build_api_app() -> Starlette:
         tags = body.get("tags", [])
         source = body.get("source", "manual")
         metadata = body.get("metadata", {})
+        # Issue #195: convenience "don't surface by default" flag, not access
+        # control -- see MemoryAddInput.sensitive's docstring.
+        sensitive = int(bool(body.get("sensitive", False)))
 
         # Issue #198: _work() runs in a worker thread via asyncio.to_thread
         # below (PF-06) — asyncio.create_task requires a running loop in the
@@ -823,9 +854,10 @@ def _build_api_app() -> Starlette:
             mem_id = _make_id(content)
             now = _now_iso()
             db.execute(
-                """INSERT INTO memories (id, content, category, tags, source, metadata, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (mem_id, content, category, json.dumps(tags), source, json.dumps(metadata), now, now),
+                """INSERT INTO memories (id, content, category, tags, source, metadata,
+                                         created_at, updated_at, sensitive)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (mem_id, content, category, json.dumps(tags), source, json.dumps(metadata), now, now, sensitive),
             )
             db.commit()
             _embed_and_store(mem_id, content)
@@ -858,6 +890,10 @@ def _build_api_app() -> Starlette:
         if "metadata" in body and body["metadata"] is not None:
             sets.append("metadata = ?")
             bindings.append(json.dumps(body["metadata"]))
+        if "sensitive" in body and body["sensitive"] is not None:
+            # Issue #195: see MemoryUpdateInput.sensitive's docstring.
+            sets.append("sensitive = ?")
+            bindings.append(int(bool(body["sensitive"])))
 
         if not sets:
             return _json_err("No fields to update")

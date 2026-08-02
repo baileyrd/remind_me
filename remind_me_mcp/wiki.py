@@ -248,15 +248,18 @@ def set_meta(key: str, value: str) -> None:
 def pending_compile_count() -> int:
     """Count raw memories awaiting wiki synthesis.
 
-    These are non-superseded ``memories`` rows created after the compile
-    watermark — exactly the set ``tools.wiki._compile_sync`` would surface
-    (it caps each brief at its ``limit``; this is the uncapped total). Zero
-    means the wiki is current with the memory store.
+    These are non-superseded, non-sensitive ``memories`` rows created after
+    the compile watermark — exactly the set ``tools.wiki._compile_sync``
+    would surface (it caps each brief at its ``limit``; this is the
+    uncapped total). Zero means the wiki is current with the memory store.
+    Sensitive memories (issue #195) are excluded here too, with no
+    override — see ``tools/wiki.py``'s ``_compile_sync`` for why a sensitive
+    memory never enters the compile brief in the first place.
     """
     watermark = get_meta(COMPILE_WATERMARK_KEY, "") or _EPOCH
     row = _db._get_db().execute(
         "SELECT COUNT(*) FROM memories "
-        "WHERE superseded_by IS NULL AND deleted_at IS NULL AND created_at > ?",
+        "WHERE superseded_by IS NULL AND deleted_at IS NULL AND sensitive = 0 AND created_at > ?",
         (watermark,),
     ).fetchone()
     return int(row[0]) if row is not None else 0

@@ -149,9 +149,10 @@ class VectorSearcher(Protocol):
     """Semantic KNN search over embedded memory chunks (matches `db._semantic_search`).
 
     Implementations are expected to over-fetch at chunk granularity and
-    collapse to one best-distance hit per memory, excluding superseded rows.
-    Must degrade to an empty list (not raise) when no embedder or vector
-    table is available — semantic search is optional everywhere it's called.
+    collapse to one best-distance hit per memory, excluding superseded rows
+    and, unless `include_sensitive` (issue #195), sensitive rows. Must
+    degrade to an empty list (not raise) when no embedder or vector table is
+    available — semantic search is optional everywhere it's called.
     """
 
     def __call__(
@@ -161,6 +162,7 @@ class VectorSearcher(Protocol):
         extra_texts: list[str] | None = None,
         category: str | None = None,
         tags: list[str] | None = None,
+        include_sensitive: bool = False,
     ) -> list[dict[str, Any]]:
         """Returns ranked memory dicts (best first), each carrying a
         'semantic_distance' key; empty list if semantic search is unavailable."""

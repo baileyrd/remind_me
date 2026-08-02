@@ -51,6 +51,7 @@ def test_v23_to_v24_adds_memory_revisions_table(db_conn: sqlite3.Connection) -> 
     assert cols == {
         "id", "memory_id", "content", "category", "tags", "metadata",
         "edited_at", "revision_reason",
+        "sensitive",  # v25->v26, issue #195
     }
 
 

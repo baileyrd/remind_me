@@ -164,6 +164,10 @@ paths:
     get:
       operationId: listMemories
       summary: List memories with optional filters and pagination
+      description: |
+        Excludes memories marked `sensitive` by default (issue #195); pass
+        `include_sensitive=true` to include them. A convenience filter, not
+        access control.
       parameters:
         - $ref: "#/components/parameters/Category"
         - name: source
@@ -171,6 +175,7 @@ paths:
           schema:
             type: string
         - $ref: "#/components/parameters/Tags"
+        - $ref: "#/components/parameters/IncludeSensitive"
         - name: limit
           in: query
           schema:
@@ -235,6 +240,15 @@ paths:
                 metadata:
                   type: object
                   default: {}
+                sensitive:
+                  type: boolean
+                  default: false
+                  description: |
+                    Convenience "don't surface by default" flag (issue #195),
+                    NOT access control. Excludes this memory from
+                    GET /api/memories, GET /api/memories/search,
+                    remind_me_digest, and remind_me_wiki_compile unless
+                    explicitly opted back in.
       responses:
         "201":
           description: Created
@@ -259,6 +273,9 @@ paths:
         structured subject/object matches it) in addition to any remaining
         free-text FTS5 query. An `entity:`-only query (no text left) lists
         matching memories newest-first instead of FTS-ranking them.
+
+        Excludes memories marked `sensitive` by default (issue #195); pass
+        `include_sensitive=true` to include them.
       parameters:
         - name: q
           in: query
@@ -279,6 +296,7 @@ paths:
             minimum: 0
         - $ref: "#/components/parameters/Category"
         - $ref: "#/components/parameters/Tags"
+        - $ref: "#/components/parameters/IncludeSensitive"
       responses:
         "200":
           description: OK. If an `entity:` token doesn't resolve, total/count are 0 and `message` explains why.
@@ -1093,6 +1111,15 @@ components:
       description: Comma-separated; a memory must have ALL listed tags.
       schema:
         type: string
+    IncludeSensitive:
+      name: include_sensitive
+      in: query
+      description: |
+        Include memories marked `sensitive` (issue #195). Off by default;
+        not access control — see the `Memory` schema's `sensitive` field.
+      schema:
+        type: boolean
+        default: false
 
   requestBodies:
     MemoryUpdate:
@@ -1115,6 +1142,9 @@ components:
                   type: string
               metadata:
                 type: object
+              sensitive:
+                type: boolean
+                description: See the `sensitive` field on POST /api/memories.
 
   responses:
     BadRequest:
@@ -1215,6 +1245,15 @@ components:
             by any of these routes — a deleted memory is excluded from every
             read path — documented here only because it's a real column on
             the underlying row, mirroring superseded_by's treatment above.
+        sensitive:
+          type: boolean
+          description: |
+            Convenience "don't surface by default" flag (issue #195), NOT
+            access control — remind_me is single-user, so anyone with DB
+            access already sees everything regardless of this field.
+            GET /api/memories and GET /api/memories/search exclude a
+            sensitive memory unless `include_sensitive=true`; a direct
+            GET /api/memories/{memory_id} lookup is unaffected.
 
     WikiPageSummary:
       type: object

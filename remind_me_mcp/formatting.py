@@ -38,7 +38,7 @@ def _fmt_memory_md(m: dict) -> str:
     meta = m.get("metadata", {})
     meta_str = ", ".join(f"{k}={v}" for k, v in meta.items()) if meta else ""
     lines = [
-        f"### Memory `{m['id']}`",
+        f"### Memory `{m['id']}`" + (" 🔒 _sensitive_" if m.get("sensitive") else ""),
         f"**Category:** {m['category']}  |  **Tags:** {tags}  |  **Source:** {m.get('source', '?')}",
     ]
     if meta_str:

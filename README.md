@@ -329,7 +329,7 @@ The stats view replaces the main content area with summary cards, horizontal bar
 
 | Tool | Description |
 |------|-------------|
-| `remind_me_search` | Hybrid search with RRF rank fusion, auto-routed or pinned ranking `strategy`, token budget, dormant exclusion, structured `subject:`/`predicate:`/`entity:` queries, opt-in `expand_entities` graph expansion, opt-in `include_neighbors` sibling-chunk expansion, and opt-in `expand_co_retrieval` co-retrieval expansion |
+| `remind_me_search` | Hybrid search with RRF rank fusion, auto-routed or pinned ranking `strategy`, token budget, dormant exclusion, structured `subject:`/`predicate:`/`entity:` queries, opt-in `expand_entities` graph expansion, opt-in `include_neighbors` sibling-chunk expansion, opt-in `expand_co_retrieval` co-retrieval expansion, and opt-in `include_sensitive` to include memories marked sensitive — see [Sensitive Memories](#sensitive-memories) |
 | `remind_me_entity` | Look up a knowledge-graph entity by name or alias: canonical record, facts, and linked memories |
 | `remind_me_entity_traverse` | Multi-hop traversal of the typed entity-relation graph (1-3 hops, both directions, optional relation filter) — for questions that require chaining relations, not just co-mention |
 | `remind_me_feedback` | Mark a memory helpful/unhelpful for a search result — a signed signal, distinct from the always-positive reinforcement of a plain access. Without `query`: global `base_weight`/vitality adjustment. With `query`: query-contextual instead — only applies to future searches with a similar query |
@@ -338,10 +338,10 @@ The stats view replaces the main content area with summary cards, horizontal bar
 
 | Tool | Description |
 |------|-------------|
-| `remind_me_add` | Store a new memory with content, category, tags, metadata, optional SPO triple, and entity mentions |
-| `remind_me_list` | List memories with filters (category, tags, source) and pagination |
-| `remind_me_get` | Retrieve a single memory by ID |
-| `remind_me_update` | Update a memory's content, category, tags, or metadata |
+| `remind_me_add` | Store a new memory with content, category, tags, metadata, optional SPO triple, entity mentions, and optional `sensitive` flag — see [Sensitive Memories](#sensitive-memories) |
+| `remind_me_list` | List memories with filters (category, tags, source), pagination, and opt-in `include_sensitive` |
+| `remind_me_get` | Retrieve a single memory by ID — always returns it, even if marked sensitive (a direct id lookup isn't "surfacing by default") |
+| `remind_me_update` | Update a memory's content, category, tags, metadata, or `sensitive` flag |
 | `remind_me_delete` | Permanently delete a memory |
 | `remind_me_history` | List a memory's prior content revisions, newest first — see [Edit History](#edit-history) |
 | `remind_me_revert` | Restore a memory to a prior revision — see [Edit History](#edit-history) |
@@ -993,6 +993,17 @@ If you want "ping me when something's due," use `REMIND_ME_NOTIFY_WEBHOOK_URL`. 
 - **Scope: content fields only.** What's tracked is exactly what `remind_me_update` can change (`content`, `category`, `tags`, `metadata`) — not `remind_at` or the vitality/classification columns. `remind_me_set_reminder` happens to funnel through the same shared internal update helper, but since it only ever touches `remind_at`, it never produces a revision.
 - **Local only, never synced** — like `reminder_deliveries` and the wiki index tables, `memory_revisions` carries no sync outbox trigger. Edit history is per-device audit trail, not a replicated entity; a revert on one device does not (yet) merge with another device's edit history for the same memory.
 - **Retention** — `REMIND_ME_REVISION_RETENTION_DAYS` (default 90) bounds how far back `remind_me_revert` can reach. Old revisions are pruned by the always-on reminder-scheduler loop (not the sync loop — revisions accumulate regardless of whether sync is configured at all).
+
+## Sensitive Memories
+
+`sensitive: bool = False` on `remind_me_add`/`remind_me_update` (and their REST equivalents) marks a memory as one that shouldn't surface in ambient/passive reads by default (issue #195).
+
+- **This is NOT access control.** remind_me is local-first and single-user (see [Design Scope](#design-scope)) — anyone with access to the SQLite database file already sees every row in it regardless of this flag. `sensitive` only reduces *accidental* exposure — a memory about something you'd rather not have pop up in an ordinary search or a scheduled digest, not a memory you need cryptographically hidden from other people. Real secrecy from other people requires filesystem/OS-level access control on the database file (or [encryption at rest](#encryption-at-rest)), not this flag.
+- **Excluded by default from:** `remind_me_search`, `remind_me_list`, `GET /api/memories`, `GET /api/memories/search` — each gained a matching `include_sensitive: bool = False` opt-in for the (rarer) case where you actually want to see sensitive results, e.g. because the question is specifically about that content.
+- **Always excluded, no opt-in, from:** `remind_me_digest` and `remind_me_wiki_compile`'s pending-sources query. Both are ambient/passive surfaces by nature — a digest can be scheduled and pushed to a notification channel without you asking a specific question, and a wiki page is meant to be read by anyone who opens the wiki — so neither offers an escape hatch. Want to write about a sensitive topic in the wiki anyway? Call `remind_me_wiki_write` directly; nothing stops that, only *automatic* inclusion during compile.
+- **Never filtered:** `remind_me_get` (fetch by an id you already hold), `remind_me_history`, `remind_me_revert`. A direct lookup by a known id isn't "surfacing by default" — the caller already knows exactly what they're asking for.
+- **A tracked, revertable field** — like content/category/tags/metadata (see [Edit History](#edit-history) above), toggling `sensitive` via `remind_me_update` snapshots the prior value and shows up in `remind_me_history`; `remind_me_revert` restores it along with everything else a revision captures.
+- **Not yet synced across devices** — the column rides the normal write path and enters the sync outbox payload, but (mirroring `remind_at`'s own existing scope limit) the receiving side of sync does not yet apply it, so marking a memory sensitive on one device does not currently propagate to another. A reasonable follow-up, not implemented in this pass.
 
 ## Digest
 

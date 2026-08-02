@@ -58,9 +58,14 @@ def test_v24_to_v25_adds_captured_at_index(db_conn: sqlite3.Connection) -> None:
     assert "idx_analytics_snapshots_captured_at" in indexes
 
 
-def test_schema_version_is_25(db_conn: sqlite3.Connection) -> None:
+def test_schema_version_is_current(db_conn: sqlite3.Connection) -> None:
+    """Compares against the live _SCHEMA_VERSION (issue #195 bumped it to 26)
+    rather than a hardcoded number, so a future migration doesn't have to
+    remember to update this file too."""
+    from remind_me_mcp.db import _SCHEMA_VERSION
+
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 25
+    assert version == _SCHEMA_VERSION
 
 
 # ---------------------------------------------------------------------------
