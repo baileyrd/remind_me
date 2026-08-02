@@ -1,5 +1,12 @@
 # Release Notes
 
+## v1.32.0 — 2026-08-02
+
+### New Features
+
+- **Vault digest (#188)** — a new `remind_me_digest` MCP tool synthesizes a compressed vault snapshot: recent additions, vault vitality, upcoming/overdue reminders, and sync health, all in one read. It is pure synthesis, not a new source of truth — every section calls the exact same underlying function its own standalone tool already uses (`vitality.build_vitality_report` behind `remind_me_vitality_report`, `sync.get_sync_status` behind `remind_me_sync_status`, and — on-demand only, since it's a network call — `sync.reconcile_with_hub` for a fresh hub verdict), so the digest can never disagree with those tools' own numbers. The reminders window logic (upcoming/overdue/all) was factored out of `tools/reminders.py` into a new `remind_me_mcp.reminders` module so both the tool and the digest share one definition, mirroring how `vitality.py`/`tools/lifecycle.py` and `wiki.py`/`tools/wiki.py` already split core logic from its MCP wrapper. `since_days` (default 7) configures the recent-additions lookback; `response_format` supports `markdown` (default) or `json`. Works standalone with zero configuration — an empty vault produces a coherent "nothing to report" digest rather than an error.
+- **Optional scheduled delivery (`REMIND_ME_DIGEST_INTERVAL`)** — `"daily"`/`"weekly"`, unset (default) disables it entirely, since unlike reminders a digest is a standing summary, not core functionality. When enabled, a due digest is built and pushed through `notifications.notify()` (issue #180's channels), exactly like a fired reminder or a sync fault. Rather than a second background thread, the check rides the existing reminder scheduler's poll loop (`remind_me_mcp.scheduler`) — a digest's daily/weekly cadence is far coarser than the scheduler's 60s-default poll interval, but the disabled-by-default check costs a zero-config server nothing extra per tick (a single attribute read before ever touching the database), while a second thread would add its own start/stop/join lifecycle purely to poll something this thread already wakes up for anyway. Throttling is gated on a persisted watermark (`sync_flags` key/value table, key `digest_last_sent_at` — reusing the exact table `sync.py` already established for this kind of cross-restart timestamp) rather than an in-memory timer, so a server restart mid-interval does not immediately re-fire a digest that was already sent.
+
 ## v1.31.0 — 2026-08-02
 
 ### New Features

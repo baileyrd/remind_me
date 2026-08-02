@@ -313,6 +313,7 @@ The stats view replaces the main content area with summary cards, horizontal bar
 |------|-------------|
 | `remind_me_set_reminder` | Set a future `remind_at` timestamp on an existing memory, or clear one already set (omit/null `remind_at`) — must be a valid ISO-8601 timestamp in the future |
 | `remind_me_list_reminders` | List memories with a set reminder: `upcoming` (still in the future), `overdue` (due but not yet delivered — e.g. the server was offline), or `all` |
+| `remind_me_digest` | Summarize recent additions, vault vitality, reminders, and sync health in one read — see [Digest](#digest) |
 
 ### Capture & decomposition
 
@@ -806,6 +807,20 @@ Two wiring points, both optional in the sense that they're no-ops with nothing c
 
 Deliberately *not* wired into `remind_me_server_status`'s maintenance-backlog nudges or the feedback hint — those are in-band by design (surfaced only inside a live tool response), not outbound alerts.
 
+## Digest
+
+`remind_me_digest` (issue #188) is a compressed, one-read snapshot of the vault: recent additions, vault vitality, reminders, and sync health. It is pure synthesis — every section calls the exact same underlying function its own standalone tool already uses (`vitality.build_vitality_report`, the same function behind `remind_me_vitality_report` in [Lifecycle](#lifecycle); the reminders window logic behind [`remind_me_list_reminders`](#reminders); `sync.get_sync_status`, the same function behind `remind_me_sync_status` in [Multi-Machine Sync](#multi-machine-sync)), so the digest can never disagree with those tools' own numbers.
+
+- **Works standalone, no configuration required** — call `remind_me_digest` any time; an empty vault gets a coherent "nothing to report" digest rather than an error or a blank response.
+- **`since_days`** (default 7) controls how far back counts as a "recent addition."
+- **`response_format`** — `markdown` (default) for a readable report, or `json` for the same underlying data programmatically.
+- When sync is enabled, the tool also fetches a fresh `remind_me_sync_reconcile`-equivalent hub verdict (`in-sync`/`pull-lag`/`node-ahead`/`fault`) and appends it to the Sync Health section — best-effort; a hub that can't be reached doesn't fail the digest, that line is simply omitted.
+
+**Optional scheduled delivery** — `REMIND_ME_DIGEST_INTERVAL` (`"daily"`, `"weekly"`, or unset/`""` to disable, the default) periodically builds the digest and pushes it through [Notifications](#notifications)' `notify()`, exactly like a fired reminder or a sync fault. Unlike the reminder scheduler (always on), this is genuinely opt-in — a digest is a standing summary, not core reminder functionality.
+
+- **Piggybacks on the existing reminder-poll thread** rather than a second background thread: the check is a single disabled-by-default attribute read when unset, so a zero-config server pays nothing extra per poll tick. See `remind_me_mcp/scheduler.py`'s module docstring for the full reasoning.
+- **Throttled by a persisted watermark**, not an in-memory timer — the last-sent timestamp lives in the same `sync_flags` key/value table `remind_me_mcp.sync` already uses for its own cross-restart bookkeeping (under the key `digest_last_sent_at`), so a server restart mid-interval does not immediately re-fire a digest that was already sent.
+
 ## Multi-Machine Sync
 
 ### Distributed Sync (recommended)
@@ -1217,6 +1232,7 @@ Every new memory used to start at a flat `base_weight=1.0` regardless of kind, s
 | `REMIND_ME_NOTIFY_SMTP_TO` | *(unset)* | Comma-separated recipient address(es). Required (with `_SMTP_HOST`) for the email notifier to be considered configured |
 | `REMIND_ME_NOTIFY_SMTP_USE_TLS` | `true` | STARTTLS a plaintext SMTP connection before authenticating. No effect on port 465 (always implicit TLS) |
 | `REMIND_ME_NOTIFY_SYNC_FAULT_INTERVAL` | `1800` | Minimum seconds between sync-fault notifications, so a persisting `fault` verdict from `remind_me_sync_reconcile` doesn't re-alert on every call |
+| `REMIND_ME_DIGEST_INTERVAL` | *(unset)* | `daily`, `weekly`, or unset/empty to disable scheduled digest delivery via `notify()`. The on-demand `remind_me_digest` tool call always works regardless of this setting |
 | `REMIND_ME_TOOL_PROFILE` | `full` | Advertised tool surface: `full` (48 tools, ~21k context), `standard` (30, ~14.8k — drops imports/sync/ops), or `core` (17, ~7.8k — conversational only, also hides the maintenance prompts). An unrecognised value logs a warning and falls back to `full` |
 | `REMIND_ME_MAINTENANCE_NUDGES` | `true` | Whether search/add responses may carry a maintenance-backlog nudge. Set `false` to silence them entirely |
 | `REMIND_ME_MAINTENANCE_NUDGE_INTERVAL` | `3600` | Minimum seconds between nudge *checks*. Bounds cost as well as noise — the backlog COUNTs only run when this has elapsed |

@@ -448,6 +448,27 @@ class ListRemindersInput(BaseModel):
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
 
 
+class DigestInput(BaseModel):
+    """Input for remind_me_digest: a synthesized vault snapshot (issue #188).
+
+    Assembles recent additions, vault vitality, reminders, and sync health
+    into one read -- see remind_me_mcp.digest for the section-by-section
+    detail. Works with no configuration; scheduled delivery of the same
+    digest through a notification channel is a separate opt-in
+    (REMIND_ME_DIGEST_INTERVAL).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    since_days: int = Field(
+        default=7,
+        ge=1,
+        le=365,
+        description="How many days back counts as a 'recent addition' in the digest's first section.",
+    )
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
+
+
 class ImportKind(StrEnum):
     """How to parse an imported file (FT-02).
 
@@ -1331,6 +1352,7 @@ __all__ = [
     "SetReminderInput",
     "ReminderWindow",
     "ListRemindersInput",
+    "DigestInput",
     "ImportKind",
     "ChatImportInput",
     "MemoryStatsInput",

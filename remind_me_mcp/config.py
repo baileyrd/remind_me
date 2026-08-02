@@ -636,6 +636,31 @@ BACKLOG Wave 4 documents, so this throttles to one notification per window
 per persisting fault rather than firing on every poll."""
 
 # ---------------------------------------------------------------------------
+# Digest (issue #188)
+# ---------------------------------------------------------------------------
+
+DIGEST_INTERVAL = os.environ.get("REMIND_ME_DIGEST_INTERVAL", "").strip().lower()
+"""'daily' / 'weekly' / '' (default, disabled). Unlike REMINDER_POLL_INTERVAL,
+scheduled digest delivery is genuinely opt-in -- a digest is a standing
+summary, not core reminder functionality, so it stays off until configured.
+The on-demand `remind_me_digest` tool call is unaffected by this either way;
+it always works standalone."""
+
+_DIGEST_INTERVAL_SECONDS: dict[str, int] = {"daily": 86400, "weekly": 604800}
+
+DIGEST_INTERVAL_SECONDS: int | None = _DIGEST_INTERVAL_SECONDS.get(DIGEST_INTERVAL)
+"""Resolved seconds for DIGEST_INTERVAL, or None when disabled or an
+unrecognized value was given (treated the same as disabled -- a typo'd
+interval should not silently pick some other cadence)."""
+
+if DIGEST_INTERVAL and DIGEST_INTERVAL_SECONDS is None:
+    log.warning(
+        "REMIND_ME_DIGEST_INTERVAL=%r is not 'daily' or 'weekly' -- "
+        "scheduled digest delivery stays disabled",
+        DIGEST_INTERVAL,
+    )
+
+# ---------------------------------------------------------------------------
 # Push/webhook ingestion (FT-09, Phase 5a)
 # ---------------------------------------------------------------------------
 
@@ -741,6 +766,8 @@ __all__ = [
     "NOTIFY_SMTP_TO",
     "NOTIFY_SMTP_USE_TLS",
     "NOTIFY_SYNC_FAULT_INTERVAL",
+    "DIGEST_INTERVAL",
+    "DIGEST_INTERVAL_SECONDS",
     "WEBHOOK_PORT",
     "WEBHOOK_BIND",
     "WEBHOOK_SECRET",

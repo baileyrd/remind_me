@@ -20,6 +20,17 @@ unconditionally (unlike the folder watcher, which is opt-in via
 poll interval) and :func:`stop_scheduler` signals the thread and joins it
 before the database connections are closed (SE-07), mirroring
 ``watcher.py``/``sync.py``'s thread lifecycle.
+
+The same loop also carries the optional scheduled-digest check (issue #188,
+``remind_me_mcp.digest.maybe_send_scheduled_digest``) rather than a second
+background thread. A digest's natural cadence (daily/weekly at the coarsest)
+is far coarser than this loop's default 60s reminder-poll interval, but
+``maybe_send_scheduled_digest`` is a single disabled-by-default attribute
+check when ``REMIND_ME_DIGEST_INTERVAL`` is unset -- so piggybacking costs a
+zero-config server nothing extra per tick, while a second thread would add
+its own lifecycle (start/stop/join, another daemon thread name, another
+failure mode to log) purely to poll something on a much longer timescale
+that this thread already wakes up for anyway.
 """
 
 from __future__ import annotations
@@ -157,6 +168,12 @@ def start_scheduler() -> threading.Thread:
                         log.info("Reminder scheduler delivered %d reminder(s)", delivered)
                 except Exception as e:
                     log.error("Reminder scheduler poll failed: %s", e, exc_info=True)
+                try:
+                    from remind_me_mcp.digest import maybe_send_scheduled_digest
+
+                    maybe_send_scheduled_digest()
+                except Exception as e:
+                    log.error("Scheduled digest check failed: %s", e, exc_info=True)
                 _stop.wait(REMINDER_POLL_INTERVAL)
             log.info("Reminder scheduler thread stopped")
 
