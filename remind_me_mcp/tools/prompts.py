@@ -261,6 +261,46 @@ Report how many candidates you reviewed and how many you actually changed.
 """
 
 
+@mcp.prompt(
+    name="review_contradictions",
+    title="Review free-text contradiction candidates",
+    description=(
+        "Review pairs of memories that share an entity but were never caught "
+        "by structured-triple supersession, and correct any genuine conflict "
+        "(remind_me_contradiction_candidates -> remind_me_update/"
+        "remind_me_delete/remind_me_add)."
+    ),
+)
+def review_contradictions(limit: str = "20") -> str:
+    """Drive the free-text contradiction review loop."""
+    return f"""\
+Run the contradiction review loop over memory pairs that share an entity but
+were never caught by the automatic structured-triple supersession mechanism
+(same subject+predicate, different object).
+
+1. Call `remind_me_contradiction_candidates` with `limit={limit}` to fetch
+   candidate pairs. If it returns none, say so and stop.
+2. For each pair, read both memories' full content and decide whether they
+   actually assert incompatible things, or are merely topically related
+   (mentioning the same person/project without conflicting), sequential
+   (an earlier state and a later, unremarkable update), or unrelated beyond
+   the shared entity. Most pairs will NOT be genuine contradictions -- only
+   flag ones where both cannot be true at once.
+3. For a genuine contradiction, correct it with whichever EXISTING tool fits:
+   `remind_me_update` to edit the stale memory in place, `remind_me_delete`
+   to remove it outright, or `remind_me_add` with an explicit
+   `subject`/`predicate`/`object` triple naming the corrected fact (this also
+   lets the automatic supersession mechanism catch any future exact-triple
+   conflict on the same claim).
+
+This is a review pass, not a bulk edit -- leave a pair alone on a weak
+signal. There is no separate "resolve" tool for this loop: update/delete/add,
+which already exist, are the write path.
+
+Report how many pairs you reviewed and how many you actually corrected.
+"""
+
+
 __all__ = [
     "decompose_facts",
     "normalize_imports",
@@ -269,4 +309,5 @@ __all__ = [
     "compile_wiki",
     "consolidate_duplicates",
     "recalibrate_importance",
+    "review_contradictions",
 ]

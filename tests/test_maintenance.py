@@ -66,6 +66,7 @@ def test_pending_counts_reports_every_queue(db_conn: sqlite3.Connection) -> None
         "unnormalized_imports",
         "unclassified_memories",
         "recalibration_candidates",
+        "contradiction_candidates",
         "pending_wiki_compile",
     }
     assert all(isinstance(v, int) for v in counts.values())

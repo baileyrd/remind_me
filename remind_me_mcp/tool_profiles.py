@@ -94,6 +94,7 @@ MAINTENANCE = frozenset({
     "remind_me_reclassify",
     "remind_me_reclassify_batch",
     "remind_me_recalibrate_candidates",
+    "remind_me_contradiction_candidates",
     "remind_me_consolidate",
     "remind_me_vitality_report",
     "remind_me_wiki_write",
@@ -110,6 +111,7 @@ MAINTENANCE_PROMPTS = frozenset({
     "compile_wiki",
     "consolidate_duplicates",
     "recalibrate_importance",
+    "review_contradictions",
 })
 
 

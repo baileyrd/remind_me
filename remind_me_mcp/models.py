@@ -1343,6 +1343,39 @@ class RecalibrateCandidatesInput(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Free-text contradiction candidates (issue #201)
+# ---------------------------------------------------------------------------
+
+
+class ContradictionCandidatesInput(BaseModel):
+    """Input for remind_me_contradiction_candidates: surface pairs of memories
+    that might conflict but were never caught by structured-triple
+    supersession (issue #201).
+
+    Read-only surfacing half of the same two-phase, Claude-driven shape as
+    remind_me_recalibrate_candidates: this tool only narrows an unbounded
+    all-pairs comparison down to a reviewable batch, bounded by the entity
+    graph (pairs must share at least one linked entity) and excluding pairs
+    already resolvable by the exact subject+predicate supersession mechanism
+    (see maintenance.CONTRADICTION_CANDIDATE_PAIRS_SQL). The actual judgment
+    -- whether a given pair genuinely conflicts -- happens in the calling
+    Claude session, which then acts on a real finding with the EXISTING
+    remind_me_update/remind_me_delete tools, or by writing a superseding
+    remind_me_add with an explicit SPO triple -- there is no separate
+    "apply"/"resolve" tool here.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    limit: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="Number of candidate pairs to return",
+    )
+
+
+# ---------------------------------------------------------------------------
 # LLM Wiki models (FT-08)
 # ---------------------------------------------------------------------------
 

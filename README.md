@@ -424,6 +424,7 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_reclassify` | Apply a memory type classification to a single memory |
 | `remind_me_reclassify_batch` | Fetch unclassified memories for batch classification |
 | `remind_me_recalibrate_candidates` | Fetch old, high-importance memories that have never received a feedback signal, for review — pairs with `remind_me_reclassify`/`remind_me_reclassify_batch` (the apply half) and `remind_me_feedback` (a pure importance nudge); no separate apply tool |
+| `remind_me_contradiction_candidates` | Fetch bounded pairs of memories sharing an entity that might conflict but weren't caught by structured-triple supersession, for review — pairs with `remind_me_update`/`remind_me_delete`/`remind_me_add` (the apply half); no separate apply tool |
 | `remind_me_consolidate` | Find semantically similar memories, preview clusters (dry_run=true), and merge duplicates using an LLM-authored `summaries` entry per cluster (dry_run=false) — a cluster with no matching summary is skipped, not merged with a raw concatenation |
 
 ### LLM Wiki
@@ -459,7 +460,7 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_check_update` | Check if a newer version is available on origin/main |
 | `remind_me_self_update` | Pull latest changes from origin and reinstall the package |
 
-50 tools + 7 prompts + 4 resources (`memory://stats`, `memory://categories`, `wiki://schema`, `wiki://index`).
+51 tools + 8 prompts + 4 resources (`memory://stats`, `memory://categories`, `wiki://schema`, `wiki://index`).
 
 ### Prompts: the maintenance loops as one-shot workflows
 
@@ -474,6 +475,7 @@ Every LLM-driven maintenance workflow is a *sequence* — a batch tool surfaces 
 | `compile_wiki` | `remind_me_wiki_compile` → `remind_me_wiki_write` ×N → `mark_integrated=true` |
 | `consolidate_duplicates` | `remind_me_consolidate` dry run → merge with LLM-authored summaries |
 | `recalibrate_importance` | `remind_me_recalibrate_candidates` → `remind_me_reclassify`/`remind_me_feedback` |
+| `review_contradictions` | `remind_me_contradiction_candidates` → `remind_me_update`/`remind_me_delete`/`remind_me_add` |
 
 Every argument is optional (batch size, similarity threshold), so invoking a prompt bare runs the loop with the tool's own defaults. The two loops whose second phase is hard to undo — `compile_wiki`'s watermark advance and `consolidate_duplicates`' merge — put the preview phase first and say why, so the destructive step is never the first thing done.
 
@@ -964,7 +966,18 @@ The dashboard's **Entities** view is a human-facing browser for the graph: a cli
 
 Supersession previously only happened via similarity-merge (`remind_me_consolidate`) — near-duplicate memories get merged. That misses a genuine contradiction: "I moved to Boston" doesn't textually resemble "I live in Seattle," even though they're in direct conflict. Whenever an SPO triple is written (`remind_me_add`, `remind_me_decompose`, `remind_me_annotate`), any other non-superseded, non-deleted memory sharing the same **subject + predicate** but a **different object** is automatically superseded — the same `superseded_by` mechanism, so every existing superseded-exclusion read path (search, list, entity lookups) picks it up for free.
 
-This is deliberately narrow: a differently-worded predicate never contradicts, e.g. "I *live in* Seattle" and "I *visited* Boston" don't collide, since they don't share a predicate — the caller (an LLM choosing predicate names) controls specificity, not this check. It's a cheap, deterministic first pass over the existing SPO columns; an LLM-based contradiction check is a possible later enhancement if this proves too narrow in practice.
+This is deliberately narrow: a differently-worded predicate never contradicts, e.g. "I *live in* Seattle" and "I *visited* Boston" don't collide, since they don't share a predicate — the caller (an LLM choosing predicate names) controls specificity, not this check. It's a cheap, deterministic first pass over the existing SPO columns.
+
+**The free-text gap (issue #201).** The mechanism above only fires on exact structured-triple matches — it says nothing about two pieces of free-text prose that conflict without ever being decomposed into a shared subject/predicate ("I moved to Boston last month" vs. "My apartment in Seattle has great light" as two unstructured memories). `remind_me_contradiction_candidates` (`limit`, default 20) closes that gap the same read-only, Claude-judged way [Importance Recalibration](#importance-recalibration-issue-200) closes its own gap: it surfaces bounded PAIRS of memories using a deterministic heuristic, and the calling Claude session judges whether a given pair actually conflicts — no LLM call happens inside the server, and nothing is auto-superseded by this tool.
+
+The comparison space is bounded two ways, so this never becomes an all-pairs O(n²) scan of the vault:
+
+1. **Shared entity.** Both memories in a pair must mention at least one common entity in the entity graph (FT-04, the same graph `remind_me_entity` traverses) — two memories that share no entity are extremely unlikely to be a direct contradiction.
+2. **Not already covered.** Pairs that would already auto-supersede via the exact subject+predicate mechanism above are excluded — a genuinely covered pair can't actually coexist as two live (non-superseded) memories by the time both would be visible, since the write path already resolved it.
+
+Each candidate pair carries both memories' content snippets, category, `memory_type`, any SPO triple, and the shared entity name(s), so the calling session has enough context to judge. This surfaces pairs that MIGHT conflict, not pairs that ARE confirmed contradictions — prose comparison is inherently less certain than exact triple matching. There is deliberately no third "apply"/"resolve" tool: once a genuine contradiction is confirmed, use the EXISTING `remind_me_update` (correct the stale memory in place), `remind_me_delete` (remove it), or `remind_me_add` with an explicit SPO triple (which also lets the exact-triple mechanism catch any future conflict on the same claim automatically). A matching `review_contradictions` prompt drives the loop end to end.
+
+Architectural note, same correction as #200's: the issue's literal text proposed a scheduler-hosted LLM pass; this server has no in-server LLM dependency and never calls an LLM API itself, so this is built as the two-phase, on-demand pattern instead. A `contradiction_candidates` queue joins [Maintenance Nudges](#maintenance-nudges) using the same deterministic pairing query, so a growing backlog surfaces the same way every other maintenance queue does.
 
 ### Sync & export
 
@@ -1481,6 +1494,8 @@ The write-time prior above and `remind_me_feedback`'s adjustments are the only t
 This is a **two-phase, Claude-driven workflow**, the same shape as `remind_me_normalize_batch`/`remind_me_normalize_apply` and `remind_me_consolidate`'s dry-run mode: the tool surfaces structured candidates, the calling agent does the actual reasoning, and — deliberately — there is no third "apply" tool. The apply half is the tools that already exist: `remind_me_reclassify`/`remind_me_reclassify_batch` for a genuine `memory_type` change, or `remind_me_feedback` (an "unhelpful"/"helpful" signal with no `query`) for a pure importance nudge with no type change. Building a redundant write path here would just duplicate reclassify's.
 
 Architectural note: the original issue proposed "a periodic (scheduler-loop-hosted) LLM-driven pass," following the pattern of the reminder/digest/analytics-snapshot scheduler loops (#186/#187/#188). This server has no in-server LLM dependency and never calls an LLM API itself — a background thread can only run deterministic code — so the scheduler-hosted framing doesn't fit here the way it does for those purely-mechanical loops. What *is* mechanical and scheduler-appropriate is the count: [Maintenance Nudges](#maintenance-nudges) gained a `recalibration_candidates` queue using this same heuristic, so a growing backlog surfaces on ordinary tool responses (once past the usual threshold) the same way every other maintenance queue already does — only the counting is deterministic background work; the judgment stays client-side, on demand.
+
+This importance-staleness gap has a free-text-prose analog: `remind_me_contradiction_candidates` surfaces entity-linked memory pairs that might conflict without ever sharing a formal SPO triple — see [Contradiction-Based Supersession](#contradiction-based-supersession) for the full writeup. Same two-phase, no-in-server-LLM shape as this section, just surfacing PAIRS instead of single memories.
 
 ## Environment Variables
 
