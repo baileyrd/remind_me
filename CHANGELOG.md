@@ -13,11 +13,15 @@ Format: Added / Changed / Deprecated / Removed / Fixed / Security, newest first.
 - MCP: `remind_me_build_info{version=...}` metric; version in `remind_me_server_status` and `--status`; version shown in the dashboard header.
 - MCP: `GET /count` on the peer server and a `remind_me_sync_reconcile_peer` tool, so peer drift is observable; `remind_me_sync_reconcile` gains an opt-in `quick` pre-check.
 - CI: `hub-e2e` job runs `hub/e2e_test.py` against a live Postgres — the hub's first automatic runtime coverage — plus a guard requiring a `HUB_VERSION` bump when `hub/main.py` changes.
+- MCP: `GET /api/versions` — this node's build and, when sync is configured, the hub's (probed live, `null` when unreachable); the dashboard header shows both.
 ### Changed
 - MCP: `__version__` now resolves in `remind_me_mcp/version.py` so HTTP surfaces can import it without cycling through the package root; `from remind_me_mcp import __version__` still works.
 ### Fixed
 - Hub: `setup.sh update` reported success without checking that the new build was actually serving.
 - Hub e2e: two assertions expected exactly one entity, unsatisfiable since entity relations were added.
+- `docs/openapi.yaml` drift for `/api/versions`, and an order-dependent test that patched a shared `httpx` global and left module-level cache state behind.
+### Docs
+- `hub/README.md`: running the hub over HTTPS — the client already supports it, how to terminate TLS, `SSL_CERT_FILE` for a private CA, and the peer-sync/trust-failure caveats.
 ### Security
 - Hub: FastAPI's `/docs`, `/redoc` and `/openapi.json` were served unauthenticated, advertising every route including `POST /admin/compact_tombstones`. Disabled.
 
