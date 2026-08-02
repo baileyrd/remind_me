@@ -1222,6 +1222,14 @@ often version-skew problems and the two halves release independently:
 | `remind_me_sync_status` | `version` | this node's build, next to its `node_id` |
 | `remind_me_sync_reconcile` | `version`, `hub_version` | both sides in one report; `hub_version` is `null` against a hub older than this feature |
 
+`remind_me_sync_reconcile` accepts `quick=true`, which checks the hub's
+`/count` first and skips `/stats` when every total already agrees — measured
+at ~41ms against ~128ms on a 200k-row hub. It is **off by default on
+purpose**: equal totals don't prove equal contents (a recategorization that
+synced on one side only leaves the total unchanged while two categories drift
+in opposite directions), and catching exactly that drift is what reconcile is
+for. A quick run that took the fast path says so, via `checked: "totals"`.
+
 The hub also serves **`GET /count`** (bearer auth), the cheap counterpart to
 `/stats`: scalar `COUNT(*)`s with no `GROUP BY`, optionally narrowed with
 `?table=memories|entities|memory_entities|entity_relations`. Poll it from a

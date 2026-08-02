@@ -3203,3 +3203,133 @@ def test_genuine_content_update_still_enqueues_an_outbox_row(
 
     pending = sync_db.execute("SELECT COUNT(*) FROM sync_outbox").fetchone()[0]
     assert pending == 1
+
+
+# ---------------------------------------------------------------------------
+# reconcile quick mode (issue #215)
+# ---------------------------------------------------------------------------
+
+
+def count_and_stats_recorder(
+    count_payload: dict[str, Any] | None, stats_payload: dict[str, Any]
+) -> RequestRecorder:
+    responses: dict[str, Any] = {"/stats": stats_payload}
+    if count_payload is not None:
+        responses["/count"] = count_payload
+    return RequestRecorder(responses)
+
+
+def hub_count(
+    *, total: int, tombstones: int = 0, entities: int = 0,
+    memory_entities: int = 0, entity_relations: int = 0,
+) -> dict[str, Any]:
+    """A hub GET /count payload in the shape hub/main.py returns."""
+    return {
+        "role": "hub",
+        "version": "1.5.0",
+        "approximate": False,
+        "memories": {
+            "total": total,
+            "live": total - tombstones,
+            "tombstones": tombstones,
+        },
+        "entities": entities,
+        "memory_entities": memory_entities,
+        "entity_relations": entity_relations,
+        "time": _now_iso(),
+    }
+
+
+@pytest.mark.asyncio
+async def test_quick_skips_stats_when_totals_agree(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """The point of the fast path: the expensive call never happens."""
+    insert_memory(sync_db, "m1")
+    recorder = count_and_stats_recorder(hub_count(total=1), hub_stats(by_category={"general": 1}))
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_hub(client, quick=True)
+
+    assert result["verdict"] == "in-sync"
+    assert result["checked"] == "totals"
+    paths = [r.url.path for r in recorder.requests]
+    assert "/count" in paths
+    assert "/stats" not in paths, "quick mode must not pay for /stats when totals agree"
+
+
+@pytest.mark.asyncio
+async def test_quick_falls_through_to_stats_on_drift(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """Disagreeing totals need the breakdown, so the full path still runs."""
+    insert_memory(sync_db, "m1")
+    recorder = count_and_stats_recorder(hub_count(total=5), hub_stats(by_category={"general": 5}))
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_hub(client, quick=True)
+
+    assert "checked" not in result, "a fallen-through run is a full run"
+    assert result["memories"]["hub"] == 5
+    assert "/stats" in [r.url.path for r in recorder.requests]
+
+
+@pytest.mark.asyncio
+async def test_quick_falls_through_when_the_hub_has_no_count(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """An unanswerable pre-check must never be read as agreement.
+
+    A hub predating /count 404s it; treating that as "totals agree" would
+    report in-sync against a hub whose contents were never compared.
+    """
+    insert_memory(sync_db, "m1")
+    recorder = count_and_stats_recorder(None, hub_stats(by_category={"general": 1}))
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_hub(client, quick=True)
+
+    assert result["status"] == "ok"
+    assert "checked" not in result
+    assert "/stats" in [r.url.path for r in recorder.requests]
+
+
+@pytest.mark.asyncio
+async def test_quick_ignores_an_approximate_count(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """An estimate can't settle an equality question."""
+    insert_memory(sync_db, "m1")
+    payload = hub_count(total=1)
+    payload["approximate"] = True
+    recorder = count_and_stats_recorder(payload, hub_stats(by_category={"general": 1}))
+
+    async with mock_client(recorder) as client:
+        await sync.reconcile_with_hub(client, quick=True)
+
+    assert "/stats" in [r.url.path for r in recorder.requests]
+
+
+@pytest.mark.asyncio
+async def test_default_is_the_full_comparison(
+    sync_db: sqlite3.Connection, status_enabled: None
+) -> None:
+    """Equal totals don't prove equal contents.
+
+    An offsetting recategorization (one category up, another down, total
+    unchanged) is invisible to a totals-only check — and catching drift the
+    ordinary machinery missed is this function's whole job, so the default
+    must not take that shortcut.
+    """
+    insert_memory(sync_db, "m1", category="general")
+    recorder = count_and_stats_recorder(
+        hub_count(total=1), hub_stats(by_category={"fact": 1})
+    )
+
+    async with mock_client(recorder) as client:
+        result = await sync.reconcile_with_hub(client)
+
+    assert "/count" not in [r.url.path for r in recorder.requests]
+    # Totals match exactly; only the breakdown reveals the drift.
+    assert result["memories"]["delta"] == 0
+    assert {c["category"] for c in result["categories_with_drift"]} == {"fact", "general"}

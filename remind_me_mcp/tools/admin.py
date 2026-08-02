@@ -1235,7 +1235,7 @@ async def remind_me_sync_status() -> str:
         "openWorldHint": True,
     },
 )
-async def remind_me_sync_reconcile() -> str:
+async def remind_me_sync_reconcile(quick: bool = False) -> str:
     """Diff this node's record counts against the hub's and classify the drift (SY-14).
 
     Read-only on both sides — it calls the hub's ``GET /stats`` and compares
@@ -1253,6 +1253,16 @@ async def remind_me_sync_reconcile() -> str:
     - ``fault`` — hub ahead but the last successful pull is stale (or never
       happened), so it isn't lag
 
+    Args:
+        quick: Use the hub's cheap ``GET /count`` and skip ``/stats`` when
+            every total already agrees — about 3x cheaper on a large hub, for
+            a monitor polling the common no-drift case. Off by default
+            because equal totals don't prove equal contents: a
+            recategorization that synced on one side only leaves the total
+            unchanged while two categories drift in opposite directions, and
+            catching exactly that is what this tool is for. A quick run that
+            took the fast path is marked ``checked: "totals"``.
+
     Returns:
         str: JSON — verdict with hints, per-category drift (only categories
         that disagree, plus a count of those that don't), totals, tombstones,
@@ -1263,7 +1273,7 @@ async def remind_me_sync_reconcile() -> str:
     """
     from remind_me_mcp.sync import reconcile_with_hub
 
-    return json.dumps(await reconcile_with_hub(), indent=2)
+    return json.dumps(await reconcile_with_hub(quick=quick), indent=2)
 
 
 @mcp.tool(

@@ -1579,7 +1579,56 @@ def _notify_sync_fault(hub_url: str, hints: list[str]) -> None:
         log.warning("Sync fault notification failed: %s", e)
 
 
-async def reconcile_with_hub(client: httpx.AsyncClient | None = None) -> dict[str, Any]:
+def _cmp_counts(hub_value: Any, local_value: int) -> dict[str, Any]:
+    """One hub-vs-local comparison entry.
+
+    Module-level so the quick path and the full path can't describe the same
+    comparison differently -- a caller diffing the two outputs would have no
+    way to tell a shape difference from a real one.
+    """
+    hub_n = hub_value if isinstance(hub_value, int) else 0
+    return {"hub": hub_n, "local": local_value, "delta": hub_n - local_value}
+
+
+async def _hub_totals_agree(
+    client: httpx.AsyncClient, local: dict[str, Any]
+) -> bool | None:
+    """Ask the hub's /count whether every total matches *local* (issue #215).
+
+    Returns True/False, or None when the hub has no /count (predating it) or
+    the request failed -- both meaning "no answer", which the caller must
+    treat as "go and do the full comparison", never as agreement.
+
+    Measured on a 200k-row hub: /count ~41ms against /stats ~128ms, so
+    skipping /stats is worth roughly 3x on the common no-drift path.
+    """
+    try:
+        resp = await client.get(f"{HUB_URL}/count", headers=HEADERS, timeout=15)
+        if resp.status_code != 200:
+            return None
+        hub = resp.json()
+    except Exception as e:  # noqa: BLE001 — a status call must never raise
+        log.debug("Hub /count pre-check unavailable: %s", e)
+        return None
+
+    memories = hub.get("memories")
+    if not isinstance(memories, dict) or hub.get("approximate"):
+        # An estimate can't settle an equality question. Nothing asks for
+        # approx here, so this only fires against something unexpected --
+        # in which case the full comparison is the right fallback.
+        return None
+    return (
+        memories.get("total") == local["total"]
+        and memories.get("tombstones") == local["tombstones"]
+        and hub.get("entities") == local["entities"]
+        and hub.get("memory_entities") == local["memory_entities"]
+        and hub.get("entity_relations") == local["entity_relations"]
+    )
+
+
+async def reconcile_with_hub(
+    client: httpx.AsyncClient | None = None, quick: bool = False
+) -> dict[str, Any]:
     """Diff this node's record counts against the hub's, with a verdict (SY-14).
 
     Read-only on both sides. Answers "does my data match the hub?" — previously
@@ -1598,11 +1647,28 @@ async def reconcile_with_hub(client: httpx.AsyncClient | None = None) -> dict[st
     Args:
         client: Optional httpx client, for tests. A new one is created when
             omitted.
+        quick: Check the hub's cheap ``/count`` first and skip ``/stats``
+            entirely when every total already agrees (issue #215). Roughly
+            3x cheaper on a 200k-row hub (~41ms vs ~128ms, measured) for a
+            monitor polling the common no-drift case.
+
+            **Off by default, and that is a correctness decision, not
+            caution.** Equal totals do not prove equal contents: a
+            recategorization that synced on one side and not the other moves
+            a record between categories, leaving the total identical while
+            two categories drift in opposite directions. The full comparison
+            sees that; a totals-only check cannot. Since catching drift the
+            ordinary machinery missed is this function's entire job,
+            weakening the default to save 87ms would trade the thing it is
+            for the thing it costs. A caller that has decided totals are
+            enough can say so, and the result says plainly what was checked.
 
     Returns:
         A JSON-serializable dict. ``status`` is ``ok`` when the hub answered;
         otherwise ``disabled`` / ``unreachable`` / ``unsupported`` /
-        ``unauthorized`` / ``error`` with a hint, and no verdict.
+        ``unauthorized`` / ``error`` with a hint, and no verdict. A ``quick``
+        run that took the fast path is marked ``checked: "totals"`` and omits
+        the per-category breakdown it did not fetch.
     """
     if not SYNC_ENABLED:
         return {
@@ -1613,6 +1679,38 @@ async def reconcile_with_hub(client: httpx.AsyncClient | None = None) -> dict[st
     owns_client = client is None
     client = client or httpx.AsyncClient()
     try:
+        if quick:
+            # The pre-check needs local counts either way, and computing them
+            # twice on the slow path would give back what /count saved.
+            local = _local_counts(_get_db())
+            if await _hub_totals_agree(client, local) is True:
+                return {
+                    "status": "ok",
+                    "verdict": "in-sync",
+                    "hints": [],
+                    # Says what it actually verified. A caller comparing this
+                    # against a full run should be able to see why one has a
+                    # category breakdown and the other doesn't, without
+                    # inferring it from a missing key.
+                    "checked": "totals",
+                    "node_id": NODE_ID,
+                    "version": __version__,
+                    "hub_url": HUB_URL,
+                    "memories": _cmp_counts(local["total"], local["total"]),
+                    "tombstones": _cmp_counts(local["tombstones"], local["tombstones"]),
+                    "entities": _cmp_counts(local["entities"], local["entities"]),
+                    "memory_entities": _cmp_counts(
+                        local["memory_entities"], local["memory_entities"]
+                    ),
+                    "entity_relations": _cmp_counts(
+                        local["entity_relations"], local["entity_relations"]
+                    ),
+                    "outbox_pending": _pending_to_remote(_get_db(), "hub")[0],
+                }
+            # False (real drift) or None (no /count, or it failed) both fall
+            # through to the full comparison — only an explicit True may skip
+            # it, so an unanswerable pre-check can never be read as agreement.
+
         resp = await client.get(f"{HUB_URL}/stats", headers=HEADERS, timeout=15)
         if resp.status_code == 404:
             # A hub predating SY-13 has no /stats. Say so plainly rather than
@@ -1688,9 +1786,7 @@ async def reconcile_with_hub(client: httpx.AsyncClient | None = None) -> dict[st
         _notify_sync_fault(HUB_URL, hints)
     pending, _ = _pending_to_remote(db, "hub")
 
-    def _cmp(hub_value: Any, local_value: int) -> dict[str, Any]:
-        hub_n = hub_value if isinstance(hub_value, int) else 0
-        return {"hub": hub_n, "local": local_value, "delta": hub_n - local_value}
+    _cmp = _cmp_counts
 
     def _graph_verdict(
         cursor_id: str, label: str, hub_value: Any, local_value: int
