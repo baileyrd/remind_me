@@ -202,6 +202,40 @@ to run an open localhost API (not recommended). Mutating requests must send
 `Content-Type: application/json` (cross-origin form posts are rejected with 415).
 `GET /health` is an unauthenticated liveness probe.
 
+#### Scoped API keys
+
+The default key above always has full read-write access — it's the same
+credential in every request. To share a read-only dashboard view, or embed a
+key in a lower-trust client without handing out full write access, create an
+additional **named, scoped** key with the `remind_me_api_key` MCP tool:
+
+```
+remind_me_api_key(action="create", name="dashboard-viewer", scope="read")
+```
+
+This returns the plaintext key **exactly once** — save it immediately; only
+its SHA-256 hash is stored afterward, so it cannot be retrieved again, only
+revoked and replaced. A `read`-scoped key authenticates normally against
+every `GET` route but is rejected with `403` on any mutating route
+(`POST`/`PUT`/`PATCH`/`DELETE`); a `read-write`-scoped key has the same full
+access as the default key. Use it exactly like the default key:
+
+```bash
+curl -H "Authorization: Bearer <scoped-key>" http://localhost:5199/api/stats
+```
+
+`remind_me_api_key(action="list")` shows every key's name/scope/created_at
+(never the key material), including a synthetic `default` entry for the
+backward-compat key above. `remind_me_api_key(action="revoke", name=...)`
+immediately ends a named key's access — the default key isn't revocable this
+way, since it's config-managed (the env var or its own auto-generated file),
+not app-managed; set `REMIND_ME_API_KEY=disabled` or delete the persisted
+`api_key` file to rotate it instead.
+
+This is not multi-tenancy (see [ARCHITECTURE.md](ARCHITECTURE.md)): every key
+— default or scoped — reads and writes the exact same single vault; only the
+*scope* differs per key, there is no per-key data partitioning.
+
 ### What It Does
 
 - **Browse & search** — full-text search with `⌘K` shortcut, category sidebar with counts, clickable tag filters
@@ -378,10 +412,11 @@ The stats view replaces the main content area with summary cards, horizontal bar
 | `remind_me_watch_status` | Folder watcher status: watched dirs, scan counters, recent errors |
 | `remind_me_webhook_status` | Push/webhook ingestion status: bind/port, request counters, recent errors |
 | `remind_me_revoke_clients` | List OAuth connector clients, or revoke one (with all of its tokens) |
+| `remind_me_api_key` | Create, list, or revoke named, scope-limited (`read`/`read-write`) dashboard API keys — see [Authentication](#authentication) |
 | `remind_me_check_update` | Check if a newer version is available on origin/main |
 | `remind_me_self_update` | Pull latest changes from origin and reinstall the package |
 
-48 tools + 6 prompts + 4 resources (`memory://stats`, `memory://categories`, `wiki://schema`, `wiki://index`).
+49 tools + 6 prompts + 4 resources (`memory://stats`, `memory://categories`, `wiki://schema`, `wiki://index`).
 
 ### Prompts: the maintenance loops as one-shot workflows
 

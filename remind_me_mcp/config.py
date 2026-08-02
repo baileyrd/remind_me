@@ -13,6 +13,10 @@ import os
 import secrets
 import subprocess
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 # Module logger only — root logging setup (logging.basicConfig) lives in the
 # __main__ entrypoint so importing this package never hijacks the host
@@ -306,6 +310,79 @@ def resolve_mcp_http_secret() -> str:
 # Security
 # ---------------------------------------------------------------------------
 
+
+def _resolve_or_generate_secret(
+    explicit: str | None,
+    filename: str,
+    *,
+    label: str,
+    noun: str,
+    log_generated: Callable[[Path, str], None],
+) -> str:
+    """Shared "read-existing-file-or-generate-and-persist" secret resolution.
+
+    Factors out the body that :func:`resolve_api_key`, :func:`resolve_connector_token`,
+    and :func:`resolve_ics_token` each repeated verbatim (issue #185 is the
+    third consumer of this exact pattern; this is the resulting factoring):
+    trust an explicit value if the caller already resolved one; else read an
+    existing 0600 secret file; else generate a fresh one, persist it with
+    0600 permissions, and log the generation exactly once.
+
+    Deliberately does NOT own the "which env var wins, and any special
+    sentinel values" step -- that varies per caller (only ``resolve_api_key``
+    treats the literal ``"disabled"`` specially) and stays in each caller,
+    which passes in its own already-resolved ``explicit`` value. It also
+    doesn't own the log message shown at generation time -- callers log a
+    different level of detail (``resolve_api_key`` never logs the key itself,
+    only its file path; the others log the file path *and* the secret) --
+    passed in as ``log_generated`` instead of a single templated string.
+
+    Reads ``MEMORY_DIR`` at call time (not a captured default) so tests can
+    monkeypatch it, matching every caller's own "reads module attributes at
+    call time" contract.
+
+    Args:
+        explicit: The caller's already-resolved env var value, or None when
+            unset. Returned as-is when not None -- no file I/O happens.
+        filename: File name under ``MEMORY_DIR`` to read/persist the secret at.
+        label: Human name for the secret, used in the ephemeral-fallback
+            warning's first clause (e.g. ``"connector token"``).
+        noun: Short noun for the same warning's second clause (``"key"`` or
+            ``"token"``), matching each call site's original wording.
+        log_generated: Called with ``(secret_file, secret)`` exactly once,
+            immediately after a fresh secret is generated and persisted --
+            never on a cache hit (an existing file, or an explicit value).
+
+    Returns:
+        The effective secret.
+    """
+    if explicit is not None:
+        return explicit
+    secret_file = MEMORY_DIR / filename
+    try:
+        if secret_file.is_file():
+            existing = secret_file.read_text(encoding="utf-8").strip()
+            if existing:
+                return existing
+        secret = secrets.token_urlsafe(32)
+        secret_file.touch(mode=0o600, exist_ok=True)
+        restrict_to_owner(secret_file)
+        secret_file.write_text(secret + "\n", encoding="utf-8")
+        log_generated(secret_file, secret)
+        return secret
+    except OSError as exc:
+        secret = secrets.token_urlsafe(32)
+        log.warning(
+            "Could not persist %s at %s (%s); using an ephemeral %s for this run: %s",
+            label,
+            secret_file,
+            exc,
+            noun,
+            secret,
+        )
+        return secret
+
+
 API_KEY: str | None = os.environ.get("REMIND_ME_API_KEY") or None
 """Bearer token for /api/* routes, from the REMIND_ME_API_KEY env var.
 
@@ -316,6 +393,12 @@ want an open localhost API."""
 
 API_KEY_FILE = MEMORY_DIR / "api_key"
 """Location of the auto-generated dashboard API key (created with 0600 perms)."""
+
+API_KEYS_FILE = MEMORY_DIR / "api_keys.json"
+"""Location of the named, scoped API key store (issue #185; 0600 perms) --
+see ``remind_me_mcp.api_keys.ApiKeyStore``. Additive to ``API_KEY``/
+``API_KEY_FILE`` above, which remains the implicit backward-compat
+read-write key and is never stored in this file."""
 
 
 def resolve_api_key() -> str | None:
@@ -341,33 +424,18 @@ def resolve_api_key() -> str | None:
             )
             return None
         return API_KEY
-    key_file = MEMORY_DIR / "api_key"
-    try:
-        if key_file.is_file():
-            existing = key_file.read_text(encoding="utf-8").strip()
-            if existing:
-                return existing
-        key = secrets.token_urlsafe(32)
-        key_file.touch(mode=0o600, exist_ok=True)
-        restrict_to_owner(key_file)
-        key_file.write_text(key + "\n", encoding="utf-8")
+
+    def _log_generated(key_file: Path, key: str) -> None:
         log.info(
             "Generated dashboard API key — stored at %s. Clients must send "
             "'Authorization: Bearer <key>'. Set REMIND_ME_API_KEY=disabled to "
             "opt out of dashboard auth.",
             key_file,
         )
-        return key
-    except OSError as exc:
-        key = secrets.token_urlsafe(32)
-        log.warning(
-            "Could not persist dashboard API key at %s (%s); using an "
-            "ephemeral key for this run: %s",
-            key_file,
-            exc,
-            key,
-        )
-        return key
+
+    return _resolve_or_generate_secret(
+        None, "api_key", label="dashboard API key", noun="key", log_generated=_log_generated
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -426,18 +494,9 @@ def resolve_connector_token() -> str:
     Reads module attributes at call time so tests can monkeypatch
     ``REMOTE_MCP_TOKEN`` / ``MEMORY_DIR``.
     """
-    if REMOTE_MCP_TOKEN is not None:
-        return REMOTE_MCP_TOKEN.strip()
-    token_file = MEMORY_DIR / "connector_token"
-    try:
-        if token_file.is_file():
-            existing = token_file.read_text(encoding="utf-8").strip()
-            if existing:
-                return existing
-        token = secrets.token_urlsafe(32)
-        token_file.touch(mode=0o600, exist_ok=True)
-        restrict_to_owner(token_file)
-        token_file.write_text(token + "\n", encoding="utf-8")
+    explicit = REMOTE_MCP_TOKEN.strip() if REMOTE_MCP_TOKEN is not None else None
+
+    def _log_generated(token_file: Path, token: str) -> None:
         log.info(
             "Generated remote MCP connector token — stored at %s. Connector "
             "URL path: /mcp/%s (treat the URL like a password; rotate by "
@@ -445,17 +504,10 @@ def resolve_connector_token() -> str:
             token_file,
             token,
         )
-        return token
-    except OSError as exc:
-        token = secrets.token_urlsafe(32)
-        log.warning(
-            "Could not persist connector token at %s (%s); using an "
-            "ephemeral token for this run: %s",
-            token_file,
-            exc,
-            token,
-        )
-        return token
+
+    return _resolve_or_generate_secret(
+        explicit, "connector_token", label="connector token", noun="token", log_generated=_log_generated
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -497,18 +549,9 @@ def resolve_ics_token() -> str:
     Reads module attributes at call time so tests can monkeypatch
     ``ICS_TOKEN`` / ``MEMORY_DIR``.
     """
-    if ICS_TOKEN is not None:
-        return ICS_TOKEN.strip()
-    token_file = MEMORY_DIR / "ics_token"
-    try:
-        if token_file.is_file():
-            existing = token_file.read_text(encoding="utf-8").strip()
-            if existing:
-                return existing
-        token = secrets.token_urlsafe(32)
-        token_file.touch(mode=0o600, exist_ok=True)
-        restrict_to_owner(token_file)
-        token_file.write_text(token + "\n", encoding="utf-8")
+    explicit = ICS_TOKEN.strip() if ICS_TOKEN is not None else None
+
+    def _log_generated(token_file: Path, token: str) -> None:
         log.info(
             "Generated reminders calendar feed token — stored at %s. Feed "
             "path: /api/reminders/%s.ics (treat this URL like a password; "
@@ -516,17 +559,10 @@ def resolve_ics_token() -> str:
             token_file,
             token,
         )
-        return token
-    except OSError as exc:
-        token = secrets.token_urlsafe(32)
-        log.warning(
-            "Could not persist reminders feed token at %s (%s); using an "
-            "ephemeral token for this run: %s",
-            token_file,
-            exc,
-            token,
-        )
-        return token
+
+    return _resolve_or_generate_secret(
+        explicit, "ics_token", label="reminders feed token", noun="token", log_generated=_log_generated
+    )
 
 
 _import_roots_env: str | None = os.environ.get("REMIND_ME_IMPORT_ROOTS")
@@ -796,6 +832,7 @@ __all__ = [
     "resolve_mcp_http_secret",
     "API_KEY",
     "API_KEY_FILE",
+    "API_KEYS_FILE",
     "resolve_api_key",
     "REMOTE_MCP",
     "REMOTE_MCP_HOST",

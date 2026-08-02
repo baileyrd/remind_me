@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from remind_me_mcp import ann_index
+from remind_me_mcp import config as _config
+from remind_me_mcp.api_keys import ApiKeyStore
 from remind_me_mcp.config import (
     DB_PATH,
     SYNC_ENABLED,
@@ -98,6 +100,13 @@ def _header(scope: _Scope, name: bytes) -> str:
     return ""
 
 
+_SCOPE_MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+"""Methods a 'read'-scoped API key (issue #185) may not use — every method
+that changes state. Deliberately includes DELETE (unlike
+JSONContentTypeMiddleware's narrower _MUTATING_METHODS, which only cares
+about routes that carry a JSON body)."""
+
+
 class BearerAuthMiddleware:
     """Pure-ASGI bearer-token middleware (SE-05).
 
@@ -117,6 +126,15 @@ class BearerAuthMiddleware:
             Authorization header — so it authenticates itself via its own
             path token instead; mirrors remote.py's SecretPathMiddleware
             ``allow_prefixes``).
+        key_store: Optional :class:`~remind_me_mcp.api_keys.ApiKeyStore`
+            (issue #185). When a request's bearer token doesn't match
+            ``secret`` (the backward-compat, always-read-write default key),
+            it is checked against this store instead. A match with
+            ``scope="read"`` is rejected with 403 on a mutating method
+            (``_SCOPE_MUTATING_METHODS``) and otherwise passes through with
+            the same access as the default key. ``None`` (the combined-mode
+            MCP HTTP wrapper's usage) skips this entirely — scoped keys are a
+            dashboard-API-only concept, not a general MCP HTTP auth feature.
     """
 
     def __init__(
@@ -126,15 +144,17 @@ class BearerAuthMiddleware:
         protect_prefix: str = "/",
         allow_paths: tuple[str, ...] = (),
         allow_prefixes: tuple[str, ...] = (),
+        key_store: ApiKeyStore | None = None,
     ) -> None:
         self.app = app
         self.secret = secret
         self.protect_prefix = protect_prefix
         self.allow_paths = allow_paths
         self.allow_prefixes = allow_prefixes
+        self.key_store = key_store
 
     async def __call__(self, scope: _Scope, receive: _Receive, send: _Send) -> None:
-        """Enforce bearer auth on protected HTTP paths; pass everything else through."""
+        """Enforce bearer auth (and, for a scoped key, method scope) on protected paths."""
         if scope["type"] != "http" or self.secret is None:
             await self.app(scope, receive, send)
             return
@@ -149,8 +169,29 @@ class BearerAuthMiddleware:
         auth = _header(scope, b"authorization")
         expected = f"Bearer {self.secret}"
         if hmac.compare_digest(auth.encode("utf-8"), expected.encode("utf-8")):
+            # The backward-compat default key: always full read-write access,
+            # exactly as before scoped keys existed.
             await self.app(scope, receive, send)
             return
+        if self.key_store is not None and auth.startswith("Bearer "):
+            presented = auth[len("Bearer ") :]
+            record = self.key_store.verify(presented)
+            if record is not None:
+                method = str(scope.get("method", "")).upper()
+                if record.get("scope") == "read" and method in _SCOPE_MUTATING_METHODS:
+                    await _send_json(
+                        send,
+                        403,
+                        {
+                            "error": (
+                                f"API key {record.get('name')!r} is read-only "
+                                f"(scope=read); {method} requires a read-write key"
+                            )
+                        },
+                    )
+                    return
+                await self.app(scope, receive, send)
+                return
         await _send_json(send, 401, {"error": "Unauthorized"})
 
 
@@ -1242,6 +1283,12 @@ def _build_api_app() -> Starlette:
     # persists a key on first run; REMIND_ME_API_KEY=disabled opts out.
     api_key = resolve_api_key()
 
+    # issue #185: additional named, scope-limited keys layered on top of the
+    # single default key above. Read fresh from config.MEMORY_DIR (not a
+    # module-level default) so tests that monkeypatch it see the isolated
+    # store, matching every other secret-file path in this codebase.
+    key_store = ApiKeyStore(_config.MEMORY_DIR / "api_keys.json")
+
     middleware = [
         Middleware(
             CORSMiddleware,
@@ -1254,6 +1301,7 @@ def _build_api_app() -> Starlette:
             secret=api_key,
             protect_prefix="/api/",
             allow_prefixes=("/api/reminders/",),
+            key_store=key_store,
         ),
         Middleware(JSONContentTypeMiddleware),
     ]

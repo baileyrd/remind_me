@@ -1377,6 +1377,124 @@ async def remind_me_revoke_clients(client_id: str = "") -> str:
     return json.dumps({"status": "revoked", **result}, indent=2)
 
 
+@mcp.tool(
+    name="remind_me_api_key",
+    annotations={
+        "title": "Create / List / Revoke Scoped Dashboard API Keys",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def remind_me_api_key(action: str = "list", name: str = "", scope: str = "read") -> str:
+    """Create, list, or revoke named, scope-limited dashboard API keys (issue #185).
+
+    The dashboard's ``/api/*`` routes already require the single default
+    bearer key (SE-01, ``REMIND_ME_API_KEY`` / auto-generated). This tool
+    layers additional, independently named keys on top of that one — useful
+    for sharing a read-only dashboard view, or embedding a key in a
+    lower-trust client, without handing out the full read-write default key.
+    This is NOT multi-tenancy (ARCHITECTURE.md non-goal): every key reads and
+    writes the exact same single vault; only its *scope* differs.
+
+    Actions:
+      - ``"list"`` (default): returns every key's name/scope/created_at —
+        including a synthetic ``"default"`` entry for the backward-compat
+        key — but NEVER key material or its hash.
+      - ``"create"``: generates a new key with the given ``name`` and
+        ``scope`` ('read' or 'read-write'), stores only its SHA-256 hash, and
+        returns the plaintext key — the ONLY time it is ever shown. Save it
+        immediately; it cannot be retrieved again, only revoked.
+      - ``"revoke"``: deletes a named key by ``name``, immediately ending its
+        access (the dashboard server re-reads the key store on every
+        request). The ``"default"`` key cannot be revoked this way — it is
+        config-managed (``REMIND_ME_API_KEY`` or its own auto-generated
+        file), not app-managed; use ``REMIND_ME_API_KEY=disabled`` or delete
+        the persisted ``api_key`` file to rotate it instead.
+
+    A ``read``-scoped key authenticates normally for every ``GET`` route but
+    is rejected with 403 on any mutating route (POST/PUT/PATCH/DELETE). A
+    ``read-write``-scoped key has the same full access as the default key.
+
+    Args:
+        action: One of 'create', 'list', 'revoke'. Defaults to 'list'.
+        name: Required for 'create'/'revoke' — the key's unique name.
+        scope: Required for 'create' — 'read' or 'read-write'. Defaults to
+            'read' (the safer default for a newly-created key).
+
+    Returns:
+        str: JSON — the key list, the newly-created key (plaintext, once),
+        a revocation confirmation, or an error.
+    """
+    from remind_me_mcp import config as cfg
+    from remind_me_mcp.api_keys import DEFAULT_KEY_NAME, SCOPES, ApiKeyStore
+
+    store = ApiKeyStore(cfg.MEMORY_DIR / "api_keys.json")
+    action = action.strip().lower()
+
+    if action == "list":
+        # File I/O off the event loop (PF-06 conventions).
+        keys = await asyncio.to_thread(store.list_keys)
+        return json.dumps(
+            {
+                "keys": [
+                    {
+                        "name": DEFAULT_KEY_NAME,
+                        "scope": "read-write",
+                        "created_at": None,
+                        "note": (
+                            "backward-compat key (REMIND_ME_API_KEY / auto-generated); "
+                            "config-managed, not revocable through this tool"
+                        ),
+                    },
+                    *keys,
+                ],
+                "state_file": str(store.path),
+            },
+            indent=2,
+        )
+
+    if action == "create":
+        if not name:
+            return json.dumps({"status": "error", "error": "name is required for action='create'"})
+        try:
+            plaintext = await asyncio.to_thread(store.create_key, name, scope)
+        except ValueError as e:
+            return json.dumps({"status": "error", "error": str(e)})
+        return json.dumps(
+            {
+                "status": "created",
+                "name": name,
+                "scope": scope,
+                "key": plaintext,
+                "warning": (
+                    "Save this key now — it is shown only once and cannot be "
+                    "retrieved again (only its hash is stored). Send it as "
+                    "'Authorization: Bearer <key>'."
+                ),
+            },
+            indent=2,
+        )
+
+    if action == "revoke":
+        if not name:
+            return json.dumps({"status": "error", "error": "name is required for action='revoke'"})
+        try:
+            revoked = await asyncio.to_thread(store.revoke_key, name)
+        except ValueError as e:
+            return json.dumps({"status": "error", "error": str(e)})
+        if not revoked:
+            return json.dumps({"status": "error", "error": f"Unknown key name: {name!r}"})
+        return json.dumps({"status": "revoked", "name": name})
+
+    return json.dumps({
+        "status": "error",
+        "error": f"Unknown action {action!r}: use 'create', 'list', or 'revoke'",
+        "scopes": list(SCOPES),
+    })
+
+
 # ---------------------------------------------------------------------------
 # Update tools
 # ---------------------------------------------------------------------------

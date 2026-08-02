@@ -1,7 +1,7 @@
 """
 remind_me_mcp.tool_profiles — optionally narrow the advertised tool surface.
 
-The full surface is 48 tools costing roughly 21k tokens of context in *every*
+The full surface is 49 tools costing roughly 21k tokens of context in *every*
 session, on every client, whether or not an admin tool is ever touched. For a
 server whose whole job is putting memories into context that is an awkward
 ratio: ``remind_me_wiki_load`` defaults to a 12k-token budget, so the tool
