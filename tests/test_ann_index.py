@@ -222,6 +222,64 @@ def test_corrupt_disk_index_self_heals_instead_of_going_sticky(db_conn_with_vec)
 
 
 # ---------------------------------------------------------------------------
+# Periodic autosave
+# ---------------------------------------------------------------------------
+
+
+def test_add_vector_autosaves_after_configured_mutation_count(
+    db_conn_with_vec, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An abnormal exit (crash, taskkill /F, power loss) between clean
+    shutdowns must lose at most one autosave interval's worth of updates, not
+    everything since the last save -- add_vector/remove_vector persist the
+    index to disk every ANN_AUTOSAVE_EVERY mutations."""
+    import remind_me_mcp.config as _cfg
+
+    monkeypatch.setattr(_cfg, "ANN_AUTOSAVE_EVERY", 3)
+    ann_index._index_path().unlink(missing_ok=True)
+
+    for i in range(1, 3):
+        ann_index.add_vector(db_conn_with_vec, i, _vec(i).tobytes())
+        assert not ann_index._index_path().exists()
+
+    ann_index.add_vector(db_conn_with_vec, 3, _vec(3).tobytes())
+    assert ann_index._index_path().exists()
+
+
+def test_autosave_disabled_when_every_is_zero(
+    db_conn_with_vec, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ANN_AUTOSAVE_EVERY=0 restores the old shutdown-only save behavior."""
+    import remind_me_mcp.config as _cfg
+
+    monkeypatch.setattr(_cfg, "ANN_AUTOSAVE_EVERY", 0)
+    ann_index._index_path().unlink(missing_ok=True)
+
+    for i in range(1, 10):
+        ann_index.add_vector(db_conn_with_vec, i, _vec(i).tobytes())
+
+    assert not ann_index._index_path().exists()
+
+
+def test_autosave_counter_resets_after_manual_save(
+    db_conn_with_vec, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """save_index() resets the mutation counter so a later autosave fires
+    only after another full interval, not immediately on the next mutation."""
+    import remind_me_mcp.config as _cfg
+
+    monkeypatch.setattr(_cfg, "ANN_AUTOSAVE_EVERY", 3)
+    ann_index._index_path().unlink(missing_ok=True)
+
+    ann_index.add_vector(db_conn_with_vec, 1, _vec(1).tobytes())
+    ann_index.save_index()
+    ann_index._index_path().unlink()
+
+    ann_index.add_vector(db_conn_with_vec, 2, _vec(2).tobytes())
+    assert not ann_index._index_path().exists()
+
+
+# ---------------------------------------------------------------------------
 # rebuild_index / status
 # ---------------------------------------------------------------------------
 

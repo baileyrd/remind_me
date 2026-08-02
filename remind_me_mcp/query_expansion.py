@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 
 from remind_me_mcp.config import OLLAMA_URL
 
@@ -50,8 +51,15 @@ _HYDE_PROMPT = (
 # never cached — the daemon may come back. Module-level state, like the
 # config constants above; a plain bounded dict because callers run
 # expand_query from worker threads and lru_cache can't skip caching failures.
+#
+# _cache_lock guards both dicts below. _pending coalesces concurrent callers
+# racing the same uncached query: without it, two threads can both miss the
+# cache and both fire a blocking Ollama generation (up to HYDE_TIMEOUT each)
+# for the same query instead of one call serving both.
 _EXPANSION_CACHE: dict[str, list[str]] = {}
 _EXPANSION_CACHE_MAX = 128
+_cache_lock = threading.Lock()
+_pending: dict[str, threading.Event] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -114,18 +122,40 @@ def expand_query(query: str) -> list[str]:
     """
     if EXPANSION_MODE != "hyde" or not query.strip():
         return []
-    cached = _EXPANSION_CACHE.get(query)
-    if cached is not None:
-        # Re-insert so hot queries survive eviction (LRU behaviour).
-        _EXPANSION_CACHE[query] = _EXPANSION_CACHE.pop(query)
-        return list(cached)
-    passage = hyde_passage(query)
-    if not passage:
-        return []
-    _EXPANSION_CACHE[query] = [passage]
-    while len(_EXPANSION_CACHE) > _EXPANSION_CACHE_MAX:
-        _EXPANSION_CACHE.pop(next(iter(_EXPANSION_CACHE)))
-    return [passage]
+
+    with _cache_lock:
+        cached = _EXPANSION_CACHE.get(query)
+        if cached is not None:
+            # Re-insert so hot queries survive eviction (LRU behaviour).
+            _EXPANSION_CACHE[query] = _EXPANSION_CACHE.pop(query)
+            return list(cached)
+        existing_event = _pending.get(query)
+        is_leader = existing_event is None
+        event = existing_event if existing_event is not None else threading.Event()
+        if is_leader:
+            _pending[query] = event
+
+    if not is_leader:
+        # A concurrent caller is already generating this exact query --
+        # wait for it and share its result instead of firing a second
+        # redundant (and equally slow) Ollama call.
+        event.wait(HYDE_TIMEOUT + 1)
+        with _cache_lock:
+            cached = _EXPANSION_CACHE.get(query)
+        return list(cached) if cached is not None else []
+
+    try:
+        passage = hyde_passage(query)
+        with _cache_lock:
+            if passage:
+                _EXPANSION_CACHE[query] = [passage]
+                while len(_EXPANSION_CACHE) > _EXPANSION_CACHE_MAX:
+                    _EXPANSION_CACHE.pop(next(iter(_EXPANSION_CACHE)))
+        return [passage] if passage else []
+    finally:
+        with _cache_lock:
+            _pending.pop(query, None)
+        event.set()
 
 
 # ---------------------------------------------------------------------------

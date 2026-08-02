@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from typing import Any
 
@@ -85,6 +86,10 @@ class CrossEncoderReranker:
         # attempt a real HuggingFace download on every call.
         self._deps_missing = False
         self._failed_until = 0.0
+        # Thread-safe loading (mirrors embeddings._Embedder, issue #153):
+        # concurrent first-callers block on one real load instead of racing
+        # separate downloads/ONNX-session constructions.
+        self._load_lock = threading.Lock()
 
     def _ensure_loaded(self) -> None:
         """Lazily download and load the ONNX model + tokenizer (same cache as the embedder).
@@ -92,9 +97,19 @@ class CrossEncoderReranker:
         Load failures are cached (PF-01): an ImportError marks the reranker
         permanently unavailable for this process, while any other failure is
         only retried after AVAILABILITY_FAILURE_TTL seconds.
+
+        Thread-safe: serialized on ``_load_lock`` with a double-checked
+        ``_ready`` flag, so concurrent first-callers share one load.
         """
         if self._ready:
             return
+        with self._load_lock:
+            if self._ready:  # a concurrent caller may have just finished
+                return
+            self._load_locked()
+
+    def _load_locked(self) -> None:
+        """The actual load body -- always called with ``_load_lock`` held."""
         if self._deps_missing:
             raise RuntimeError("Reranker dependencies are not installed (cached failure)")
         if time.monotonic() < self._failed_until:
@@ -189,13 +204,20 @@ class CrossEncoderReranker:
 # ---------------------------------------------------------------------------
 
 _reranker: CrossEncoderReranker | None = None
+_reranker_construct_lock = threading.Lock()
 
 
 def _get_reranker() -> CrossEncoderReranker | None:
-    """Get or create the global reranker; None when it cannot be loaded."""
+    """Get or create the global reranker; None when it cannot be loaded.
+
+    Constructing the singleton is locked (mirrors embeddings._get_embedder,
+    issue #153) so concurrent first-callers share one reranker instance
+    instead of racing separate constructions/model loads.
+    """
     global _reranker
-    if _reranker is None:
-        _reranker = CrossEncoderReranker()
+    with _reranker_construct_lock:
+        if _reranker is None:
+            _reranker = CrossEncoderReranker()
     return _reranker if _reranker.available else None
 
 

@@ -69,6 +69,8 @@ from mcp.server.auth.provider import (
 )
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
+from remind_me_mcp.config import restrict_to_owner
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -184,7 +186,7 @@ class OAuthStateStore:
         tmp_path = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
         try:
             tmp_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
-            tmp_path.chmod(0o600)
+            restrict_to_owner(tmp_path)
             os.replace(tmp_path, self.path)
         except OSError:
             tmp_path.unlink(missing_ok=True)

@@ -637,10 +637,14 @@ Each memory record also carries a `role` key, so the export file is directly con
 
 ## Watched Folders (Auto-Ingest)
 
-Set `REMIND_ME_WATCH_DIRS` (colon-separated, each directory must lie inside `REMIND_ME_IMPORT_ROOTS`) and the server polls those folders in the background, auto-ingesting new or changed `.md`, `.markdown`, `.txt`, `.json`, and `.jsonl` files through the same import pipeline (`kind=auto`, hash dedup applies):
+Set `REMIND_ME_WATCH_DIRS` (`os.pathsep`-separated — `:` on macOS/Linux, `;` on Windows — each directory must lie inside `REMIND_ME_IMPORT_ROOTS`) and the server polls those folders in the background, auto-ingesting new or changed `.md`, `.markdown`, `.txt`, `.json`, and `.jsonl` files through the same import pipeline (`kind=auto`, hash dedup applies):
 
 ```bash
 REMIND_ME_WATCH_DIRS=~/notes:~/Downloads/exports remind-me-mcp
+```
+
+```powershell
+$env:REMIND_ME_WATCH_DIRS = "C:\notes;C:\Downloads\exports"
 ```
 
 - **Polling, not inotify** — directories are scanned every `REMIND_ME_WATCH_INTERVAL` seconds (default 60); no extra dependencies.
@@ -1156,9 +1160,9 @@ Every new memory used to start at a flat `base_weight=1.0` regardless of kind, s
 | `REMIND_ME_MEMPALACE_PATH` | `~/.mempalace/palace` | Path to a MemPalace ChromaDB persistent store, read (read-only) by `remind_me_import_mempalace` |
 | `REMIND_ME_CONSOLIDATE_MAX_CANDIDATES` | `1500` | Hard cap on how many memories `remind_me_consolidate`'s clustering step pairwise-compares in one call — `remind_me_consolidate`'s own `limit` (max 5000) doesn't alone bound the O(n²) comparison cost |
 | `REMIND_ME_API_KEY` | *(auto-generated)* | Bearer token for `/api/*` routes. When unset, a key is generated on first run and stored at `~/.remind-me/api_key` (0600) — check the server log or that file for the value. Set to `disabled` to explicitly turn dashboard auth off |
-| `REMIND_ME_IMPORT_ROOTS` | `$HOME` | Colon-separated allowed filesystem roots for import operations (enforced by both the HTTP API and the MCP import tools) |
-| `REMIND_ME_EXPORT_ROOTS` | `$HOME` | Colon-separated allowed filesystem roots for export destinations (enforced by both the HTTP API and the MCP export tool) |
-| `REMIND_ME_WATCH_DIRS` | *(unset)* | Colon-separated directories for the folder watcher to auto-ingest. Empty = watcher disabled. Each directory must lie inside `REMIND_ME_IMPORT_ROOTS` |
+| `REMIND_ME_IMPORT_ROOTS` | `$HOME` | `os.pathsep`-separated (`:` on macOS/Linux, `;` on Windows) allowed filesystem roots for import operations (enforced by both the HTTP API and the MCP import tools) |
+| `REMIND_ME_EXPORT_ROOTS` | `$HOME` | `os.pathsep`-separated (`:` on macOS/Linux, `;` on Windows) allowed filesystem roots for export destinations (enforced by both the HTTP API and the MCP export tool) |
+| `REMIND_ME_WATCH_DIRS` | *(unset)* | `os.pathsep`-separated (`:` on macOS/Linux, `;` on Windows) directories for the folder watcher to auto-ingest. Empty = watcher disabled. Each directory must lie inside `REMIND_ME_IMPORT_ROOTS` |
 | `REMIND_ME_WATCH_INTERVAL` | `60` | Seconds between folder watcher scan passes |
 | `REMIND_ME_WATCH_GRACE` | `5` | Debounce grace period in seconds — files modified more recently than this are deferred until a scan sees a stable (mtime, size) |
 | `REMIND_ME_TOOL_PROFILE` | `full` | Advertised tool surface: `full` (46 tools, ~21k context), `standard` (30, ~14.8k — drops imports/sync/ops), or `core` (17, ~7.8k — conversational only, also hides the maintenance prompts). An unrecognised value logs a warning and falls back to `full` |

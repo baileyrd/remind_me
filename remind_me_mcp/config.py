@@ -11,12 +11,52 @@ import json
 import logging
 import os
 import secrets
+import subprocess
 from pathlib import Path
 
 # Module logger only — root logging setup (logging.basicConfig) lives in the
 # __main__ entrypoint so importing this package never hijacks the host
 # application's logging configuration (HY-06).
 log = logging.getLogger("remind_me_mcp.config")
+
+
+def restrict_to_owner(path: Path) -> None:
+    """Best-effort restrict a secret file to the current user only.
+
+    ``chmod(0o600)`` is sufficient on POSIX, but on Windows os.chmod only
+    toggles the read-only attribute -- it does not touch NTFS ACLs -- so a
+    file "protected" that way is still readable by any other local account
+    with filesystem access to the containing directory. On Windows, also
+    strip inherited ACEs and grant Full Control only to the current user via
+    the built-in ``icacls`` CLI. Best-effort: ACL failures are logged, not
+    raised, since the secret file itself was already written successfully.
+    """
+    path.chmod(0o600)
+    if os.name != "nt":
+        return
+    user = f"{os.environ.get('USERDOMAIN', '')}\\{os.environ.get('USERNAME', '')}".strip("\\")
+    if not user:
+        log.warning(
+            "Could not determine current user to restrict ACLs on %s "
+            "(USERNAME/USERDOMAIN unset); file may be readable by other "
+            "local accounts",
+            path,
+        )
+        return
+    try:
+        subprocess.run(
+            ["icacls", str(path), "/inheritance:r", "/grant:r", f"{user}:F"],
+            capture_output=True,
+            check=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warning(
+            "Could not restrict ACLs on %s via icacls (%s); file may be "
+            "readable by other local accounts",
+            path,
+            exc,
+        )
 
 
 def _env_int(name: str, default: int) -> int:
@@ -143,6 +183,14 @@ for no benefit — a typical single-user store never crosses it. Has no effect
 if the optional `usearch` package (the `ann` extra) isn't installed; the
 brute-force scan is always the fallback."""
 
+ANN_AUTOSAVE_EVERY = _env_int("REMIND_ME_ANN_AUTOSAVE_EVERY", 200)
+"""Persist the in-memory ANN index to disk after this many add/remove
+mutations, in addition to the always-on save at clean shutdown. Without this,
+an abnormal exit (crash, taskkill /F, power loss) between clean shutdowns
+silently loses every incremental ANN update since the last save, forcing a
+full rebuild from memories_vec on next start with no warning it happened.
+Set to 0 to disable periodic autosave (shutdown-only, the old behavior)."""
+
 CONSOLIDATE_MAX_CANDIDATES = _env_int("REMIND_ME_CONSOLIDATE_MAX_CANDIDATES", 1500)
 """Hard cap on how many memories consolidation.find_clusters pairwise-compares
 in one call. remind_me_consolidate's own `limit` (default 500, max 5000)
@@ -208,7 +256,7 @@ def resolve_mcp_http_secret() -> str:
                 return existing
         secret = secrets.token_urlsafe(32)
         secret_file.touch(mode=0o600, exist_ok=True)
-        secret_file.chmod(0o600)
+        restrict_to_owner(secret_file)
         secret_file.write_text(secret + "\n", encoding="utf-8")
         log.info(
             "Generated combined-mode MCP bearer secret — stored at %s. "
@@ -276,7 +324,7 @@ def resolve_api_key() -> str | None:
                 return existing
         key = secrets.token_urlsafe(32)
         key_file.touch(mode=0o600, exist_ok=True)
-        key_file.chmod(0o600)
+        restrict_to_owner(key_file)
         key_file.write_text(key + "\n", encoding="utf-8")
         log.info(
             "Generated dashboard API key — stored at %s. Clients must send "
@@ -363,7 +411,7 @@ def resolve_connector_token() -> str:
                 return existing
         token = secrets.token_urlsafe(32)
         token_file.touch(mode=0o600, exist_ok=True)
-        token_file.chmod(0o600)
+        restrict_to_owner(token_file)
         token_file.write_text(token + "\n", encoding="utf-8")
         log.info(
             "Generated remote MCP connector token — stored at %s. Connector "
@@ -387,11 +435,11 @@ def resolve_connector_token() -> str:
 
 _import_roots_env: str | None = os.environ.get("REMIND_ME_IMPORT_ROOTS")
 IMPORT_ROOTS: list[Path] = (
-    [Path(r.strip()).expanduser().resolve() for r in _import_roots_env.split(":") if r.strip()]
+    [Path(r.strip()).expanduser().resolve() for r in _import_roots_env.split(os.pathsep) if r.strip()]
     if _import_roots_env
     else [Path.home()]
 )
-"""Allowed filesystem roots for import operations. Colon-separated paths. Default: user home directory."""
+"""Allowed filesystem roots for import operations. os.pathsep-separated paths (';' on Windows, ':' elsewhere). Default: user home directory."""
 
 
 def is_in_import_roots(path: Path) -> bool:
@@ -407,11 +455,11 @@ def is_in_import_roots(path: Path) -> bool:
 
 _export_roots_env: str | None = os.environ.get("REMIND_ME_EXPORT_ROOTS")
 EXPORT_ROOTS: list[Path] = (
-    [Path(r.strip()).expanduser().resolve() for r in _export_roots_env.split(":") if r.strip()]
+    [Path(r.strip()).expanduser().resolve() for r in _export_roots_env.split(os.pathsep) if r.strip()]
     if _export_roots_env
     else [Path.home()]
 )
-"""Allowed filesystem roots for export destinations. Colon-separated paths. Default: user home directory."""
+"""Allowed filesystem roots for export destinations. os.pathsep-separated paths (';' on Windows, ':' elsewhere). Default: user home directory."""
 
 
 def is_in_export_roots(path: Path) -> bool:
@@ -430,11 +478,11 @@ def is_in_export_roots(path: Path) -> bool:
 
 _watch_dirs_env: str | None = os.environ.get("REMIND_ME_WATCH_DIRS")
 WATCH_DIRS: list[Path] = (
-    [Path(r.strip()).expanduser().resolve() for r in _watch_dirs_env.split(":") if r.strip()]
+    [Path(r.strip()).expanduser().resolve() for r in _watch_dirs_env.split(os.pathsep) if r.strip()]
     if _watch_dirs_env
     else []
 )
-"""Directories polled by the folder watcher (FT-03). Colon-separated paths.
+"""Directories polled by the folder watcher (FT-03). os.pathsep-separated paths (';' on Windows, ':' elsewhere).
 Default: empty — the watcher is disabled. Every directory must lie inside
 IMPORT_ROOTS (the SE-02 containment rule shared with the import tools);
 non-contained entries are rejected at startup."""
@@ -488,6 +536,7 @@ there's no single correct value for every fork of this package."""
 # ---------------------------------------------------------------------------
 
 __all__ = [
+    "restrict_to_owner",
     "MEMORY_DIR",
     "DB_PATH",
     "IMPORT_LOG",
@@ -507,6 +556,7 @@ __all__ = [
     "EMBED_CHUNK_OVERLAP",
     "EMBED_MAX_CHUNKS",
     "ANN_MIN_CHUNKS",
+    "ANN_AUTOSAVE_EVERY",
     "CONSOLIDATE_MAX_CANDIDATES",
     "MODEL_DIR",
     "BACKUP_DIR",

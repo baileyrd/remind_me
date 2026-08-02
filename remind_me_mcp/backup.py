@@ -172,10 +172,14 @@ def restore_backup(source: Path, *, dest: Path | None = None) -> Path | None:
        itself recoverable -- a raw file copy, not ``create_backup``'s live
        ``Connection.backup()`` API, since *dest* may be exactly the
        corrupt/unopenable file this restore is trying to replace.
-    3. Remove any stale ``-wal``/``-shm`` sidecar files next to *dest* --
-       they belong to the file being replaced and would otherwise be
-       (incorrectly) applied on top of the restored content.
-    4. ``os.replace`` *source* into place at *dest*.
+    3. Copy *source* to a temp file next to *dest* and ``os.replace`` it
+       into place. If the replace fails (e.g. on Windows, *dest* is still
+       open by a not-actually-stopped server), the temp file is cleaned up
+       and the error propagates with *dest* and its sidecars untouched.
+    4. Only once the replace has succeeded, remove any stale ``-wal``/
+       ``-shm`` sidecar files next to *dest* -- they belonged to the file
+       just replaced and would otherwise be (incorrectly) applied on top of
+       the restored content.
 
     Args:
         source: Path to the backup file to restore.
@@ -202,16 +206,28 @@ def restore_backup(source: Path, *, dest: Path | None = None) -> Path | None:
         shutil.copy2(dest, pre_restore_snapshot)
         log.info("Pre-restore snapshot of %s created: %s", dest, pre_restore_snapshot)
 
-    for suffix in ("-wal", "-shm"):
-        sidecar = dest.with_name(dest.name + suffix)
-        sidecar.unlink(missing_ok=True)
-
     # Copy (not move/rename) source into a temp file next to dest, then
     # os.replace that temp copy into place -- restoring must never consume
     # or delete the backup file itself, which os.replace(source, dest)
     # directly would (rename semantics remove the source).
+    #
+    # Order matters (Windows): os.replace fails with PermissionError if
+    # anything (including a not-actually-stopped server) still holds dest
+    # open. The stale -wal/-shm sidecars are only deleted *after* a
+    # successful replace -- deleting them first and then hitting a failed
+    # replace would discard dest's uncommitted WAL content while leaving the
+    # (unreplaced) old dest in place, silently losing recent writes.
     tmp_dest = dest.with_suffix(".db.restoring")
     shutil.copy2(source, tmp_dest)
-    os.replace(tmp_dest, dest)
+    try:
+        os.replace(tmp_dest, dest)
+    except OSError:
+        tmp_dest.unlink(missing_ok=True)
+        raise
+
+    for suffix in ("-wal", "-shm"):
+        sidecar = dest.with_name(dest.name + suffix)
+        sidecar.unlink(missing_ok=True)
+
     log.info("Restored %s over %s", source, dest)
     return pre_restore_snapshot

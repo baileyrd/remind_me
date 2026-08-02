@@ -22,6 +22,7 @@ from remind_me_mcp.db import _embed_and_store, _fuse_query_embedding, _semantic_
 def _isolated_expansion_cache(monkeypatch):
     """Give every test a fresh expansion cache (module-level state, DI-08)."""
     monkeypatch.setattr(qe, "_EXPANSION_CACHE", {})
+    monkeypatch.setattr(qe, "_pending", {})
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +117,50 @@ def test_expand_query_does_not_cache_failures(monkeypatch):
     assert qe.expand_query("flaky") == []
     assert qe.expand_query("flaky") == []
     assert len(calls) == 2
+
+
+def test_expand_query_coalesces_concurrent_identical_queries(monkeypatch):
+    """Two threads racing the same uncached query must share one generation
+    call instead of each firing its own (redundant, equally slow) Ollama
+    request -- the leader generates while the follower waits and reuses
+    its result."""
+    import threading
+    import time
+
+    monkeypatch.setattr(qe, "EXPANSION_MODE", "hyde")
+    calls: list[str] = []
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_passage(q: str) -> str:
+        calls.append(q)
+        entered.set()
+        release.wait(timeout=5)
+        return "the shared passage"
+
+    monkeypatch.setattr(qe, "hyde_passage", slow_passage)
+
+    results: list[list[str]] = [None, None]  # type: ignore[list-item]
+
+    def leader():
+        results[0] = qe.expand_query("same question?")
+
+    def follower():
+        entered.wait(timeout=5)  # ensure the leader has claimed it first
+        results[1] = qe.expand_query("same question?")
+
+    t1 = threading.Thread(target=leader)
+    t2 = threading.Thread(target=follower)
+    t1.start()
+    t2.start()
+    time.sleep(0.05)  # give the follower a chance to register as waiting
+    release.set()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    assert len(calls) == 1
+    assert results[0] == ["the shared passage"]
+    assert results[1] == ["the shared passage"]
 
 
 def test_expand_query_cache_is_bounded(monkeypatch):

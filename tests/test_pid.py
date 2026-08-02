@@ -17,6 +17,7 @@ import pytest
 import remind_me_mcp.pid as pid_mod
 from remind_me_mcp.pid import (
     _check_ui_server_health,
+    _pid_is_alive,
     _read_pid_file,
     _remove_pid_file,
     _write_pid_file,
@@ -71,6 +72,21 @@ def test_read_pid_file_missing_returns_none(pid_file: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# _pid_is_alive
+# ---------------------------------------------------------------------------
+
+
+def test_pid_is_alive_true_for_current_process() -> None:
+    """The current process is always reported as alive."""
+    assert _pid_is_alive(os.getpid()) is True
+
+
+def test_pid_is_alive_false_for_bogus_pid() -> None:
+    """An implausibly large PID that (almost certainly) doesn't exist is reported as dead."""
+    assert _pid_is_alive(4194304) is False
+
+
+# ---------------------------------------------------------------------------
 # Stale / malformed PID files
 # ---------------------------------------------------------------------------
 
@@ -79,10 +95,7 @@ def test_read_pid_file_stale_pid_cleans_up(pid_file: Path, monkeypatch: pytest.M
     """A PID file pointing at a dead process is treated as stale and removed."""
     pid_file.write_text(json.dumps({"pid": 4194304, "host": "127.0.0.1", "port": 5199, "url": "http://127.0.0.1:5199"}))
 
-    def dead_kill(pid: int, sig: int) -> None:
-        raise ProcessLookupError(pid)
-
-    monkeypatch.setattr(os, "kill", dead_kill)
+    monkeypatch.setattr(pid_mod, "_pid_is_alive", lambda pid: False)
 
     assert _read_pid_file() is None
     assert not pid_file.exists()

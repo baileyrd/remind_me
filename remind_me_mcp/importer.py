@@ -50,6 +50,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import threading
 from pathlib import Path
@@ -1089,6 +1090,46 @@ def import_content(
 # ---------------------------------------------------------------------------
 
 
+def _collect_importable_files(
+    root: Path, extensions: set[str], recursive: bool
+) -> list[Path]:
+    """List files under *root* matching *extensions*, tolerating bad entries.
+
+    A broken symlink, Windows reparse point, or permission-denied entry
+    (common under synced folders like OneDrive placeholders) must not fail
+    the whole scan -- it's logged and skipped so the rest of the directory
+    still imports.
+    """
+    files: list[Path] = []
+
+    def _on_walk_error(exc: OSError) -> None:
+        log.warning("Skipping inaccessible path while scanning %s: %s", root, exc)
+
+    if recursive:
+        for dirpath, _dirnames, filenames in os.walk(root, onerror=_on_walk_error):
+            dir_path = Path(dirpath)
+            for name in filenames:
+                path = dir_path / name
+                try:
+                    if path.suffix.lower() in extensions and path.is_file():
+                        files.append(path)
+                except OSError as exc:
+                    log.warning("Skipping unreadable file %s: %s", path, exc)
+    else:
+        try:
+            entries = list(root.iterdir())
+        except OSError as exc:
+            log.warning("Could not list directory %s: %s", root, exc)
+            entries = []
+        for path in entries:
+            try:
+                if path.suffix.lower() in extensions and path.is_file():
+                    files.append(path)
+            except OSError as exc:
+                log.warning("Skipping unreadable file %s: %s", path, exc)
+    return files
+
+
 async def import_directory(
     directory: str,
     category: str = "chat_import",
@@ -1124,10 +1165,7 @@ async def import_directory(
     if tags is None:
         tags = []
     extensions = {".json", ".jsonl", ".md", ".markdown", ".txt"}
-    if recursive:
-        files = [f for f in root.rglob("*") if f.suffix.lower() in extensions and f.is_file()]
-    else:
-        files = [f for f in root.iterdir() if f.suffix.lower() in extensions and f.is_file()]
+    files = _collect_importable_files(root, extensions, recursive)
 
     sem = asyncio.Semaphore(IMPORT_CONCURRENCY)
 

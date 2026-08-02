@@ -13,13 +13,13 @@ import os
 import time
 from typing import TYPE_CHECKING
 
+import pytest
+
 from remind_me_mcp import backup as backup_mod
 
 if TYPE_CHECKING:
     import sqlite3
     from pathlib import Path
-
-    import pytest
 
 # ---------------------------------------------------------------------------
 # create_backup
@@ -344,6 +344,38 @@ def test_restore_backup_removes_stale_wal_shm_sidecars(
 
     assert not wal.exists()
     assert not shm.exists()
+
+
+def test_restore_backup_failed_replace_leaves_dest_and_sidecars_untouched(
+    db_conn: sqlite3.Connection, tmp_path, monkeypatch
+) -> None:
+    """If os.replace fails (e.g. Windows: dest still open by a
+    not-actually-stopped server), the original dest and its -wal/-shm
+    sidecars must be left exactly as they were -- deleting sidecars before
+    a replace that then fails would discard uncommitted WAL content while
+    the (unreplaced) old dest remains, silently losing recent writes."""
+    good_backup = _make_valid_backup(db_conn, "failed replace")
+
+    dest = tmp_path / "dest" / "memory.db"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(b"original content")
+    wal = dest.with_name(dest.name + "-wal")
+    shm = dest.with_name(dest.name + "-shm")
+    wal.write_bytes(b"live wal")
+    shm.write_bytes(b"live shm")
+
+    def fake_replace(src, dst):
+        raise PermissionError("dest is still open")
+
+    monkeypatch.setattr(backup_mod.os, "replace", fake_replace)
+
+    with pytest.raises(PermissionError):
+        backup_mod.restore_backup(good_backup, dest=dest)
+
+    assert dest.read_bytes() == b"original content"
+    assert wal.read_bytes() == b"live wal"
+    assert shm.read_bytes() == b"live shm"
+    assert not dest.with_suffix(".db.restoring").exists()
 
 
 def test_restore_backup_can_target_a_custom_dest(

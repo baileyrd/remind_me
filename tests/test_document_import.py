@@ -13,6 +13,7 @@ in-memory database, _embed_and_store_rows monkeypatched to a no-op.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -29,7 +30,6 @@ from remind_me_mcp.importer import (
 
 if TYPE_CHECKING:
     import sqlite3
-    from pathlib import Path
 
 
 NOTES_MD = """# Projects
@@ -470,6 +470,39 @@ async def test_import_directory_one_unexpected_failure_does_not_discard_the_rest
     assert "embedding backend unreachable" in by_file["bad.md"]["error"]
     assert by_file["good_one.md"]["status"] == "ok"
     assert by_file["good_two.md"]["status"] == "ok"
+
+
+async def test_import_directory_survives_inaccessible_subtree(
+    db_conn_concurrent: sqlite3.Connection,
+    no_embed: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One inaccessible subdirectory (permission-denied folder, broken
+    symlink/reparse point) must not fail the whole directory import -- it's
+    logged and skipped while every other file still imports."""
+    import remind_me_mcp.importer as _importer_mod
+
+    (tmp_path / "good_one.md").write_text(NOTES_MD)
+    bad_dir = tmp_path / "restricted"
+    bad_dir.mkdir()
+    (bad_dir / "unreachable.md").write_text(PLAIN_NOTES)
+
+    real_scandir = _importer_mod.os.scandir
+
+    def fake_scandir(path="."):
+        if Path(path) == bad_dir:
+            raise PermissionError(13, "Access is denied", str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(_importer_mod.os, "scandir", fake_scandir)
+
+    summary = await import_directory(directory=str(tmp_path))
+
+    assert summary["files_processed"] == 1
+    assert summary["imported"] == 1
+    by_file = {d["file"]: d for d in summary["details"]}
+    assert by_file["good_one.md"]["status"] == "ok"
 
 
 # ---------------------------------------------------------------------------
