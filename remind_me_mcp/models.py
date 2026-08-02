@@ -519,12 +519,16 @@ class DigestInput(BaseModel):
 
 
 class ImportKind(StrEnum):
-    """How to parse an imported file (FT-02, extended by FT-19).
+    """How to parse an imported file (FT-02, extended by FT-19 and FT-20).
 
     AUTO routes by extension and content sniffing: .json/.jsonl always import
     as chat; .pdf always imports as pdf; .png/.jpg/.jpeg always import as
     image; .md/.markdown/.txt import as chat when they contain chat role
     markers (e.g. '**User:**', '## Assistant'), otherwise as a document.
+    READWISE (a Readwise "Export" JSON file, one memory per highlight) is
+    deliberately NOT reachable through AUTO — a Readwise export and a chat
+    export are both plain .json with no reliable content-sniff to tell them
+    apart, so it must be requested explicitly (see readwise_import.py).
     """
 
     AUTO = "auto"
@@ -532,6 +536,7 @@ class ImportKind(StrEnum):
     DOCUMENT = "document"
     PDF = "pdf"
     IMAGE = "image"
+    READWISE = "readwise"
 
 
 class ChatImportInput(BaseModel):
@@ -577,17 +582,21 @@ class ChatImportInput(BaseModel):
     kind: ImportKind = Field(
         default=ImportKind.AUTO,
         description=(
-            "How to parse the file (FT-02, extended by FT-19): "
+            "How to parse the file (FT-02, extended by FT-19 and FT-20): "
             "'auto' — detect by extension/content (chat-style markdown imports "
             "as chat, notes markdown/text as a document, .pdf as pdf, "
-            "image extensions as image), "
+            "image extensions as image; never resolves to 'readwise' — see below), "
             "'chat' — force the chat-export parser, "
             "'document' — force per-section/paragraph document chunking "
             "(.md/.markdown/.txt only), "
             "'pdf' — force per-page PDF chunking (.pdf only; requires the "
             "optional 'pdf' extra), "
             "'image' — force OCR of an image into a single memory "
-            "(.png/.jpg/.jpeg only; requires the optional 'image' extra)"
+            "(.png/.jpg/.jpeg only; requires the optional 'image' extra), "
+            "'readwise' — force a Readwise 'Export' JSON file into one memory "
+            "per highlight (.json only; must be requested explicitly — 'auto' "
+            "never picks it, since a Readwise export and a chat export are both "
+            "indistinguishable-by-extension .json files)"
         ),
     )
 
@@ -713,9 +722,10 @@ class BulkImportDirInput(BaseModel):
     kind: ImportKind = Field(
         default=ImportKind.AUTO,
         description=(
-            "Per-file parsing mode (FT-02, extended by FT-19): 'auto' "
-            "(detect chat/document/pdf/image per file), 'chat', 'document', "
-            "'pdf', or 'image'"
+            "Per-file parsing mode (FT-02, extended by FT-19 and FT-20): 'auto' "
+            "(detect chat/document/pdf/image per file — never 'readwise', which "
+            "must be forced explicitly and then applies to every .json file in "
+            "the directory), 'chat', 'document', 'pdf', 'image', or 'readwise'"
         ),
     )
 

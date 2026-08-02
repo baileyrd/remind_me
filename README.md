@@ -10,6 +10,7 @@ Persistent, searchable memory that works across **Claude.ai**, **Claude Code**, 
 - **Chat export import** — ingest JSON, JSONL, or Markdown exports from Claude, ChatGPT, or custom formats
 - **Document ingestion** — import Markdown notes and plain-text files, chunked per-section (heading context preserved) or per-paragraph; `kind=auto` detects chat vs document per file
 - **PDF and image (OCR) ingestion** — import `.pdf` files (chunked per-page, page number kept as metadata) and `.png`/`.jpg`/`.jpeg` images (OCR'd into a single memory); `kind=auto` routes both automatically. Requires the optional `pdf`/`image` extras — see [PDF and Image Import](#pdf-and-image-import)
+- **Readwise highlights import** — import a Readwise "Export" JSON file as one memory per highlight (book/article title, author, category, and the highlight's own note all kept as metadata/content); requires explicit `kind=readwise` — see [Importing from Readwise](#importing-from-readwise)
 - **Bulk directory import** — point at a folder of exports/notes/PDFs/images and import them all
 - **Watched folders** — set `REMIND_ME_WATCH_DIRS` and new or changed files auto-ingest in the background; changed files supersede their previous import
 - **Push/webhook ingestion** — set `REMIND_ME_WEBHOOK_SECRET` and `POST /ingest` accepts content directly over the network, no filesystem staging required
@@ -655,9 +656,12 @@ The import tools (`remind_me_import_chat`, `remind_me_import_directory`, `POST /
 
 | Kind | Behavior |
 |------|----------|
-| `auto` *(default)* | `.json`/`.jsonl` always parse as chat. `.md`/`.markdown`/`.txt` are content-sniffed: files with chat role markers (`**User:**`, `## Assistant`, …) import as chat, everything else as a document |
+| `auto` *(default)* | `.json`/`.jsonl` always parse as chat. `.pdf` always parses as pdf; `.png`/`.jpg`/`.jpeg` always parses as image. `.md`/`.markdown`/`.txt` are content-sniffed: files with chat role markers (`**User:**`, `## Assistant`, …) import as chat, everything else as a document. **Never** resolves to `readwise` — see below |
 | `chat` | Force the chat-export parser (chunked per-message) |
 | `document` | Force document chunking (`.md`/`.markdown`/`.txt` only) |
+| `pdf` | Force per-page PDF chunking (`.pdf` only; requires the optional `pdf` extra) — see [PDF and Image Import](#pdf-and-image-import) |
+| `image` | Force OCR of an image into a single memory (`.png`/`.jpg`/`.jpeg` only; requires the optional `image` extra) — see [PDF and Image Import](#pdf-and-image-import) |
+| `readwise` | Force a Readwise "Export" JSON file into one memory per highlight (`.json` only, must be requested explicitly — never chosen by `auto`) — see [Importing from Readwise](#importing-from-readwise) |
 
 Document imports chunk Markdown per-section (the heading context is kept with each chunk and stored in metadata) and plain text per-paragraph. They get `source: document_import` and default to category `document`.
 
@@ -665,7 +669,33 @@ Imports are restricted to paths inside `REMIND_ME_IMPORT_ROOTS` (default: your h
 
 ### Pluggable Connectors
 
-The `chat` and `document` kinds are plain parser functions registered by kind string in `remind_me_mcp/importer.py` (`register_connector(kind, connector)`), not a hardcoded dispatch — `remind_me_import_chat`/`remind_me_import_directory` resolve the effective kind exactly as before, then look it up in the registry. A third-party module can register more connectors without touching `importer.py`; `remind_me_mcp/mempalace_import.py` does this for its own `_parse_frontmatter` step, registered under `"mempalace"` purely for discovery (its real ingestion path, `remind_me_import_mempalace`, keeps its own bespoke per-drawer dedup/paging loop — MemPalace drawers arrive individually from a paginated ChromaDB read, not as one raw file). `remind_me_mcp/dbs_import.py` follows the same pattern for [dbs](https://github.com/baileyrd/daily-backup-system) — see [Importing from dbs](#importing-from-dbs) below. Call `remind_me_list_connectors` to see every registered connector and which are valid `remind_me_import_chat` kinds.
+Every import kind — including the built-in `chat`, `document`, `pdf`, `image`, and `readwise` — is a plain parser function registered by kind string in `remind_me_mcp/importer.py`, not a hardcoded dispatch. `remind_me_import_chat`/`remind_me_import_directory`/`POST /api/import` resolve the effective kind (by extension, or by content-sniffing for `auto`, or by whatever the caller forced) and then look it up in one registry. A third-party module can register more kinds **without touching `importer.py` at all** — this is the whole point of the registry, and it's meant to be actually used by someone outside this codebase, not just an internal implementation detail. What follows is the contract, not just a pointer to source.
+
+**Registering a connector.** Call `register_connector(kind, parser)` at import time (module-level, right after defining `parser` — see every built-in below):
+
+```python
+from remind_me_mcp.importer import register_connector
+
+def my_connector(raw: str, meta: dict) -> tuple[list[tuple[str, dict]], int]:
+    ...
+
+register_connector("my_kind", my_connector)
+```
+
+- `kind` is any string. It's only reachable through `remind_me_import_chat`/`remind_me_import_directory`/`POST /api/import` if it's also added to `importer.IMPORT_KINDS` (a first-party change) *and*, if it needs `kind="auto"` to route to it, wired into the effective-kind resolution in `_ingest_parsed` — most third-party connectors instead register purely for **discovery** (`remind_me_list_connectors`) and drive their own bespoke ingestion function/tool, the way `mempalace_import.py` and `dbs_import.py` do (see below): a MemPalace drawer or a dbs item arrives individually from a paginated read, not as one raw file, so neither ever flows through the file-based `import_chat_file` pipeline at all.
+- The parser's signature is fixed: `(raw: str, meta: dict[str, Any]) -> tuple[list[tuple[str, str_or_dict]], int]` — concretely, `(content, chunk_metadata)` pairs plus a raw-entry count. `raw` is the file's content decoded as UTF-8 (`errors="replace"`); a binary format (like `pdf`/`image`) instead reads `meta["raw_bytes"]` — the *undecoded* original bytes — and ignores `raw` entirely, since UTF-8-decoding binary data would corrupt it. `meta` also carries `suffix`, `extract_mode`, and `max_length`.
+- Each `content` string becomes one memory's content; each paired `chunk_metadata` dict is merged into that memory's stored `metadata` JSON — this is the mechanism for attaching source-specific context (a PDF's page number, a Readwise highlight's book title/author) without threading a special case through the shared pipeline. Use `remind_me_mcp.importer._chunk_text(text, max_length)` to split anything that might exceed `max_length` — every built-in connector does, so oversized content is handled the exact same way everywhere.
+- The `int` return value is the count of logical source units found *before* chunking (e.g. messages, or highlights) — it becomes the `raw_entries` field of the import result. For a connector where chunking *is* the extraction unit (like `document`), it just equals the number of chunks returned.
+
+**What you get for free.** Once a connector returns that shape, `_ingest_parsed` (the one function every kind funnels through) handles everything else identically: SHA-256 content-hash dedup against `chat_imports` (re-importing the same file is a no-op), assigning deterministic memory ids, batched embedding, and the `doc_id`/`chunk_index` bookkeeping that makes neighbor-aware chunk retrieval and `remind_me_undo_import` work. None of that is something a connector author needs to think about, let alone reimplement.
+
+**Reference implementations**, roughly in order of how much of the shared pipeline they use:
+
+- `remind_me_mcp/readwise_import.py` — the fullest example of "just implement the parser": turns a Readwise export into one `(highlight_text[+note], {book/author/... metadata})` pair per highlight, and nothing else — dedup, chunking, and embedding are entirely `_ingest_parsed`'s job. Also the best example of *deliberately not* joining `kind="auto"`'s content-sniffing (documented in its own module docstring) when a format shares a suffix with an existing kind and can't be told apart reliably.
+- `remind_me_mcp/dbs_import.py` — a connector registered purely for discovery (`remind_me_list_connectors`), with its own dedicated tool (`remind_me_import_dbs`) and bespoke per-item dedup/supersession loop, because dbs items arrive individually from a live SQLite read rather than as one file. Read this one if your source is a live store you'd page through, not a static export file.
+- `remind_me_mcp/mempalace_import.py` — the same discovery-only pattern as `dbs_import.py`, for a ChromaDB-backed store.
+
+Call `remind_me_list_connectors` to see every registered connector and which subset are valid `remind_me_import_chat`/`remind_me_import_directory` kinds (`IMPORT_KINDS` — narrower than the full registry, for exactly the discovery-only reason above).
 
 ### Importing from dbs
 
@@ -680,6 +710,21 @@ remind_me_import_dbs(db_path="/path/to/dbs.sqlite3")
 - `source`/`item_type` filter to one dbs source or item kind; `tags` adds extra tags to every imported memory; `dry_run` reports what would happen without writing.
 
 This is the highest-fidelity of the three ways to feed dbs's collected content into remind_me (see dbs's `docs/remind-me-integration-review-2026-07-21.md` for the other two — an unzipped-notes export watched by `REMIND_ME_WATCH_DIRS`, or a per-item webhook push) — the only one that gives Claude entity-level provenance (which source, which tags) instead of prose to parse back out.
+
+### Importing from Readwise
+
+[Readwise](https://readwise.io) exports your highlights as JSON — either via Settings → Export, or by calling its documented Export API (`GET https://readwise.io/api/v2/export/`, see [readwise.io/api_deets](https://readwise.io/api_deets)) and saving the response. Import the resulting file with `kind` set explicitly:
+
+```
+Use remind_me_import_chat with:
+  file_path: ~/Downloads/readwise-export.json
+  kind: readwise
+```
+
+- **`kind=readwise` is never inferred by `auto`.** A Readwise export and an arbitrary chat export are both plain `.json` files, and unlike the Markdown chat-role-marker sniff `auto` already does, there's no reliable, false-positive-free way to content-sniff a Readwise export apart from other JSON shapes — guessing wrong would risk silently misrouting an existing chat export. You always have to ask for `readwise` by name.
+- **One memory per highlight**, not one memory per book/article. A highlight is Readwise's own atomic unit — grouping a book's highlights into one memory would force every highlight to compete with every other highlight from the same book for search ranking and embedding budget, which is exactly the retrieval precision a memory store exists to protect. Book context isn't lost, just demoted to metadata: every highlight's memory carries the book/article's `title`, `author`, `category` (`books`/`articles`/`tweets`/`podcasts`/...), and `source_url`, plus the highlight's own `location`, `highlighted_at`, `tags`, and Readwise highlight URL, all under a `readwise_`-prefixed key in metadata.
+- **A highlight's own note is appended to its content**, not discarded — `"{highlight text}\n\nNote: {your note}"` — since the note is often the actual reason you highlighted the passage, and only memory content participates in full-text search.
+- Same hash-based dedup, chunking, and embedding as every other import kind (it flows through the same shared pipeline) — re-importing the same export file is a no-op.
 
 ### Claude Export Format
 
@@ -708,6 +753,7 @@ Use remind_me_import_directory with:
 - **JSONL**: One message or conversation per line
 - **Markdown**: Chat exports (headings or bold markers for roles: `## Human`, `**Assistant:**`, …) or plain notes (imported as documents)
 - **Plain text** (`.txt`): imported as documents, chunked per-paragraph
+- **Readwise export** (`.json`, `kind=readwise` required — see [Importing from Readwise](#importing-from-readwise)): one memory per highlight
 
 ## Exporting & Backup
 

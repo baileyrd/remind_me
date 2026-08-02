@@ -963,7 +963,7 @@ paths:
                 kind:
                   type: string
                   default: auto
-                  enum: [auto, chat, document, pdf, image]
+                  enum: [auto, chat, document, pdf, image, readwise]
       responses:
         "200":
           description: |

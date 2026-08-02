@@ -19,6 +19,7 @@ from remind_me_mcp import (
     config,
     image_import,  # noqa: F401 — registers the "image" import kind (FT-19)
     pdf_import,  # noqa: F401 — registers the "pdf" import kind (FT-19)
+    readwise_import,  # noqa: F401 — registers the "readwise" import kind (FT-20)
 )
 from remind_me_mcp import tools as _pkg
 from remind_me_mcp.config import EMBED_BATCH_SIZE, SYNC_ENABLED
@@ -63,7 +64,7 @@ except ImportError:
 )
 async def memory_import_chat(params: ChatImportInput) -> str:
     """Import a chat export (JSON, JSONL, or Markdown), a document/notes file,
-    a PDF, or an image into memory.
+    a PDF, an image, or a Readwise highlights export into memory.
 
     Supports Claude's export format, OpenAI's export format, and generic {role, content} message
     arrays — plus generic documents (FT-02): Markdown notes are chunked per-section (heading
@@ -75,6 +76,15 @@ async def memory_import_chat(params: ChatImportInput) -> str:
     traceback. With the default kind='auto', chat-style markdown imports as chat, notes files
     as documents, .pdf as pdf, and .png/.jpg/.jpeg as image. Deduplicates by file hash —
     re-importing the same file is a no-op.
+
+    A Readwise "Export" JSON file (FT-20) needs `kind='readwise'` passed explicitly — it is
+    never chosen by `kind='auto'`, since a Readwise export and an arbitrary chat export are
+    both indistinguishable-by-extension .json files and this server has no reliable way to
+    content-sniff one from the other without risking misrouting an existing chat export (see
+    `remind_me_mcp/readwise_import.py`'s docstring). Each highlight becomes its own memory
+    (finer-grained than one memory per book, for search precision), tagged in metadata with
+    its book/article title, author, category, and source URL; a highlight's own note is
+    appended to its content rather than discarded.
 
     Args:
         params (ChatImportInput): File path, import kind, extraction mode, and tagging options.

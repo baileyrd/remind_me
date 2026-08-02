@@ -1,5 +1,15 @@
 # Release Notes
 
+## v1.39.0 — 2026-08-02
+
+### New Features
+
+- **Readwise highlights import connector (FT-20, #182)** — a new built-in `readwise` import kind (`remind_me_mcp/readwise_import.py`, registered exactly like `pdf_import.py`/`image_import.py`) turns a Readwise ["Export"](https://readwise.io/api_deets) JSON file into memory — verified against Readwise's own documented Export API response shape (`GET /api/v2/export/`: a `{"results": [...]}` object of book/article entries, each with a `highlights` array), not just the simplified "array of entries" the issue described; a bare top-level array is also accepted for convenience.
+- **One memory per highlight**, not one memory per book. A highlight is Readwise's own atomic unit of meaning; grouping a book's highlights into one memory (mirroring how `pdf_import.py` chunks per page) would force every highlight to compete with its siblings for search ranking and embedding budget — the opposite of what a memory store is for. Book/article `title`, `author`, `category`, and `source_url` still travel with every highlight, just as `readwise_`-prefixed chunk metadata (mirroring `dbs_import.py`'s per-item metadata attachment) rather than shaping the embedding.
+- **A highlight's own note is appended to its content, not discarded** — `"{highlight text}\n\nNote: {note}"` — since only memory content is full-text-searchable and the note is frequently the actual reason the passage was highlighted in the first place.
+- **`kind=readwise` must be requested explicitly — `auto` never infers it.** A Readwise export and an arbitrary chat export are both plain, indistinguishable-by-extension `.json` files, and unlike the Markdown chat-role-marker sniff `kind=auto` already does for `.md`/`.txt`, there's no reliable, false-positive-free way to content-sniff one JSON shape apart from another — misrouting an existing chat export would be a strictly worse failure than asking for one extra keyword. Documented as a deliberate tradeoff, not a silent gap.
+- **README's "Pluggable Connectors" section rewritten** into an actual authoring guide for a third-party connector — the `register_connector` signature contract, what `_ingest_parsed` (hash dedup, chunking, batched embedding) handles for free once a connector returns the right shape, and pointers at `readwise_import.py`/`dbs_import.py` as reference implementations — rather than the prior one-paragraph mention.
+
 ## v1.38.0 — 2026-08-02
 
 ### New Features

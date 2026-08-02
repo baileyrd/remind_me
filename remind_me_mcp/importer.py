@@ -48,6 +48,20 @@ a PDF or image, so ``_ingest_parsed`` also carries the undecoded
 ``.png``/``.jpg``/``.jpeg`` to ``image``, alongside the existing chat/
 document sniffing.
 
+FT-20: a fifth built-in kind, ``readwise`` (registered from
+``readwise_import.py``, same wiring convention as the connectors above),
+imports a Readwise "Export" JSON file (one memory per highlight — see that
+module's docstring for the granularity rationale). Unlike every other
+kind sharing the ``.json``/``.jsonl`` suffixes, ``readwise`` is **not**
+reachable through ``kind="auto"``: a Readwise export and a chat export are
+both arbitrary JSON, and this module has no reliable, false-positive-free
+way to content-sniff one from the other the way :func:`_looks_like_chat_markdown`
+does for role-structured Markdown — guessing wrong would silently misroute
+someone's existing chat-export ``.json`` files, which is a worse failure
+than requiring one extra keyword. Callers must pass ``kind="readwise"``
+explicitly; :func:`_validate_kind_and_suffix` enforces that a forced
+``readwise`` kind only ever pairs with a ``.json`` file.
+
 FT-06: exports may carry entity-graph records tagged with a ``record_type``
 discriminator ('entity' / 'memory_entity'; absent = memory, mirroring the
 FT-04 sync wire format). Message extraction skips them, and JSON/JSONL chat
@@ -87,9 +101,9 @@ log = logging.getLogger("remind_me_mcp.importer")
 
 IMPORT_CONCURRENCY = 8
 
-IMPORT_KINDS = ("auto", "chat", "document", "pdf", "image")
+IMPORT_KINDS = ("auto", "chat", "document", "pdf", "image", "readwise")
 """Valid values for the ``kind`` parameter of :func:`import_chat_file` (FT-02,
-extended for ``pdf``/``image`` by FT-19).
+extended for ``pdf``/``image`` by FT-19, and ``readwise`` by FT-20).
 
 Deliberately NOT derived from :data:`_CONNECTORS` (Phase 4): that registry can
 hold connectors -- like ``mempalace`` -- that exist purely for discovery
@@ -121,6 +135,13 @@ IMAGE_SOURCE = "image_import"
 IMAGE_CATEGORY = "image"
 """Default ``memories.category`` for image imports when the caller passed the
 generic chat default ('chat_import') or an empty category."""
+
+READWISE_SOURCE = "readwise_import"
+"""``memories.source`` value for Readwise highlight imports (FT-20)."""
+
+READWISE_CATEGORY = "readwise"
+"""Default ``memories.category`` for Readwise imports when the caller passed
+the generic chat default ('chat_import') or an empty category."""
 
 _IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg")
 """File extensions routed to the ``image`` connector (FT-19)."""
@@ -802,7 +823,7 @@ def _validate_kind_and_suffix(kind: str, suffix: str, filename: str) -> dict[str
     """Shared kind/suffix validation for both import entry points.
 
     Args:
-        kind: 'chat', 'document', 'pdf', 'image', or 'auto'.
+        kind: 'chat', 'document', 'pdf', 'image', 'readwise', or 'auto'.
         suffix: Lowercased file extension (from the path or the pushed
             filename).
         filename: Display name for the error's 'file' field.
@@ -813,7 +834,10 @@ def _validate_kind_and_suffix(kind: str, suffix: str, filename: str) -> dict[str
     if kind not in IMPORT_KINDS:
         return {
             "status": "error",
-            "reason": f"invalid kind: {kind!r} (use 'auto', 'chat', 'document', 'pdf', or 'image')",
+            "reason": (
+                f"invalid kind: {kind!r} (use 'auto', 'chat', 'document', "
+                "'pdf', 'image', or 'readwise')"
+            ),
             "file": filename,
         }
     if suffix not in _ALL_SUPPORTED_SUFFIXES:
@@ -840,6 +864,16 @@ def _validate_kind_and_suffix(kind: str, suffix: str, filename: str) -> dict[str
         return {
             "status": "error",
             "reason": f"image import requires one of {_IMAGE_SUFFIXES}, got {suffix}",
+            "file": filename,
+        }
+    # FT-20: readwise shares the .json suffix with chat (kind="auto" never
+    # routes here -- see the module docstring), but a forced kind="readwise"
+    # must still name an actual .json file, not a Markdown/text/jsonl one
+    # the readwise connector has no shape for.
+    if kind == "readwise" and suffix != ".json":
+        return {
+            "status": "error",
+            "reason": f"readwise import requires a .json file, got {suffix}",
             "file": filename,
         }
     if suffix == _PDF_SUFFIX and kind not in ("auto", "pdf"):
@@ -895,21 +929,28 @@ def _ingest_parsed(
         tags: Tags to apply to all imported memories.
         extract_mode: Message extraction strategy (chat imports only).
         max_length: Maximum characters per memory chunk.
-        kind: 'chat', 'document', 'pdf', 'image', or 'auto'.
+        kind: 'chat', 'document', 'pdf', 'image', 'readwise', or 'auto'.
+            'readwise' must be requested explicitly for a .json file — it is
+            never chosen by 'auto' (FT-20; see the module docstring).
 
     Returns:
         Same result shape as :func:`import_chat_file`.
     """
     db = _get_db()
 
-    # Resolve the effective kind (FT-02, extended by FT-19). JSON/JSONL are
-    # always chat exports; .pdf/image suffixes always route to their
-    # dedicated binary connector regardless of kind (validation above already
-    # confirmed kind is 'auto' or the matching kind for these suffixes);
-    # markdown/text files are content-sniffed in auto mode so chat-style
-    # markdown keeps importing as chat (existing behavior preserved).
+    # Resolve the effective kind (FT-02, extended by FT-19/FT-20). JSON/JSONL
+    # are chat exports UNLESS the caller explicitly forced kind="readwise"
+    # (validation above already confirmed that only pairs with .json, never
+    # .jsonl) -- kind="auto" never resolves to readwise here, by design (see
+    # the module's FT-20 docstring note: no reliable, false-positive-free way
+    # to content-sniff a Readwise export apart from an arbitrary chat-shaped
+    # JSON file). .pdf/image suffixes always route to their dedicated binary
+    # connector regardless of kind (validation above already confirmed kind
+    # is 'auto' or the matching kind for these suffixes); markdown/text files
+    # are content-sniffed in auto mode so chat-style markdown keeps importing
+    # as chat (existing behavior preserved).
     if suffix in (".json", ".jsonl"):
-        effective_kind = "chat"
+        effective_kind = "readwise" if kind == "readwise" else "chat"
     elif suffix == _PDF_SUFFIX:
         effective_kind = "pdf"
     elif suffix in _IMAGE_SUFFIXES:
@@ -955,6 +996,10 @@ def _ingest_parsed(
         source = IMAGE_SOURCE
         if category in ("", "chat_import"):
             category = IMAGE_CATEGORY
+    elif effective_kind == "readwise":
+        source = READWISE_SOURCE
+        if category in ("", "chat_import"):
+            category = READWISE_CATEGORY
     else:
         source = "chat_import"
 
@@ -1079,11 +1124,13 @@ def import_chat_file(
         extract_mode: Message extraction strategy (e.g., 'assistant_messages');
             chat imports only.
         max_length: Maximum characters per memory chunk.
-        kind: 'chat', 'document', 'pdf', 'image', or 'auto' (default). Auto
-            routes .json/.jsonl to the chat parser, .pdf to the pdf parser,
-            .png/.jpg/.jpeg to the image (OCR) parser, and sniffs
-            .md/.markdown/.txt content: chat role markers import as chat,
-            everything else as a document.
+        kind: 'chat', 'document', 'pdf', 'image', 'readwise', or 'auto'
+            (default). Auto routes .json/.jsonl to the chat parser, .pdf to
+            the pdf parser, .png/.jpg/.jpeg to the image (OCR) parser, and
+            sniffs .md/.markdown/.txt content: chat role markers import as
+            chat, everything else as a document. 'readwise' (a Readwise
+            "Export" JSON file, one memory per highlight — FT-20) is never
+            chosen by auto and must be requested explicitly.
 
     Returns:
         A status dict. On success: {'status': 'ok', 'import_id': str,
@@ -1168,8 +1215,8 @@ def import_content(
         tags: Tags to apply to all imported memories.
         extract_mode: Message extraction strategy (chat imports only).
         max_length: Maximum characters per memory chunk.
-        kind: 'chat', 'document', 'pdf', 'image', or 'auto' (default) — see
-            :func:`import_chat_file`.
+        kind: 'chat', 'document', 'pdf', 'image', 'readwise', or 'auto'
+            (default) — see :func:`import_chat_file`.
 
     Returns:
         Same result shape as :func:`import_chat_file`.
@@ -1275,8 +1322,12 @@ async def import_directory(
         extract_mode: Message extraction strategy (chat files only).
         max_length: Max characters per memory chunk.
         recursive: Whether to search subdirectories.
-        kind: 'chat', 'document', 'pdf', 'image', or 'auto' (default) —
-            per-file routing, see :func:`import_chat_file` (FT-02, FT-19).
+        kind: 'chat', 'document', 'pdf', 'image', 'readwise', or 'auto'
+            (default) — per-file routing, see :func:`import_chat_file`
+            (FT-02, FT-19, FT-20). 'readwise' is applied to every .json file
+            in the directory when forced (auto never picks it), so mixing
+            genuine Readwise exports with other .json files in one directory
+            import isn't supported — import them separately.
 
     Returns:
         Summary dict with keys: files_processed, imported, skipped,
@@ -1343,6 +1394,8 @@ __all__ = [
     "PDF_CATEGORY",
     "IMAGE_SOURCE",
     "IMAGE_CATEGORY",
+    "READWISE_SOURCE",
+    "READWISE_CATEGORY",
     "Connector",
     "register_connector",
     "_CONNECTORS",
