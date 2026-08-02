@@ -243,6 +243,14 @@ check("count splits live from tombstoned",
       c["memories"]["live"] == c["memories"]["total"] - c["memories"]["tombstones"],
       str(c["memories"]))
 
+approx = httpx.get(f"{HUB_URL}/count?approx=1", headers=AUTH).json()
+check("approx mode declares itself", approx["approximate"] is True, str(approx))
+check("exact mode declares itself", c["approximate"] is False, str(c))
+# No live/tombstone split in approx mode: that needs a filtered scan, which is
+# the cost being avoided, and estimating it would be inventing a number.
+check("approx memories reports total only",
+      set(approx["memories"]) == {"total"}, str(approx["memories"]))
+
 one = httpx.get(f"{HUB_URL}/count?table=memories", headers=AUTH).json()
 check("count?table= narrows to one table",
       "memories" in one and "entities" not in one, str(one))

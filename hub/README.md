@@ -159,10 +159,10 @@ answers your question — they are not interchangeable.
 
 ```bash
 curl -s http://127.0.0.1:8765/health
-# {"status":"ok","role":"hub","version":"1.3.0","db":"ok","time":"..."}
+# {"status":"ok","role":"hub","version":"1.4.0","db":"ok","time":"..."}
 
 curl -s -H "Authorization: Bearer $SYNC_SECRET" http://127.0.0.1:8765/count
-# {"role":"hub","version":"1.3.0",
+# {"role":"hub","version":"1.4.0",
 #  "memories":{"total":812,"live":790,"tombstones":22},
 #  "entities":143,"memory_entities":901,"entity_relations":37,"time":"..."}
 
@@ -177,6 +177,26 @@ right after a bulk import. `/stats` exists for reconciliation (it is what
 table scans, which is the right cost once per reconcile and the wrong cost
 once per minute. `table=` accepts `memories`, `entities`, `memory_entities`
 or `entity_relations`; anything else is a `400`.
+
+For a purely trend-shaped question — a graph that only needs to go up and to
+the right — add `?approx=1`:
+
+```bash
+curl -s -H "Authorization: Bearer $SYNC_SECRET" \
+     'http://127.0.0.1:8765/count?approx=1'
+# {"role":"hub","version":"1.4.0","approximate":true,
+#  "memories":{"total":812},"entities":143,...}
+```
+
+Postgres cannot answer an unqualified `COUNT(*)` without scanning — MVCC
+means there is no stored row count to read — so even `/count` is O(rows).
+`approx=1` reads `pg_class.reltuples` instead: one catalog lookup, maintained
+by autovacuum/ANALYZE, typically within a fraction of a percent. **A table
+that hasn't been analysed recently can be materially off**, which is fine for
+a trend line and not fine for reconciliation, so exact remains the default
+and every response says which it gave you (`approximate`). Approximate
+`memories` reports `total` only: the live/tombstone split needs a filtered
+scan, and estimating it would mean inventing a number.
 
 `memories.live` is `total - tombstones`, and it is the number that should
 agree with a node — a node's user-visible count excludes tombstones while
@@ -332,7 +352,7 @@ systemctl --user daemon-reload
 systemctl --user start remind-me-postgres.service
 systemctl --user start remind-me-hub.service
 curl -s http://127.0.0.1:8765/health
-# {"status":"ok","role":"hub","version":"1.3.0","db":"ok","time":"..."}
+# {"status":"ok","role":"hub","version":"1.4.0","db":"ok","time":"..."}
 ```
 
 The hub creates (or migrates) the database schema itself at startup, and

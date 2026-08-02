@@ -183,3 +183,44 @@ def test_count_table_filter_is_an_allowlist() -> None:
     body = _count_body()
     assert "_COUNTABLE" in body, "/count must validate `table` against the allowlist"
     assert "400" in body, "an unknown table must be rejected as a 400, not interpolated"
+
+
+def test_approx_mode_uses_the_planner_estimate_not_a_scan() -> None:
+    """?approx=1 must not just be an exact count with a different label.
+
+    The whole point is dropping the scan: Postgres can't answer an
+    unqualified COUNT(*) without one, which is what makes a per-minute
+    scrape of a large table a standing load.
+    """
+    src = _source()
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.FunctionDef) and node.name == "_approx_count_tables":
+            body = ast.unparse(node.body[1:] if ast.get_docstring(node) else node.body)
+            assert "pg_class" in body and "reltuples" in body
+            assert "COUNT(*)" not in body, "approximate mode must not scan"
+            return
+    raise AssertionError("hub/main.py has no _approx_count_tables helper")
+
+
+def test_exact_is_the_default() -> None:
+    """Reconciliation needs real numbers; a silently-estimated total is worse
+    than a slow one."""
+    tree = ast.parse(_source())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "count":
+            approx_arg = [a for a in node.args.args if a.arg == "approx"]
+            assert approx_arg, "/count must accept an approx parameter"
+            default = node.args.defaults[-1]
+            assert isinstance(default, ast.Constant) and default.value is False
+            return
+    raise AssertionError("hub/main.py has no /count route")
+
+
+def test_response_always_declares_which_kind_of_count_it_gave() -> None:
+    """Present unconditionally, not only when true.
+
+    Otherwise a caller has to infer exactness from a missing key, and the
+    other signal — no live/tombstone split — is far too quiet to hang
+    correctness on.
+    """
+    assert "'approximate': approx" in _count_body()

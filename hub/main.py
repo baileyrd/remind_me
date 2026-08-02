@@ -55,7 +55,7 @@ from psycopg.types.json import Jsonb
 log = logging.getLogger("remind_me_hub")
 logging.basicConfig(level=logging.INFO)
 
-HUB_VERSION = "1.3.0"
+HUB_VERSION = "1.4.0"
 """Version of the hub server, reported by /health, /count and /stats.
 
 Versioned independently of the ``remind-me-mcp`` package rather than tracking
@@ -553,6 +553,44 @@ parameterizable position in Postgres, so the value must never come from the
 request itself."""
 
 
+def _approx_count_tables(
+    conn: psycopg.Connection, wanted: tuple[str, ...]
+) -> dict[str, Any]:
+    """O(1) row estimates from the planner's statistics (issue #214).
+
+    Postgres cannot answer an unqualified ``COUNT(*)`` without scanning:
+    MVCC means visibility is per-transaction, so there is no stored row count
+    to read. /count exists to be polled, and a per-minute scrape of a large
+    memories table is a standing load that dropping /stats' GROUP BY only
+    partly addressed. ``pg_class.reltuples`` is maintained by autovacuum and
+    ANALYZE and costs a single catalog lookup.
+
+    ``memories`` reports ``total`` only -- deliberately no live/tombstone
+    split. That split needs a filtered scan, which is the very thing being
+    avoided; estimating it would mean inventing a number, and the whole
+    contract here is "fast and honestly approximate", not "fast and made up".
+
+    A never-analysed table reports -1 in the catalog, which is normalized to
+    0 rather than passed through as a nonsense count.
+    """
+    rows = conn.execute(
+        """
+        SELECT relname, GREATEST(reltuples, 0)::bigint AS estimate
+          FROM pg_class
+         WHERE relname = ANY(%s)
+           AND relkind = 'r'
+        """,
+        (list(wanted),),
+    ).fetchall()
+    estimates = {r["relname"]: r["estimate"] for r in rows}
+
+    counts: dict[str, Any] = {}
+    for name in wanted:
+        estimate = estimates.get(name, 0)
+        counts[name] = {"total": estimate} if name == "memories" else estimate
+    return counts
+
+
 def _count_tables(
     conn: psycopg.Connection, wanted: tuple[str, ...]
 ) -> dict[str, Any]:
@@ -588,7 +626,7 @@ def _count_tables(
 
 
 @app.get("/count", dependencies=[Depends(_require_auth)])
-def count(table: str | None = None) -> JSONResponse:
+def count(table: str | None = None, approx: bool = False) -> JSONResponse:
     """Scalar record counts — the cheap subset of /stats, safe to poll.
 
     /stats answers "how does my node differ from the hub, and where?", and
@@ -611,6 +649,13 @@ def count(table: str | None = None) -> JSONResponse:
     how fast it grows, which is exactly the kind of thing an unauthenticated
     poller should not be able to graph. /health stays the public route, and
     stays count-free.
+
+    ``?approx=1`` swaps the COUNT scans for planner estimates (issue #214) --
+    O(1), accurate to a fraction of a percent on an analysed table, and
+    plenty for a trend line. Exact stays the default because reconciliation
+    and the /count-vs-/stats agreement check both need real numbers, and a
+    silently-estimated total would be worse than a slow one. The response
+    says which it gave you.
     """
     if table is not None and table not in _COUNTABLE:
         raise HTTPException(
@@ -620,12 +665,19 @@ def count(table: str | None = None) -> JSONResponse:
     wanted = (table,) if table else _COUNTABLE
 
     with _connect() as conn:
-        counts = _count_tables(conn, wanted)
+        counts = (
+            _approx_count_tables(conn, wanted) if approx else _count_tables(conn, wanted)
+        )
 
     return JSONResponse(
         content={
             "role": "hub",
             "version": HUB_VERSION,
+            # Always present, not only when true: a caller that forgot to ask
+            # would otherwise have to infer exactness from the absence of a
+            # key, and "no live/tombstone split" is too quiet a signal to
+            # hang correctness on.
+            "approximate": approx,
             **counts,
             "time": datetime.now(UTC).isoformat(),
         },
