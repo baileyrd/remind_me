@@ -230,6 +230,90 @@ def test_unrelated_paths_rejected(remote_client) -> None:
     assert remote_client.get(f"/api/{_TOKEN}").status_code == 404
 
 
+# ---------------------------------------------------------------------------
+# Rate limiting (issue #183)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def rate_limited_client(monkeypatch: pytest.MonkeyPatch):
+    """Like remote_client, but with a tiny REMIND_ME_RATE_LIMIT_REQUESTS so
+    tests can trip the limiter without sending dozens of requests."""
+    from starlette.testclient import TestClient
+
+    monkeypatch.setattr(cfg, "AUTO_UPDATE_CHECK", False)
+    monkeypatch.setattr(main_mod.mcp, "_session_manager", None)
+    monkeypatch.setattr(cfg, "RATE_LIMIT_REQUESTS", 2)
+    monkeypatch.setattr(cfg, "RATE_LIMIT_WINDOW_SECONDS", 60)
+
+    app = build_remote_app(_TOKEN)
+    with TestClient(app, base_url="https://machine.tailnet.ts.net", raise_server_exceptions=False) as client:
+        yield client
+
+
+def test_secret_path_returns_429_with_retry_after_once_limit_exceeded(rate_limited_client) -> None:
+    ok1 = rate_limited_client.post(f"/mcp/{_TOKEN}", json=_MCP_INITIALIZE, headers=_MCP_HEADERS)
+    ok2 = rate_limited_client.post(f"/mcp/{_TOKEN}", json=_MCP_INITIALIZE, headers=_MCP_HEADERS)
+    assert ok1.status_code == 200, ok1.text
+    assert ok2.status_code == 200, ok2.text
+
+    blocked = rate_limited_client.post(f"/mcp/{_TOKEN}", json=_MCP_INITIALIZE, headers=_MCP_HEADERS)
+    assert blocked.status_code == 429
+    assert "retry-after" in {k.lower() for k in blocked.headers}
+    assert int(blocked.headers["Retry-After"]) >= 1
+    assert blocked.json() == {"error": "rate limit exceeded"}
+
+
+def test_bare_mcp_bearer_shares_bucket_with_secret_path(rate_limited_client) -> None:
+    """Both entry points to the same connector token consume the same
+    verified ('auth:known') bucket, not two independent ones."""
+    r1 = rate_limited_client.post(f"/mcp/{_TOKEN}", json=_MCP_INITIALIZE, headers=_MCP_HEADERS)
+    r2 = rate_limited_client.post(
+        "/mcp", json=_MCP_INITIALIZE, headers={**_MCP_HEADERS, "Authorization": f"Bearer {_TOKEN}"}
+    )
+    assert r1.status_code == 200, r1.text
+    assert r2.status_code == 200, r2.text
+
+    r3 = rate_limited_client.post(f"/mcp/{_TOKEN}", json=_MCP_INITIALIZE, headers=_MCP_HEADERS)
+    assert r3.status_code == 429
+
+
+def test_wrong_token_flood_bounded_by_ip_and_separate_from_legit_bucket(rate_limited_client) -> None:
+    """Requests presenting a wrong/garbage secret-path token are bounded
+    together (IP-keyed) -- and exhausting that bucket does not touch the
+    legitimate token's own bucket."""
+    r1 = rate_limited_client.post("/mcp/wrong-a", json=_MCP_INITIALIZE, headers=_MCP_HEADERS)
+    r2 = rate_limited_client.post("/mcp/wrong-b", json=_MCP_INITIALIZE, headers=_MCP_HEADERS)
+    assert r1.status_code == 404
+    assert r2.status_code == 404
+
+    r3 = rate_limited_client.post("/mcp/wrong-c", json=_MCP_INITIALIZE, headers=_MCP_HEADERS)
+    assert r3.status_code == 429
+
+    ok = rate_limited_client.post(f"/mcp/{_TOKEN}", json=_MCP_INITIALIZE, headers=_MCP_HEADERS)
+    assert ok.status_code == 200, ok.text
+
+
+def test_health_is_never_rate_limited(rate_limited_client) -> None:
+    for _ in range(10):
+        assert rate_limited_client.get("/health").status_code == 200
+
+
+def test_rate_limit_disabled_entirely(monkeypatch: pytest.MonkeyPatch) -> None:
+    from starlette.testclient import TestClient
+
+    monkeypatch.setattr(cfg, "AUTO_UPDATE_CHECK", False)
+    monkeypatch.setattr(main_mod.mcp, "_session_manager", None)
+    monkeypatch.setattr(cfg, "RATE_LIMIT_ENABLED", False)
+    monkeypatch.setattr(cfg, "RATE_LIMIT_REQUESTS", 1)
+
+    app = build_remote_app(_TOKEN)
+    with TestClient(app, base_url="https://machine.tailnet.ts.net", raise_server_exceptions=False) as client:
+        for _ in range(5):
+            resp = client.post(f"/mcp/{_TOKEN}", json=_MCP_INITIALIZE, headers=_MCP_HEADERS)
+            assert resp.status_code == 200, resp.text
+
+
 def test_middleware_passes_non_http_scopes_through() -> None:
     """Lifespan scopes bypass the gate so the app lifespan always runs."""
     import asyncio

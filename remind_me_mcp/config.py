@@ -86,6 +86,31 @@ def _env_int(name: str, default: int) -> int:
         )
         return default
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Read a boolean environment variable, falling back to *default* when unset.
+
+    Recognizes ``false``/``0``/``no``/``off`` (case-insensitive, surrounding
+    whitespace stripped) as False. Deliberately unlike :func:`_env_int`'s
+    "blank means unset" rule: an explicit *empty string* is also treated as
+    False here regardless of *default* -- ``REMIND_ME_X=""`` is a meaningful,
+    explicit opt-out for a boolean flag (mirroring how
+    ``REMIND_ME_RERANK=""`` disables reranking), not the same as the
+    variable being unset at all. Anything else (including unset) resolves
+    to *default*.
+
+    Args:
+        name: The environment variable name.
+        default: Value returned when the variable is unset.
+
+    Returns:
+        The parsed boolean.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("false", "0", "no", "off", "")
+
 # ---------------------------------------------------------------------------
 # Directory / file paths
 # ---------------------------------------------------------------------------
@@ -677,6 +702,26 @@ refuses to start when this is unset — an unsecured push endpoint would be
 worse than useless."""
 
 # ---------------------------------------------------------------------------
+# Rate limiting (issue #183)
+# ---------------------------------------------------------------------------
+
+RATE_LIMIT_ENABLED: bool = _env_bool("REMIND_ME_RATE_LIMIT_ENABLED", True)
+"""Whether the webhook ingest endpoint and remote MCP connector enforce a
+request-rate limit. Default on. REMIND_ME_RATE_LIMIT_ENABLED="" disables it
+entirely, mirroring how REMIND_ME_RERANK="" disables reranking -- an
+explicit empty value is as much an opt-out as any of the recognized false
+spellings."""
+
+RATE_LIMIT_REQUESTS = _env_int("REMIND_ME_RATE_LIMIT_REQUESTS", 60)
+"""Max requests per REMIND_ME_RATE_LIMIT_WINDOW_SECONDS per rate-limit key
+(remind_me_mcp.rate_limit.RateLimiter). Sync traffic uses its own hub/peer
+protocol (peer_server.py), entirely separate from the two routes this
+limits, so SYNC_INTERVAL's cadence never factors into this default."""
+
+RATE_LIMIT_WINDOW_SECONDS = _env_int("REMIND_ME_RATE_LIMIT_WINDOW_SECONDS", 60)
+"""Window length in seconds for REMIND_ME_RATE_LIMIT_REQUESTS."""
+
+# ---------------------------------------------------------------------------
 # Updates
 # ---------------------------------------------------------------------------
 
@@ -771,6 +816,9 @@ __all__ = [
     "WEBHOOK_PORT",
     "WEBHOOK_BIND",
     "WEBHOOK_SECRET",
+    "RATE_LIMIT_ENABLED",
+    "RATE_LIMIT_REQUESTS",
+    "RATE_LIMIT_WINDOW_SECONDS",
     "AUTO_UPDATE_CHECK",
     "UPDATE_EXPECTED_ORIGIN",
 ]

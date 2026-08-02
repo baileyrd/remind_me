@@ -682,6 +682,7 @@ curl -X POST http://127.0.0.1:8769/ingest \
 - **Same pipeline as file import** — `content` is UTF-8 text; `filename`'s extension selects the parser (JSON/JSONL chat exports, Markdown/plain-text documents), and hash dedup applies exactly like `remind_me_import_chat`. `category`, `tags`, `extract_mode`, `max_length`, and `kind` are all optional, with the same defaults as `remind_me_import_chat`.
 - **Status** — `remind_me_webhook_status` reports enabled/running state, bind/port, and request counters (ingested/skipped/errored); `remind_me_server_status` includes a one-line summary too.
 - **Configuration** — `REMIND_ME_WEBHOOK_PORT` (default 8769), `REMIND_ME_WEBHOOK_BIND`, `REMIND_ME_WEBHOOK_SECRET`.
+- **Rate limited** — `POST /ingest` enforces `REMIND_ME_RATE_LIMIT_REQUESTS` (default 60) per `REMIND_ME_RATE_LIMIT_WINDOW_SECONDS` (default 60), returning `429` with a `Retry-After` header once exceeded. The check runs *before* the bearer check, keyed by IP, so an anonymous flood is bounded too — but a request presenting the exact `REMIND_ME_WEBHOOK_SECRET` gets its own dedicated bucket, so a legitimate high-volume pusher is never throttled by unrelated traffic hitting the same tunnel. Set `REMIND_ME_RATE_LIMIT_ENABLED=""` to disable entirely (shared with the [remote connector](#claudeai-custom-connector-remote-mcp)'s limit — see [Environment Variables](#environment-variables)).
 
 ## Ingest-Time Normalization
 
@@ -997,6 +998,8 @@ Streamable HTTP transport. Two auth modes share the same server:
   `Authorization: Bearer <connector-token>`. The secret path and bearer
   token keep working even when OAuth is on. Everything else gets a 404/401.
 
+**Rate limited** — the MCP endpoint (both `/mcp/<token>` and `/mcp`, in either auth mode) enforces `REMIND_ME_RATE_LIMIT_REQUESTS` (default 60) per `REMIND_ME_RATE_LIMIT_WINDOW_SECONDS` (default 60), returning `429` with a `Retry-After` header once exceeded — the same limiter and defaults as the [push/webhook endpoint](#pushwebhook-ingestion). It runs as the outermost check, ahead of the secret-path/bearer gate and (in OAuth mode) the SDK's own auth stack, so a flood of entirely unauthenticated requests against a leaked or guessed tunnel URL is bounded too. A request presenting the exact connector token — via either the secret path or the legacy bearer header — gets its own dedicated bucket, so the owner's real traffic is never throttled by unrelated probing that happens to share the tunnel's forwarding address (which is what every remote caller's apparent IP collapses to, behind most tunnel setups). OAuth's dynamically-issued per-client access tokens aren't individually re-verified for this check (that would duplicate the provider's own async token lookup); they share the IP-keyed bucket like anonymous traffic — a deliberate tradeoff documented in `remind_me_mcp/rate_limit.py`. Set `REMIND_ME_RATE_LIMIT_ENABLED=""` to disable entirely.
+
 ### 1. Expose the port over HTTPS
 
 claude.ai requires a publicly reachable HTTPS endpoint. With Tailscale:
@@ -1241,6 +1244,9 @@ Every new memory used to start at a flat `base_weight=1.0` regardless of kind, s
 | `REMIND_ME_WEBHOOK_SECRET` | *(unset)* | Bearer token for the push/webhook ingestion server. Empty = disabled — the server refuses to start without it |
 | `REMIND_ME_WEBHOOK_PORT` | `8769` | Port for the push/webhook ingestion server |
 | `REMIND_ME_WEBHOOK_BIND` | `127.0.0.1` | Bind address for the push/webhook ingestion server. Widen deliberately (e.g. a Tailscale IP) since it writes arbitrary pushed content directly into memory |
+| `REMIND_ME_RATE_LIMIT_ENABLED` | `true` | Whether `POST /ingest` and the remote MCP connector's endpoint enforce a request-rate limit. `""` disables it entirely, mirroring how `REMIND_ME_RERANK=""` disables reranking |
+| `REMIND_ME_RATE_LIMIT_REQUESTS` | `60` | Max requests per `REMIND_ME_RATE_LIMIT_WINDOW_SECONDS` per rate-limit key (a verified bearer/connector token, or the caller's IP as a fallback) |
+| `REMIND_ME_RATE_LIMIT_WINDOW_SECONDS` | `60` | Window length in seconds for `REMIND_ME_RATE_LIMIT_REQUESTS` |
 | `REMIND_ME_OTEL_ENABLED` | `false` | Enable OpenTelemetry tracing of tool calls, sync cycles, and watcher scans. Requires the `otel` extra (`pip install remind-me-mcp[otel]`); degrades gracefully to a no-op if missing |
 | `REMIND_ME_OTEL_ENDPOINT` | *(unset)* | OTLP/HTTP collector endpoint (e.g. `http://localhost:4318/v1/traces`). Unset uses the OTLP exporter's own default |
 | `REMIND_ME_OTEL_SERVICE_NAME` | `remind-me-mcp` | `service.name` resource attribute reported to the collector |
