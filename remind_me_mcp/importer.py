@@ -378,6 +378,39 @@ def _chunk_text(text: str, max_len: int) -> list[str]:
     return chunks
 
 
+def _flatten_content_blocks(content_field: Any) -> str:
+    """Flatten a message ``content`` field to plain text.
+
+    A content field is either a bare string or a list of blocks. Text blocks
+    contribute their text; non-text blocks (``tool_use``, ``tool_result``,
+    ``thinking``, images) contribute nothing — they are machine chatter, not
+    conversation, and storing them would bury recallable facts under transcript
+    noise.
+
+    Args:
+        content_field: The raw ``content`` value from a message object.
+
+    Returns:
+        The joined text, stripped. Empty when the field holds no text blocks.
+    """
+    if isinstance(content_field, str):
+        return content_field.strip()
+    if not isinstance(content_field, list):
+        return "" if content_field is None else str(content_field).strip()
+
+    parts: list[str] = []
+    for block in content_field:
+        if isinstance(block, str):
+            parts.append(block)
+        elif isinstance(block, dict):
+            # An explicit non-text type is skipped. A block with no 'type' at
+            # all but a 'text' key is kept: older exports omit the discriminator.
+            block_type = block.get("type")
+            if block_type == "text" or (block_type is None and "text" in block):
+                parts.append(str(block.get("text", "")))
+    return "\n".join(p for p in parts if p).strip()
+
+
 def _extract_messages_from_json(data: Any, extract_mode: str) -> list[dict[str, str]]:
     """Extract a flat list of {role, content} messages from JSON data.
 
@@ -385,6 +418,8 @@ def _extract_messages_from_json(data: Any, extract_mode: str) -> list[dict[str, 
       - List of {role, content} messages
       - Dict with 'messages' key
       - Claude export format with 'chat_messages' containing 'content' arrays
+      - Claude Code session transcripts, which wrap the message in a per-line
+        envelope: ``{"type": ..., "message": {"role": ..., "content": [...]}}``
       - List of conversations (each containing 'messages' or 'chat_messages')
 
     Args:
@@ -409,22 +444,28 @@ def _extract_messages_from_json(data: Any, extract_mode: str) -> list[dict[str, 
         for msg in data["chat_messages"]:
             role = msg.get("sender", msg.get("role", "unknown"))
             # Claude exports have content as a list of {type, text} blocks
-            content_field = msg.get("content", msg.get("text", ""))
-            if isinstance(content_field, list):
-                text_parts = []
-                for block in content_field:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text_parts.append(block.get("text", ""))
-                    elif isinstance(block, str):
-                        text_parts.append(block)
-                content = "\n".join(text_parts)
-            elif isinstance(content_field, str):
-                content = content_field
-            else:
-                content = str(content_field)
-            if content.strip():
-                messages.append({"role": role, "content": content.strip()})
+            content = _flatten_content_blocks(msg.get("content", msg.get("text", "")))
+            if content:
+                messages.append({"role": role, "content": content})
         return messages
+
+    # Claude Code session transcript: one envelope per JSONL line, carrying the
+    # real message under 'message'. Without this the envelope matches no branch
+    # below and the whole transcript imports as zero memories.
+    if (
+        isinstance(data, dict)
+        and "chat_messages" not in data
+        and isinstance(data.get("message"), dict)
+    ):
+        inner = data["message"]
+        if "role" in inner or "sender" in inner:
+            # The envelope's own 'type' names the speaker when the inner
+            # message omits the role.
+            role = inner.get("role") or inner.get("sender") or data.get("type") or "unknown"
+            content = _flatten_content_blocks(inner.get("content", inner.get("text", "")))
+            if content:
+                messages.append({"role": role, "content": content})
+            return messages
 
     # Bare single {role, content} message object — the standard chat JSONL
     # shape (one message per line) and the record format written by the
@@ -443,15 +484,10 @@ def _extract_messages_from_json(data: Any, extract_mode: str) -> list[dict[str, 
                 if "messages" in item or "chat_messages" in item:
                     messages.extend(_extract_messages_from_json(item, extract_mode))
                 elif "role" in item or "sender" in item:
-                    role = item.get("role", item.get("sender", "unknown"))
-                    content = item.get("content", item.get("text", ""))  # type: ignore[assignment]  # nested .get default may be None
-                    if isinstance(content, list):
-                        content = "\n".join(
-                            b.get("text", "") if isinstance(b, dict) else str(b)
-                            for b in content
-                        )
-                    if isinstance(content, str) and content.strip():
-                        messages.append({"role": role, "content": content.strip()})  # type: ignore[dict-item]  # role from .get may be None
+                    role = item.get("role") or item.get("sender") or "unknown"
+                    content = _flatten_content_blocks(item.get("content", item.get("text", "")))
+                    if content:
+                        messages.append({"role": role, "content": content})
         return messages
 
     # Dict with 'messages' key
