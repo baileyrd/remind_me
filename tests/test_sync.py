@@ -2537,6 +2537,80 @@ def test_sync_status_reports_a_remote_that_never_completed_a_cycle(
     assert "no route to host" in hub["last_error"]["error"]
 
 
+# ---------------------------------------------------------------------------
+# _remote_is_failing — status banner truthfulness
+# ---------------------------------------------------------------------------
+
+
+def test_remote_is_failing_ignores_an_error_superseded_by_a_later_success() -> None:
+    """An error older than the last successful contact is not a current failure.
+
+    Regression: last_error lives in the syncing process's memory while the
+    watermarks live in the shared sync_log, so with one MCP server process per
+    connected client a stale error from one process outlived another process's
+    successful retry — and server_status reported a healthy sync as failing.
+    """
+    from remind_me_mcp.tools.admin import _remote_is_failing
+
+    remote = {
+        "remote_id": "hub",
+        "last_error": {"error": "ConnectError: boom", "at": "2026-08-03T15:39:08+00:00"},
+        "last_push_at": "2026-08-03T15:40:10+00:00",
+        "last_pull_at": "2026-08-03T15:40:10+00:00",
+    }
+    assert _remote_is_failing(remote) is False
+
+
+def test_remote_is_failing_reports_an_error_newer_than_the_last_success() -> None:
+    """An error after the most recent success is the live state."""
+    from remind_me_mcp.tools.admin import _remote_is_failing
+
+    remote = {
+        "remote_id": "hub",
+        "last_error": {"error": "ConnectError: boom", "at": "2026-08-03T15:41:00+00:00"},
+        "last_push_at": "2026-08-03T15:40:10+00:00",
+        "last_pull_at": "2026-08-03T15:40:10+00:00",
+    }
+    assert _remote_is_failing(remote) is True
+
+
+def test_remote_is_failing_uses_the_newest_of_push_and_pull() -> None:
+    """A recent push clears an error even when the pull watermark is stale."""
+    from remind_me_mcp.tools.admin import _remote_is_failing
+
+    remote = {
+        "remote_id": "hub",
+        "last_error": {"error": "ConnectError: boom", "at": "2026-08-03T15:39:08+00:00"},
+        "last_push_at": "2026-08-03T15:40:10+00:00",
+        "last_pull_at": "1970-01-01T00:00:00+00:00",
+    }
+    assert _remote_is_failing(remote) is False
+
+
+def test_remote_is_failing_edge_cases() -> None:
+    """No error is healthy; an error with no success at all, or an unparseable
+    stamp, is reported rather than silently treated as healthy."""
+    from remind_me_mcp.tools.admin import _remote_is_failing
+
+    assert _remote_is_failing({"remote_id": "hub", "last_error": None}) is False
+
+    never_succeeded = {
+        "remote_id": "hub",
+        "last_error": {"error": "ConnectError: boom", "at": "2026-08-03T15:39:08+00:00"},
+        "last_push_at": None,
+        "last_pull_at": None,
+    }
+    assert _remote_is_failing(never_succeeded) is True
+
+    unparseable = {
+        "remote_id": "hub",
+        "last_error": {"error": "ConnectError: boom", "at": "not a timestamp"},
+        "last_push_at": "2026-08-03T15:40:10+00:00",
+        "last_pull_at": "2026-08-03T15:40:10+00:00",
+    }
+    assert _remote_is_failing(unparseable) is True
+
+
 def test_sync_status_counts_tombstones_and_compaction_eligibility(
     sync_db: sqlite3.Connection, status_enabled: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:

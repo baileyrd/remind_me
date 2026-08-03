@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+from datetime import UTC, datetime
 from typing import Any
 
 from remind_me_mcp import (
@@ -584,6 +585,53 @@ async def remind_me_backup() -> str:
     return f"✓ Backup created: `{path}`\n\n**Total backups kept:** {len(backups)}"
 
 
+def _remote_is_failing(remote: dict[str, Any]) -> bool:
+    """Report whether a remote's last error still reflects its current state.
+
+    ``last_error`` alone cannot answer this. It lives in the syncing process's
+    memory, while the push/pull watermarks live in the shared ``sync_log``
+    table — so when several MCP server processes sync the same database (one
+    per connected client is the normal deployment), one process can hold an
+    error from a cycle that another process has since retried successfully.
+    The watermarks only ever advance on success, so an error older than the
+    most recent one has been superseded and must not be reported as "the last
+    cycle failed".
+
+    Args:
+        remote: One entry from ``get_sync_status()["remotes"]``.
+
+    Returns:
+        True when the remote's newest event is the error rather than a success.
+    """
+    error = remote.get("last_error")
+    if not error:
+        return False
+
+    error_at = _parse_iso(error.get("at"))
+    if error_at is None:
+        return True  # an unparseable stamp is not grounds for calling it healthy
+
+    successes = [
+        stamp
+        for stamp in (_parse_iso(remote.get("last_push_at")), _parse_iso(remote.get("last_pull_at")))
+        if stamp is not None
+    ]
+    return not successes or error_at >= max(successes)
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    """Parse an ISO-8601 timestamp, or None when it is absent or malformed."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    # A naive stamp would raise on comparison with an aware one; sync writes
+    # everything in UTC, so assuming it is the safe reading.
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
 @mcp.tool(
     name="remind_me_server_status",
     annotations={
@@ -801,7 +849,7 @@ async def remind_me_server_status() -> str:
             f"every {sync['sync_interval_seconds']}s; "
             f"outbox {outbox['pending']} pending ({drain})"
         )
-        errored = [r["remote_id"] for r in sync["remotes"] if r["last_error"]]
+        errored = [r["remote_id"] for r in sync["remotes"] if _remote_is_failing(r)]
         if errored:
             lines.append(f"_⚠ Last cycle failed for: {', '.join(errored)}_")
         lines.append("_Details: `remind_me_sync_status`_")
