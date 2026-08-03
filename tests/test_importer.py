@@ -174,6 +174,117 @@ def test_extract_empty_content_skipped() -> None:
     assert result[0]["content"] == "This should appear."
 
 
+def test_extract_claude_code_envelope() -> None:
+    """A Claude Code transcript line unwraps its 'message' envelope.
+
+    Regression: these lines previously matched no branch, so a whole session
+    transcript imported as zero memories without reporting an error.
+    """
+    line = {
+        "type": "assistant",
+        "uuid": "abc-123",
+        "sessionId": "s-1",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Here is the answer."}],
+        },
+    }
+    result = _extract_messages_from_json(line, "all_messages")
+    assert len(result) == 1
+    assert result[0]["role"] == "assistant"
+    assert result[0]["content"] == "Here is the answer."
+
+
+def test_extract_claude_code_envelope_string_content() -> None:
+    """The envelope also accepts a bare string content field."""
+    line = {"type": "user", "message": {"role": "user", "content": "plain text"}}
+    result = _extract_messages_from_json(line, "all_messages")
+    assert result == [{"role": "user", "content": "plain text"}]
+
+
+def test_extract_claude_code_tool_blocks_dropped() -> None:
+    """tool_use / tool_result / thinking blocks contribute no text."""
+    line = {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "internal reasoning"},
+                {"type": "text", "text": "Running the check."},
+                {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}},
+            ],
+        },
+    }
+    result = _extract_messages_from_json(line, "all_messages")
+    assert result == [{"role": "assistant", "content": "Running the check."}]
+
+    tool_only = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "a.txt"}],
+        },
+    }
+    assert _extract_messages_from_json(tool_only, "all_messages") == []
+
+
+def test_extract_claude_code_non_message_lines_ignored() -> None:
+    """Envelope lines carrying no inner message yield nothing."""
+    for line in (
+        {"type": "summary", "summary": "Session summary", "leafUuid": "x"},
+        {"type": "system", "content": "hook fired"},
+        {"type": "user", "message": "not a dict"},
+    ):
+        assert _extract_messages_from_json(line, "all_messages") == []
+
+
+def test_extract_claude_code_jsonl_end_to_end(tmp_path: Path) -> None:
+    """A full Claude Code .jsonl transcript imports through the chat connector."""
+    from remind_me_mcp.importer import _chat_connector
+
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        "\n".join(
+            json.dumps(rec)
+            for rec in (
+                {"type": "summary", "summary": "ignored"},
+                {
+                    "type": "user",
+                    "message": {"role": "user", "content": "How do I list files?"},
+                },
+                {
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": "Use ls."},
+                            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}},
+                        ],
+                    },
+                },
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "tool_result", "tool_use_id": "t1"}],
+                    },
+                },
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    parsed, raw_entries = _chat_connector(
+        transcript.read_text(encoding="utf-8"),
+        {"suffix": ".jsonl", "extract_mode": "all_messages", "max_length": 10000},
+    )
+    assert raw_entries == 2
+    assert [chunk for chunk, _meta in parsed] == [
+        "[user] How do I list files?",
+        "[assistant] Use ls.",
+    ]
+
+
 def test_extract_string_content() -> None:
     """Content as a plain string (not a list) is handled correctly."""
     data = [
