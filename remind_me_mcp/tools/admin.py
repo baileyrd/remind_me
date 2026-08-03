@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from remind_me_mcp import (
@@ -629,7 +629,7 @@ def _parse_iso(value: Any) -> datetime | None:
         return None
     # A naive stamp would raise on comparison with an aware one; sync writes
     # everything in UTC, so assuming it is the safe reading.
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 @mcp.tool(
