@@ -204,16 +204,40 @@ RECALIBRATION_CANDIDATE_WHERE = f"""
 #      (worst case: a genuinely-covered pair also gets surfaced here, which
 #      the calling session will just recognize and skip), not a correctness
 #      bug the way it would be in the write-path supersession check itself.
-CONTRADICTION_CANDIDATE_PAIRS_SQL = """
+CONTRADICTION_CANDIDATE_MAX_ENTITY_FANOUT = 20
+"""Entities mentioned by more memories than this are excluded from the
+pairing join entirely (both sides, since either me1 or me2 can land on the
+hub entity).
+
+A broadly-mentioned entity -- a person, or a project with hundreds of
+memories about it -- makes "shares an entity" stop meaning anything: two
+memories are joined here because they both happen to mention the same
+person/project, not because they're likely to say conflicting things about
+it, and the pair count from one such entity is quadratic in its mention
+count (n choose 2). Observed on this vault: a single 745-mention project
+entity alone produced 277,140 of 372,750 total candidates -- 74% of the
+queue -- before this cap existed. 20 was chosen empirically as the fan-out
+above which pairs stopped reading as plausible candidates and started
+reading as "these two both mention the same project," bringing this vault's
+queue down to a size comparable to its sibling queues (thousands, not
+hundreds of thousands) rather than picked from a formula."""
+
+CONTRADICTION_CANDIDATE_PAIRS_SQL = f"""
     SELECT DISTINCT me1.memory_id AS id_a, me2.memory_id AS id_b
     FROM memory_entities me1
     JOIN memory_entities me2
         ON me2.entity_id = me1.entity_id AND me2.memory_id > me1.memory_id
     JOIN memories m1 ON m1.id = me1.memory_id
     JOIN memories m2 ON m2.id = me2.memory_id
+    JOIN (
+        SELECT entity_id, COUNT(*) AS mentions
+        FROM memory_entities
+        GROUP BY entity_id
+    ) fanout ON fanout.entity_id = me1.entity_id
     WHERE m1.superseded_by IS NULL AND m1.deleted_at IS NULL
       AND m2.superseded_by IS NULL AND m2.deleted_at IS NULL
       AND m1.category != 'dialog' AND m2.category != 'dialog'
+      AND fanout.mentions <= {CONTRADICTION_CANDIDATE_MAX_ENTITY_FANOUT}
       AND NOT (
           m1.subject IS NOT NULL AND m1.predicate IS NOT NULL
           AND m2.subject IS NOT NULL AND m2.predicate IS NOT NULL
