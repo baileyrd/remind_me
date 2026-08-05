@@ -368,4 +368,78 @@ else:
           f'remind_me_hub_memories{{state="live"}} {c["memories"]["live"]}' in m.text,
           m.text)
 
+# ---------------- Legacy schema migration ----------------
+# The migration that turns a restored legacy dump (TIMESTAMPTZ columns) into
+# this hub's canonical TEXT form had no test at all until a `.500000` was
+# found being written as `.5`. That is not cosmetic: under COLLATE "C" the
+# migrated value sorts BEFORE the client's own ('+' is 0x2B, '0' is 0x30), so
+# a migrated row compares as *older* than the identical instant on the node
+# that wrote it -- corrupting the keyset pull cursor and the LWW comparison
+# alike, for any legacy row whose microseconds end in a zero.
+#
+# _TS_CONVERT is read out of main.py rather than duplicated here, so this
+# cannot pass against a stale copy of the expression, and it is executed by
+# the real Postgres rather than reasoned about -- the two properties that
+# would have caught the original bug.
+import ast  # noqa: E402
+from datetime import UTC, datetime  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+
+def _ts_convert_expression() -> str:
+    """The live _TS_CONVERT from hub/main.py.
+
+    Parsed rather than imported: this step runs with psycopg only, and
+    importing main.py would need fastapi.
+    """
+    source = (Path(__file__).resolve().parent / "main.py").read_text(encoding="utf-8")
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "_TS_CONVERT" for t in node.targets
+        ):
+            return ast.literal_eval(node.value)
+    raise AssertionError("no _TS_CONVERT assignment found in hub/main.py")
+
+
+_TS_CASES = [
+    # (microseconds, why this case is here)
+    (0, "no fraction at all"),
+    (500000, "trailing zeros -- the case that was broken"),
+    (100000, "one significant digit, five trailing zeros"),
+    (123456, "no trailing zeros"),
+    (1, "leading zeros, which must survive too"),
+    (10, "both leading and trailing zeros"),
+]
+
+_expr = _ts_convert_expression().format(col="ts")
+with psycopg.connect(DSN) as conn:
+    for micros, why in _TS_CASES:
+        moment = datetime(2026, 8, 4, 9, 0, 0, micros, tzinfo=UTC)
+        (migrated,) = conn.execute(
+            f"SELECT {_expr} FROM (SELECT %s::timestamptz AS ts) t", (moment,)
+        ).fetchone()
+        expected = moment.isoformat()
+        check(f"migration matches isoformat for {micros:06d}us ({why})",
+              migrated == expected, f"got {migrated!r}, want {expected!r}")
+
+    # The property the byte-level format exists to guarantee, stated directly:
+    # a migrated legacy row must not sort before the same instant written by a
+    # client. This is what the '.5' bug actually broke.
+    earlier = datetime(2026, 8, 4, 9, 0, 0, 500000, tzinfo=UTC)
+    later = datetime(2026, 8, 4, 9, 0, 1, 0, tzinfo=UTC)
+    (m_earlier,) = conn.execute(
+        f"SELECT {_expr} FROM (SELECT %s::timestamptz AS ts) t", (earlier,)
+    ).fetchone()
+    (m_later,) = conn.execute(
+        f"SELECT {_expr} FROM (SELECT %s::timestamptz AS ts) t", (later,)
+    ).fetchone()
+    # Detail is the values themselves, not a failure phrasing: `check` prints
+    # it on a pass too, and "PASS ... x != x" reads as a contradiction.
+    check("migrated values order chronologically as bytes",
+          m_earlier < m_later, f"{m_earlier!r} then {m_later!r}")
+    check("a migrated value is byte-identical to the client's own",
+          m_earlier == earlier.isoformat(),
+          f"migrated {m_earlier!r}, client {earlier.isoformat()!r}")
+
+
 print("\nALL CHECKS PASSED")
