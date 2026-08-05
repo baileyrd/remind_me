@@ -433,11 +433,13 @@ with psycopg.connect(DSN) as conn:
     (m_later,) = conn.execute(
         f"SELECT {_expr} FROM (SELECT %s::timestamptz AS ts) t", (later,)
     ).fetchone()
+    # Detail is the values themselves, not a failure phrasing: `check` prints
+    # it on a pass too, and "PASS ... x != x" reads as a contradiction.
     check("migrated values order chronologically as bytes",
-          m_earlier < m_later, f"{m_earlier!r} !< {m_later!r}")
+          m_earlier < m_later, f"{m_earlier!r} then {m_later!r}")
     check("a migrated value is byte-identical to the client's own",
           m_earlier == earlier.isoformat(),
-          f"{m_earlier!r} != {earlier.isoformat()!r}")
+          f"migrated {m_earlier!r}, client {earlier.isoformat()!r}")
 
 
 print("\nALL CHECKS PASSED")
