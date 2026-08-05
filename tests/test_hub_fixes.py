@@ -207,3 +207,52 @@ def test_sync_pull_entities_also_supports_full() -> None:
     src = _function_source("sync_pull_entities")
     assert re.search(r"\bfull\s*:\s*bool\s*=\s*False\b", src)
     assert re.search(r"exclude_node\s+and\s+not\s+full", src)
+
+
+# ---------------------------------------------------------------------------
+# Legacy-migration microsecond precision
+#
+# The migration wrote `.500000` as `.5`, which `datetime.isoformat()` never
+# produces. Under COLLATE "C" that sorts *before* the client's own value
+# (`+` is 0x2B, `0` is 0x30), so a migrated row compares as older than the
+# identical instant on the node that wrote it -- corrupting the keyset pull
+# cursor's ordering and the LWW comparison alike.
+#
+# This is a static guard; the behavioural test that actually executes the
+# expression against a real Postgres lives in hub/e2e_test.py, because no
+# pytest leg can reach a database. Kept anyway: the main suite runs on every
+# push, and a regression here is silent and data-corrupting.
+# ---------------------------------------------------------------------------
+
+
+def _ts_convert() -> str:
+    """The live `_TS_CONVERT` expression, parsed from the source."""
+    for node in ast.walk(ast.parse(_source())):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "_TS_CONVERT" for t in node.targets
+        ):
+            return ast.literal_eval(node.value)
+    raise AssertionError("no _TS_CONVERT assignment found in hub/main.py")
+
+
+def test_ts_convert_preserves_microsecond_precision() -> None:
+    expr = _ts_convert()
+    assert r"\.000000$" in expr, (
+        "the migration must strip only a wholly-zero fraction. Stripping "
+        "trailing zeros generally turns .500000 into .5, which "
+        "datetime.isoformat() never emits -- and which sorts before the "
+        "client's own value under COLLATE \"C\", making a migrated row "
+        "compare as older than the same instant on the node that wrote it."
+    )
+    assert r"\.?0+$" not in expr, (
+        "'\\.?0+$' is the bug: it strips significant trailing digits, not "
+        "just an all-zero fraction."
+    )
+
+
+def test_ts_convert_still_pads_to_six_digits_and_appends_utc() -> None:
+    """The two halves the ordering guarantee rests on, kept explicit."""
+    expr = _ts_convert()
+    assert ".US" in expr, "must format microseconds to six digits"
+    assert "+00:00" in expr, "must carry the explicit UTC offset isoformat() emits"
+    assert "AT TIME ZONE 'UTC'" in expr, "must normalise to UTC before formatting"

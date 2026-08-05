@@ -55,7 +55,7 @@ from psycopg.types.json import Jsonb
 log = logging.getLogger("remind_me_hub")
 logging.basicConfig(level=logging.INFO)
 
-HUB_VERSION = "1.5.0"
+HUB_VERSION = "1.5.1"
 """Version of the hub server, reported by /health, /count and /stats.
 
 Versioned independently of the ``remind-me-mcp`` package rather than tracking
@@ -208,13 +208,26 @@ CREATE INDEX IF NOT EXISTS idx_entity_relations_created_at_id
     ON entity_relations (created_at, id);
 """
 
-# Convert a TIMESTAMPTZ column to the canonical TEXT form. Trailing
-# fractional zeros are trimmed so the result matches Python's
-# datetime.isoformat() exactly (no microseconds when zero) — mixed
-# precision still string-orders correctly under COLLATE "C".
+# Convert a TIMESTAMPTZ column to the canonical TEXT form: exactly what
+# datetime.isoformat() would have produced, since that is what every client
+# writes and what every cursor compares against.
+#
+# Only a *wholly zero* fraction is stripped. The obvious-looking '\.?0+$'
+# strips trailing zeros generally, which is wrong: isoformat() emits six
+# digits or none, never '.5'. That is not cosmetic — under COLLATE "C" the
+# migrated '...:00.5+00:00' sorts BEFORE the client's own
+# '...:00.500000+00:00' ('+' is 0x2B, '0' is 0x30), so a migrated row compares
+# as *older* than the identical instant on the node that wrote it. That
+# corrupts both the keyset pull cursor's ordering and the LWW comparison this
+# hub resolves conflicts with, for any legacy row whose microseconds are
+# non-zero and end in a zero — about one row in ten.
+#
+# Covered by test_hub_legacy_migration in hub/e2e_test.py, which runs the
+# migration against a real Postgres; the static guard is
+# test_hub_fixes.test_ts_convert_preserves_microsecond_precision.
 _TS_CONVERT = (
     "regexp_replace(to_char({col} AT TIME ZONE 'UTC', "
-    "'YYYY-MM-DD\"T\"HH24:MI:SS.US'), '\\.?0+$', '') || '+00:00'"
+    "'YYYY-MM-DD\"T\"HH24:MI:SS.US'), '\\.000000$', '') || '+00:00'"
 )
 
 # Columns added since the legacy hub schema, with client-matching defaults.
