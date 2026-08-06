@@ -51,9 +51,17 @@ DECAY_RATES: dict[str, float] = {
     "learning": 0.08,
     "blocker": 0.15,
     "action_item": 0.20,
+    "reference": 0.03,
     "unclassified": 0.10,
 }
-"""Mapping of memory_type to default decay rate. Lower values persist longer."""
+"""Mapping of memory_type to default decay rate. Lower values persist longer.
+
+``reference`` (issue #220) sits below ``fact``'s 0.05 because time alone does
+not stale it: a snippet of source does not stop being what that file said,
+the way "Nano's shell is PowerShell" can stop being true. It is not as slow
+as ``decision``'s 0.02, though -- the artefact a reference mirrors (a file)
+changes more often than a decision is reversed, so it should fade somewhat
+faster than the slowest thing in the vault."""
 
 BASE_WEIGHT_TYPE_PRIORS: dict[str, float] = {
     "decision": 1.3,
@@ -63,6 +71,7 @@ BASE_WEIGHT_TYPE_PRIORS: dict[str, float] = {
     "preference": 1.1,
     "learning": 1.05,
     "action_item": 1.0,
+    "reference": 0.95,
     "unclassified": 1.0,
 }
 """Seeds base_weight from memory_type at write time (issue #56) -- every new
@@ -71,7 +80,15 @@ aside competes evenly in ranking with a real decision until feedback/access
 signal accrues enough to differentiate them. Multipliers on the default 1.0
 base_weight, in the same universe as record_feedback's adjustments, so a
 seeded prior composes naturally with later feedback rather than needing
-separate bookkeeping."""
+separate bookkeeping.
+
+``reference`` is seeded slightly below neutral (issue #220) because it
+arrives in bulk -- the import that prompted the type added ~740 memories in
+one pass -- and reference material is something you look up deliberately, not
+something that should crowd a real decision out of an unprompted recall. A
+prior below 1.0 has precedent in BASE_WEIGHT_SOURCE_PRIORS' 0.85 for
+chat_import, for the same "numerous and individually less load-bearing"
+reason."""
 
 BASE_WEIGHT_SOURCE_PRIORS: dict[str, float] = {
     "manual": 1.0,

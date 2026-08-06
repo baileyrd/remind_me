@@ -14,6 +14,8 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
+import pytest
+
 from remind_me_mcp.db import (
     _ensure_schema,
     _make_id,
@@ -25,8 +27,6 @@ from remind_me_mcp.db import (
 
 if TYPE_CHECKING:
     import sqlite3
-
-    import pytest
 
 # ---------------------------------------------------------------------------
 # _now_iso
@@ -514,9 +514,9 @@ def test_v4_to_v5_indexes_exist(db_conn: sqlite3.Connection) -> None:
 def test_schema_version_is_current(db_conn: sqlite3.Connection) -> None:
     """After migration, _SCHEMA_VERSION and PRAGMA user_version match the latest."""
     from remind_me_mcp.db import _SCHEMA_VERSION
-    assert _SCHEMA_VERSION == 28
+    assert _SCHEMA_VERSION == 29
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 28, f"Expected user_version 28, got {version}"
+    assert version == 29, f"Expected user_version 29, got {version}"
 
 
 def test_v6_to_v7_new_columns_exist(db_conn: sqlite3.Connection) -> None:
@@ -954,3 +954,118 @@ def test_migration_from_old_version_snapshots_once(
     backups = backup_mod.list_backups()
     assert len(backups) == 1
     assert "pre-migration-v13" in backups[0]["filename"]
+
+# ---------------------------------------------------------------------------
+# v28 -> v29: reference memory_type (issue #220)
+# ---------------------------------------------------------------------------
+
+
+def test_migration_decay_rate_matches_the_canonical_table() -> None:
+    """db.py duplicates the rate because vitality imports db (a cycle).
+
+    A silent drift would leave migrated rows decaying at one rate while
+    everything written afterwards used another, which nothing else would
+    catch.
+    """
+    from remind_me_mcp.db import _REFERENCE_DECAY_RATE
+    from remind_me_mcp.vitality import DECAY_RATES
+
+    assert DECAY_RATES["reference"] == _REFERENCE_DECAY_RATE
+
+
+def test_every_valid_memory_type_has_a_decay_rate_and_a_prior() -> None:
+    """Adding a type without both leaves it silently on a fallback."""
+    from remind_me_mcp.models import VALID_MEMORY_TYPES
+    from remind_me_mcp.vitality import BASE_WEIGHT_TYPE_PRIORS, DECAY_RATES
+
+    assert not VALID_MEMORY_TYPES - set(DECAY_RATES)
+    assert not VALID_MEMORY_TYPES - set(BASE_WEIGHT_TYPE_PRIORS)
+
+
+def _seed_for_v29(db: sqlite3.Connection, mem_id: str, source: str, memory_type: str) -> None:
+    now = _now_iso()
+    db.execute(
+        """INSERT INTO memories (id, content, category, tags, metadata, source,
+                                 created_at, updated_at, memory_type, decay_rate)
+           VALUES (?, ?, 'general', '[]', '{}', ?, ?, ?, ?, 0.05)""",
+        (mem_id, f"content {mem_id}", source, now, now, memory_type),
+    )
+    db.commit()
+
+
+def test_v29_refiles_mempalace_facts_as_reference(
+    db_conn: sqlite3.Connection,
+) -> None:
+    from remind_me_mcp.db import _REFERENCE_DECAY_RATE, _migrate_v28_to_v29
+
+    _seed_for_v29(db_conn, "mp-1", "mempalace_import", "fact")
+    _seed_for_v29(db_conn, "mp-2", "mempalace:rusty_lsp", "fact")
+    before = db_conn.execute(
+        "SELECT updated_at FROM memories WHERE id = 'mp-1'"
+    ).fetchone()["updated_at"]
+
+    _migrate_v28_to_v29(db_conn)
+    db_conn.commit()
+
+    for mem_id in ("mp-1", "mp-2"):
+        row = db_conn.execute(
+            "SELECT memory_type, decay_rate, updated_at FROM memories WHERE id = ?",
+            (mem_id,),
+        ).fetchone()
+        assert row["memory_type"] == "reference", mem_id
+        # The rate is stored per row, so leaving it would make the new type
+        # cosmetic -- these would keep decaying at fact's 0.05.
+        assert row["decay_rate"] == _REFERENCE_DECAY_RATE, mem_id
+    after = db_conn.execute(
+        "SELECT updated_at FROM memories WHERE id = 'mp-1'"
+    ).fetchone()["updated_at"]
+    # Must move, or the reclassification never reaches another node and a
+    # not-yet-upgraded peer pushes 'fact' back over it under LWW.
+    assert after >= before
+
+
+def test_v29_leaves_everything_else_alone(db_conn: sqlite3.Connection) -> None:
+    """The narrowness is the point: a wrong guess here silently reclassifies
+    someone's real facts."""
+    from remind_me_mcp.db import _migrate_v28_to_v29
+
+    _seed_for_v29(db_conn, "manual-fact", "manual", "fact")
+    _seed_for_v29(db_conn, "mp-decision", "mempalace_import", "decision")
+    _seed_for_v29(db_conn, "chat-fact", "chat_import", "fact")
+
+    _migrate_v28_to_v29(db_conn)
+    db_conn.commit()
+
+    kept = {
+        r["id"]: r["memory_type"]
+        for r in db_conn.execute("SELECT id, memory_type FROM memories").fetchall()
+    }
+    assert kept["manual-fact"] == "fact"
+    assert kept["mp-decision"] == "decision"
+    assert kept["chat-fact"] == "fact"
+
+
+def test_v29_is_a_no_op_on_a_vault_with_no_such_imports(
+    db_conn: sqlite3.Connection,
+) -> None:
+    from remind_me_mcp.db import _migrate_v28_to_v29
+
+    _seed_for_v29(db_conn, "only-fact", "manual", "fact")
+    _migrate_v28_to_v29(db_conn)
+    db_conn.commit()
+    row = db_conn.execute(
+        "SELECT memory_type, decay_rate FROM memories WHERE id = 'only-fact'"
+    ).fetchone()
+    assert row["memory_type"] == "fact" and row["decay_rate"] == 0.05
+
+
+def test_reference_is_accepted_by_the_classifier_input() -> None:
+    """Adding the type to VALID_MEMORY_TYPES without the tool schema knowing
+    about it would mean nothing ever assigns it."""
+    from remind_me_mcp.models import MemoryClassification
+
+    parsed = MemoryClassification(memory_id="m1", memory_type="reference")
+    assert parsed.memory_type == "reference"
+    with pytest.raises(ValueError):
+        MemoryClassification(memory_id="m1", memory_type="not_a_type")
+
