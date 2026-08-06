@@ -87,6 +87,11 @@ log = logging.getLogger("remind_me_mcp.sync")
 
 HEADERS = {"Authorization": f"Bearer {SYNC_SECRET}"}
 BATCH_SIZE = 200
+# ``sync_log.last_pull_seq`` sentinels (issue #167). See the v27->v28
+# migration for why all three states live in one integer column.
+SEQ_UNKNOWN = -1        # not yet established; probe on the next pull
+SEQ_UNSUPPORTED = -2    # remote has no hub_seq; stay on the legacy cursor
+
 PULL_PAGE_SIZE = 500
 # Safety valve so a misbehaving remote cannot trap one cycle forever.
 MAX_PULL_PAGES = 100
@@ -275,6 +280,82 @@ async def _push_outbox(
 # Pull (keyset cursor + drain loop — SY-04)
 # ---------------------------------------------------------------------------
 
+
+async def _establish_seq_cursor(
+    db: sqlite3.Connection,
+    client: httpx.AsyncClient,
+    url: str,
+    remote_id: str,
+) -> int:
+    """Decide whether *remote_id* supports the ``since_seq`` cursor (issue #167).
+
+    Probes with ``since_seq=0&limit=1`` and inspects the one record that
+    comes back. The check is *did that record carry a ``hub_seq``*, not
+    "did the request succeed" -- a remote that predates #160 ignores the
+    unknown query parameter and answers happily from its legacy cursor, so
+    a 200 proves nothing on its own. Only the field's presence does.
+
+    Returns the new cursor state, already persisted:
+
+    - ``0`` when supported -- deliberately a full re-walk from the start of
+      the sequence rather than a seed from the highest ``hub_seq`` seen so
+      far. The records this whole change exists to rescue are precisely the
+      ones a legacy cursor has never returned, so no watermark derived from
+      legacy pulls can be trusted to sit below them. The re-walk is bounded
+      (``MAX_PULL_PAGES`` per cycle) and almost entirely no-ops: a record
+      whose ``updated_at`` equals the local copy's loses last-write-wins,
+      so it is neither rewritten nor re-embedded. Paying that once is the
+      cost of being certain nothing stays stranded.
+    - ``SEQ_UNSUPPORTED`` otherwise, which is sticky so a peer server (whose
+      SQLite store has no sequence to expose) is not re-probed every cycle
+      for the life of the process. ``reset_pull_cursor`` clears it, which is
+      the documented path after upgrading a hub.
+
+    A probe that fails outright (network, 5xx) leaves the state untouched
+    and returns ``SEQ_UNKNOWN``: this cycle falls back to the legacy cursor
+    and the next one tries again. An unreachable remote must not be
+    mistaken for one that lacks the feature.
+    """
+    try:
+        resp = await client.get(
+            f"{url}/sync/pull",
+            params={"since_seq": 0, "limit": 1},
+            headers=HEADERS,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        records = resp.json().get("records", [])
+    except Exception as e:
+        log.debug("hub_seq probe of %s failed, staying on the legacy cursor: %s", remote_id, e)
+        return SEQ_UNKNOWN
+
+    supported = any(
+        isinstance(rec, dict) and rec.get("hub_seq") is not None for rec in records
+    )
+    # An empty result is not evidence of absence -- an empty hub returns no
+    # records whichever cursor it understands -- so leave the state unknown
+    # and probe again next cycle rather than marking it unsupported forever.
+    if not records:
+        return SEQ_UNKNOWN
+
+    state = 0 if supported else SEQ_UNSUPPORTED
+    db.execute(
+        """
+        INSERT INTO sync_log (remote_id, last_pull_seq)
+        VALUES (?, ?)
+        ON CONFLICT (remote_id) DO UPDATE SET last_pull_seq = excluded.last_pull_seq
+        """,
+        (remote_id, state),
+    )
+    db.commit()
+    log.info(
+        "Remote %s %s the hub_seq pull cursor",
+        remote_id,
+        "supports" if supported else "does not support",
+    )
+    return state
+
+
 async def _pull_remote(client: httpx.AsyncClient, url: str, remote_id: str) -> int:
     """Pull new memories from a remote since our last keyset cursor.
 
@@ -289,22 +370,31 @@ async def _pull_remote(client: httpx.AsyncClient, url: str, remote_id: str) -> i
     db = _get_db()
 
     row = db.execute(
-        "SELECT last_pull, last_pull_id FROM sync_log WHERE remote_id = ?",
+        "SELECT last_pull, last_pull_id, last_pull_seq FROM sync_log WHERE remote_id = ?",
         (remote_id,),
     ).fetchone()
     since = row["last_pull"] if row else _EPOCH
     since_id = row["last_pull_id"] if row else ""
+    since_seq = row["last_pull_seq"] if row else SEQ_UNKNOWN
+
+    # Establish the sequence cursor before pulling, so a node that is already
+    # caught up on the legacy cursor -- the exact state in which stranded
+    # records are invisible -- still switches over instead of waiting for
+    # traffic that by definition never arrives.
+    if since_seq == SEQ_UNKNOWN:
+        since_seq = await _establish_seq_cursor(db, client, url, remote_id)
 
     total = 0
     for _ in range(MAX_PULL_PAGES):
+        params: dict[str, Any] = {"exclude_node": NODE_ID, "limit": PULL_PAGE_SIZE}
+        if since_seq >= 0:
+            params["since_seq"] = since_seq
+        else:
+            params["since"] = since
+            params["since_id"] = since_id
         resp = await client.get(
             f"{url}/sync/pull",
-            params={
-                "since": since,
-                "since_id": since_id,
-                "exclude_node": NODE_ID,
-                "limit": PULL_PAGE_SIZE,
-            },
+            params=params,
             headers=HEADERS,
             timeout=15,
         )
@@ -317,27 +407,52 @@ async def _pull_remote(client: httpx.AsyncClient, url: str, remote_id: str) -> i
         result = _upsert_records(db, records)
         total += result.applied
 
-        # Advance the keyset cursor to the greatest (updated_at, id) received.
-        page_max: tuple[str, str] | None = None
-        for rec in records:
-            try:
-                pair = (_canon_ts(rec["updated_at"]), str(rec["id"]))
-            except (KeyError, TypeError, ValueError):
-                continue
-            if page_max is None or pair > page_max:
-                page_max = pair
-        if page_max is None or page_max <= (since, since_id):
-            # No usable cursor progress — stop rather than spin on this page.
-            break
-        since, since_id = page_max
+        if since_seq >= 0:
+            # Advance on the greatest hub_seq received. A record without one
+            # cannot move this cursor: skipping it would strand it exactly
+            # the way the legacy cursor strands late pushes.
+            page_seq: int | None = None
+            for rec in records:
+                raw = rec.get("hub_seq")
+                if raw is None:
+                    continue
+                try:
+                    value = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                if page_seq is None or value > page_seq:
+                    page_seq = value
+            if page_seq is None or page_seq <= since_seq:
+                break
+            since_seq = page_seq
+            db.execute("""
+                INSERT INTO sync_log (remote_id, last_pull_seq)
+                VALUES (?, ?)
+                ON CONFLICT (remote_id) DO UPDATE SET
+                    last_pull_seq = excluded.last_pull_seq
+            """, (remote_id, since_seq))
+        else:
+            # Advance the keyset cursor to the greatest (updated_at, id) received.
+            page_max: tuple[str, str] | None = None
+            for rec in records:
+                try:
+                    pair = (_canon_ts(rec["updated_at"]), str(rec["id"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if page_max is None or pair > page_max:
+                    page_max = pair
+            if page_max is None or page_max <= (since, since_id):
+                # No usable cursor progress — stop rather than spin on this page.
+                break
+            since, since_id = page_max
 
-        db.execute("""
-            INSERT INTO sync_log (remote_id, last_pull, last_pull_id)
-            VALUES (?, ?, ?)
-            ON CONFLICT (remote_id) DO UPDATE SET
-                last_pull = excluded.last_pull,
-                last_pull_id = excluded.last_pull_id
-        """, (remote_id, since, since_id))
+            db.execute("""
+                INSERT INTO sync_log (remote_id, last_pull, last_pull_id)
+                VALUES (?, ?, ?)
+                ON CONFLICT (remote_id) DO UPDATE SET
+                    last_pull = excluded.last_pull,
+                    last_pull_id = excluded.last_pull_id
+            """, (remote_id, since, since_id))
         db.commit()
         # Touched per-page, not just after a clean drain: a mid-drain error on
         # a later page (e.g. a timeout deep into a large backlog) would
@@ -2085,20 +2200,28 @@ def reset_pull_cursor(
     for kind in kinds:
         cursor_id = _cursor_id(remote_id, kind)
         row = db.execute(
-            "SELECT last_pull, last_pull_id FROM sync_log WHERE remote_id = ?",
+            "SELECT last_pull, last_pull_id, last_pull_seq FROM sync_log WHERE remote_id = ?",
             (cursor_id,),
         ).fetchone()
         before = {
             "last_pull": row["last_pull"] if row else _EPOCH,
             "last_pull_id": row["last_pull_id"] if row else "",
+            "last_pull_seq": row["last_pull_seq"] if row else SEQ_UNKNOWN,
         }
+        # Reset to SEQ_UNKNOWN, not to 0: this must also undo a stuck
+        # SEQ_UNSUPPORTED, which is how a hub upgraded past #160 gets picked
+        # up (issue #167). Re-probing costs one record; assuming either
+        # answer would be wrong for one of the two remote kinds.
         db.execute(
             """
-            INSERT INTO sync_log (remote_id, last_pull, last_pull_id)
-            VALUES (?, ?, '')
-            ON CONFLICT (remote_id) DO UPDATE SET last_pull = excluded.last_pull, last_pull_id = ''
+            INSERT INTO sync_log (remote_id, last_pull, last_pull_id, last_pull_seq)
+            VALUES (?, ?, '', ?)
+            ON CONFLICT (remote_id) DO UPDATE SET
+                last_pull = excluded.last_pull,
+                last_pull_id = '',
+                last_pull_seq = excluded.last_pull_seq
             """,
-            (cursor_id, _EPOCH),
+            (cursor_id, _EPOCH, SEQ_UNKNOWN),
         )
         reset.append({"cursor": cursor_id, "kind": kind, "was": before})
     db.commit()

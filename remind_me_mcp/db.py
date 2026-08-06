@@ -459,7 +459,7 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 # Current target schema version.  Increment when adding a new migration step.
-_SCHEMA_VERSION = 27
+_SCHEMA_VERSION = 28
 
 
 
@@ -657,6 +657,11 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         _migrate_v26_to_v27(db)
         db.execute("PRAGMA user_version = 27")
         current_version = 27
+
+    if current_version < 28:
+        _migrate_v27_to_v28(db)
+        db.execute("PRAGMA user_version = 28")
+        current_version = 28
 
     db.commit()
 
@@ -2292,6 +2297,49 @@ def _migrate_v26_to_v27(db: sqlite3.Connection) -> None:
             ON saved_search_seen_memories(saved_search_id, memory_id);
     """)
 
+
+
+def _migrate_v27_to_v28(db: sqlite3.Connection) -> None:
+    """v27 -> v28: ``sync_log.last_pull_seq``, the hub-sequence pull cursor (issue #167).
+
+    #160 gave the hub a monotonic ``hub_seq`` column and an opt-in
+    ``since_seq`` keyset cursor on ``/sync/pull``, but that was hub-side
+    only: the client never sent ``since_seq``, so end-to-end the bug it was
+    filed for stayed live. A node back online after a fortnight pushes
+    records still carrying old ``updated_at`` values, which sort *behind*
+    every other node's already-advanced legacy cursor and are therefore
+    permanently invisible to them. This column is the client half.
+
+    Three states, deliberately encoded in one integer rather than a second
+    boolean column, because they are mutually exclusive stages of one
+    lifecycle and splitting them would allow nonsense combinations:
+
+    - ``-1`` -- not yet established. The next pull probes the remote.
+    - ``-2`` -- the remote does not understand ``since_seq`` (a peer server,
+      whose SQLite store has no sequence, or a hub predating #160). Sticky,
+      so a peer is not re-probed on every cycle forever. ``reset_pull_cursor``
+      (issue #122) clears it back to ``-1``, which is the documented way to
+      re-establish after a hub upgrade.
+    - ``>= 0`` -- an established watermark; pulls send ``since_seq`` and
+      advance on the greatest ``hub_seq`` received.
+
+    Note the column is added to *every* ``sync_log`` row, including the
+    ``{remote}#entities``/``#links``/``#entity_relations`` graph cursors,
+    which never use it -- the graph tables have no ``hub_seq``. A separate
+    table keyed only to the memory cursor would model that more precisely
+    and buy nothing: the graph rows simply keep their ``-1`` default
+    forever, and one ALTER is cheaper than a join on every pull.
+
+    Existing rows default to ``-1`` rather than ``0`` so an upgrade probes
+    rather than assuming; see ``sync._pull_remote`` for why establishing
+    starts the sequence cursor at ``0`` (a full re-walk) rather than at the
+    highest ``hub_seq`` seen so far.
+    """
+    cols = {r["name"] for r in db.execute("PRAGMA table_info(sync_log)").fetchall()}
+    if "last_pull_seq" not in cols:
+        db.execute(
+            "ALTER TABLE sync_log ADD COLUMN last_pull_seq INTEGER NOT NULL DEFAULT -1"
+        )
 
 def embedding_mismatch_info(db: sqlite3.Connection) -> dict[str, str] | None:
     """Read-only check: do the stored vectors' model/dim/backend differ from

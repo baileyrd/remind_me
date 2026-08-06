@@ -88,14 +88,14 @@ def test_v25_to_v26_is_idempotent() -> None:
 
 def test_schema_version_is_current(db_conn: sqlite3.Connection) -> None:
     """A DB migrated through the sensitive-flag migration (v26) lands on the
-    current schema version (v27, issue #194's saved-searches tables) --
+    current schema version (v28, issue #167's last_pull_seq cursor) --
     updated alongside each later schema bump, mirroring test_db.py's own
     test_schema_version_is_current."""
     from remind_me_mcp.db import _SCHEMA_VERSION
 
-    assert _SCHEMA_VERSION == 27
+    assert _SCHEMA_VERSION == 28
     version = db_conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 27
+    assert version == 28
 
 
 def test_sensitive_included_in_outbox_payload_columns() -> None:
