@@ -2340,7 +2340,16 @@ def _migrate_v27_to_v28(db: sqlite3.Connection) -> None:
     starts the sequence cursor at ``0`` (a full re-walk) rather than at the
     highest ``hub_seq`` seen so far.
     """
-    cols = {r["name"] for r in db.execute("PRAGMA table_info(sync_log)").fetchall()}
+    # Positional access, not ``r["name"]``: ``_ensure_schema`` documents its
+    # argument as "an open SQLite connection", with no row_factory
+    # requirement -- unlike the query helpers below, whose docstrings do ask
+    # for ``sqlite3.Row`` explicitly. This was the one place in the module
+    # that assumed otherwise, and the test suite could not see it because
+    # every caller sets the row factory a line before calling in. The port's
+    # ADR-0007 schema regeneration is the real consumer that does not.
+    # ``PRAGMA table_info`` returns (cid, name, type, notnull, dflt_value,
+    # pk), so index 1 reads the same through a tuple or a Row.
+    cols = {r[1] for r in db.execute("PRAGMA table_info(sync_log)").fetchall()}
     if "last_pull_seq" not in cols:
         db.execute(
             "ALTER TABLE sync_log ADD COLUMN last_pull_seq INTEGER NOT NULL DEFAULT -1"

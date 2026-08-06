@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from remind_me_mcp.db import (
+    _SCHEMA_VERSION,
     _ensure_schema,
     _make_id,
     _maybe_snapshot_before_migration,
@@ -27,6 +28,7 @@ from remind_me_mcp.db import (
 
 if TYPE_CHECKING:
     import sqlite3
+    from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # _now_iso
@@ -1068,4 +1070,30 @@ def test_reference_is_accepted_by_the_classifier_input() -> None:
     assert parsed.memory_type == "reference"
     with pytest.raises(ValueError):
         MemoryClassification(memory_id="m1", memory_type="not_a_type")
+
+
+def test_ensure_schema_works_without_a_row_factory(tmp_path: Path) -> None:
+    """``_ensure_schema`` must not require ``row_factory = sqlite3.Row``.
+
+    Its docstring asks only for "an open SQLite connection" -- unlike the
+    query helpers, which document the Row requirement explicitly. Every
+    other test reaches it through a fixture that sets the factory a line
+    beforehand, so the whole suite was blind to a migration that indexed a
+    ``PRAGMA table_info`` row by name. The port's ADR-0007 schema
+    regeneration calls in on a bare connection and broke on exactly that.
+
+    Deliberately builds the connection by hand rather than using a fixture:
+    a fixture is what hid this.
+    """
+    import sqlite3 as _sqlite3
+
+    conn = _sqlite3.connect(str(tmp_path / "bare.db"))
+    try:
+        assert conn.row_factory is None
+        _ensure_schema(conn)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(sync_log)")}
+        assert "last_pull_seq" in cols
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == _SCHEMA_VERSION
+    finally:
+        conn.close()
 
