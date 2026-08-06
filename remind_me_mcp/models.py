@@ -1393,6 +1393,11 @@ class ContradictionCandidatesInput(BaseModel):
     remind_me_update/remind_me_delete tools, or by writing a superseding
     remind_me_add with an explicit SPO triple -- there is no separate
     "apply"/"resolve" tool here.
+
+    Paged with an ``(after_a, after_b)`` keyset cursor (issue #219). A keyset
+    rather than an offset because the pair set is derived from live memories:
+    an edit between calls shifts an offset's window, silently skipping or
+    repeating rows, whereas "after this pair" stays correct.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -1403,6 +1408,39 @@ class ContradictionCandidatesInput(BaseModel):
         le=100,
         description="Number of candidate pairs to return",
     )
+    after_a: str | None = Field(
+        default=None,
+        description=(
+            "Keyset cursor: return only pairs ordered after (after_a, after_b). "
+            "Pass the next_after_a/next_after_b from the previous response to "
+            "advance through the queue. Both must be given together."
+        ),
+    )
+    after_b: str | None = Field(
+        default=None,
+        validate_default=True,
+        description="Second half of the keyset cursor; see after_a.",
+    )
+
+    # validate_default=True is load-bearing: without it the validator never
+    # runs when after_b is simply omitted, so `after_a` alone sails straight
+    # through -- which is the exact half-a-cursor case it exists to reject.
+    @field_validator("after_b", mode="after")
+    @classmethod
+    def _cursor_halves_travel_together(cls, v: str | None, info: Any) -> str | None:
+        """Reject half a cursor (issue #219).
+
+        A lone ``after_a`` would silently mean "from the first pair of that
+        memory", and a lone ``after_b`` would be ignored entirely -- both
+        read as a working call that quietly pages from the wrong place,
+        which is the same class of silent-wrong-answer this issue is about.
+        """
+        after_a = info.data.get("after_a")
+        if (after_a is None) != (v is None):
+            raise ValueError(
+                "after_a and after_b must be provided together (both or neither)"
+            )
+        return v
 
 
 # ---------------------------------------------------------------------------

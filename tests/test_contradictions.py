@@ -389,3 +389,139 @@ def test_contradictions_module_does_not_import_scheduler() -> None:
         if isinstance(node, ast.ImportFrom) and node.module
     }
     assert not any("scheduler" in m for m in imported_modules)
+
+# ---------------------------------------------------------------------------
+# Keyset pagination (issue #219)
+# ---------------------------------------------------------------------------
+
+
+def _seed_pairs(db: sqlite3.Connection, memory_factory, count: int) -> list[str]:
+    """Create *count* memories all sharing one entity, so they pair with
+    each other. Returns the memory ids."""
+    ids = []
+    for i in range(count):
+        mem = memory_factory(content=f"claim number {i}")
+        _link_entity(db, mem["id"], "shared-topic")
+        ids.append(mem["id"])
+    return ids
+
+
+async def _page(**kwargs) -> dict:
+    return json.loads(
+        await remind_me_contradiction_candidates(ContradictionCandidatesInput(**kwargs))
+    )
+
+
+async def test_paging_reaches_pairs_beyond_the_first_page(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """The bug: every call re-served the identical top-N forever.
+
+    5 memories sharing an entity make 10 pairs. Walking with limit=3 must
+    reach all 10, not the same 3 four times.
+    """
+    _seed_pairs(db_conn, memory_factory, 5)
+
+    seen: list[tuple[str, str]] = []
+    page = await _page(limit=3)
+    total = page["total_candidates"]
+    # Bounded, not `while True`. Against a build that ignores the cursor the
+    # walk never terminates -- has_more stays true and the same page repeats
+    # forever -- so an unbounded loop HANGS the suite instead of failing it.
+    # Verified the hard way while checking this test is not vacuous.
+    for _ in range(total + 5):
+        seen.extend(
+            (c["memory_a"]["id"], c["memory_b"]["id"]) for c in page["candidates"]
+        )
+        if not page["has_more"]:
+            break
+        page = await _page(
+            limit=3, after_a=page["next_after_a"], after_b=page["next_after_b"]
+        )
+    else:
+        pytest.fail("paging never terminated -- the cursor is not advancing")
+
+    assert total == 10, f"expected 10 pairs from 5 memories, got {total}"
+    assert len(seen) == 10, f"walked {len(seen)} pairs, expected all {total}"
+    assert len(set(seen)) == 10, "the walk repeated a pair"
+
+
+async def test_without_a_cursor_every_call_returns_the_same_page(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """The old behaviour, pinned deliberately.
+
+    This is not a bug being preserved -- it is the baseline that makes the
+    test above meaningful. A cursor-less call is still the first page by
+    definition; what #219 fixed is that there was no way to ask for a
+    second one.
+    """
+    _seed_pairs(db_conn, memory_factory, 5)
+    first = await _page(limit=3)
+    second = await _page(limit=3)
+    assert first["candidates"] == second["candidates"]
+
+
+async def test_the_final_page_reports_no_more(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """A short page is the end of the queue, so the cursor must be null.
+
+    Callers loop on has_more; if a short page still handed back a cursor the
+    loop would make one extra empty request forever.
+    """
+    _seed_pairs(db_conn, memory_factory, 3)  # 3 pairs
+    page = await _page(limit=10)
+    assert len(page["candidates"]) == 3
+    assert page["has_more"] is False
+    assert page["next_after_a"] is None and page["next_after_b"] is None
+
+
+async def test_an_exactly_full_final_page_costs_one_empty_request(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """When the last page is exactly `limit` long there is no way to know it
+    was the last, so has_more is true and the next call comes back empty.
+
+    Asserted rather than left implicit: it is the one case where the walk
+    makes a request it did not need, and a reader should see that it
+    terminates cleanly rather than looping.
+    """
+    _seed_pairs(db_conn, memory_factory, 3)  # exactly 3 pairs
+    page = await _page(limit=3)
+    assert page["has_more"] is True
+    final = await _page(limit=3, after_a=page["next_after_a"], after_b=page["next_after_b"])
+    assert final["candidates"] == []
+    assert final["has_more"] is False
+
+
+async def test_total_candidates_is_the_whole_queue_not_the_remainder(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """Documented explicitly because it is the natural thing to get wrong:
+    a caller using it as a remaining-work denominator would see it never
+    shrink and conclude paging was broken."""
+    _seed_pairs(db_conn, memory_factory, 5)
+    first = await _page(limit=3)
+    later = await _page(
+        limit=3, after_a=first["next_after_a"], after_b=first["next_after_b"]
+    )
+    assert first["total_candidates"] == later["total_candidates"] == 10
+
+
+def test_half_a_cursor_is_rejected() -> None:
+    """Either half alone would page from the wrong place silently."""
+    for kwargs in ({"after_a": "abc"}, {"after_b": "def"}):
+        with pytest.raises(ValueError, match="together"):
+            ContradictionCandidatesInput(**kwargs)
+
+
+async def test_a_cursor_past_the_end_returns_an_empty_page(
+    db_conn: sqlite3.Connection, memory_factory
+) -> None:
+    """Hex ids never exceed 'z', so this cursor sorts after every pair."""
+    _seed_pairs(db_conn, memory_factory, 3)
+    page = await _page(limit=10, after_a="zzzzzzzzzzzz", after_b="zzzzzzzzzzzz")
+    assert page["candidates"] == []
+    assert page["has_more"] is False
+    assert page["total_candidates"] == 3, "the total still describes the whole queue"
