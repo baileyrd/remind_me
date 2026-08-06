@@ -207,7 +207,7 @@ def test_decay_rates_maps_memory_types() -> None:
     """DECAY_RATES dict maps expected memory types to specific float rates."""
     expected_types = {
         "decision", "preference", "fact", "insight", "learning",
-        "blocker", "action_item", "unclassified",
+        "blocker", "action_item", "reference", "unclassified",
     }
     assert set(DECAY_RATES.keys()) == expected_types
     for key, value in DECAY_RATES.items():

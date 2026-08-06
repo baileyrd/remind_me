@@ -998,8 +998,21 @@ VALID_MEMORY_TYPES: set[str] = {
     "learning",
     "blocker",
     "action_item",
+    "reference",
 }
-"""Allowed memory_type values for classification (excludes 'unclassified')."""
+"""Allowed memory_type values for classification (excludes 'unclassified').
+
+``reference`` (issue #220) is for standing reference material -- source code,
+diagrams, doc fragments imported wholesale -- rather than something distilled
+from a conversation. It exists because the other seven all describe a *claim*
+of some kind, and bulk-imported file contents assert nothing: they were being
+filed as ``fact`` for want of anywhere better, which made ``fact``-filtered
+views a mixture of real assertions and pasted-in source.
+
+Named ``reference`` rather than ``source_snippet`` because the content is not
+only code -- the batch that prompted this included SVG diagrams and
+documentation -- and a name that says "code" would push the next importer of
+non-code reference material back into ``fact``."""
 
 
 class MemoryClassification(BaseModel):
@@ -1014,7 +1027,11 @@ class MemoryClassification(BaseModel):
         ...,
         description=(
             "The classification type. Must be one of: "
-            "decision, preference, fact, insight, learning, blocker, action_item"
+            "decision, preference, fact, insight, learning, blocker, "
+            "action_item, reference. Use 'reference' for standing reference "
+            "material with no claim attached -- source code, diagrams, doc "
+            "fragments imported wholesale -- and 'fact' only for a durable "
+            "factual assertion."
         ),
     )
 
@@ -1076,7 +1093,10 @@ class AtomicFact(BaseModel):
         default=None,
         description=(
             "Optional classification type. Must be one of: "
-            "decision, preference, fact, insight, learning, blocker, action_item. "
+            "decision, preference, fact, insight, learning, blocker, "
+            "action_item, reference. Use 'reference' for raw reference "
+            "material (source code, diagrams, doc fragments) rather than "
+            "'fact', which is for durable factual assertions. "
             "Defaults to 'unclassified' if not provided."
         ),
     )

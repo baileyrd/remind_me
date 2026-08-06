@@ -459,7 +459,7 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 # Current target schema version.  Increment when adding a new migration step.
-_SCHEMA_VERSION = 28
+_SCHEMA_VERSION = 29
 
 
 
@@ -662,6 +662,11 @@ def _migrate_schema(db: sqlite3.Connection) -> None:
         _migrate_v27_to_v28(db)
         db.execute("PRAGMA user_version = 28")
         current_version = 28
+
+    if current_version < 29:
+        _migrate_v28_to_v29(db)
+        db.execute("PRAGMA user_version = 29")
+        current_version = 29
 
     db.commit()
 
@@ -2339,6 +2344,70 @@ def _migrate_v27_to_v28(db: sqlite3.Connection) -> None:
     if "last_pull_seq" not in cols:
         db.execute(
             "ALTER TABLE sync_log ADD COLUMN last_pull_seq INTEGER NOT NULL DEFAULT -1"
+        )
+
+
+_REFERENCE_DECAY_RATE = 0.03
+"""Must equal ``vitality.DECAY_RATES["reference"]`` (issue #220).
+
+Duplicated rather than imported because ``vitality`` imports *this* module,
+so importing it back at module scope is a cycle. The duplication is guarded
+by ``test_migration_decay_rate_matches_the_canonical_table``, which fails if
+the two ever drift -- a silent drift would leave migrated rows decaying at
+one rate while everything written afterwards uses another."""
+
+
+def _migrate_v28_to_v29(db: sqlite3.Connection) -> None:
+    """v28 -> v29: refile bulk-imported reference material off ``fact`` (issue #220).
+
+    The ``reference`` memory_type is new in this release. Existing
+    memory-palace imports predate it and were classified ``fact`` as a
+    fallback, which is what made ``fact``-filtered views a mixture of real
+    assertions and pasted-in source. This moves them.
+
+    Deliberately narrow. Only rows whose ``source`` marks them as a
+    memory-palace import AND that are currently ``fact`` are touched --
+    the batch the issue observed, and nothing else. A broader heuristic
+    ("looks like code") would be guessing at content the user classified
+    on purpose, and a wrong guess here is a silent reclassification of
+    someone's real facts.
+
+    ``decay_rate`` moves with the type. It is stored per row (set from
+    ``DECAY_RATES`` at write time), so changing memory_type alone would
+    leave these rows decaying at ``fact``'s 0.05 forever and the new type
+    would be cosmetic.
+
+    ``updated_at`` moves too, so the change reaches other nodes. Every node
+    runs this same deterministic migration when it upgrades, so in principle
+    they would converge without syncing -- but ``memory_type`` is a synced
+    column, and a node that upgrades later would otherwise push its stale
+    ``fact`` back over an upgraded node's ``reference`` on the next
+    last-write-wins comparison. Propagating costs one outbox row per
+    affected memory and removes that whole class of flapping. (The same
+    reasoning as the reference repo's issue #135, where a supersession that
+    did not touch ``updated_at`` never reached any other node.)
+
+    Safe on a node with no such imports: the UPDATE matches nothing and the
+    migration is a no-op.
+    """
+    now = _now_iso()
+    cursor = db.execute(
+        """
+        UPDATE memories
+           SET memory_type = 'reference',
+               decay_rate  = ?,
+               updated_at  = ?
+         WHERE memory_type = 'fact'
+           AND deleted_at IS NULL
+           AND (source = 'mempalace_import' OR source LIKE 'mempalace:%')
+        """,
+        (_REFERENCE_DECAY_RATE, now),
+    )
+    if cursor.rowcount:
+        log.info(
+            "Migration v29: refiled %d memory-palace import(s) from 'fact' to "
+            "'reference' (issue #220)",
+            cursor.rowcount,
         )
 
 def embedding_mismatch_info(db: sqlite3.Connection) -> dict[str, str] | None:
