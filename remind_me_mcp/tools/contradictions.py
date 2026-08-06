@@ -111,13 +111,22 @@ async def remind_me_contradiction_candidates(params: ContradictionCandidatesInpu
     the corrected fact (which also lets future exact-triple conflicts on
     that claim auto-supersede).
 
+    Paginate with the keyset cursor (issue #219): pass the ``next_after_a``/
+    ``next_after_b`` from one response as ``after_a``/``after_b`` on the next
+    call, and stop when ``has_more`` is false. Without a cursor every call
+    returns the same first page, so a queue of tens of thousands of pairs has
+    only ``limit`` reachable rows.
+
     Args:
-        params: Batch size (default 20, max 100).
+        params: Batch size (default 20, max 100), and an optional
+            ``after_a``/``after_b`` keyset cursor (both or neither).
 
     Returns:
         JSON string with a candidates array of {memory_a, memory_b} pairs
-        (each side carrying enough content/context to judge) and a
-        total_candidates count.
+        (each side carrying enough content/context to judge), a
+        total_candidates count for the WHOLE queue (not the remainder after
+        the cursor), and ``next_after_a``/``next_after_b``/``has_more`` for
+        paging.
     """
     db = _pkg._get_db()
 
@@ -125,11 +134,35 @@ async def remind_me_contradiction_candidates(params: ContradictionCandidatesInpu
         f"SELECT COUNT(*) AS cnt FROM ({_CONTRADICTION_CANDIDATE_PAIRS_SQL}) p"  # noqa: S608 — constants only
     ).fetchone()
 
+    # Keyset cursor on the (id_a, id_b) the query already orders by (issue
+    # #219). Without it every call re-served the identical first page, so a
+    # queue of ~78k pairs had exactly 100 reachable rows and a worker looping
+    # this tool made no progress at all.
+    #
+    # A keyset, not an OFFSET: pairs are derived from live memories, so a
+    # memory edited or deleted between calls changes the result set, and an
+    # offset would silently skip or repeat rows around the edit. A keyset
+    # asks "after this pair" and is stable under both.
+    #
+    # Of the three options the issue floated, this is the only one that keeps
+    # the module read-only. Excluding already-reviewed pairs needs somewhere
+    # to record a review, and there is deliberately no apply/resolve tool
+    # here. Ordering by updated_at fails outright: most pairs are correctly
+    # judged NOT to conflict, so reviewing them changes nothing, and they
+    # would be re-served forever -- the very bug being fixed.
+    cursor_clause = ""
+    query_params: list[object] = []
+    if params.after_a is not None and params.after_b is not None:
+        cursor_clause = "WHERE (id_a > ? OR (id_a = ? AND id_b > ?))"
+        query_params += [params.after_a, params.after_a, params.after_b]
+    query_params.append(params.limit)
+
     pair_rows = db.execute(
         f"""SELECT id_a, id_b FROM ({_CONTRADICTION_CANDIDATE_PAIRS_SQL})
+            {cursor_clause}
             ORDER BY id_a, id_b
             LIMIT ?""",  # noqa: S608 — constants only
-        (params.limit,),
+        query_params,
     ).fetchall()
 
     def _side(memory_id: str) -> dict:
@@ -170,8 +203,21 @@ async def remind_me_contradiction_candidates(params: ContradictionCandidatesInpu
         for row in pair_rows
     ]
 
+    # The cursor to pass back for the next page. Null on a short page, which
+    # is the queue being exhausted -- callers loop until it is null rather
+    # than comparing counts, since total_candidates is the size of the whole
+    # queue, not of what remains after the cursor.
+    next_after_a: str | None = None
+    next_after_b: str | None = None
+    if len(pair_rows) == params.limit and pair_rows:
+        next_after_a = pair_rows[-1]["id_a"]
+        next_after_b = pair_rows[-1]["id_b"]
+
     result = {
         "candidates": candidates,
         "total_candidates": total_row["cnt"] if total_row is not None else 0,
+        "next_after_a": next_after_a,
+        "next_after_b": next_after_b,
+        "has_more": next_after_a is not None,
     }
     return json.dumps(result, indent=2)
