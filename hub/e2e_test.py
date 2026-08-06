@@ -368,6 +368,88 @@ else:
           f'remind_me_hub_memories{{state="live"}} {c["memories"]["live"]}' in m.text,
           m.text)
 
+# ---------------- since_seq pull cursor, client half (issue #167) ----------------
+# #160 gave the hub a monotonic hub_seq and a since_seq cursor; the client was
+# only wired to it in #167, and until then the bug had no end-to-end fix. This
+# section reproduces the production scenario against the real hub: a node back
+# online after a long absence pushes a record still stamped with an OLD
+# updated_at, which sorts behind every other node's already-advanced legacy
+# cursor and is therefore invisible to them forever.
+#
+# The issue was deferred for exactly this reason -- "no way to integration-test
+# the hub side in this dev environment". That stopped being true once the
+# hub-e2e job existed, so the check belongs here rather than in a mock.
+import asyncio  # noqa: E402
+import tempfile  # noqa: E402
+
+_OLD_TS = "2019-01-01T00:00:00+00:00"
+
+_seq_dir = tempfile.mkdtemp(prefix="e2e-seq-")
+_seq_db_mod, _seq_sync, _seq_db = make_node("node-seq", _seq_dir)
+
+# A late push carrying an old timestamp, from a *different* node so this node
+# is eligible to pull it back.
+httpx.post(
+    f"{HUB_URL}/sync/push",
+    headers=AUTH,
+    json={
+        "node_id": "node-late",
+        "records": [{
+            "id": "late-push-167",
+            "content": "pushed late, stamped old",
+            "created_at": _OLD_TS,
+            "updated_at": _OLD_TS,
+        }],
+    },
+    timeout=10,
+).raise_for_status()
+
+# Wedge this node's legacy cursor past that timestamp -- the stuck state.
+_seq_db.execute(
+    """INSERT INTO sync_log (remote_id, last_pull, last_pull_id, last_pull_seq)
+       VALUES ('hub', ?, 'zzz', ?)
+       ON CONFLICT (remote_id) DO UPDATE SET
+           last_pull = excluded.last_pull,
+           last_pull_id = excluded.last_pull_id,
+           last_pull_seq = excluded.last_pull_seq""",
+    ("2030-01-01T00:00:00+00:00", _seq_sync.SEQ_UNSUPPORTED),
+)
+_seq_db.commit()
+
+
+async def _seq_pull():
+    async with httpx.AsyncClient() as c:
+        return await _seq_sync._pull_remote(c, HUB_URL, "hub")
+
+
+# Pinned to SEQ_UNSUPPORTED this is precisely the pre-#167 client, so this
+# assertion is what makes the one below meaningful rather than vacuous.
+asyncio.run(_seq_pull())
+_ids = [r["id"] for r in _seq_db.execute("SELECT id FROM memories").fetchall()]
+check("legacy cursor cannot see a late push (the bug being fixed)",
+      "late-push-167" not in _ids, str(_ids))
+
+# Now let the client establish the seq cursor, as it does on upgrade.
+_seq_db.execute(
+    "UPDATE sync_log SET last_pull_seq = ? WHERE remote_id = 'hub'",
+    (_seq_sync.SEQ_UNKNOWN,),
+)
+_seq_db.commit()
+asyncio.run(_seq_pull())
+
+_ids = [r["id"] for r in _seq_db.execute("SELECT id FROM memories").fetchall()]
+check("since_seq cursor rescues it", "late-push-167" in _ids, str(_ids))
+
+_seq_state = _seq_db.execute(
+    "SELECT last_pull_seq FROM sync_log WHERE remote_id = 'hub'"
+).fetchone()["last_pull_seq"]
+check("the seq cursor advanced past the rescued record",
+      _seq_state > 0, f"last_pull_seq={_seq_state}")
+
+_seq_db_mod._close_db()
+shutil.rmtree(_seq_dir, ignore_errors=True)
+
+
 # ---------------- Legacy schema migration ----------------
 # The migration that turns a restored legacy dump (TIMESTAMPTZ columns) into
 # this hub's canonical TEXT form had no test at all until a `.500000` was

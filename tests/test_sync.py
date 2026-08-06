@@ -383,9 +383,12 @@ async def test_pull_remote_upserts_records(sync_db: sqlite3.Connection) -> None:
 
 
 async def test_pull_remote_sends_since_cursor(sync_db: sqlite3.Connection) -> None:
+    # last_pull_seq pinned to SEQ_UNSUPPORTED so no capability probe fires:
+    # this test is about the legacy cursor's parameters (issue #167).
     sync_db.execute(
-        """INSERT INTO sync_log (remote_id, last_pull, last_pull_id)
-           VALUES ('hub', '2026-01-01T00:00:00+00:00', 'mem-z')"""
+        """INSERT INTO sync_log (remote_id, last_pull, last_pull_id, last_pull_seq)
+           VALUES ('hub', '2026-01-01T00:00:00+00:00', 'mem-z', ?)""",
+        (sync.SEQ_UNSUPPORTED,),
     )
     sync_db.commit()
 
@@ -414,6 +417,25 @@ async def test_pull_remote_empty(sync_db: sqlite3.Connection) -> None:
     # ...but the wall-clock contact time still advances (SY-17/18): a quiet
     # hub with nothing new to send is still a hub we successfully reached.
     assert row["last_pull_at"] != sync._EPOCH
+
+
+
+def _pin_legacy_cursor(db: sqlite3.Connection, remote_id: str = "hub") -> None:
+    """Mark *remote_id* as not supporting ``since_seq`` (issue #167).
+
+    Tests that exercise the legacy ``(updated_at, id)`` drain loop use this so
+    ``_pull_remote`` skips its capability probe — otherwise the probe shows up
+    as an extra recorded request and every request-count assertion shifts by
+    one, obscuring what the test is actually about.
+    """
+    db.execute(
+        """
+        INSERT INTO sync_log (remote_id, last_pull_seq) VALUES (?, ?)
+        ON CONFLICT (remote_id) DO UPDATE SET last_pull_seq = excluded.last_pull_seq
+        """,
+        (remote_id, sync.SEQ_UNSUPPORTED),
+    )
+    db.commit()
 
 
 def _paging_pull_handler(all_records: list[dict], page_size: int):
@@ -445,6 +467,7 @@ async def test_pull_remote_drains_multiple_pages(
         make_record("rec-b", "b", created_at=ts1, updated_at=ts1),
         make_record("rec-c", "c", created_at=ts2, updated_at=ts2),
     ]
+    _pin_legacy_cursor(sync_db)
     recorder = RequestRecorder(
         responses={"/sync/pull": _paging_pull_handler(all_records, 2)}
     )
@@ -516,6 +539,7 @@ async def test_pull_remote_touches_last_pull_at_on_mid_drain_error(
             return httpx.Response(200, json={"records": page1, "count": 2})
         return httpx.Response(500, json={"error": "boom"})
 
+    _pin_legacy_cursor(sync_db)
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(httpx.HTTPStatusError):
             await sync._pull_remote(client, "http://hub", "hub")
@@ -530,6 +554,185 @@ async def test_pull_remote_touches_last_pull_at_on_mid_drain_error(
     assert log_row["last_pull"] == ts1
     assert log_row["last_pull_id"] == "rec-b"
     assert log_row["last_pull_at"] != sync._EPOCH
+
+
+# ---------------------------------------------------------------------------
+# since_seq pull cursor (issue #167)
+# ---------------------------------------------------------------------------
+
+
+def _seq_record(rec_id: str, ts: str, hub_seq: int | None) -> dict:
+    rec = make_record(rec_id, rec_id, created_at=ts, updated_at=ts)
+    if hub_seq is not None:
+        rec["hub_seq"] = hub_seq
+    return rec
+
+
+async def test_probe_adopts_seq_mode_when_the_remote_returns_hub_seq(
+    sync_db: sqlite3.Connection,
+) -> None:
+    """A hub whose records carry hub_seq switches this remote to seq mode."""
+    recorder = RequestRecorder(
+        responses={"/sync/pull": {"records": [_seq_record("a", "2026-01-01T00:00:00+00:00", 7)], "count": 1}}
+    )
+    async with mock_client(recorder) as client:
+        await sync._pull_remote(client, "http://hub", "hub")
+
+    probe = dict(recorder.requests[0].url.params)
+    assert probe["since_seq"] == "0" and probe["limit"] == "1"
+    # Establishing starts at 0 -- a full re-walk -- so the very next request
+    # asks from the start of the sequence, not from the probed record's seq.
+    assert dict(recorder.requests[1].url.params)["since_seq"] == "0"
+    row = sync_db.execute(
+        "SELECT last_pull_seq FROM sync_log WHERE remote_id = 'hub'"
+    ).fetchone()
+    assert row["last_pull_seq"] == 7
+
+
+async def test_probe_marks_a_peer_unsupported_and_does_not_reprobe(
+    sync_db: sqlite3.Connection,
+) -> None:
+    """A peer server returns records without hub_seq; that answer is sticky."""
+    recorder = RequestRecorder(
+        responses={"/sync/pull": {"records": [_seq_record("a", "2026-01-01T00:00:00+00:00", None)], "count": 1}}
+    )
+    async with mock_client(recorder) as client:
+        await sync._pull_remote(client, "http://peer", "peer-1")
+        first_round = len(recorder.requests)
+        await sync._pull_remote(client, "http://peer", "peer-1")
+
+    row = sync_db.execute(
+        "SELECT last_pull_seq FROM sync_log WHERE remote_id = 'peer-1'"
+    ).fetchone()
+    assert row["last_pull_seq"] == sync.SEQ_UNSUPPORTED
+    # The second cycle must not probe again -- otherwise every peer pays an
+    # extra request per cycle forever.
+    probes = [r for r in recorder.requests if "since_seq" in dict(r.url.params)]
+    assert len(probes) == 1, f"probed {len(probes)} times across {first_round} + later requests"
+
+
+async def test_an_empty_remote_stays_unknown_rather_than_unsupported(
+    sync_db: sqlite3.Connection,
+) -> None:
+    """No records is not evidence of absence.
+
+    An empty hub answers the probe with nothing whichever cursor it
+    understands. Marking it unsupported on that basis would be sticky and
+    wrong, and the node would never adopt seq mode once records appeared.
+    """
+    recorder = RequestRecorder()  # default /sync/pull -> no records
+    async with mock_client(recorder) as client:
+        await sync._pull_remote(client, "http://hub", "hub")
+
+    row = sync_db.execute(
+        "SELECT last_pull_seq FROM sync_log WHERE remote_id = 'hub'"
+    ).fetchone()
+    assert row is None or row["last_pull_seq"] == sync.SEQ_UNKNOWN
+
+
+async def test_a_failed_probe_falls_back_without_recording_a_verdict(
+    sync_db: sqlite3.Connection,
+) -> None:
+    """An unreachable remote must not be mistaken for one lacking the feature."""
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if "since_seq" in dict(request.url.params):
+            return httpx.Response(503, json={"error": "down"})
+        return httpx.Response(200, json={"records": [], "count": 0})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await sync._pull_remote(client, "http://hub", "hub")
+
+    row = sync_db.execute(
+        "SELECT last_pull_seq FROM sync_log WHERE remote_id = 'hub'"
+    ).fetchone()
+    assert row is None or row["last_pull_seq"] == sync.SEQ_UNKNOWN
+    # It still pulled, on the legacy cursor.
+    assert any("since" in dict(c.url.params) for c in calls)
+
+
+async def test_seq_mode_rescues_a_late_push_the_legacy_cursor_cannot_see(
+    sync_db: sqlite3.Connection,
+) -> None:
+    """The bug this whole change exists for.
+
+    A node back online after a fortnight pushes a record still stamped with
+    an OLD updated_at but assigned a HIGH hub_seq. A legacy cursor already
+    advanced past that timestamp can never return it; a seq cursor must.
+    """
+    old_ts = "2026-01-01T00:00:00+00:00"
+    stranded = _seq_record("stranded", old_ts, 42)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = dict(request.url.params)
+        if "since_seq" in params:
+            # The hub orders by hub_seq, so the old-timestamped record is
+            # returned despite sitting behind the legacy watermark.
+            return httpx.Response(
+                200,
+                json={"records": [stranded] if int(params["since_seq"]) < 42 else [], "count": 1},
+            )
+        # Legacy mode: nothing newer than the (already advanced) watermark.
+        return httpx.Response(200, json={"records": [], "count": 0})
+
+    # A cursor already past the stranded record's timestamp -- the wedged state.
+    sync_db.execute(
+        """INSERT INTO sync_log (remote_id, last_pull, last_pull_id, last_pull_seq)
+           VALUES ('hub', '2026-06-01T00:00:00+00:00', 'zzz', ?)""",
+        (sync.SEQ_UNKNOWN,),
+    )
+    sync_db.commit()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        applied = await sync._pull_remote(client, "http://hub", "hub")
+
+    assert applied == 1, "the stranded record should have been rescued"
+    got = sync_db.execute("SELECT id FROM memories").fetchall()
+    assert [r["id"] for r in got] == ["stranded"]
+    row = sync_db.execute(
+        "SELECT last_pull_seq FROM sync_log WHERE remote_id = 'hub'"
+    ).fetchone()
+    assert row["last_pull_seq"] == 42
+
+
+async def test_a_record_without_hub_seq_cannot_advance_the_seq_cursor(
+    sync_db: sqlite3.Connection,
+) -> None:
+    """Advancing past an unsequenced record would strand it the same way."""
+    sync_db.execute(
+        """INSERT INTO sync_log (remote_id, last_pull_seq) VALUES ('hub', 5)"""
+    )
+    sync_db.commit()
+    recorder = RequestRecorder(
+        responses={"/sync/pull": {"records": [_seq_record("a", "2026-01-01T00:00:00+00:00", None)], "count": 1}}
+    )
+    async with mock_client(recorder) as client:
+        await sync._pull_remote(client, "http://hub", "hub")
+
+    row = sync_db.execute(
+        "SELECT last_pull_seq FROM sync_log WHERE remote_id = 'hub'"
+    ).fetchone()
+    assert row["last_pull_seq"] == 5, "cursor moved on a record carrying no hub_seq"
+
+
+async def test_reset_pull_cursor_clears_a_stuck_unsupported_verdict(
+    sync_db: sqlite3.Connection,
+) -> None:
+    """The documented recovery path after upgrading a hub past #160."""
+    sync_db.execute(
+        """INSERT INTO sync_log (remote_id, last_pull_seq) VALUES ('hub', ?)""",
+        (sync.SEQ_UNSUPPORTED,),
+    )
+    sync_db.commit()
+
+    sync.reset_pull_cursor("hub", kinds=("memory",))
+
+    row = sync_db.execute(
+        "SELECT last_pull_seq FROM sync_log WHERE remote_id = 'hub'"
+    ).fetchone()
+    assert row["last_pull_seq"] == sync.SEQ_UNKNOWN
 
 
 # ---------------------------------------------------------------------------
@@ -3171,7 +3374,11 @@ def test_reset_pull_cursor_reports_the_prior_watermark(
     result = sync.reset_pull_cursor("hub", kinds=["memory"])
 
     entry = result["reset"][0]
-    assert entry["was"] == {"last_pull": "2026-01-01T00:00:00+00:00", "last_pull_id": "abc"}
+    assert entry["was"] == {
+        "last_pull": "2026-01-01T00:00:00+00:00",
+        "last_pull_id": "abc",
+        "last_pull_seq": sync.SEQ_UNKNOWN,
+    }
 
 
 def test_reset_pull_cursor_rejects_an_unknown_kind(sync_db: sqlite3.Connection) -> None:
